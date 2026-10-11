@@ -17,7 +17,7 @@ RUN apk add --no-cache kmod e2fsprogs iptables ip6tables dnsmasq ca-certificates
 ADD https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_VERSION}.tgz /tmp/docker.tgz
 RUN tar -xzf /tmp/docker.tgz -C /tmp \
  && cd /tmp/docker \
- && install -m 0755 dockerd containerd containerd-shim-runc-v2 runc docker-proxy docker-init ctr /usr/local/bin/ \
+ && install -m 0755 dockerd containerd containerd-shim-runc-v2 runc docker-proxy docker-init /usr/local/bin/ \
  && rm -rf /tmp/docker /tmp/docker.tgz
 COPY --from=agent rekcod-agent /usr/local/bin/rekcod-agent
 COPY rootfs/ /
@@ -58,7 +58,9 @@ RUN set -eu; mkdir /out; k=/rootfs/boot/vmlinuz-virt; \
     tail -c +$((off + 1)) "$k" | head -c "$len" | gunzip > /out/Image; \
     [ "$(dd if=/out/Image bs=1 skip=56 count=4 2>/dev/null)" = "ARMd" ]; \
     cp /rootfs/boot/initramfs-virt /out/initramfs; rm -rf /rootfs/boot/*; \
-    mb=$(( $(du -sm /rootfs | cut -f1) * 3 / 2 + 256 )); \
+    # content + 25% + 64 MB: the root only takes logs and /etc writes; docker
+    # state is on the data disk. The release tarball compresses the rest away.
+    mb=$(( $(du -sm /rootfs | cut -f1) * 5 / 4 + 64 )); \
     mke2fs -q -t ext4 -L rekcod-root -d /rootfs /out/root.img "${mb}M"; \
     cat /out/Image /out/initramfs /out/root.img | sha256sum | cut -c1-16 > /out/VERSION
 

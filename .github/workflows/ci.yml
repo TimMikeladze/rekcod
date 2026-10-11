@@ -1,0 +1,40 @@
+name: ci
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  host:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+      - run: cargo clippy -p rekcod -p rekcod-proto -- -D warnings
+      - run: cargo clippy -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings
+      - run: cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
+
+  guest:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - name: agent
+        run: |
+          cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
+          mkdir -p out/agent && cp target/aarch64-unknown-linux-musl/release/rekcod-agent out/agent/
+      - name: guest image
+        run: |
+          docker build --platform linux/arm64 --build-context agent=out/agent \
+            --target out --output type=local,dest=out/guest guest
+          ls -l out/guest
+          size=$(stat -c %s out/guest/root.img)
+          test "$size" -lt $((400 * 1024 * 1024)) || { echo "root.img too big: $size"; exit 1; }

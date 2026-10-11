@@ -17,6 +17,8 @@ mod cli;
 #[cfg(target_os = "macos")]
 mod daemon;
 #[cfg(target_os = "macos")]
+mod fetch;
+#[cfg(target_os = "macos")]
 mod vm;
 #[cfg(target_os = "macos")]
 mod watch;

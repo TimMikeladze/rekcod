@@ -11,6 +11,20 @@ docker compose up -d                  # unchanged
 rekcod stop                           # powers off, restores your previous context
 ```
 
+## Install
+
+From a GitHub release (the repo is private for now, so use `gh`):
+
+```sh
+gh release download -R TimMikeladze/rekcod -p 'rekcod-*-darwin-arm64.tar.gz'
+tar -xzf rekcod-*-darwin-arm64.tar.gz && sudo mv bin/rekcod /usr/local/bin/
+xattr -d com.apple.quarantine /usr/local/bin/rekcod 2>/dev/null   # not notarized yet
+rekcod start      # first run downloads and verifies the guest image (~100 MB)
+```
+
+The binary pins the guest it was released with (`~/.rekcod/guest/<version>/`) and
+checks its sha256 before unpacking. `REKCOD_RELEASE_URL` points the download elsewhere.
+
 ## What works
 
 Verified by `scripts/e2e.sh` (37 checks) and `tests/stress/` on an M5 Pro, macOS 27:
@@ -66,7 +80,13 @@ first guest image build. After that, rekcod can rebuild its own guest.
 scripts/build.sh                                   # host binary (signed), agent, out/guest
 REKCOD_BUILD_DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock scripts/build.sh   # self-hosted
 scripts/build.sh --host-only                       # skip the guest image
+scripts/package.sh                                 # release tarballs + SHA256SUMS in out/release
 ```
+
+Releases: push a `vX.Y.Z` tag matching `Cargo.toml`. `.github/workflows/release.yml`
+builds the guest on arm64 Linux and the host on macOS, then publishes the release.
+CI (`ci.yml`) runs unit tests, clippy and a guest build. The e2e suite needs a Mac
+that can run VMs, so it runs locally.
 
 `target/release/rekcod` finds `out/guest` on its own. Elsewhere, set `REKCOD_GUEST_DIR` or copy
 `out/guest` to `~/.rekcod/guest`.
@@ -109,7 +129,7 @@ Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md)
 - **First access can be slower than OrbStack** when a container touches files before background warming finishes (about 1 s per 20k files). Repeat work is 3–9× faster.
 - Mac→container change latency is about 25 ms (OrbStack: about 10 ms). Changes are visible after that bounded delay, not instantly.
 - **Memory isn't returned to macOS.** `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop (docs/phase2.md, docs/research.md).
-- No menu bar app, no brew formula.
+- No menu bar app, no brew formula. Releases are ad-hoc signed, not notarized.
 
 Debug knobs: `REKCOD_DEBUG=1` logs forwarded file events. `REKCOD_KERNEL_CMDLINE` overrides
 the guest command line. `REKCOD_NO_BALLOON=1` drops the balloon device. In the guest, `cat /sys/module/virtiofs/parameters/rekcod_stats`

@@ -1,0 +1,42 @@
+name: release
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  guest:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - run: |
+          cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
+          mkdir -p out/agent && cp target/aarch64-unknown-linux-musl/release/rekcod-agent out/agent/
+          docker build --platform linux/arm64 --build-context agent=out/agent \
+            --target out --output type=local,dest=out/guest guest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest
+          path: out/guest
+
+  release:
+    needs: guest
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: guest
+          path: out/guest
+      - name: check tag matches Cargo.toml
+        run: test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
+      - run: GUEST_DIR=out/guest scripts/package.sh
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" out/release/* --generate-notes

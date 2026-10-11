@@ -113,4 +113,6 @@ plus hourly trim, and bind-mount warming are shipped and checked in `scripts/e2e
 
 A custom vsock file server is slower per request than Apple's virtio-fs (63 vs 46 µs). libkrun would lose Rosetta.
 
-**Start with:** Phase 3 (shipping).
+Phase 3 progress: see `docs/phase3.md` (guest shrink, releases, auto-fetch, CI done; signing/notarization and brew open).
+
+**Start with:** Developer ID signing + notarization (needs the user's Apple account).

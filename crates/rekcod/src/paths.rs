@@ -61,7 +61,8 @@ impl Paths {
 
     /// Guest kernel, initramfs and root image: `$REKCOD_GUEST_DIR`, then
     /// `~/.rekcod/guest`, then next to the binary (`../share/rekcod/guest`),
-    /// then the repo's `out/guest` for dev builds.
+    /// then the repo's `out/guest` for dev builds, then (release builds) the
+    /// embedded guest version under `~/.rekcod/guest/<version>`, downloaded if missing.
     pub fn guest_dir(&self) -> Result<PathBuf> {
         let mut candidates = Vec::new();
         if let Some(dir) = std::env::var_os("REKCOD_GUEST_DIR") {
@@ -76,6 +77,11 @@ impl Paths {
             if dir.join("Image").exists() && dir.join("root.img").exists() {
                 return Ok(dir.canonicalize()?);
             }
+        }
+        // Release builds: the guest they were built with, downloaded on first use.
+        #[cfg(target_os = "macos")]
+        if let Some(dir) = crate::fetch::ensure_guest(&self.home)? {
+            return Ok(dir);
         }
         bail!(
             "guest image not found (looked in {}); build it with scripts/build.sh",

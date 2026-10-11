@@ -1,0 +1,13 @@
+[package]
+name = "rekcod-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "rekcod guest agent: vsock bridges for the docker API, published ports and control"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rekcod-proto.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+tokio-vsock = "0.7"
+libc = "0.2"

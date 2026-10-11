@@ -1,0 +1,386 @@
+//! User-facing commands: start, stop, status, import, shell.
+
+use std::collections::BTreeMap;
+use std::fs::OpenOptions;
+use std::io::Read;
+use std::os::unix::process::CommandExt;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+use anyhow::{Context, Result, bail};
+
+use crate::docker::{self, CONTEXT};
+use crate::http;
+use crate::paths::Paths;
+use crate::vm;
+
+const HELPER_IMAGE: &str = "alpine:3.22";
+
+fn block_on<F: Future>(f: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime").block_on(f)
+}
+
+/// GET on the rekcod docker socket.
+fn api_get(paths: &Paths, path: &str) -> Result<Vec<u8>> {
+    block_on(async {
+        let stream = tokio::net::UnixStream::connect(paths.socket()).await?;
+        tokio::time::timeout(Duration::from_secs(5), http::get(stream, path)).await?
+    })
+}
+
+fn running_pid(paths: &Paths) -> Option<i32> {
+    let pid: i32 = std::fs::read_to_string(paths.pid_file()).ok()?.trim().parse().ok()?;
+    (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
+}
+
+pub(crate) fn sysctl_u64(name: &str) -> Option<u64> {
+    let name = std::ffi::CString::new(name).ok()?;
+    let mut value: u64 = 0;
+    let mut len = std::mem::size_of::<u64>();
+    let rc = unsafe {
+        libc::sysctlbyname(name.as_ptr(), (&mut value as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    (rc == 0).then_some(value)
+}
+
+fn random_mac() -> Result<String> {
+    let mut b = [0u8; 6];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
+    b[0] = (b[0] & 0xfe) | 0x02; // unicast, locally administered
+    Ok(b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(":"))
+}
+
+/// Root disk follows the installed guest version; data disk and MAC persist.
+fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
+    let guest = paths.guest_dir()?;
+    let version = std::fs::read_to_string(guest.join("VERSION")).unwrap_or_else(|_| "dev".into());
+    let installed = std::fs::read_to_string(paths.guest_version()).unwrap_or_default();
+    if !paths.root_disk().exists() || installed.trim() != version.trim() {
+        // std::fs::copy clones on APFS, so this is instant and takes no space.
+        std::fs::copy(guest.join("root.img"), paths.root_disk()).context("install root disk")?;
+        std::fs::write(paths.guest_version(), &version)?;
+    }
+    if !paths.data_disk().exists() {
+        let f = std::fs::File::create(paths.data_disk())?;
+        f.set_len(disk_gib << 30)?;
+    }
+    if !paths.mac_address().exists() {
+        std::fs::write(paths.mac_address(), random_mac()?)?;
+    }
+    Ok(())
+}
+
+fn tail(path: &std::path::Path, lines: usize) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let all: Vec<&str> = text.lines().collect();
+    all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, no_switch: bool) -> Result<()> {
+    let t0 = Instant::now();
+    if let Some(pid) = running_pid(paths) {
+        println!("rekcod is already running (pid {pid})");
+    } else {
+        prepare_vm(paths, disk_gib)?;
+        let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+        let cpus = cpus.unwrap_or(host_cpus).clamp(1, vm::max_cpus());
+        let host_mib = sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
+        let memory_mib = memory_gib.map(|g| g << 10).unwrap_or((host_mib / 2).min(8 << 10));
+
+        let log = OpenOptions::new().create(true).append(true).open(paths.daemon_log())?;
+        let mut cmd = Command::new(std::env::current_exe()?);
+        cmd.args(["daemon", "--cpus", &cpus.to_string(), "--memory-mib", &memory_mib.to_string()])
+            .stdin(Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log);
+        // Detach from the terminal so closing it doesn't kill the VM.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().context("spawn rekcod daemon")?;
+
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            if api_get(paths, "/_ping").is_ok_and(|b| b == b"OK") {
+                break;
+            }
+            if let Some(status) = child.try_wait()? {
+                bail!(
+                    "daemon exited ({status}).\n--- {} ---\n{}\n--- {} ---\n{}",
+                    paths.daemon_log().display(),
+                    tail(&paths.daemon_log(), 15),
+                    paths.console_log().display(),
+                    tail(&paths.console_log(), 25),
+                );
+            }
+            if Instant::now() > deadline {
+                bail!("dockerd did not answer within 120s; see {}", paths.console_log().display());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    let version = api_get(paths, "/version")
+        .ok()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["Version"].as_str().map(String::from))
+        .unwrap_or_else(|| "?".into());
+    println!("rekcod ready in {:.1}s · dockerd {version}", t0.elapsed().as_secs_f64());
+
+    if !docker::available() {
+        println!("docker CLI not found. Install it (`brew install docker docker-compose`) or use:");
+        println!("  export DOCKER_HOST={}", paths.docker_host());
+        return Ok(());
+    }
+    docker::ensure_context(&paths.docker_host())?;
+    if no_switch {
+        println!("docker context `{CONTEXT}` is available (not switched: --no-switch)");
+    } else {
+        let previous = docker::current_context().unwrap_or_else(|_| "default".into());
+        if previous != CONTEXT {
+            std::fs::write(paths.prev_context(), &previous)?;
+            docker::use_context(CONTEXT)?;
+            println!("docker context: {CONTEXT} (was {previous}; `rekcod stop` switches back)");
+        } else {
+            println!("docker context: {CONTEXT}");
+        }
+    }
+    if std::env::var_os("DOCKER_HOST").is_some() {
+        println!("warning: DOCKER_HOST is set and overrides docker contexts; `unset DOCKER_HOST` to use rekcod");
+    }
+    Ok(())
+}
+
+pub fn stop(paths: &Paths, no_switch: bool) -> Result<()> {
+    match running_pid(paths) {
+        None => println!("rekcod is not running"),
+        Some(pid) => {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
+            let deadline = Instant::now() + Duration::from_secs(45);
+            while unsafe { libc::kill(pid, 0) } == 0 {
+                if Instant::now() > deadline {
+                    bail!("daemon (pid {pid}) did not exit; see {}", paths.daemon_log().display());
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            println!("rekcod stopped");
+        }
+    }
+    if !no_switch && docker::available() && docker::current_context().is_ok_and(|c| c == CONTEXT) {
+        let mut previous = std::fs::read_to_string(paths.prev_context()).unwrap_or_default().trim().to_string();
+        if previous.is_empty() || !docker::context_exists(&previous) {
+            previous = "default".into();
+        }
+        docker::use_context(&previous)?;
+        println!("docker context: {previous}");
+    }
+    Ok(())
+}
+
+pub fn status(paths: &Paths) -> Result<()> {
+    let Some(pid) = running_pid(paths) else {
+        println!("rekcod is not running (`rekcod start`)");
+        return Ok(());
+    };
+    let status: serde_json::Value = std::fs::read(paths.status_file())
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    let version: serde_json::Value = api_get(paths, "/version")
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default();
+    println!("rekcod running (pid {pid})");
+    println!("  dockerd   {} (API {})", version["Version"].as_str().unwrap_or("?"), version["ApiVersion"].as_str().unwrap_or("?"));
+    println!("  kernel    {}", version["KernelVersion"].as_str().unwrap_or("?"));
+    println!("  vm        {} CPUs, {} MiB", status["cpus"], status["memory_mib"]);
+    let sharing = if status["fs_cache"].as_bool() == Some(true) { "cached, invalidated by FSEvents" } else { "uncached (stock virtio-fs)" };
+    println!("  files     {sharing}");
+    if let (Some(target), Some(max)) = (status["balloon_mib"].as_u64(), status["memory_mib"].as_u64())
+        && target < max
+    {
+        println!("  balloon   guest limited to {target} of {max} MiB (REKCOD_BALLOON, experimental)");
+    }
+    println!("  socket    {}", paths.docker_host());
+    if docker::available() {
+        println!("  context   {}", docker::current_context().unwrap_or_else(|_| "?".into()));
+    }
+    let ports = status["ports"].as_array().cloned().unwrap_or_default();
+    if ports.is_empty() {
+        println!("  ports     none published");
+    }
+    for p in ports {
+        let addr = p["address"].as_str().unwrap_or("?");
+        let addr = if addr == "::" { "*".to_string() } else { addr.to_string() };
+        let note = p["error"].as_str().map(|e| format!("  ! not forwarded: {e}")).unwrap_or_default();
+        println!("  port      {addr}:{} -> {}{note}", p["port"], p["container"].as_str().unwrap_or("?"));
+    }
+    println!("  logs      {} , {}", paths.daemon_log().display(), paths.console_log().display());
+    Ok(())
+}
+
+pub fn shell(paths: &Paths) -> Result<()> {
+    let interactive = unsafe { libc::isatty(0) } == 1;
+    let host = paths.docker_host();
+    let mut cmd = docker::cli();
+    cmd.args(["-H", &host, "run", "--rm", if interactive { "-it" } else { "-i" }]);
+    cmd.args(["--privileged", "--pid=host", "--net=host", HELPER_IMAGE]);
+    cmd.args(["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh"]);
+    Err(cmd.exec()).context("exec docker")
+}
+
+// ---------------------------------------------------------------- import
+
+fn is_anonymous_volume(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `docker <src...> | docker <dst...>`; returns stderr of whichever side failed.
+fn pipe(src: &[&str], dst: &[&str]) -> Result<()> {
+    let mut producer = docker::cli().args(src).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let stdout = producer.stdout.take().context("producer stdout")?;
+    let consumer = docker::cli().args(dst).stdin(stdout).stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
+    let produced = producer.wait_with_output()?;
+    if !produced.status.success() {
+        bail!("{}", String::from_utf8_lossy(&produced.stderr).trim());
+    }
+    if !consumer.status.success() {
+        bail!("{}", String::from_utf8_lossy(&consumer.stderr).trim());
+    }
+    Ok(())
+}
+
+fn ensure_image(target: &[&str], image: &str) -> Result<()> {
+    let mut inspect = target.to_vec();
+    inspect.extend(["image", "inspect", image]);
+    if !docker::run(&inspect)?.status.success() {
+        let mut pull = target.to_vec();
+        pull.extend(["pull", "-q", image]);
+        docker::run_ok(&pull)?;
+    }
+    Ok(())
+}
+
+pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes: bool, force: bool) -> Result<()> {
+    let wanted = |name: &str| only.is_empty() || only.iter().any(|o| o == name);
+    if from == CONTEXT {
+        bail!("--from must be another docker context, not `{CONTEXT}`");
+    }
+    if !api_get(paths, "/_ping").is_ok_and(|b| b == b"OK") {
+        bail!("rekcod is not running; `rekcod start` first");
+    }
+    let host = paths.docker_host();
+    let dst: [&str; 2] = ["-H", &host];
+    let src: [&str; 2] = ["--context", from];
+    docker::run_ok(&[&src[..], &["version", "--format", "{{.Server.Version}}"]].concat())
+        .with_context(|| format!("source context `{from}` is not reachable"))?;
+
+    let (mut imported, mut skipped) = (0, 0);
+    if images {
+        let list = docker::run_ok(&[&src[..], &["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]].concat())?;
+        let mut refs: Vec<&str> = list.lines().filter(|r| !r.contains("<none>") && wanted(r)).collect();
+        refs.sort();
+        refs.dedup();
+        println!("images: {} in {from}", refs.len());
+        for (i, r) in refs.iter().enumerate() {
+            let t = Instant::now();
+            if docker::run(&[&dst[..], &["image", "inspect", r]].concat())?.status.success() {
+                println!("  [{}/{}] {r}: already here", i + 1, refs.len());
+                skipped += 1;
+                continue;
+            }
+            let load = [&dst[..], &["load", "-q"]].concat();
+            let mut result = pipe(&[&src[..], &["save", r]].concat(), &load);
+            if result.is_err() {
+                // containerd image stores may hold partial multi-platform indexes; export just the local platform.
+                let platform = docker::run_ok(&[&src[..], &["image", "inspect", "--format", "{{.Os}}/{{.Architecture}}", r]].concat())?;
+                result = pipe(&[&src[..], &["save", "--platform", &platform, r]].concat(), &load);
+            }
+            match result {
+                Ok(()) => {
+                    imported += 1;
+                    println!("  [{}/{}] {r}: ok ({:.1}s)", i + 1, refs.len(), t.elapsed().as_secs_f64());
+                }
+                Err(e) => println!("  [{}/{}] {r}: FAILED: {e:#}", i + 1, refs.len()),
+            }
+        }
+    }
+
+    if volumes {
+        let list = docker::run_ok(&[&src[..], &["volume", "ls", "--format", "{{.Name}}"]].concat())?;
+        let names: Vec<&str> = list.lines().filter(|n| !n.is_empty()).collect();
+        let anonymous = names.iter().filter(|n| is_anonymous_volume(n)).count();
+        let named: Vec<&str> = names.into_iter().filter(|n| !is_anonymous_volume(n) && wanted(n)).collect();
+        println!("volumes: {} named in {from} ({anonymous} anonymous skipped)", named.len());
+        if !named.is_empty() {
+            ensure_image(&src, HELPER_IMAGE)?;
+            ensure_image(&dst, HELPER_IMAGE)?;
+        }
+        for name in named {
+            let users = docker::run_ok(&[&src[..], &["ps", "--filter", &format!("volume={name}"), "--format", "{{.Names}}"]].concat())?;
+            if !users.is_empty() && !force {
+                println!("  {name}: skipped, in use by {} (stop it at the source first, or --force)", users.replace('\n', ", "));
+                skipped += 1;
+                continue;
+            }
+            if docker::run(&[&dst[..], &["volume", "inspect", name]].concat())?.status.success() {
+                let mount = format!("{name}:/v:ro");
+                let probe = [&dst[..], &["run", "--rm", "-v", &mount, HELPER_IMAGE, "ls", "-A", "/v"]].concat();
+                if !docker::run_ok(&probe)?.is_empty() && !force {
+                    println!("  {name}: skipped, already has data here (--force to overwrite)");
+                    skipped += 1;
+                    continue;
+                }
+            } else {
+                let fmt = "{{.Driver}}\t{{json .Labels}}";
+                let info = docker::run_ok(&[&src[..], &["volume", "inspect", "--format", fmt, name]].concat())?;
+                let (driver, labels) = info.split_once('\t').unwrap_or(("local", "null"));
+                if driver != "local" {
+                    println!("  {name}: skipped, driver `{driver}` is not supported");
+                    skipped += 1;
+                    continue;
+                }
+                let labels: BTreeMap<String, String> = serde_json::from_str(labels).ok().flatten().unwrap_or_default();
+                let mut create: Vec<String> = dst.iter().map(|s| s.to_string()).collect();
+                create.extend(["volume".into(), "create".into()]);
+                // Compose checks its labels before reusing a volume.
+                for (k, v) in &labels {
+                    create.extend(["--label".into(), format!("{k}={v}")]);
+                }
+                create.push(name.into());
+                docker::run_ok(&create.iter().map(String::as_str).collect::<Vec<_>>())?;
+            }
+            let t = Instant::now();
+            let from_mount = format!("{name}:/from:ro");
+            let to_mount = format!("{name}:/to");
+            let result = pipe(
+                &[&src[..], &["run", "--rm", "-v", &from_mount, HELPER_IMAGE, "tar", "-C", "/from", "-cf", "-", "."]].concat(),
+                &[&dst[..], &["run", "--rm", "-i", "-v", &to_mount, HELPER_IMAGE, "tar", "-C", "/to", "-xpf", "-"]].concat(),
+            );
+            match result {
+                Ok(()) => {
+                    imported += 1;
+                    println!("  {name}: ok ({:.1}s)", t.elapsed().as_secs_f64());
+                }
+                Err(e) => println!("  {name}: FAILED: {e:#}"),
+            }
+        }
+    }
+    println!("imported {imported}, skipped {skipped}. Containers are not copied: run `docker compose up -d` in your projects.");
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anonymous_volume_names() {
+        assert!(is_anonymous_volume(&"a".repeat(64)));
+        assert!(!is_anonymous_volume("myapp_pgdata"));
+        assert!(!is_anonymous_volume(&"g".repeat(64)));
+    }
+}

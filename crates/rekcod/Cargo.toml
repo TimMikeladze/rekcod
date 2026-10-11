@@ -1,0 +1,24 @@
+[package]
+name = "rekcod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Docker on macOS, switched in one command"
+
+[dependencies]
+rekcod-proto.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-virtualization = { version = "0.3", features = ["dispatch2"] }
+block2 = "0.6"
+dispatch2 = "0.3"
+notify = "8"

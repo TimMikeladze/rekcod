@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["crates/rekcod", "crates/rekcod-agent", "crates/rekcod-proto"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+rekcod-proto = { path = "crates/rekcod-proto" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "time", "sync", "signal", "process", "fs"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = "thin"
+strip = true

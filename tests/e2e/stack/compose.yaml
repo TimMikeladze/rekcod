@@ -1,0 +1,28 @@
+# e2e fixture: healthcheck-gated depends_on, bind mount, published ports, build.
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: rekcod
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "postgres"]
+      interval: 1s
+      timeout: 3s
+      retries: 60
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+  web:
+    image: nginx:1.29-alpine
+    ports:
+      - "18080:80"
+    volumes:
+      - ./www:/usr/share/nginx/html:ro
+    depends_on:
+      db:
+        condition: service_healthy
+  app:
+    build: ./app
+    ports:
+      - "18081:80"
+volumes:
+  pgdata: {}

@@ -1,0 +1,4 @@
+# The guest agent cross-compiles from macOS with the bundled linker; no C toolchain needed.
+[target.aarch64-unknown-linux-musl]
+linker = "rust-lld"
+rustflags = ["-C", "linker-flavor=ld.lld", "-C", "link-self-contained=yes", "-C", "target-feature=+crt-static"]

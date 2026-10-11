@@ -1,0 +1,519 @@
+diff --color -ruN -x r fuse-orig/Makefile fuse-src/Makefile
+--- a/Makefile	2026-10-11 10:24:33
++++ b/Makefile	2026-10-11 10:24:33
+@@ -11,7 +11,7 @@
+ obj-$(CONFIG_VIRTIO_FS) += virtiofs.o
+ 
+ fuse-y := dev.o dir.o file.o inode.o control.o xattr.o acl.o readdir.o ioctl.o
+-fuse-y += iomode.o
++fuse-y += iomode.o rekcod.o
+ fuse-$(CONFIG_FUSE_DAX) += dax.o
+ fuse-$(CONFIG_FUSE_PASSTHROUGH) += passthrough.o
+ 
+diff --color -ruN -x r fuse-orig/dir.c fuse-src/dir.c
+--- a/dir.c	2026-10-11 10:24:33
++++ b/dir.c	2026-10-11 10:47:16
+@@ -141,7 +141,8 @@
+  */
+ void fuse_invalidate_atime(struct inode *inode)
+ {
+-	if (!IS_RDONLY(inode))
++	/* rekcod: atime isn't worth a GETATTR round trip per read file */
++	if (!IS_RDONLY(inode) && !get_fuse_conn(inode)->rekcod)
+ 		fuse_invalidate_attr_mask(inode, STATX_ATIME);
+ }
+ 
+@@ -1208,7 +1209,7 @@
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	memset(&outarg, 0, sizeof(outarg));
+ 	/* Directories have separate file-handle space */
+-	if (file && S_ISREG(inode->i_mode)) {
++	if (file && S_ISREG(inode->i_mode) && !fuse_file_lazy(file->private_data)) {
+ 		struct fuse_file *ff = file->private_data;
+ 
+ 		inarg.getattr_flags |= FUSE_GETATTR_FH;
+@@ -1269,7 +1270,7 @@
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	memset(&outarg, 0, sizeof(outarg));
+ 	/* Directories have separate file-handle space */
+-	if (file && S_ISREG(inode->i_mode)) {
++	if (file && S_ISREG(inode->i_mode) && !fuse_file_lazy(file->private_data)) {
+ 		struct fuse_file *ff = file->private_data;
+ 
+ 		inarg.getattr_flags |= FUSE_GETATTR_FH;
+@@ -1888,7 +1889,7 @@
+ 		inarg.ctime = inode_get_ctime_sec(inode);
+ 		inarg.ctimensec = inode_get_ctime_nsec(inode);
+ 	}
+-	if (ff) {
++	if (ff && !fuse_file_lazy(ff)) {
+ 		inarg.valid |= FATTR_FH;
+ 		inarg.fh = ff->fh;
+ 	}
+@@ -1985,7 +1986,7 @@
+ 	memset(&inarg, 0, sizeof(inarg));
+ 	memset(&outarg, 0, sizeof(outarg));
+ 	iattr_to_fattr(idmap, fc, attr, &inarg, trust_local_cmtime);
+-	if (file) {
++	if (file && !fuse_file_lazy(file->private_data)) {
+ 		struct fuse_file *ff = file->private_data;
+ 		inarg.valid |= FATTR_FH;
+ 		inarg.fh = ff->fh;
+diff --color -ruN -x r fuse-orig/file.c fuse-src/file.c
+--- a/file.c	2026-10-11 10:33:42
++++ b/file.c	2026-10-11 10:46:01
+@@ -69,6 +69,7 @@
+ 	}
+ 
+ 	INIT_LIST_HEAD(&ff->write_entry);
++	mutex_init(&ff->rekcod_mutex);
+ 	refcount_set(&ff->count, 1);
+ 	RB_CLEAR_NODE(&ff->polled_node);
+ 	init_waitqueue_head(&ff->poll_wait);
+@@ -110,7 +111,9 @@
+ 
+ 		if (!args) {
+ 			/* Do nothing when server does not implement 'opendir' */
+-		} else if (args->opcode == FUSE_RELEASE && ff->fm->fc->no_open) {
++		} else if ((args->opcode == FUSE_RELEASE && ff->fm->fc->no_open) ||
++			   fuse_file_lazy(ff)) {
++			/* never opened on the host: nothing to release there */
+ 			fuse_release_end(ff->fm, args, 0);
+ 		} else if (sync) {
+ 			fuse_simple_request(ff->fm, args);
+@@ -149,7 +152,13 @@
+ 	ff->fh = 0;
+ 	/* Default for no-open */
+ 	ff->open_flags = FOPEN_KEEP_CACHE | (isdir ? FOPEN_CACHE_DIR : 0);
+-	if (open) {
++	if (open && fc->rekcod &&
++	    (isdir || ((open_flags & O_ACCMODE) == O_RDONLY &&
++		       !(open_flags & (O_TRUNC | O_DIRECT))))) {
++		ff->rekcod_lazy = true;
++		ff->rekcod_isdir = isdir;
++		ff->rekcod_flags = open_flags;
++	} else if (open) {
+ 		/* Store outarg for fuse_finish_open() */
+ 		struct fuse_open_out *outargp = &ff->args->open_outarg;
+ 		int err;
+@@ -181,6 +190,25 @@
+ 	return ff;
+ }
+ 
++u64 fuse_file_fh(struct fuse_file *ff)
++{
++	struct fuse_open_out outarg = {};
++
++	if (likely(!fuse_file_lazy(ff)))
++		return ff->fh;
++
++	mutex_lock(&ff->rekcod_mutex);
++	if (ff->rekcod_lazy &&
++	    !fuse_send_open(ff->fm, ff->nodeid, ff->rekcod_flags,
++			    ff->rekcod_isdir ? FUSE_OPENDIR : FUSE_OPEN, &outarg)) {
++		ff->fh = outarg.fh;
++		smp_store_release(&ff->rekcod_lazy, false);
++	}
++	/* On failure fh stays 0 and the host rejects the request (EBADF). */
++	mutex_unlock(&ff->rekcod_mutex);
++	return ff->fh;
++}
++
+ int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
+ 		 bool isdir)
+ {
+@@ -380,7 +408,8 @@
+ 	 * before commencing with fs shutdown doesn't work if submounts are
+ 	 * used.
+ 	 */
+-	fuse_file_put(ff, ff->fm->fc->auto_submounts);
++	/* rekcod: the VM never unmounts the share, so RELEASE needn't block close() */
++	fuse_file_put(ff, ff->fm->fc->auto_submounts && !ff->fm->fc->rekcod);
+ }
+ 
+ void fuse_release_common(struct file *file, bool isdir)
+@@ -550,7 +579,7 @@
+ 		return err;
+ 
+ 	err = 0;
+-	if (fm->fc->no_flush)
++	if (fm->fc->no_flush || fuse_file_lazy(ff))
+ 		goto inval_attr_out;
+ 
+ 	memset(&inarg, 0, sizeof(inarg));
+@@ -589,7 +618,7 @@
+ 	struct fuse_fsync_in inarg;
+ 
+ 	memset(&inarg, 0, sizeof(inarg));
+-	inarg.fh = ff->fh;
++	inarg.fh = fuse_file_fh(ff);
+ 	inarg.fsync_flags = datasync ? FUSE_FSYNC_FDATASYNC : 0;
+ 	args.opcode = opcode;
+ 	args.nodeid = get_node_id(inode);
+@@ -655,7 +684,7 @@
+ 	struct fuse_file *ff = file->private_data;
+ 	struct fuse_args *args = &ia->ap.args;
+ 
+-	ia->read.in.fh = ff->fh;
++	ia->read.in.fh = fuse_file_fh(ff);
+ 	ia->read.in.offset = pos;
+ 	ia->read.in.size = count;
+ 	ia->read.in.flags = file->f_flags;
+@@ -2698,7 +2727,7 @@
+ 	struct fuse_file *ff = file->private_data;
+ 
+ 	memset(inarg, 0, sizeof(*inarg));
+-	inarg->fh = ff->fh;
++	inarg->fh = fuse_file_fh(ff);
+ 	inarg->owner = fuse_lock_owner_id(fc, fl->c.flc_owner);
+ 	inarg->lk.start = fl->fl_start;
+ 	inarg->lk.end = fl->fl_end;
+@@ -2839,7 +2868,7 @@
+ 	struct fuse_file *ff = file->private_data;
+ 	FUSE_ARGS(args);
+ 	struct fuse_lseek_in inarg = {
+-		.fh = ff->fh,
++		.fh = fuse_file_fh(ff),
+ 		.offset = offset,
+ 		.whence = whence
+ 	};
+@@ -2962,7 +2991,7 @@
+ {
+ 	struct fuse_file *ff = file->private_data;
+ 	struct fuse_mount *fm = ff->fm;
+-	struct fuse_poll_in inarg = { .fh = ff->fh, .kh = ff->kh };
++	struct fuse_poll_in inarg = { .fh = fuse_file_fh(ff), .kh = ff->kh };
+ 	struct fuse_poll_out outarg;
+ 	FUSE_ARGS(args);
+ 	int err;
+@@ -3160,7 +3189,7 @@
+ 	struct fuse_mount *fm = ff->fm;
+ 	FUSE_ARGS(args);
+ 	struct fuse_fallocate_in inarg = {
+-		.fh = ff->fh,
++		.fh = fuse_file_fh(ff),
+ 		.offset = offset,
+ 		.length = length,
+ 		.mode = mode
+diff --color -ruN -x r fuse-orig/fuse_i.h fuse-src/fuse_i.h
+--- a/fuse_i.h	2026-10-11 10:24:33
++++ b/fuse_i.h	2026-10-11 10:53:00
+@@ -254,6 +254,16 @@
+ 
+ 	} readdir;
+ 
++	/*
++	 * rekcod: OPEN deferred until the host file handle is needed. Reads
++	 * served from the page cache or readdir cache never open on the host,
++	 * and closing a never-opened file sends no RELEASE.
++	 */
++	bool rekcod_lazy;
++	bool rekcod_isdir;
++	unsigned int rekcod_flags;
++	struct mutex rekcod_mutex;
++
+ 	/** RB node to be linked on fuse_conn->polled_files */
+ 	struct rb_node polled_node;
+ 
+@@ -587,6 +597,7 @@
+ 	bool no_control:1;
+ 	bool no_force_umount:1;
+ 	bool legacy_opts_show:1;
++	bool rekcod:1;	/* virtiofs: long TTLs + invalidation via rekcod_notify */
+ 	enum fuse_dax_mode dax_mode;
+ 	unsigned int max_read;
+ 	unsigned int blksize;
+@@ -759,6 +770,9 @@
+ 	/** Is flush not implemented by fs? */
+ 	unsigned no_flush:1;
+ 
++	/** rekcod: defer OPEN/OPENDIR of read-only files and dirs (see file.c) */
++	unsigned rekcod:1;
++
+ 	/** Is setxattr not implemented by fs? */
+ 	unsigned no_setxattr:1;
+ 
+@@ -1225,6 +1239,17 @@
+ void fuse_invalidate_atime(struct inode *inode);
+ 
+ u64 fuse_time_to_jiffies(u64 sec, u32 nsec);
++
++/* rekcod: jiffies64 of the last host-driven invalidation (rekcod.c) */
++extern atomic64_t rekcod_last_inval;
++
++/* rekcod lazy open: the host file handle, opening on the host first if needed */
++u64 fuse_file_fh(struct fuse_file *ff);
++
++static inline bool fuse_file_lazy(struct fuse_file *ff)
++{
++	return smp_load_acquire(&ff->rekcod_lazy);
++}
+ #define ATTR_TIMEOUT(o) \
+ 	fuse_time_to_jiffies((o)->attr_valid, (o)->attr_valid_nsec)
+ 
+diff --color -ruN -x r fuse-orig/ioctl.c fuse-src/ioctl.c
+--- a/ioctl.c	2026-10-11 10:33:43
++++ b/ioctl.c	2026-10-11 10:37:47
+@@ -218,7 +218,7 @@
+ 	struct fuse_file *ff = file->private_data;
+ 	struct fuse_mount *fm = ff->fm;
+ 	struct fuse_ioctl_in inarg = {
+-		.fh = ff->fh,
++		.fh = fuse_file_fh(ff),
+ 		.cmd = cmd,
+ 		.arg = arg,
+ 		.flags = flags
+@@ -425,6 +425,16 @@
+ 
+ long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+ {
++	struct fuse_file *ff = file->private_data;
++
++	/*
++	 * rekcod: regular files are never terminals. Answer isatty() (TCGETS,
++	 * issued by every Python open()) locally instead of opening the file on
++	 * the host just to have it say ENOTTY.
++	 */
++	if (ff->fm->fc->rekcod && _IOC_TYPE(cmd) == 'T' &&
++	    S_ISREG(file_inode(file)->i_mode))
++		return -ENOTTY;
+ 	return fuse_ioctl_common(file, cmd, arg, 0);
+ }
+ 
+@@ -444,7 +454,7 @@
+ 	int err;
+ 
+ 	memset(&inarg, 0, sizeof(inarg));
+-	inarg.fh = ff->fh;
++	inarg.fh = fuse_file_fh(ff);
+ 	inarg.cmd = cmd;
+ 
+ #if BITS_PER_LONG == 32
+diff --color -ruN -x r fuse-orig/virtio_fs.c fuse-src/virtio_fs.c
+--- a/virtio_fs.c	2026-10-11 10:24:33
++++ b/virtio_fs.c	2026-10-11 10:53:00
+@@ -77,6 +77,9 @@
+ 	void *window_kaddr;
+ 	phys_addr_t window_phys_addr;
+ 	size_t window_len;
++
++	/* rekcod: cache lookups/attrs/pages; the host invalidates via rekcod_notify */
++	bool rekcod;
+ };
+ 
+ struct virtio_fs_forget_req {
+@@ -109,10 +112,12 @@
+ enum {
+ 	OPT_DAX,
+ 	OPT_DAX_ENUM,
++	OPT_REKCOD,
+ };
+ 
+ static const struct fs_parameter_spec virtio_fs_parameters[] = {
+ 	fsparam_flag("dax", OPT_DAX),
++	fsparam_flag("rekcod", OPT_REKCOD),
+ 	fsparam_enum("dax", OPT_DAX_ENUM, dax_param_enums),
+ 	{}
+ };
+@@ -135,6 +140,9 @@
+ 	case OPT_DAX_ENUM:
+ 		ctx->dax_mode = result.uint_32;
+ 		break;
++	case OPT_REKCOD:
++		ctx->rekcod = true;
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -753,6 +761,164 @@
+ }
+ 
+ /* Work function for request completion */
++/*
++ * rekcod: the host server hands out near-zero cache timeouts and never caches
++ * negative lookups, so almost every stat/open crosses into macOS. With the
++ * "rekcod" mount option, replies are rewritten to cache for a day; the host
++ * watches the shared directories and invalidates changed paths through
++ * /sys/module/fuse/parameters/rekcod_notify (fs/fuse/rekcod.c).
++ */
++#define REKCOD_TTL_SEC (24 * 60 * 60)
++
++/* Requests answered by the host, per opcode; read /sys/module/virtiofs/parameters/rekcod_stats. */
++#define REKCOD_OPS 64
++static atomic64_t rekcod_ops[REKCOD_OPS];
++
++static int rekcod_stats_get(char *buf, const struct kernel_param *kp)
++{
++	int i, n = 0;
++
++	for (i = 0; i < REKCOD_OPS; i++) {
++		s64 v = atomic64_read(&rekcod_ops[i]);
++
++		if (v)
++			n += sysfs_emit_at(buf, n, "%d %lld\n", i, v);
++	}
++	return n;
++}
++
++static const struct kernel_param_ops rekcod_stats_ops = { .get = rekcod_stats_get };
++module_param_cb(rekcod_stats, &rekcod_stats_ops, NULL, 0444);
++
++static void rekcod_entry_ttl(struct fuse_entry_out *e)
++{
++	e->entry_valid = REKCOD_TTL_SEC;
++	e->entry_valid_nsec = 0;
++	e->attr_valid = REKCOD_TTL_SEC;
++	e->attr_valid_nsec = 0;
++}
++
++/* READDIRPLUS replies carry an entry_out per name; the reply sits in pages. */
++static void rekcod_readdirplus_ttl(struct fuse_args_pages *ap, unsigned int len)
++{
++	unsigned int i;
++
++	for (i = 0; i < ap->num_pages && len; i++) {
++		unsigned int left = min(len, ap->descs[i].length);
++		char *base = kmap_local_page(ap->pages[i]);
++		char *p = base + ap->descs[i].offset;
++
++		len -= left;
++		while (left >= FUSE_NAME_OFFSET_DIRENTPLUS) {
++			struct fuse_direntplus *d = (struct fuse_direntplus *)p;
++			size_t reclen = FUSE_DIRENTPLUS_SIZE(d);
++
++			if (!d->dirent.namelen || reclen > left)
++				break;
++			rekcod_entry_ttl(&d->entry_out);
++			p += reclen;
++			left -= reclen;
++		}
++		kunmap_local(base);
++	}
++}
++
++static void *rekcod_out(struct fuse_args *args, unsigned int i, size_t size)
++{
++	if (args->out_numargs <= i || args->out_args[i].size < size)
++		return NULL;
++	return args->out_args[i].value;
++}
++
++/*
++ * A reply racing with a host-driven invalidation may describe the old state
++ * (the request left before the change was announced). Don't pin such replies
++ * for a day: keep the server's short timeouts while invalidations are recent.
++ */
++#define REKCOD_QUIET_MS 50
++
++static bool rekcod_quiet(void)
++{
++	return time_after64(get_jiffies_64(),
++			    atomic64_read(&rekcod_last_inval) + msecs_to_jiffies(REKCOD_QUIET_MS));
++}
++
++static void rekcod_rewrite_reply(struct fuse_req *req)
++{
++	struct fuse_args *args = req->args;
++	bool quiet = rekcod_quiet();
++	struct fuse_entry_out *entry;
++	struct fuse_attr_out *attr;
++	struct fuse_statx_out *statx;
++	struct fuse_open_out *open;
++
++	switch (req->in.h.opcode) {
++	case FUSE_LOOKUP:
++		entry = rekcod_out(args, 0, sizeof(*entry));
++		if (!entry)
++			return;
++		if (!quiet)
++			return;
++		if (req->out.h.error == -ENOENT) {
++			/* nodeid 0 = negative entry with a valid timeout */
++			memset(entry, 0, sizeof(*entry));
++			entry->entry_valid = REKCOD_TTL_SEC;
++			req->out.h.error = 0;
++		} else if (!req->out.h.error) {
++			rekcod_entry_ttl(entry);
++		}
++		return;
++	case FUSE_MKNOD:
++	case FUSE_MKDIR:
++	case FUSE_SYMLINK:
++	case FUSE_LINK:
++	case FUSE_TMPFILE:
++	case FUSE_CREATE:
++		if (req->out.h.error)
++			return;
++		entry = rekcod_out(args, 0, sizeof(*entry));
++		if (entry && quiet)
++			rekcod_entry_ttl(entry);
++		if (req->in.h.opcode == FUSE_CREATE) {
++			open = rekcod_out(args, 1, sizeof(*open));
++			if (open)
++				open->open_flags |= FOPEN_KEEP_CACHE;
++		}
++		return;
++	case FUSE_GETATTR:
++	case FUSE_SETATTR:
++		attr = rekcod_out(args, 0, sizeof(*attr));
++		if (attr && !req->out.h.error && quiet) {
++			attr->attr_valid = REKCOD_TTL_SEC;
++			attr->attr_valid_nsec = 0;
++		}
++		return;
++	case FUSE_STATX:
++		statx = rekcod_out(args, 0, sizeof(*statx));
++		if (statx && !req->out.h.error && quiet) {
++			statx->attr_valid = REKCOD_TTL_SEC;
++			statx->attr_valid_nsec = 0;
++		}
++		return;
++	case FUSE_READDIRPLUS:
++		if (!req->out.h.error && args->out_pages && args->out_numargs && quiet)
++			rekcod_readdirplus_ttl(container_of(args, struct fuse_args_pages, args),
++					       args->out_args[args->out_numargs - 1].size);
++		return;
++	case FUSE_OPEN:
++	case FUSE_OPENDIR:
++		open = rekcod_out(args, 0, sizeof(*open));
++		if (!open || req->out.h.error)
++			return;
++		pr_info_once("virtio-fs: rekcod: server open_flags 0x%x\n", open->open_flags);
++		/* Page cache instead of per-read host round trips; rekcod_notify drops stale pages. */
++		open->open_flags &= ~(FOPEN_DIRECT_IO | FOPEN_NOFLUSH);
++		open->open_flags |= FOPEN_KEEP_CACHE |
++			(req->in.h.opcode == FUSE_OPENDIR ? FOPEN_CACHE_DIR : 0);
++		return;
++	}
++}
++
+ static void virtio_fs_request_complete(struct fuse_req *req,
+ 				       struct virtio_fs_vq *fsvq)
+ {
+@@ -768,6 +934,11 @@
+ 	 */
+ 	args = req->args;
+ 	copy_args_from_argbuf(args, req);
++	if (((struct virtio_fs *)fsvq->vq->vdev->priv)->rekcod) {
++		if (req->in.h.opcode < REKCOD_OPS)
++			atomic64_inc(&rekcod_ops[req->in.h.opcode]);
++		rekcod_rewrite_reply(req);
++	}
+ 
+ 	if (args->out_pages && args->page_zeroing) {
+ 		len = args->out_args[args->out_numargs - 1].size;
+@@ -1582,6 +1753,14 @@
+ 	err = fuse_fill_super_common(sb, ctx);
+ 	if (err < 0)
+ 		goto err_free_fuse_devs;
++
++	fs->rekcod = ctx->rekcod;
++	if (fs->rekcod) {
++		/* Writes go straight to the host; skip the FLUSH round trip on close. */
++		fc->no_flush = 1;
++		fc->rekcod = 1;
++		pr_info("virtio-fs: <%s> rekcod caching enabled\n", fs->tag);
++	}
+ 
+ 	for (i = 0; i < fs->nvqs; i++) {
+ 		struct virtio_fs_vq *fsvq = &fs->vqs[i];

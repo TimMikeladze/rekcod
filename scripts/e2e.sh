@@ -28,6 +28,20 @@ check "amd64 via Rosetta" sh -c 'test "$(docker run --rm --platform linux/amd64 
 check "host.docker.internal resolves" docker run --rm alpine:3.22 getent hosts host.docker.internal
 check "external DNS" docker run --rm alpine:3.22 nslookup example.com
 
+echo "switcher gaps"
+docker run -d --rm --name rekcod-e2e-udp -p 18053:5353/udp alpine:3.22 sh -c 'nc -lu -p 5353 -e cat' >/dev/null
+sleep 1.5
+check "published UDP port echoes" sh -c 'test "$(echo ping | nc -u -w2 127.0.0.1 18053)" = ping'
+docker rm -f rekcod-e2e-udp >/dev/null 2>&1
+python3 -m http.server 18077 --bind 127.0.0.1 --directory tests/e2e/stack/www >/dev/null 2>&1 & srv=$!
+sleep 0.5
+check "host.docker.internal reaches Mac 127.0.0.1" sh -c 'docker run --rm alpine:3.22 wget -qO- http://host.docker.internal:18077/ | grep -q "rekcod e2e"'
+kill $srv 2>/dev/null
+tmpf=$(mktemp /tmp/rekcod-e2e.XXXX); echo mac-tmp >"$tmpf"
+check "Mac /tmp bind mount" sh -c "test \"\$(docker run --rm -v $tmpf:/f alpine:3.22 cat /f)\" = mac-tmp"
+rm -f "$tmpf"
+check "rekcod compact" "$R" compact
+
 echo "compose"
 cp -R tests/e2e/stack/. "$work/"
 compose="docker compose -p rekcod-e2e -f $work/compose.yaml"
@@ -75,6 +89,16 @@ chmod 600 "$coh/new"
 check "chmod visible" see 'test "$(stat -c %a /c/new)" = 600'
 docker exec rekcod-e2e-coh sh -c 'echo from-guest > /c/g'
 check "guest write visible on the Mac" test "$(cat "$coh/g" 2>/dev/null)" = from-guest
+# APFS is case-insensitive: cached negatives/aliases for other spellings must go.
+docker exec rekcod-e2e-coh sh -c 'cat /c/case1 /c/case2; cat /c/CASE3' >/dev/null 2>&1
+echo mac >"$coh/Case1"
+check "Mac create Case1 visible as case1" see 'test "$(cat /c/case1)" = mac'
+check "guest create Case2 visible as case2" docker exec rekcod-e2e-coh sh -c 'echo guest > /c/Case2 && test "$(cat /c/case2)" = guest'
+docker exec rekcod-e2e-coh cat /c/CASE1 >/dev/null 2>&1
+rm "$coh/Case1"
+check "Mac delete Case1 drops alias CASE1" see '! test -e /c/CASE1'
+echo x >"$coh/case3" && mv "$coh/case3" "$coh/Case3"
+check "Mac case-only rename visible" see 'ls /c | grep -qx Case3 && test "$(cat /c/CASE3)" = x'
 docker rm -f rekcod-e2e-coh >/dev/null 2>&1
 
 if [[ -n "${E2E_IMPORT_FROM:-}" ]]; then

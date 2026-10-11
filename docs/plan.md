@@ -96,11 +96,13 @@ Each phase ends with a measurement. If a gate fails, the next phase changes.
 - The balloon doesn't lower the host footprint on macOS 27, so it stays off by default.
 - **Gate:** warm metadata bind ÷ volume ≤ 1.2×. A correctness suite passes: fsx-style random ops, rename and unlink races, FSEvents overflow, case-aliasing, and Postgres on a bind mount. Idle RSS is at or below OrbStack's.
 
-**Phase 3: differentiators.** §3a and §3b, then §3d and §3f. §3b needs only phase 1 plus the §3d hook, so it can start right after phase 1, in parallel with phase 2.
+**Re-sequenced 2026-10-11 (adoption first, see `handoff.md`):** 2b closes the open phase-2 gates. 3 ships it (releases, guest auto-fetch, signing and notarization, brew, CI). 4 works through the parity backlog. 5 is the differentiators below. 6 is the VMM and file-server research below.
+
+**Phase 5 (was 3): differentiators.** §3a and §3b, then §3d and §3f. §3b needs only phase 1 plus the §3d hook, so it can start right after phase 1, in parallel with phase 2.
 - **Gate:** restoring a seeded Postgres snapshot and reaching healthy is faster than `up` + migrate + seed by an order of magnitude.
 - **Gate (`rekcod run`):** a warm `rekcod run node -v` adds ≤ 300 ms over native. `rekcod run <dev cmd>` serves on Mac `localhost` with hot reload, with zero config, on the Next.js, Vite, Bun/Hono, Express, FastAPI and Django starters. Under `--sandbox`, a test install hook can't read `~/.ssh` or reach a non-allowlisted host.
 
-**Phase 4 (optional): libkrun backend** for DAX and memory experiments. Promote it only if the RAM win is large on a monorepo build **and** Rosetta isn't needed (Apple ends Linux Rosetta, or the target users run only arm64 images).
+**Phase 6 (was 4, optional): libkrun backend** for DAX and memory experiments. Promote it only if the RAM win is large on a monorepo build **and** Rosetta isn't needed (Apple ends Linux Rosetta, or the target users run only arm64 images).
 
 ## 5. Non-goals
 

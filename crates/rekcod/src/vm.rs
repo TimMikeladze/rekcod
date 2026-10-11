@@ -153,8 +153,13 @@ impl Vm {
         });
     }
 
-    /// Opens a vsock connection to `port` in the guest.
-    pub async fn connect(&self, port: u32) -> Result<UnixStream> {
+    /// Opens a vsock connection to `port` in the guest. See [`Conn`] for why
+    /// it is always drained.
+    pub async fn connect(&self, port: u32) -> Result<Conn> {
+        Ok(Conn::new(self.connect_raw(port).await?))
+    }
+
+    async fn connect_raw(&self, port: u32) -> Result<UnixStream> {
         let (tx, rx) = oneshot::channel::<Result<RawFd>>();
         let tx = OnQueue(Mutex::new(Some(tx)));
         let vm = self.vm.clone();
@@ -280,11 +285,12 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
         c.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             VZVirtioEntropyDeviceConfiguration::new(),
         )]));
-        c.setMemoryBalloonDevices(&NSArray::from_retained_slice(&[
-            Retained::into_super(
+        // Debug knob (VM freeze bisect, docs/phase2b-4.md): REKCOD_NO_BALLOON=1.
+        if std::env::var_os("REKCOD_NO_BALLOON").is_none() {
+            c.setMemoryBalloonDevices(&NSArray::from_retained_slice(&[Retained::into_super(
                 VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new(),
-            ),
-        ]));
+            )]));
+        }
 
         // Kernel console (hvc0) appends to the console log.
         let log = std::fs::OpenOptions::new()
@@ -304,5 +310,106 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
 
         c.validateWithError().map_err(|e| anyhow!("invalid VM config: {}", e.localizedDescription()))?;
         Ok((c, rosetta))
+    }
+}
+
+/// Bytes a connection may buffer for a slow reader before it is dropped.
+const CONN_BUFFER_MAX: usize = 64 << 20;
+
+/// A vsock connection that is read eagerly.
+///
+/// Virtualization.framework delivers guest->host vsock data with a *blocking*
+/// `writev` on the vsock device's queue, and vCPUs synchronize with that queue.
+/// If we stop reading one connection (e.g. a docker CLI that stopped draining a
+/// log stream, so `copy_bidirectional` stops reading the guest side), the
+/// write blocks, a vCPU blocks behind it, IPIs to that vCPU go unanswered, and
+/// the whole guest freezes (docs/phase2b-4.md, "VM freeze"). So a task always
+/// reads into memory; a reader that falls more than [`CONN_BUFFER_MAX`] behind
+/// loses the connection instead of the VM.
+pub struct Conn {
+    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    pending: Vec<u8>,
+    pos: usize,
+    buffered: Arc<std::sync::atomic::AtomicUsize>,
+    write: tokio::io::WriteHalf<UnixStream>,
+    pump: tokio::task::JoinHandle<()>,
+}
+
+impl Conn {
+    fn new(stream: UnixStream) -> Conn {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+        let (mut read, write) = tokio::io::split(stream);
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let buffered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = buffered.clone();
+        let pump = tokio::spawn(async move {
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                match read.read(&mut buf).await {
+                    Ok(0) | Err(_) => return, // dropping tx = EOF for the reader
+                    Ok(n) => {
+                        // Reader stalled or gone: end its stream (EOF) but keep
+                        // reading and discarding, so the guest never blocks.
+                        if counter.fetch_add(n, Ordering::Relaxed) + n > CONN_BUFFER_MAX
+                            || tx.send(buf[..n].to_vec()).is_err()
+                        {
+                            drop(tx);
+                            while matches!(read.read(&mut buf).await, Ok(n) if n > 0) {}
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Conn { rx, pending: Vec::new(), pos: 0, buffered, write, pump }
+    }
+}
+
+impl Drop for Conn {
+    fn drop(&mut self) {
+        self.pump.abort();
+    }
+}
+
+impl tokio::io::AsyncRead for Conn {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::Poll;
+        let this = &mut *self;
+        if this.pos >= this.pending.len() {
+            match this.rx.poll_recv(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
+                Poll::Ready(Some(chunk)) => {
+                    this.buffered.fetch_sub(chunk.len(), std::sync::atomic::Ordering::Relaxed);
+                    this.pending = chunk;
+                    this.pos = 0;
+                }
+            }
+        }
+        let n = out.remaining().min(this.pending.len() - this.pos);
+        out.put_slice(&this.pending[this.pos..this.pos + n]);
+        this.pos += n;
+        Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncWrite for Conn {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.write).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.write).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.write).poll_shutdown(cx)
     }
 }

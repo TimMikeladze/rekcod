@@ -72,6 +72,10 @@ enum Cmd {
     },
     /// Open a root shell in the VM.
     Shell,
+    /// Give unused data-disk space back to macOS now (also runs hourly).
+    Compact,
+    #[command(hide = true, subcommand)]
+    Research(Research),
     #[command(hide = true)]
     Daemon {
         #[arg(long)]
@@ -79,6 +83,13 @@ enum Cmd {
         #[arg(long)]
         memory_mib: u64,
     },
+}
+
+/// Phase 6 prototypes (docs/research.md). The daemon must run with REKCOD_RESEARCH=1.
+#[derive(Subcommand)]
+enum Research {
+    /// Cold lstat latency: host metadata server over vsock vs virtio-fs.
+    BenchMeta { dir: String },
 }
 
 #[cfg(target_os = "macos")]
@@ -96,6 +107,10 @@ fn main() {
             cli::import(&paths, &from, &names, !volumes_only, !images_only, force)
         }
         Cmd::Shell => cli::shell(&paths),
+        Cmd::Compact => cli::compact(&paths),
+        Cmd::Research(Research::BenchMeta { dir }) => {
+            daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
+        }
         Cmd::Daemon { cpus, memory_mib } => daemon::run(paths, daemon::Options { cpus, memory_mib }),
     });
     if let Err(e) = result {

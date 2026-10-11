@@ -24,6 +24,9 @@ impl Paths {
     pub fn socket(&self) -> PathBuf {
         self.home.join("run/docker.sock")
     }
+    pub fn control_socket(&self) -> PathBuf {
+        self.home.join("run/control.sock")
+    }
     pub fn pid_file(&self) -> PathBuf {
         self.home.join("run/daemon.pid")
     }

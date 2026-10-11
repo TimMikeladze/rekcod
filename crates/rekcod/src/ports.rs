@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::net::{IpAddr, Ipv6Addr};
 
+pub use rekcod_proto::Proto;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Binding {
+    pub proto: Proto,
     pub addr: IpAddr,
     pub port: u16,
 }
@@ -45,9 +47,14 @@ pub fn desired(containers_json: &[u8]) -> serde_json::Result<BTreeMap<Binding, S
     for c in containers {
         let name = c.names.first().map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
         for p in c.ports.unwrap_or_default() {
-            let (Some(port), "tcp") = (p.public_port, p.kind.as_str()) else { continue };
+            let proto = match p.kind.as_str() {
+                "tcp" => Proto::Tcp,
+                "udp" => Proto::Udp,
+                _ => continue,
+            };
+            let Some(port) = p.public_port else { continue };
             if let Some(addr) = mac_addr(&p.ip) {
-                out.insert(Binding { addr, port }, name.clone());
+                out.insert(Binding { proto, addr, port }, name.clone());
             }
         }
     }
@@ -65,10 +72,13 @@ mod tests {
             {"IP":"::","PrivatePort":80,"PublicPort":8080,"Type":"tcp"},
             {"IP":"127.0.0.1","PrivatePort":5432,"PublicPort":5432,"Type":"tcp"},
             {"PrivatePort":9000,"Type":"tcp"},
-            {"IP":"0.0.0.0","PrivatePort":53,"PublicPort":53,"Type":"udp"}]}]"#;
+            {"IP":"0.0.0.0","PrivatePort":53,"PublicPort":5353,"Type":"udp"},
+            {"IP":"::","PrivatePort":53,"PublicPort":5353,"Type":"udp"},
+            {"IP":"0.0.0.0","PrivatePort":9,"PublicPort":9,"Type":"sctp"}]}]"#;
         let d = desired(json).unwrap();
-        let want: Vec<(String, u16)> = vec![("127.0.0.1".into(), 5432), ("::".into(), 8080)];
-        let got: Vec<(String, u16)> = d.keys().map(|b| (b.addr.to_string(), b.port)).collect();
+        let want: Vec<(Proto, String, u16)> =
+            vec![(Proto::Tcp, "127.0.0.1".into(), 5432), (Proto::Tcp, "::".into(), 8080), (Proto::Udp, "::".into(), 5353)];
+        let got: Vec<(Proto, String, u16)> = d.keys().map(|b| (b.proto, b.addr.to_string(), b.port)).collect();
         assert_eq!(got, want);
         assert!(d.values().all(|n| n == "web-1"));
     }

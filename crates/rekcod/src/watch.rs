@@ -50,10 +50,22 @@ pub fn bind_sources(containers_json: &[u8]) -> serde_json::Result<BTreeSet<PathB
     let all: BTreeSet<PathBuf> = containers
         .into_iter()
         .flat_map(|c| c.mounts.unwrap_or_default())
-        .filter(|m| m.kind == "bind" && SHARED_ROOTS.iter().any(|r| Path::new(&m.source).starts_with(r)))
-        .map(|m| PathBuf::from(m.source))
+        .filter(|m| m.kind == "bind")
+        .map(|m| mac_path(Path::new(&m.source)))
+        .filter(|p| SHARED_ROOTS.iter().any(|r| p.starts_with(r)))
         .collect();
     Ok(outermost(all))
+}
+
+/// The Mac path FSEvents reports for a bind source: `/tmp` and `/var/folders`
+/// are symlinks into `/private` on macOS (the guest mounts them the same way).
+pub fn mac_path(source: &Path) -> PathBuf {
+    for alias in ["/tmp", "/var/folders"] {
+        if let Ok(rest) = source.strip_prefix(alias) {
+            return Path::new("/private").join(alias.trim_start_matches('/')).join(rest);
+        }
+    }
+    source.to_path_buf()
 }
 
 fn outermost(all: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
@@ -110,13 +122,22 @@ impl Watch {
     {
         let (tx, mut rx) = mpsc::unbounded_channel::<Change>();
         let events = tx.clone();
+        // Test hook (tests/stress/overflow.sh): treat events below this path as
+        // if FSEvents had dropped them, i.e. deliver the parent as a subtree.
+        let force_rescan = std::env::var_os("REKCOD_TEST_FORCE_RESCAN").map(PathBuf::from);
         let watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
             let rescan = event.need_rescan();
             for path in event.paths {
-                if !excluded(&path) {
-                    let _ = events.send(if rescan { Change::Tree(path) } else { Change::Path(path) });
+                if excluded(&path) {
+                    continue;
                 }
+                let change = match &force_rescan {
+                    Some(prefix) if path.starts_with(prefix) => Change::Tree(path.parent().unwrap_or(&path).to_path_buf()),
+                    _ if rescan => Change::Tree(path),
+                    _ => Change::Path(path),
+                };
+                let _ = events.send(change);
             }
         })?;
         tokio::spawn(async move {
@@ -217,10 +238,12 @@ mod tests {
                        {"Type":"volume","Source":"/var/lib/docker/volumes/x/_data","Destination":"/data"},
                        {"Type":"bind","Source":"/var/run/docker.sock","Destination":"/var/run/docker.sock"}]},
             {"Mounts":[{"Type":"bind","Source":"/private/var/folders/x/T/proj","Destination":"/p"}]},
+            {"Mounts":[{"Type":"bind","Source":"/tmp/scratch","Destination":"/s"}]},
+            {"Mounts":[{"Type":"bind","Source":"/tmpfoo","Destination":"/s"}]},
             {"Mounts":null}
         ]"#;
         let got: Vec<String> = bind_sources(json).unwrap().iter().map(|p| p.display().to_string()).collect();
-        assert_eq!(got, vec!["/Users/me/app", "/private/var/folders/x/T/proj"]);
+        assert_eq!(got, vec!["/Users/me/app", "/private/tmp/scratch", "/private/var/folders/x/T/proj"]);
     }
 
     #[test]

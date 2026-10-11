@@ -3,21 +3,28 @@
 //! - `~/.rekcod/run/docker.sock` -> vsock DOCKER_PORT (raw byte pipe)
 //! - published ports: watches `/events`, mirrors each port on the Mac,
 //!   tunnels connections to vsock FORWARD_PORT
+//! - published ports: TCP and UDP, mirrored on the Mac
+//! - `host.docker.internal`: keeps connections parked in the guest that the
+//!   agent hands back to be spliced to the Mac's `127.0.0.1:<port>`
 //! - pushes the Mac clock to the guest every 30 s
+//! - `~/.rekcod/run/control.sock`: relays `rekcod compact` (and research
+//!   commands) to the guest agent
 //! - SIGTERM: ask the guest to power off, force it after a timeout
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use rekcod_proto::{
-    CAP_FS_NOTIFY, CONTROL_PORT, Control, DNS_PORT, DOCKER_PORT, FORWARD_PORT, dns_frame, forward_header,
+    CAP_FS_NOTIFY, CONTROL_PORT, Control, DNS_PORT, DOCKER_PORT, FORWARD_PORT, META_PORT, Proto, REVERSE_PORT,
+    forward_header, frame, parse_reverse_header,
 };
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
-use tokio::net::{TcpListener, UdpSocket, UnixListener};
+use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixListener};
 use tokio::sync::mpsc;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::task::JoinHandle;
@@ -90,6 +97,9 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             if std::env::var_os("REKCOD_DEBUG").is_some() {
                 log!("file events: {changed:?}");
             }
+            for tree in changed.iter().filter(|l| l.ends_with('/')) {
+                log!("file events: invalidating everything under {tree}");
+            }
             if let Err(e) = notify_guest(&vm, &changed).await {
                 log!("file events: {e:#}");
             }
@@ -100,7 +110,14 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     }
     let status = Arc::new(Status::new(paths.clone(), cfg.cpus, cfg.memory_mib, fs_cache, watch));
     status.write();
+    let ctl = paths.control_socket();
+    let _ = std::fs::remove_file(&ctl);
+    tokio::spawn(control_server(vm.clone(), UnixListener::bind(&ctl).with_context(|| format!("bind {}", ctl.display()))?));
     tokio::spawn(clock_sync(vm.clone()));
+    tokio::spawn(reverse_pool(vm.clone()));
+    if std::env::var_os("REKCOD_RESEARCH").is_some() {
+        tokio::spawn(meta_server(vm.clone()));
+    }
     if std::env::var_os("REKCOD_BALLOON").is_some() {
         tokio::spawn(memory_manager(vm.clone(), cfg.memory_mib * 1024 * 1024, status.clone()));
     }
@@ -130,7 +147,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
 }
 
 fn cleanup(paths: &Paths) {
-    for f in [paths.socket(), paths.pid_file(), paths.status_file()] {
+    for f in [paths.socket(), paths.control_socket(), paths.pid_file(), paths.status_file()] {
         let _ = std::fs::remove_file(f);
     }
 }
@@ -172,11 +189,49 @@ async fn wait_for_agent(vm: &Vm) -> Result<String> {
 }
 
 async fn control(vm: &Vm, cmd: Control) -> Result<String> {
+    control_within(vm, cmd, Duration::from_secs(5)).await
+}
+
+async fn control_within(vm: &Vm, cmd: Control, timeout: Duration) -> Result<String> {
     let stream = vm.connect(CONTROL_PORT).await?;
     let mut stream = BufReader::new(stream);
     stream.get_mut().write_all(cmd.encode().as_bytes()).await?;
     let mut reply = String::new();
-    tokio::time::timeout(Duration::from_secs(5), stream.read_line(&mut reply)).await??;
+    tokio::time::timeout(timeout, stream.read_line(&mut reply)).await??;
+    Ok(reply.trim_end().to_string())
+}
+
+/// `~/.rekcod/run/control.sock`: one command line in, the agent's reply out.
+/// Only commands that are safe to expose to the CLI are relayed.
+async fn control_server(vm: Vm, listener: UnixListener) {
+    loop {
+        let Ok((conn, _)) = listener.accept().await else { continue };
+        let vm = vm.clone();
+        tokio::spawn(async move {
+            let mut conn = BufReader::new(conn);
+            let mut line = String::new();
+            if conn.read_line(&mut line).await.is_err() {
+                return;
+            }
+            let reply = match Control::parse(&line) {
+                Some(cmd @ (Control::Trim | Control::BenchMeta(_))) => control_within(&vm, cmd, Duration::from_secs(600))
+                    .await
+                    .unwrap_or_else(|e| format!("error: {e:#}")),
+                _ => format!("error: unsupported command {:?}", line.trim_end()),
+            };
+            let _ = conn.get_mut().write_all(format!("{reply}\n").as_bytes()).await;
+        });
+    }
+}
+
+/// Sends one command through the daemon's control socket (used by the CLI).
+pub fn send_control(paths: &Paths, cmd: &Control) -> Result<String> {
+    use std::io::{BufRead, Write};
+    let mut conn = std::os::unix::net::UnixStream::connect(paths.control_socket())
+        .context("connect to the rekcod daemon (is rekcod running?)")?;
+    conn.write_all(cmd.encode().as_bytes())?;
+    let mut reply = String::new();
+    std::io::BufReader::new(conn).read_line(&mut reply)?;
     Ok(reply.trim_end().to_string())
 }
 
@@ -271,7 +326,7 @@ async fn dns_session(vm: &Vm) -> Result<()> {
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
             tokio::spawn(async move {
-                if let Some(frame) = resolve(&query).await.as_deref().and_then(dns_frame) {
+                if let Some(frame) = resolve(&query).await.as_deref().and_then(frame) {
                     let _ = tx.send(frame);
                 }
             });
@@ -295,10 +350,26 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
         let mut buf = vec![0u8; 4096];
         if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
             buf.truncate(n);
+            // Truncated (TC): the full answer only comes over TCP.
+            if buf.len() > 2 && buf[2] & 0x02 != 0
+                && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
+            {
+                return Some(full);
+            }
             return Some(buf);
         }
     }
     None
+}
+
+async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
+    let mut tcp = TcpStream::connect(server).await?;
+    tcp.write_all(&frame(query).context("query too large")?).await?;
+    let mut len = [0u8; 2];
+    tcp.read_exact(&mut len).await?;
+    let mut answer = vec![0u8; u16::from_be_bytes(len) as usize];
+    tcp.read_exact(&mut answer).await?;
+    Ok(answer)
 }
 
 async fn docker_proxy(vm: Vm, listener: UnixListener) {
@@ -320,6 +391,7 @@ async fn docker_proxy(vm: Vm, listener: UnixListener) {
 
 #[derive(Serialize)]
 struct PortStatus {
+    proto: &'static str,
     address: String,
     port: u16,
     container: String,
@@ -353,12 +425,14 @@ struct Status {
     fs_cache: bool,
     balloon: Mutex<u64>,
     forwards: Mutex<BTreeMap<Binding, Forward>>,
+    /// Bind sources seen at the last reconcile; new ones get their caches warmed.
+    binds: Mutex<BTreeSet<PathBuf>>,
 }
 
 impl Status {
     fn new(paths: Paths, cpus: usize, memory_mib: u64, fs_cache: bool, watch: Arc<Watch>) -> Status {
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        Status { paths, watch, started_at, cpus, memory_mib, fs_cache, balloon: Mutex::new(memory_mib), forwards: Mutex::default() }
+        Status { paths, watch, started_at, cpus, memory_mib, fs_cache, balloon: Mutex::new(memory_mib), forwards: Mutex::default(), binds: Mutex::default() }
     }
 
     fn write(&self) {
@@ -368,6 +442,10 @@ impl Status {
             .unwrap()
             .iter()
             .map(|(b, f)| PortStatus {
+                proto: match b.proto {
+                    Proto::Tcp => "tcp",
+                    Proto::Udp => "udp",
+                },
                 address: b.addr.to_string(),
                 port: b.port,
                 container: f.container.clone(),
@@ -420,7 +498,17 @@ async fn watch_events(vm: &Vm, status: &Arc<Status>) -> Result<()> {
 async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     let body = http::get(vm.connect(DOCKER_PORT).await?, "/containers/json").await?;
     let want = ports::desired(&body)?;
-    for err in status.watch.set_roots(watch::bind_sources(&body)?) {
+    let binds = watch::bind_sources(&body)?;
+    if status.fs_cache {
+        let new: Vec<PathBuf> = binds.difference(&status.binds.lock().unwrap()).cloned().collect();
+        for path in new.into_iter().filter(|p| p.is_dir()) {
+            if let Some(p) = path.to_str() {
+                let _ = control(vm, Control::Warm(p.to_string())).await;
+            }
+        }
+    }
+    *status.binds.lock().unwrap() = binds.clone();
+    for err in status.watch.set_roots(binds) {
         log!("{err}");
     }
     let mut changed = false;
@@ -431,7 +519,7 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
             if !keep {
                 if let Some(task) = fwd.task.take() {
                     task.abort();
-                    log!("port {}:{} closed", binding.addr, binding.port);
+                    log!("port {}:{}/{:?} closed", binding.addr, binding.port, binding.proto);
                 }
                 changed = true;
             }
@@ -444,8 +532,11 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
             changed = true;
             let fwd = match listen(binding) {
                 Ok(listener) => {
-                    log!("port {}:{} -> {container}", binding.addr, binding.port);
-                    let task = tokio::spawn(accept_loop(vm.clone(), listener, binding.port));
+                    log!("port {}:{}/{:?} -> {container}", binding.addr, binding.port, binding.proto);
+                    let task = match listener {
+                        Listener::Tcp(l) => tokio::spawn(accept_loop(vm.clone(), l, binding.port)),
+                        Listener::Udp(s) => tokio::spawn(udp_loop(vm.clone(), s, binding.port)),
+                    };
                     Forward { container, task: Some(task), error: None }
                 }
                 Err(e) => {
@@ -463,19 +554,105 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     Ok(())
 }
 
-fn listen(b: Binding) -> std::io::Result<TcpListener> {
+enum Listener {
+    Tcp(TcpListener),
+    Udp(UdpSocket),
+}
+
+fn listen(b: Binding) -> std::io::Result<Listener> {
     use socket2::{Domain, Socket, Type};
     let addr = SocketAddr::new(b.addr, b.port);
-    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    let kind = if b.proto == Proto::Udp { Type::DGRAM } else { Type::STREAM };
+    let socket = Socket::new(Domain::for_address(addr), kind, None)?;
     if addr.is_ipv6() {
         // `[::]` is dual-stack (covers 127.0.0.1 too); `[::1]` stays v6-only.
         socket.set_only_v6(!b.addr.is_unspecified())?;
     }
-    socket.set_reuse_address(true)?;
     socket.set_nonblocking(true)?;
+    if b.proto == Proto::Udp {
+        socket.bind(&addr.into())?;
+        return Ok(Listener::Udp(UdpSocket::from_std(socket.into())?));
+    }
+    socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
     socket.listen(1024)?;
-    TcpListener::from_std(socket.into())
+    Ok(Listener::Tcp(TcpListener::from_std(socket.into())?))
+}
+
+/// A UDP flow (one Mac client address) closes after this long without traffic.
+const UDP_IDLE: Duration = Duration::from_secs(60);
+
+type UdpFlows = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>;
+
+/// Published UDP port: one vsock stream per Mac client address, carrying
+/// framed datagrams both ways (the agent relays them to docker-proxy).
+async fn udp_loop(vm: Vm, sock: UdpSocket, port: u16) {
+    let sock = Arc::new(sock);
+    let flows: UdpFlows = Arc::default();
+    let mut buf = vec![0u8; 65536];
+    loop {
+        let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
+        let packet = buf[..n].to_vec();
+        let existing = flows.lock().unwrap().get(&from).cloned();
+        let packet = match existing {
+            Some(tx) => match tx.send(packet) {
+                Ok(()) => continue,
+                Err(e) => e.0,
+            },
+            None => packet,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        let _ = tx.send(packet);
+        flows.lock().unwrap().insert(from, tx);
+        tokio::spawn(udp_flow(vm.clone(), sock.clone(), from, port, rx, flows.clone()));
+    }
+}
+
+async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut rx: mpsc::UnboundedReceiver<Vec<u8>>, flows: UdpFlows) {
+    let last = Mutex::new(Instant::now());
+    let result = async {
+        let (mut rd, mut wr) = tokio::io::split(vm.connect(FORWARD_PORT).await?);
+        wr.write_all(forward_header(Proto::Udp, port).as_bytes()).await?;
+        let up = async {
+            while let Some(p) = rx.recv().await {
+                *last.lock().unwrap() = Instant::now();
+                if let Some(f) = frame(&p) {
+                    wr.write_all(&f).await?;
+                }
+            }
+            anyhow::Ok(())
+        };
+        let down = async {
+            loop {
+                let mut len = [0u8; 2];
+                rd.read_exact(&mut len).await?;
+                let mut p = vec![0u8; u16::from_be_bytes(len) as usize];
+                rd.read_exact(&mut p).await?;
+                *last.lock().unwrap() = Instant::now();
+                sock.send_to(&p, from).await?;
+            }
+            #[allow(unreachable_code)]
+            anyhow::Ok(())
+        };
+        let idle = async {
+            loop {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                if last.lock().unwrap().elapsed() > UDP_IDLE {
+                    return anyhow::Ok(());
+                }
+            }
+        };
+        tokio::select! {
+            r = up => r,
+            r = down => r,
+            r = idle => r,
+        }
+    }
+    .await;
+    flows.lock().unwrap().remove(&from);
+    if let Err(e) = result {
+        log!("forward udp :{port} for {from}: {e:#}");
+    }
 }
 
 async fn accept_loop(vm: Vm, listener: TcpListener, port: u16) {
@@ -486,7 +663,7 @@ async fn accept_loop(vm: Vm, listener: TcpListener, port: u16) {
             let _ = tcp.set_nodelay(true);
             let tunnel = async {
                 let mut guest = vm.connect(FORWARD_PORT).await?;
-                guest.write_all(forward_header(port).as_bytes()).await?;
+                guest.write_all(forward_header(Proto::Tcp, port).as_bytes()).await?;
                 copy_bidirectional(&mut tcp, &mut guest).await?;
                 anyhow::Ok(())
             };
@@ -495,4 +672,101 @@ async fn accept_loop(vm: Vm, listener: TcpListener, port: u16) {
             }
         });
     }
+}
+
+// ------------------------------------------------- host.docker.internal
+
+/// Idle connections kept parked in the guest for `host.docker.internal`.
+const REVERSE_POOL: usize = 8;
+
+/// Keeps [`REVERSE_POOL`] connections parked on the agent's REVERSE_PORT. When
+/// the agent uses one (`connect <port>`), it is spliced to the Mac's
+/// `127.0.0.1:<port>` and a replacement is parked.
+async fn reverse_pool(vm: Vm) {
+    let (used_tx, mut used_rx) = mpsc::unbounded_channel::<()>();
+    for _ in 0..REVERSE_POOL {
+        tokio::spawn(park(vm.clone(), used_tx.clone()));
+    }
+    while used_rx.recv().await.is_some() {
+        tokio::spawn(park(vm.clone(), used_tx.clone()));
+    }
+}
+
+async fn park(vm: Vm, used: mpsc::UnboundedSender<()>) {
+    let stream = loop {
+        match vm.connect(REVERSE_PORT).await {
+            Ok(s) => break s,
+            Err(_) => tokio::time::sleep(Duration::from_secs(1)).await,
+        }
+    };
+    let parked_at = Instant::now();
+    let mut guest = BufReader::new(stream);
+    let mut line = String::new();
+    let n = guest.read_line(&mut line).await.unwrap_or(0);
+    if n == 0 && parked_at.elapsed() < Duration::from_secs(1) {
+        // Agent closed it right away (restarting); don't spin.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let _ = used.send(());
+    let Some(port) = parse_reverse_header(&line) else { return };
+    let mac = match TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(s) => Ok(s),
+        Err(_) => TcpStream::connect(("::1", port)).await,
+    };
+    match mac {
+        Ok(mut mac) => {
+            let _ = mac.set_nodelay(true);
+            let _ = copy_bidirectional(&mut guest, &mut mac).await;
+        }
+        Err(e) => log!("host.docker.internal:{port}: nothing listening on the Mac ({e})"),
+    }
+}
+
+// ------------------------------------------------- research (phase 6)
+
+/// Answers the agent's metadata-latency prototype (see rekcod-agent meta.rs).
+async fn meta_server(vm: Vm) {
+    loop {
+        let session = async {
+            let mut conn = BufReader::new(vm.connect(META_PORT).await?);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                if conn.read_line(&mut line).await? == 0 {
+                    return anyhow::Ok(());
+                }
+                let reply = meta_reply(line.trim_end_matches('\n'));
+                conn.get_mut().write_all(reply.as_bytes()).await?;
+            }
+        };
+        if let Err(e) = session.await {
+            log!("meta server: {e:#}");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+fn meta_reply(req: &str) -> String {
+    use std::os::unix::fs::MetadataExt;
+    if let Some(p) = req.strip_prefix("lstat ") {
+        return match std::fs::symlink_metadata(p) {
+            Ok(m) => format!("{} {} {} {}\n", m.size(), m.mtime(), m.mode(), m.ino()),
+            Err(_) => "-\n".into(),
+        };
+    }
+    if let Some(p) = req.strip_prefix("readdir ") {
+        let mut out = String::new();
+        for e in std::fs::read_dir(p).into_iter().flatten().flatten() {
+            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            if name.contains(['\t', '\n']) {
+                continue;
+            }
+            out.push(if e.file_type().is_ok_and(|t| t.is_dir()) { 'd' } else { 'f' });
+            out.push_str(&name);
+            out.push('\t');
+        }
+        out.push('\n');
+        return out;
+    }
+    "-\n".into()
 }

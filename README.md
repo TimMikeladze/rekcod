@@ -13,16 +13,18 @@ rekcod stop                           # powers off, restores your previous conte
 
 ## What works
 
-Verified by `scripts/e2e.sh` (28 checks) on an M5 Pro, macOS 27:
+Verified by `scripts/e2e.sh` (37 checks) and `tests/stress/` on an M5 Pro, macOS 27:
 
 - Upstream dockerd 29.9.0 with its embedded BuildKit. `docker build`, compose `build:` and `buildx bake` all work.
-- Published ports on the Mac's `localhost`, mirrored from docker events. If a Mac port is already taken, rekcod reports it in `rekcod status` and leaves the other process alone.
-- Bind mounts from `/Users`, `/Volumes`, `/private` and `/var/folders` at the same paths, **cached in the
+- Published TCP and UDP ports on the Mac's `localhost`, mirrored from docker events. If a Mac port is already taken, rekcod reports it in `rekcod status` and leaves the other process alone.
+- Bind mounts from `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders` at the same paths, **cached in the
   guest and invalidated from FSEvents**. Warm work is 3–9× faster than OrbStack's bind
   mounts and faster than native macOS (table below). Mac-side edits, atomic saves, creates,
   deletes and chmods reach containers within about 25 ms and **fire inotify**, so hot reload works.
+  Case-insensitive names behave like on the Mac (`Foo` is visible as `foo`). A newly
+  bind-mounted tree is pre-warmed in the background, so first access is up to 6× faster.
 - `linux/amd64` images through Rosetta.
-- `host.docker.internal` and `gateway.docker.internal`. Container DNS goes through the Mac's own resolvers, so VPN and link-local DNS work.
+- `host.docker.internal` (including Mac services bound only to `127.0.0.1`) and `gateway.docker.internal`. Container DNS goes through the Mac's own resolvers (UDP and TCP), so VPN and link-local DNS work.
 - `docker run -i`/`attach`/`exec` with stdin half-close, healthcheck-gated `depends_on`, and idempotent `compose up`.
 - `rekcod import`: images (`save | load`) and named volumes (data, labels), so compose reuses them. Volumes in use at the source are skipped unless you pass `--force`.
 - Idle VM memory is about 160 MiB RSS.
@@ -39,7 +41,7 @@ Verified by `scripts/e2e.sh` (28 checks) on an M5 Pro, macOS 27:
 | first (cold) read of the tree | 1.7 s | 0.84 s | 0.45 s |
 
 The guest keeps its caches across container runs. The cold cost is paid once per file
-after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md`](docs/phase2.md).
+after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md).
 
 ## Commands
 
@@ -50,6 +52,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod status` | Versions, VM size, forwarded ports (and any that couldn't be bound) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
+| `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 
 Without the docker CLI, run `export DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock`.
 If `DOCKER_HOST` is already set, it overrides contexts, and `rekcod start` warns you.
@@ -75,6 +78,11 @@ cargo test --workspace                       # unit tests
 scripts/e2e.sh                               # real CLI + compose against rekcod
 E2E_IMPORT_FROM=orbstack scripts/e2e.sh      # also exercises import
 python3 bench/headroom.py --context rekcod   # file-sharing benchmark (compare --context orbstack)
+python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge
+tests/stress/overflow.sh                     # FSEvents burst; see the script for the forced-drop mode
+tests/stress/postgres.sh                     # PGDATA on a bind mount: pgbench, restart, kill -9, amcheck
+tests/stress/slow-reader.sh                  # a stalled docker client must not freeze the VM
+tests/stress/compose-e2e.sh rekcod orbstack  # docker/compose's own e2e suite
 ```
 
 ## How it works
@@ -82,6 +90,7 @@ python3 bench/headroom.py --context rekcod   # file-sharing benchmark (compare -
 ```
 docker CLI ─▶ ~/.rekcod/run/docker.sock ─▶ rekcodd ──vsock──▶ rekcod-agent ─▶ dockerd
 Mac :8080  ─▶ rekcodd listener ─────────────────vsock──▶ agent ─▶ 127.0.0.1:8080 (docker-proxy)
+container ─▶ host.docker.internal:N ─iptables─▶ agent ──parked vsock──▶ rekcodd ─▶ Mac 127.0.0.1:N
 FSEvents   ─▶ rekcodd ──vsock──▶ agent ─▶ fuse rekcod_notify: invalidate + inotify
 guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ Mac resolvers
 ```
@@ -93,19 +102,15 @@ guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ 
 - `guest/fuse/`: patched `fuse`/`virtiofs` modules (long TTLs, lazy open, host-driven invalidation), built against the guest kernel.
 - State lives in `~/.rekcod`: `vm/root.img` (replaced on upgrade), `vm/data.img` (64 GiB sparse, all docker data) and `logs/`.
 
-Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md).
+Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md), [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md). Next steps: [`docs/handoff.md`](docs/handoff.md).
 
 ## Known gaps
 
-- **First access is slower than OrbStack.** Cold, first-touch bind-mount work is 2–6× slower, because Apple's virtio-fs pays a high per-request cost. Repeat work is 3–9× faster.
+- **First access can be slower than OrbStack** when a container touches files before background warming finishes (about 1 s per 20k files). Repeat work is 3–9× faster.
 - Mac→container change latency is about 25 ms (OrbStack: about 10 ms). Changes are visible after that bounded delay, not instantly.
-- UDP port publishing isn't forwarded to the Mac.
-- `host.docker.internal` reaches Mac services listening on all interfaces, not ones bound only to `127.0.0.1`.
-- Mac `/tmp` isn't shared. Use `/private/tmp`.
-- DNS answers larger than 4 KB (TCP fallback) aren't supported.
-- **Memory isn't returned to macOS.** `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop (docs/phase2.md).
+- **Memory isn't returned to macOS.** `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop (docs/phase2.md, docs/research.md).
 - No menu bar app, no brew formula.
 
 Debug knobs: `REKCOD_DEBUG=1` logs forwarded file events. `REKCOD_KERNEL_CMDLINE` overrides
-the guest command line. In the guest, `cat /sys/module/virtiofs/parameters/rekcod_stats`
+the guest command line. `REKCOD_NO_BALLOON=1` drops the balloon device. In the guest, `cat /sys/module/virtiofs/parameters/rekcod_stats`
 shows host requests by FUSE opcode.

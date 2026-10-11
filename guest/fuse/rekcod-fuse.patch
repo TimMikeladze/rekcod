@@ -1,6 +1,6 @@
-diff --color -ruN -x r fuse-orig/Makefile fuse-src/Makefile
---- a/Makefile	2026-10-11 10:24:33
-+++ b/Makefile	2026-10-11 10:24:33
+diff --color -ruN -x rekcod.c a/Makefile b/Makefile
+--- a/Makefile	2026-10-11 11:58:15
++++ b/Makefile	2026-10-11 11:58:15
 @@ -11,7 +11,7 @@
  obj-$(CONFIG_VIRTIO_FS) += virtiofs.o
  
@@ -10,9 +10,9 @@ diff --color -ruN -x r fuse-orig/Makefile fuse-src/Makefile
  fuse-$(CONFIG_FUSE_DAX) += dax.o
  fuse-$(CONFIG_FUSE_PASSTHROUGH) += passthrough.o
  
-diff --color -ruN -x r fuse-orig/dir.c fuse-src/dir.c
---- a/dir.c	2026-10-11 10:24:33
-+++ b/dir.c	2026-10-11 10:47:16
+diff --color -ruN -x rekcod.c a/dir.c b/dir.c
+--- a/dir.c	2026-10-11 11:58:15
++++ b/dir.c	2026-10-11 11:58:40
 @@ -141,7 +141,8 @@
   */
  void fuse_invalidate_atime(struct inode *inode)
@@ -23,7 +23,48 @@ diff --color -ruN -x r fuse-orig/dir.c fuse-src/dir.c
  		fuse_invalidate_attr_mask(inode, STATX_ATIME);
  }
  
-@@ -1208,7 +1209,7 @@
+@@ -704,6 +705,7 @@
+ 	d_instantiate(entry, inode);
+ 	fuse_change_entry_timeout(entry, &outentry);
+ 	fuse_dir_changed(dir);
++	rekcod_entry_changed(entry);
+ 	err = generic_file_open(inode, file);
+ 	if (!err) {
+ 		file->private_data = ff;
+@@ -842,6 +844,7 @@
+ 		fuse_change_entry_timeout(entry, &outarg);
+ 	}
+ 	fuse_dir_changed(dir);
++	rekcod_entry_changed(entry);
+ 	return 0;
+ 
+  out_put_forget_req:
+@@ -999,6 +1002,7 @@
+ 	if (!err) {
+ 		fuse_dir_changed(dir);
+ 		fuse_entry_unlinked(entry);
++		rekcod_entry_changed(entry);
+ 	} else if (err == -EINTR || err == -ENOENT)
+ 		fuse_invalidate_entry(entry);
+ 	return err;
+@@ -1022,6 +1026,7 @@
+ 	if (!err) {
+ 		fuse_dir_changed(dir);
+ 		fuse_entry_unlinked(entry);
++		rekcod_entry_changed(entry);
+ 	} else if (err == -EINTR || err == -ENOENT)
+ 		fuse_invalidate_entry(entry);
+ 	return err;
+@@ -1059,6 +1064,8 @@
+ 		fuse_dir_changed(olddir);
+ 		if (olddir != newdir)
+ 			fuse_dir_changed(newdir);
++		rekcod_entry_changed(oldent);
++		rekcod_entry_changed(newent);
+ 
+ 		/* newent will end up negative */
+ 		if (!(flags & RENAME_EXCHANGE) && d_really_is_positive(newent))
+@@ -1208,7 +1215,7 @@
  	memset(&inarg, 0, sizeof(inarg));
  	memset(&outarg, 0, sizeof(outarg));
  	/* Directories have separate file-handle space */
@@ -32,7 +73,7 @@ diff --color -ruN -x r fuse-orig/dir.c fuse-src/dir.c
  		struct fuse_file *ff = file->private_data;
  
  		inarg.getattr_flags |= FUSE_GETATTR_FH;
-@@ -1269,7 +1270,7 @@
+@@ -1269,7 +1276,7 @@
  	memset(&inarg, 0, sizeof(inarg));
  	memset(&outarg, 0, sizeof(outarg));
  	/* Directories have separate file-handle space */
@@ -41,7 +82,7 @@ diff --color -ruN -x r fuse-orig/dir.c fuse-src/dir.c
  		struct fuse_file *ff = file->private_data;
  
  		inarg.getattr_flags |= FUSE_GETATTR_FH;
-@@ -1888,7 +1889,7 @@
+@@ -1888,7 +1895,7 @@
  		inarg.ctime = inode_get_ctime_sec(inode);
  		inarg.ctimensec = inode_get_ctime_nsec(inode);
  	}
@@ -50,7 +91,7 @@ diff --color -ruN -x r fuse-orig/dir.c fuse-src/dir.c
  		inarg.valid |= FATTR_FH;
  		inarg.fh = ff->fh;
  	}
-@@ -1985,7 +1986,7 @@
+@@ -1985,7 +1992,7 @@
  	memset(&inarg, 0, sizeof(inarg));
  	memset(&outarg, 0, sizeof(outarg));
  	iattr_to_fattr(idmap, fc, attr, &inarg, trust_local_cmtime);
@@ -59,9 +100,9 @@ diff --color -ruN -x r fuse-orig/dir.c fuse-src/dir.c
  		struct fuse_file *ff = file->private_data;
  		inarg.valid |= FATTR_FH;
  		inarg.fh = ff->fh;
-diff --color -ruN -x r fuse-orig/file.c fuse-src/file.c
---- a/file.c	2026-10-11 10:33:42
-+++ b/file.c	2026-10-11 10:46:01
+diff --color -ruN -x rekcod.c a/file.c b/file.c
+--- a/file.c	2026-10-11 11:58:15
++++ b/file.c	2026-10-11 11:58:15
 @@ -69,6 +69,7 @@
  	}
  
@@ -195,9 +236,9 @@ diff --color -ruN -x r fuse-orig/file.c fuse-src/file.c
  		.offset = offset,
  		.length = length,
  		.mode = mode
-diff --color -ruN -x r fuse-orig/fuse_i.h fuse-src/fuse_i.h
---- a/fuse_i.h	2026-10-11 10:24:33
-+++ b/fuse_i.h	2026-10-11 10:53:00
+diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
+--- a/fuse_i.h	2026-10-11 11:58:15
++++ b/fuse_i.h	2026-10-11 11:58:40
 @@ -254,6 +254,16 @@
  
  	} readdir;
@@ -233,13 +274,22 @@ diff --color -ruN -x r fuse-orig/fuse_i.h fuse-src/fuse_i.h
  	/** Is setxattr not implemented by fs? */
  	unsigned no_setxattr:1;
  
-@@ -1225,6 +1239,17 @@
+@@ -1225,6 +1239,26 @@
  void fuse_invalidate_atime(struct inode *inode);
  
  u64 fuse_time_to_jiffies(u64 sec, u32 nsec);
 +
 +/* rekcod: jiffies64 of the last host-driven invalidation (rekcod.c) */
 +extern atomic64_t rekcod_last_inval;
++
++void rekcod_drop_case_aliases(struct dentry *parent, const struct qstr *name);
++
++/* rekcod: a guest-side create/remove/rename of @entry; see rekcod.c */
++static inline void rekcod_entry_changed(struct dentry *entry)
++{
++	if (get_fuse_conn_super(entry->d_sb)->rekcod)
++		rekcod_drop_case_aliases(entry->d_parent, &entry->d_name);
++}
 +
 +/* rekcod lazy open: the host file handle, opening on the host first if needed */
 +u64 fuse_file_fh(struct fuse_file *ff);
@@ -251,9 +301,9 @@ diff --color -ruN -x r fuse-orig/fuse_i.h fuse-src/fuse_i.h
  #define ATTR_TIMEOUT(o) \
  	fuse_time_to_jiffies((o)->attr_valid, (o)->attr_valid_nsec)
  
-diff --color -ruN -x r fuse-orig/ioctl.c fuse-src/ioctl.c
---- a/ioctl.c	2026-10-11 10:33:43
-+++ b/ioctl.c	2026-10-11 10:37:47
+diff --color -ruN -x rekcod.c a/ioctl.c b/ioctl.c
+--- a/ioctl.c	2026-10-11 11:58:15
++++ b/ioctl.c	2026-10-11 11:58:15
 @@ -218,7 +218,7 @@
  	struct fuse_file *ff = file->private_data;
  	struct fuse_mount *fm = ff->fm;
@@ -289,9 +339,9 @@ diff --color -ruN -x r fuse-orig/ioctl.c fuse-src/ioctl.c
  	inarg.cmd = cmd;
  
  #if BITS_PER_LONG == 32
-diff --color -ruN -x r fuse-orig/virtio_fs.c fuse-src/virtio_fs.c
---- a/virtio_fs.c	2026-10-11 10:24:33
-+++ b/virtio_fs.c	2026-10-11 10:53:00
+diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
+--- a/virtio_fs.c	2026-10-11 11:58:15
++++ b/virtio_fs.c	2026-10-11 11:58:15
 @@ -77,6 +77,9 @@
  	void *window_kaddr;
  	phys_addr_t window_phys_addr;

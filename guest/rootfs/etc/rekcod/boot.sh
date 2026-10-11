@@ -48,6 +48,9 @@ if mount -t virtiofs -o rekcod mac /mnt/mac 2>/dev/null || mount -t virtiofs mac
     [ -d "/mnt/mac/$d" ] && mount --bind "/mnt/mac/$d" "/$d"
   done
   [ -d /private/var/folders ] && mount --bind /private/var/folders /var/folders
+  # Mac /tmp is /private/tmp: `-v /tmp/x:/x` must mean the Mac's /tmp/x (as on
+  # Docker Desktop/OrbStack). Guest services keep their state under /run and /var/lib.
+  [ -d /private/tmp ] && mount --bind /private/tmp /tmp
 else
   log "mac share unavailable"
 fi
@@ -76,6 +79,14 @@ if [ -n "$ip4" ]; then
     echo "cache-size=1000"
   } >/etc/dnsmasq.conf
   echo "nameserver $ip4" >/etc/resolv.conf
+fi
+
+# host.docker.internal is the gateway address. Its TCP goes to rekcod-agent,
+# which has the daemon connect to 127.0.0.1:<port> on the Mac, so services
+# listening only on the Mac's loopback are reachable too.
+if [ -n "$gw" ]; then
+  iptables -t nat -I PREROUTING -d "$gw" -p tcp -j REDIRECT --to-ports 2379
+  iptables -t nat -I OUTPUT -d "$gw" -p tcp -j REDIRECT --to-ports 2379
 fi
 
 if [ -n "$gw" ]; then

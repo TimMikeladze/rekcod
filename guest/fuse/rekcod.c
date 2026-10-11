@@ -109,6 +109,31 @@ static void rekcod_tree(char *path)
 	path_put(&p);
 }
 
+/*
+ * macOS shares are usually case-insensitive: once "Foo" is created, renamed or
+ * removed, any cached dentry for "foo"/"FOO" (a negative from an earlier failed
+ * lookup, or a positive alias of the old file) is wrong for up to the cache TTL.
+ * Unhash every case variant of @name in @parent other than @name itself; the
+ * next access looks it up again. ASCII folding only, like most tools expect.
+ */
+void rekcod_drop_case_aliases(struct dentry *parent, const struct qstr *name)
+{
+	struct dentry *child;
+
+	spin_lock(&parent->d_lock);
+	hlist_for_each_entry(child, &parent->d_children, d_sib) {
+		if (child->d_name.len != name->len)
+			continue;
+		spin_lock_nested(&child->d_lock, DENTRY_D_LOCK_NESTED);
+		if (!d_unhashed(child) && !d_mountpoint(child) &&
+		    memcmp(child->d_name.name, name->name, name->len) &&
+		    !strncasecmp(child->d_name.name, name->name, name->len))
+			__d_drop(child);
+		spin_unlock(&child->d_lock);
+	}
+	spin_unlock(&parent->d_lock);
+}
+
 struct rekcod_stat {
 	bool known;	/* the host sent its view of the file */
 	bool missing;	/* ... and the file does not exist */
@@ -184,6 +209,7 @@ static void rekcod_one(char *path, const struct rekcod_stat *st)
 		dput(old);
 		goto out;
 	}
+	rekcod_drop_case_aliases(parent.dentry, &name);
 	existed = old && d_really_is_positive(old);
 	if (existed)
 		old_inode = igrab(d_inode(old));

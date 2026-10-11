@@ -216,9 +216,24 @@ pub fn status(paths: &Paths) -> Result<()> {
         let addr = p["address"].as_str().unwrap_or("?");
         let addr = if addr == "::" { "*".to_string() } else { addr.to_string() };
         let note = p["error"].as_str().map(|e| format!("  ! not forwarded: {e}")).unwrap_or_default();
-        println!("  port      {addr}:{} -> {}{note}", p["port"], p["container"].as_str().unwrap_or("?"));
+        let udp = if p["proto"].as_str() == Some("udp") { "/udp" } else { "" };
+        println!("  port      {addr}:{}{udp} -> {}{note}", p["port"], p["container"].as_str().unwrap_or("?"));
     }
     println!("  logs      {} , {}", paths.daemon_log().display(), paths.console_log().display());
+    Ok(())
+}
+
+pub fn compact(paths: &Paths) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let used = || std::fs::metadata(paths.data_disk()).map(|m| m.blocks() * 512).unwrap_or(0);
+    let before = used();
+    let reply = crate::daemon::send_control(paths, &rekcod_proto::Control::Trim)?;
+    if !reply.starts_with("ok") {
+        bail!("compact failed: {reply}");
+    }
+    let after = used();
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    println!("data disk: {:.2} GiB -> {:.2} GiB on the Mac ({:.2} GiB returned)", gib(before), gib(after), gib(before.saturating_sub(after)));
     Ok(())
 }
 

@@ -15,7 +15,8 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZDirectorySharingDeviceConfiguration, VZDiskImageStorageDeviceAttachment,
+    VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment,
+    VZDiskImageSynchronizationMode,
     VZFileHandleSerialPortAttachment,
     VZGenericPlatformConfiguration, VZLinuxBootLoader, VZLinuxRosettaAvailability,
     VZLinuxRosettaDirectoryShare, VZMACAddress, 
@@ -208,12 +209,26 @@ fn url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
 
+/// Guest flushes map to `fsync(2)` on the image, like native macOS apps get.
+/// VZ's default (`Full`) turns each one into `F_FULLFSYNC`, a flush to the
+/// physical media that costs milliseconds and made Postgres commits ~18x slower.
+/// `REKCOD_DISK_SYNC=full` restores it.
+fn sync_mode() -> VZDiskImageSynchronizationMode {
+    match std::env::var("REKCOD_DISK_SYNC").as_deref() {
+        Ok("full") => VZDiskImageSynchronizationMode::Full,
+        Ok("none") => VZDiskImageSynchronizationMode::None,
+        _ => VZDiskImageSynchronizationMode::Fsync,
+    }
+}
+
 unsafe fn disk(path: &Path) -> Result<Retained<VZStorageDeviceConfiguration>> {
     let attachment = unsafe {
-        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
+        VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_cachingMode_synchronizationMode_error(
             VZDiskImageStorageDeviceAttachment::alloc(),
             &url(path),
             false,
+            VZDiskImageCachingMode::Automatic,
+            sync_mode(),
         )
     }
     .map_err(|e| anyhow!("disk {}: {}", path.display(), e.localizedDescription()))?;

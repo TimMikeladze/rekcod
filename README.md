@@ -54,6 +54,7 @@ Verified by `scripts/e2e.sh` (37 checks) and `tests/stress/` on an M5 Pro, macOS
 - `docker run -i`/`attach`/`exec` with stdin half-close, healthcheck-gated `depends_on`, and idempotent `compose up`.
 - `rekcod import`: images (`save | load`) and named volumes (data, labels; copied with `docker cp` and checked by file count and bytes), so compose reuses them. Volumes in use at the source are skipped unless you pass `--force`.
 - Idle VM memory is about 160 MiB RSS.
+- Database-style workloads run at native-Mac durability: guest `fsync` maps to macOS `fsync` (survives VM or app crashes, like any Mac app), not a full media flush on every commit. pgbench (8 clients, scale 20): about 15k TPS, versus 1k with Virtualization.framework's default. `REKCOD_DISK_SYNC=full` restores full flushes.
 - The data disk is sparse (256 GiB by default, grown in place by `--disk`), and the build cache is capped at 20 GB.
 
 ## File-sharing speed
@@ -74,7 +75,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 
 | Command | |
 |---|---|
-| `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--disk` (default 256, sparse) grows the data disk, never shrinks it |
+| `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--disk` (default 256, sparse) grows the data disk, never shrinks it |
 | `rekcod stop [--no-switch]` | Graceful power-off, restore the previous context |
 | `rekcod status` | Versions, VM size, forwarded ports (and any that couldn't be bound) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |

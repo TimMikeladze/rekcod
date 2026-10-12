@@ -44,7 +44,7 @@ struct Args {
 enum Cmd {
     /// Boot the VM and make `rekcod` the active docker context.
     Start {
-        /// vCPUs (default: all host cores).
+        /// vCPUs (default: the Mac's performance cores, at least 4).
         #[arg(long)]
         cpus: Option<usize>,
         /// Memory in GiB (default: half of host RAM, at most 8). Unused memory is not reserved.

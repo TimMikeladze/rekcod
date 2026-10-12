@@ -43,6 +43,17 @@ pub(crate) fn sysctl_u64(name: &str) -> Option<u64> {
     (rc == 0).then_some(value)
 }
 
+/// Performance cores only: vCPUs that land on efficiency cores, and the cost of
+/// coordinating many vCPUs, made pgbench ~1.7x slower with all 18 cores of an
+/// M5 Pro than with its 6 performance cores.
+fn default_cpus() -> usize {
+    let host = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    match sysctl_u64("hw.perflevel0.physicalcpu") {
+        Some(p) if p > 0 => (p as usize).clamp(4.min(host), host),
+        _ => host.div_ceil(2).max(1),
+    }
+}
+
 fn random_mac() -> Result<String> {
     let mut b = [0u8; 6];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
@@ -84,8 +95,7 @@ fn boot(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u
     }
     {
         prepare_vm(paths, disk_gib)?;
-        let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let cpus = cpus.unwrap_or(host_cpus).clamp(1, vm::max_cpus());
+        let cpus = cpus.unwrap_or_else(default_cpus).clamp(1, vm::max_cpus());
         let host_mib = sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
         let memory_mib = memory_gib.map(|g| g << 10).unwrap_or((host_mib / 2).min(8 << 10));
 

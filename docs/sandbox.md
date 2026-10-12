@@ -35,31 +35,31 @@ project directory.
 
 ## What it protects against
 
-- **Reading secrets outside the project.** `~/.ssh`, `~/.aws`, `~/.npmrc`, browser profiles
+- Reading secrets outside the project. `~/.ssh`, `~/.aws`, `~/.npmrc`, browser profiles
   and other repos don't exist in the sandbox VM, not even as empty directories (only the
   parents of the project path are created).
-- **Reaching Mac services.** Databases, dev servers and admin UIs on the Mac (loopback
+- Reaching Mac services. Databases, dev servers and admin UIs on the Mac (loopback
   or LAN-bound) aren't reachable. Neither are other machines on the LAN or link-local
   metadata addresses.
-- **Persisting outside the project.** Writes land in the project directory (visible on the
+- Persisting outside the project. Writes land in the project directory (visible on the
   Mac, as intended) or in the sandbox VM's disk, which never touches the main VM.
 
 ## What it does not protect against
 
-- **The project itself.** The command can read and change everything in the current
+- The project itself. The command can read and change everything in the current
   directory, including `.git` (hooks!) and any secrets you keep in the project. Run it from
   a directory that holds only what the command needs.
-- **Exfiltration over the internet.** The internet is open (installs need it). There is
+- Exfiltration over the internet. The internet is open (installs need it). There is
   no egress allowlist yet; `--offline` removes the network entirely.
-- **Secrets you pass in.** `--secret NAME` hands the value to the command.
-- **Virtualization.framework escapes.** A VM escape lands in the rekcod process on the
+- Secrets you pass in. `--secret NAME` hands the value to the command.
+- Virtualization.framework escapes. A VM escape lands in the rekcod process on the
   Mac, with your user's permissions.
-- **Published ports.** Ports the command listens on are forwarded to the Mac's
+- Published ports. Ports the command listens on are forwarded to the Mac's
   `localhost`, like any `rekcod x`. A malicious server could serve hostile content to your
   browser there. `--offline` doesn't change this; `--no-autoports` without `-p` does.
-- **Images.** The sandbox pulls the image itself; a malicious image is still malicious,
+- Images. The sandbox pulls the image itself; a malicious image is still malicious,
   just contained.
-- **Timing.** One sandbox VM runs at a time. Starting one for another directory stops the
+- Timing. One sandbox VM runs at a time. Starting one for another directory stops the
   previous one.
 
 ## Verified (2026-10-12, M5 Pro, macOS 27)

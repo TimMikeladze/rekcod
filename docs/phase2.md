@@ -7,12 +7,12 @@ hands out tiny cache timeouts and caches no negative lookups.
 
 ## Approach: cache forever in the guest, invalidate from FSEvents
 
-1. **Patched `fuse.ko`/`virtiofs.ko`**, built out of tree against Alpine's
+1. Patched `fuse.ko`/`virtiofs.ko`, built out of tree against Alpine's
    `linux-virt` 6.12 headers from the matching kernel.org sources. They replace the
    stock modules in the root image. Signing isn't enforced (`MODULE_SIG_FORCE` is off).
-   - **Mount option `rekcod`** (virtio-fs only, so FUSE inside containers is untouched).
+   - Mount option `rekcod` (virtio-fs only, so FUSE inside containers is untouched).
      Entry, attribute and **negative** lookups never expire on their own.
-   - **`/sys/module/fuse/parameters/rekcod_notify`** (write-only). One absolute path per
+   - `/sys/module/fuse/parameters/rekcod_notify` (write-only). One absolute path per
      line. For each path the module:
      - drops that inode's attributes and page cache (`fuse_reverse_inval_inode`), and
        invalidates the name in its parent (`fuse_reverse_inval_entry`, covering
@@ -21,14 +21,14 @@ hands out tiny cache timeouts and caches no negative lookups.
        `IN_CREATE`, `IN_DELETE`, or `IN_MODIFY`+`IN_CLOSE_WRITE`.
    - A path ending in `/` invalidates the whole subtree (FSEvents overflow, or a
      new watch root).
-2. **The daemon watches all of the shared roots**, not only running containers' bind
+2. The daemon watches all of the shared roots, not only running containers' bind
    sources. It covers `/Users` (minus `~/Library`), `/Volumes`, `/private/tmp` and
    `/private/var/folders`. Unwatched paths would otherwise stay stale forever.
    FSEvents `MustScanSubDirs` becomes a subtree invalidation.
-3. **The agent** writes batches to `rekcod_notify` instead of the phase 1
+3. The agent writes batches to `rekcod_notify` instead of the phase 1
    `link()` + `chmod` poke. The kernel raises the inotify events itself, so nothing is
    written to Mac files anymore (no ctime churn).
-4. **Fallback:** if the patched module isn't loaded, the agent keeps the phase 1
+4. Fallback: if the patched module isn't loaded, the agent keeps the phase 1
    poke and the share mounts without `rekcod`, so behaviour is unchanged.
 
 **Semantics:** bounded staleness, not coherence. A Mac-side change becomes visible in
@@ -54,7 +54,7 @@ ships after the file-sharing work and only with an OOM-safety test.
 
 ## Results (2026-10-11, M5 Pro, macOS 27.0.1)
 
-**Status:** file sharing ✅ shipped. Memory reclaim ⚠️ built, but opt-in only (see below).
+**Status:** file sharing shipped. Memory reclaim built, but opt-in only (see below).
 
 `bench/headroom.py` uses a 20.5k-file node_modules-shaped tree. The first run of a
 phase is cold; `#2` is the same work again (warm):
@@ -78,7 +78,7 @@ file and regex-searching all `.go` files took 159 ms / 5 ms / 5 ms
 Gate results:
 - Warm metadata bind ÷ volume ≤ 1.5×: **met** (0.9–1.1×).
 - Faster than OrbStack's bind on warm work: **met** (3–9×).
-- **Cold, first-touch work is still 2–6× slower than OrbStack.** Apple's virtio-fs
+- Cold, first-touch work is still 2–6× slower than OrbStack. Apple's virtio-fs
   costs about 25–60 µs per request, against OrbStack's about 5 µs. Caching can't remove
   the first request. The guest keeps its caches across container runs, so this
   is paid once per file after boot, or after the file changes on the Mac.
@@ -92,24 +92,24 @@ Gate results:
 All in the patched modules (`guest/fuse/rekcod-fuse.patch` and `guest/fuse/rekcod.c`),
 active only on mounts using `-o rekcod`:
 
-1. **Reply rewriting** (`virtio_fs.c`). This keeps the patch out of the FUSE core.
+1. Reply rewriting (`virtio_fs.c`). This keeps the patch out of the FUSE core.
    - LOOKUP, CREATE, MKDIR, GETATTR, SETATTR, STATX and **READDIRPLUS** entries are cached for a day.
    - ENOENT lookups become cached negative entries.
    - OPEN and OPENDIR keep the page cache (`FOPEN_KEEP_CACHE`) and readdir cache (`FOPEN_CACHE_DIR`).
-2. **Lazy open** (`file.c`). Read-only files and directories don't OPEN on the
+2. Lazy open (`file.c`). Read-only files and directories don't OPEN on the
    host until a read misses the cache, so a cached `open+read+close` needs no host
    round trip. RELEASE is asynchronous, and FLUSH is skipped.
-3. **No atime invalidation.** Otherwise every host READ forces a GETATTR on the next `fstat`.
-4. **`isatty()` answered locally.** Python's `open()` sends `TCGETS`, which would
+3. No atime invalidation. Otherwise every host READ forces a GETATTR on the next `fstat`.
+4. `isatty()` answered locally. Python's `open()` sends `TCGETS`, which would
    force the lazy OPEN plus an ioctl round trip (115 µs → 3.7 µs).
-5. **`rekcod_notify`** (`rekcod.c`). The host sends `path\tsize\tmtime\tctime`.
+5. `rekcod_notify` (`rekcod.c`). The host sends `path\tsize\tmtime\tctime`.
    - The kernel skips paths whose cached attributes already match. These are echoes of guest writes and files the guest just read. Inode numbers can't be compared because Apple's server remaps them.
    - Otherwise it invalidates, then raises IN_CREATE, IN_MODIFY/IN_CLOSE_WRITE or IN_DELETE when someone watches.
    - Directories that still exist keep their dentry: only their attributes and listing are dropped.
    - Paths resolve through the dcache only (`d_hash_and_lookup`), including expired dentries.
-6. **Race guard.** Replies that arrive within 50 ms of an invalidation keep the
+6. Race guard. Replies that arrive within 50 ms of an invalidation keep the
    server's short TTL, so a lookup in flight can't re-cache old state for a day.
-7. **Counters:** `/sys/module/virtiofs/parameters/rekcod_stats` lists host requests by opcode.
+7. Counters: `/sys/module/virtiofs/parameters/rekcod_stats` lists host requests by opcode.
 
 Bugs found by measuring and the coherence suite (all fixed):
 - WARNs from missing `killsb` locking flooded the console.
@@ -119,15 +119,15 @@ Bugs found by measuring and the coherence suite (all fixed):
 
 ## Memory reclaim: finding
 
-- **Balloon policy.** `memory.rs` keeps about headroom free, grows to max at once when the
+- Balloon policy. `memory.rs` keeps about headroom free, grows to max at once when the
   guest runs low, and shrinks only after 15 s of idle. It reclaims page cache under
   macOS memory pressure.
-- **The guest side works.** The balloon negotiates DEFLATE_ON_OOM, and the
+- The guest side works. The balloon negotiates DEFLATE_ON_OOM, and the
   guest inflates as asked (6.4 GB ballooned).
-- **The host side doesn't release.** The VM process's physical footprint stayed
+- The host side doesn't release. The VM process's physical footprint stayed
   at 8.0 GB (`vmmap`: resident). Virtualization.framework's traditional balloon
   doesn't hand pages back to macOS in this setup (4K-page guest on a 16K-page host).
-- **Cost:** a 5 GiB allocation takes 2.4 s instead of 1.1 s.
+- Cost: a 5 GiB allocation takes 2.4 s instead of 1.1 s.
 
 So the balloon is **off by default** (`REKCOD_BALLOON=1` to try it). Next options to
 try: order-2 (16 KiB) balloon pages so whole host pages can be released, or

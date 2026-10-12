@@ -6,20 +6,20 @@ how that's enforced.
 
 ## Rules
 
-1. **The CLI is the implementation.** Every action is a CLI command line. The menu bar
+1. The CLI is the implementation. Every action is a CLI command line. The menu bar
    never calls docker or the daemon to change anything itself; it runs `rekcod <argv>`
    (`actions::Action`).
-2. **One action list.** `crates/rekcod/src/actions.rs` defines `Kind` (every action),
+2. One action list. `crates/rekcod/src/actions.rs` defines `Kind` (every action),
    `Action` (a kind plus its target), and what's available for each thing shown:
    `vm_actions`, `container_actions`, `port_actions`, `project_actions`,
    `snapshot_actions`. The menu bar renders those lists as they are, so adding an
    action there needs no menu bar change.
-3. **One data model.** `actions::Model::load` reads everything the menu shows (VM status,
+3. One data model. `actions::Model::load` reads everything the menu shows (VM status,
    containers, ports, compose projects, snapshots, sandbox). `rekcod status --json` is
    built from the same status value.
-4. **Interactive actions** (shell, logs) need a terminal: the menu bar opens Terminal.app
+4. Interactive actions (shell, logs) need a terminal: the menu bar opens Terminal.app
    with the same command line.
-5. **Tests:** `actions::tests::every_kind_is_offered` checks every `Kind` comes out of the
+5. Tests: `actions::tests::every_kind_is_offered` checks every `Kind` comes out of the
    action lists; `menubar::tests::menu_offers_every_action_kind` checks the built menu
    contains every `Kind`; `tests::every_action_is_a_cli_command` (main.rs) checks each
    `argv` parses as a real CLI command (`Args::try_parse_from` or the docker passthrough).

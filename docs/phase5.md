@@ -68,11 +68,11 @@ rekcod snap rm NAME
   `com.docker.compose.project.working_dir=$PWD`, else `-p` / `COMPOSE_PROJECT_NAME`,
   else the normalized directory name (compose's rule).
 - Volumes = volumes labelled `com.docker.compose.project=<project>`.
-- **Save:** pause the project's running containers (a crash-consistent point;
+- Save: pause the project's running containers (a crash-consistent point;
   Postgres/MySQL recover through their WAL), copy each volume into a snapshot volume
   `rekcod-snap.<project>.<name>.<volume>` (labelled), then unpause.
   The copy runs in a helper container with `cp -a`.
-- **Restore:** stop the project's running containers, replace each volume's contents
+- Restore: stop the project's running containers, replace each volume's contents
   from the snapshot, start the same containers again.
 - Not reflinks: the data disk is ext4. A copy inside the VM runs at disk speed, which
   still beats migrate + seed. btrfs/XFS reflinks are a later optimization.
@@ -84,17 +84,17 @@ rekcod snap rm NAME
 
 `rekcod run` is docker's (passthrough), so the zero-config runner is `rekcod x`.
 
-- **Detect** the image from, in order: `.tool-versions`/`mise.toml`, `.nvmrc`/
+- Detect the image from, in order: `.tool-versions`/`mise.toml`, `.nvmrc`/
   `.node-version`/`package.json` `engines.node`, `.bun-version`/`bun.lock`,
   `.python-version`/`pyproject.toml`, `go.mod`, `Cargo.toml`, `Gemfile`, `deno.json`,
   then the command name (`node`, `npm`, `pnpm`, `bun`, `python`, `uv`, `go`, `cargo`, ...).
   `--image` overrides.
-- **Run:** `docker run --rm` with the cwd bind-mounted at the same path, `-w $PWD`,
+- Run: `docker run --rm` with the cwd bind-mounted at the same path, `-w $PWD`,
   `-it` when stdin is a TTY, `.env` passed as `--env-file`. Exit code passes through.
   pnpm/yarn go through corepack.
-- **Linux deps** live on a VM-local volume keyed by project path (`node_modules`,
+- Linux deps live on a VM-local volume keyed by project path (`node_modules`,
   `.venv`), so Mac-built native modules never load on Linux and installs are fast.
-- **Ports:** the container uses the VM's host network. The agent reports TCP listeners
+- Ports: the container uses the VM's host network. The agent reports TCP listeners
   owned by the container's processes (new `listeners <container id>` control command),
   and the daemon forwards each to the same port on the Mac's `localhost` through the
   existing FORWARD_PORT path. Containers opt in with the label `dev.rekcod.autoports`.

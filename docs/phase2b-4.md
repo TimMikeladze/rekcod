@@ -19,31 +19,31 @@ cache miss in the guest, never wrong data.
 
 ## Phase 4: gaps switchers hit
 
-1. **Cold first-touch warming.** On container start the daemon sends
+1. Cold first-touch warming. On container start the daemon sends
    `warm <path>` per new bind source (only when the guest caches). The agent
    lists and lstats the tree with 8 low-priority threads, up to 200k entries.
    No file contents are read. (readdir alone was measured not to fill the
    dentry cache through Apple's server, so each name gets its own lstat.)
-2. **UDP published ports.** Mac `UdpSocket` per binding. Each Mac client address
+2. UDP published ports. Mac `UdpSocket` per binding. Each Mac client address
    gets one vsock stream to the agent's `FORWARD_PORT` with header `udp:<port>`;
    datagrams are framed `u16 len + payload` both ways. The agent sends from a
    connected socket to `127.0.0.1:<port>` (docker-proxy listens there). Flows idle
    for 60 s are dropped.
-3. **`host.docker.internal` reaches Mac `127.0.0.1` services.** Guest iptables
+3. `host.docker.internal` reaches Mac `127.0.0.1` services. Guest iptables
    DNATs TCP to the gateway IP onto the agent (`REDIRECT --to-ports 2379`). The
    agent reads `SO_ORIGINAL_DST` and takes a parked connection from a pool the
    host keeps open on vsock `REVERSE_PORT` (2379), writes `connect <port>`, and
    the host splices it to `127.0.0.1:<port>`. No VZ listener delegate needed.
    Services bound to `0.0.0.0` on the Mac also work through this path.
-4. **Mac `/tmp`.** The guest bind-mounts `/private/tmp` over `/tmp` (as OrbStack
+4. Mac `/tmp`. The guest bind-mounts `/private/tmp` over `/tmp` (as OrbStack
    does). The watcher maps `/tmp/...` and `/var/folders/...` bind sources to
    their `/private/...` Mac paths.
-5. **DNS over TCP.** The host retries over TCP when an answer has TC set. The agent
+5. DNS over TCP. The host retries over TCP when an answer has TC set. The agent
    serves TCP on `127.0.0.1:5353` too; for UDP clients it truncates answers over
    4096 bytes (header + question, TC=1) so dnsmasq retries over TCP.
-6. **Data disk compaction.** Check that VZ's virtio-blk advertises discard; if so
+6. Data disk compaction. Check that VZ's virtio-blk advertises discard; if so
    the agent runs `fstrim /var/lib/docker` hourly and on `rekcod compact`.
-7. **Memory.** Measure `init_on_free=1` with `footprint` of the VZ XPC process;
+7. Memory. Measure `init_on_free=1` with `footprint` of the VZ XPC process;
    enable by default only if it lowers the footprint.
    Order-2 balloon pages: not attempted (the balloon itself doesn't release on
    macOS 27, see `phase2.md`).
@@ -51,12 +51,12 @@ cache miss in the guest, never wrong data.
 
 ## Phase 6: research
 
-- **Cold metadata latency.** Prototype: the host serves `lstat`/`readdir` over a
+- Cold metadata latency. Prototype: the host serves `lstat`/`readdir` over a
   vsock connection (`META_PORT` 2380); `rekcod-agent bench-meta <dir>` measures
   per-request latency against the same requests through virtio-fs (cold, after
   `drop_caches` + subtree invalidation). Decision rule: a custom server is worth
   building only if it is ≥3× faster per request.
-- **Memory release via libkrun.** Desk research only: what it would gain
+- Memory release via libkrun. Desk research only: what it would gain
   (free-page reporting) and lose (Rosetta). Written up in `docs/research.md`.
 
 ## Results (2026-10-11, M5 Pro, macOS 27.0.1)
@@ -86,7 +86,9 @@ cache miss in the guest, never wrong data.
 | compaction | 2 GiB written and deleted in a volume: `data.img` 25.3 → 23.1 GiB on the Mac after trim. `rekcod compact` + hourly trim. |
 | `init_on_free=1` | **rejected**: VM footprint 8,239 MB right after boot (the kernel zeroes all RAM) vs 644 MB default; default is 751 MB after allocating and freeing 3 GB |
 
-**VM freeze (found by the Compose suite, fixed).** The whole guest froze 3–20
+### VM freeze (found by the Compose suite, fixed)
+
+The whole guest froze 3–20
 min into docker/compose's e2e suite, on the last commit too (pre-existing).
 - Symptom: every vCPU in `Hv::Vcpu::run → wait_for_interrupt` except one; guest
   soft lockups waiting on IPIs (`kick_all_cpus_sync`, `smp_call_function_single`).

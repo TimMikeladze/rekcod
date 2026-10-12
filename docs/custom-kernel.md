@@ -11,10 +11,10 @@ modules loaded at 0.19–0.21 s, guest agent up 0.54–0.64 s after VM start.
 
 ## Approach
 
-- **Same version as Alpine**: kernel.org sources for the version Alpine 3.22 ships
+- Same version as Alpine: kernel.org sources for the version Alpine 3.22 ships
   (6.12.x LTS), so behaviour matches what we already tested. Bumping it means changing
   one `ARG`.
-- **Config = Alpine's `config-virt` + `guest/kernel/rekcod.config`**, merged with
+- Config = Alpine's `config-virt` + `guest/kernel/rekcod.config`, merged with
   `scripts/kconfig/merge_config.sh` and then `olddefconfig`. The fragment:
   - builds in (`=y`) everything boot and docker need: virtio (blk, net, console, rng,
     balloon, vsock, fs), ext4, fuse/virtiofs, overlay, bridge/veth, netfilter/nat/
@@ -22,13 +22,13 @@ modules loaded at 0.19–0.21 s, guest agent up 0.54–0.64 s after VM start.
   - turns off hardware VZ doesn't have: sound, DRM/GPU, wireless, USB, most NIC/SCSI/
     storage drivers, and debug options.
   - keeps modules enabled, so anything rare still loads from `/lib/modules`.
-- **Fuse patch goes in-tree**: `guest/fuse/rekcod-fuse.patch` and `rekcod.c` apply to
+- Fuse patch goes in-tree: `guest/fuse/rekcod-fuse.patch` and `rekcod.c` apply to
   `fs/fuse` before the build. Built-in module parameters keep their
   `/sys/module/{fuse,virtiofs}/parameters/...` paths, so the agent doesn't change.
-- **No initramfs**: virtio-blk and ext4 are built in, so the kernel mounts `/dev/vda`
+- No initramfs: virtio-blk and ext4 are built in, so the kernel mounts `/dev/vda`
   itself. The host skips `setInitialRamdiskURL` when the guest dir has no `initramfs`.
   Older guests that ship one keep working.
-- **Fallback**: `docker build --build-arg KERNEL=alpine` still builds the stock-kernel
+- Fallback: `docker build --build-arg KERNEL=alpine` still builds the stock-kernel
   guest the old way.
 
 ## Verify

@@ -43,10 +43,10 @@ Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS
 
 - Upstream dockerd 29.9.0 with its embedded BuildKit. `docker build`, compose `build:` and `buildx bake` all work.
 - Published TCP and UDP ports on the Mac's `localhost`, mirrored from docker events. If a Mac port is already taken, rekcod reports it in `rekcod status` and leaves the other process alone.
-- Bind mounts from `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders` at the same paths, **cached in the
-  guest and invalidated from FSEvents**. Warm work is 3–9× faster than OrbStack's bind
+- Bind mounts from `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders` at the same paths, cached in the
+  guest and invalidated from FSEvents. Warm work is 3–9× faster than OrbStack's bind
   mounts and faster than native macOS (table below). Mac-side edits, atomic saves, creates,
-  deletes and chmods reach containers within about 14 ms and **fire inotify**, so hot reload works.
+  deletes and chmods reach containers within about 14 ms and fire inotify, so hot reload works.
   Case-insensitive names behave like on the Mac (`Foo` is visible as `foo`). A bind-mounted
   tree is pre-warmed in the background from the moment its container is created, and the
   most recently used ones are warmed again right after `rekcod start`.
@@ -60,7 +60,9 @@ Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS
 
 ## Beyond Docker Desktop
 
-**VM-local directories.** A container label keeps dependency and build directories
+### VM-local directories
+
+A container label keeps dependency and build directories
 inside the VM, so `npm install`, `rm -rf node_modules` and build output never cross into
 macOS. The Mac sees an empty directory there.
 
@@ -78,7 +80,9 @@ rekcod's socket proxy adds a named volume per path (`rekcod-local_<project>_<ser
 when the container is created, so the contents survive `compose up --force-recreate`.
 `docker volume rm` them to start over.
 
-**Volume snapshots.** Save a seeded database once, get back to it in a second:
+### Volume snapshots
+
+Save a seeded database once, get back to it in a second:
 
 ```sh
 rekcod snap save seeded        # pauses the project's containers, copies its volumes
@@ -92,7 +96,9 @@ The project is the compose project started from the current directory (`-p` to p
 Snapshots are copies on the VM's disk (a 360 MB Postgres data dir saves or restores in
 under a second). A restore after `compose down -v` recreates the volumes so compose adopts them.
 
-**Run anything without a Dockerfile.** `rekcod x <command>` picks the image from the
+### Run anything without a Dockerfile
+
+`rekcod x <command>` picks the image from the
 command and the project's version files (`.nvmrc`, `package.json` engines, `bun.lock`,
 `.python-version`, `pyproject.toml`, `uv.lock`, `go.mod`, `Cargo.toml`, `.tool-versions`,
 `mise.toml`, ...), mounts the current directory at the same path, and keeps `node_modules`,
@@ -109,13 +115,17 @@ rekcod x --image alpine:3.22 sh                 # any image
 `-p PORT` publishes explicitly, `-e KEY=VALUE` sets variables, and `.env` is passed along.
 A warm `rekcod x node -v` adds about 65 ms over running node natively.
 
-**Menu bar.** `rekcod menubar` shows docker's whale upside down (dimmed while the VM is stopped). Its menu lists the VM, containers, forwarded ports and compose
+### Menu bar
+
+`rekcod menubar` shows docker's whale upside down (dimmed while the VM is stopped). Its menu lists the VM, containers, forwarded ports and compose
 projects with their snapshots, with the same actions as the CLI: start/stop the VM,
 compact, root shell; start, stop, restart, logs or remove a container; open a port;
 save, restore or delete a snapshot. Every item runs the matching `rekcod` command, and
 anything destructive asks first. How it stays in sync with the CLI: [`docs/frontends.md`](docs/frontends.md).
 
-**Sandbox.** `rekcod x --sandbox <command>` runs in a second, throwaway VM whose only Mac
+### Sandbox
+
+`rekcod x --sandbox <command>` runs in a second, throwaway VM whose only Mac
 directory is the current one. The rest of `$HOME` (`~/.ssh`, cloud credentials, other
 repos) doesn't exist there, and nothing on the Mac or the local network is reachable;
 the internet is. Variables get in only with `--secret NAME`; `--offline` cuts the network.
@@ -221,11 +231,11 @@ guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ 
 
 Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md), [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md), [`docs/phase5.md`](docs/phase5.md), [`docs/sandbox.md`](docs/sandbox.md), [`docs/frontends.md`](docs/frontends.md). Next steps: [`docs/handoff.md`](docs/handoff.md).
 
-## Known gaps
+## Limitations
 
-- **First access can be slower than OrbStack** for a tree rekcod hasn't seen since boot, when a container touches it before background warming finishes (about 1 s per 20k files). Recently used trees are warmed at boot (a 19.5k-file walk 3 s after `rekcod start`: 34 ms warmed vs 286 ms not). Repeat work is 3–9× faster.
+- First access can be slower than OrbStack for a tree rekcod hasn't seen since boot, when a container touches it before background warming finishes (about 1 s per 20k files). Recently used trees are warmed at boot (a 19.5k-file walk 3 s after `rekcod start`: 34 ms warmed vs 286 ms not). Repeat work is 3–9× faster.
 - Mac→container change latency is about 14 ms p50 (`bench/inotify_rtt.py`; OrbStack measured 12 ms). Changes are visible after that bounded delay, not instantly.
-- **Memory isn't returned to macOS.** `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop, even under memory pressure (docs/phase2.md, docs/phase5.md).
+- Memory isn't returned to macOS. `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop, even under memory pressure (docs/phase2.md, docs/phase5.md).
 - `--sandbox` hasn't had an external security review (docs/sandbox.md).
 - No brew formula. Releases are ad-hoc signed, not notarized.
 

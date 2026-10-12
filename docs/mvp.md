@@ -1,4 +1,4 @@
-# rekcod MVP: seamless switch
+# rekcod MVP: switch in one command
 
 Goal: someone on Docker Desktop or OrbStack switches to rekcod in one command,
 keeps their images, volumes and compose files, and can switch back in one command.

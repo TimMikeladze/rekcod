@@ -32,6 +32,8 @@ jobs:
       # buildx + gha cache: the compiled guest kernel is reused until guest/kernel,
       # guest/fuse or the Dockerfile's kernel stage changes.
       - uses: docker/setup-buildx-action@v3
+      # exposes the cache token to `run:` steps, which type=gha needs
+      - uses: crazy-max/ghaction-github-runtime@v3
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl

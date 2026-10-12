@@ -11,8 +11,11 @@ mod http;
 mod memory;
 mod paths;
 mod ports;
+mod proxy;
 mod route;
 
+#[cfg(target_os = "macos")]
+mod actions;
 #[cfg(target_os = "macos")]
 mod cli;
 #[cfg(target_os = "macos")]
@@ -22,9 +25,17 @@ mod daemon;
 #[cfg(target_os = "macos")]
 mod fetch;
 #[cfg(target_os = "macos")]
+mod menubar;
+#[cfg(target_os = "macos")]
+mod snap;
+#[cfg(target_os = "macos")]
 mod vm;
 #[cfg(target_os = "macos")]
+mod tui;
+#[cfg(target_os = "macos")]
 mod watch;
+#[cfg(target_os = "macos")]
+mod xrun;
 
 #[derive(Parser)]
 #[command(
@@ -36,8 +47,9 @@ mod watch;
                   `rekcod start web` / `rekcod stop -t 5 web` are docker's; `rekcod docker <args>` always is."
 )]
 struct Args {
+    /// Without a command: the TUI in a terminal, help otherwise.
     #[command(subcommand)]
-    command: Cmd,
+    command: Option<Cmd>,
 }
 
 #[derive(Subcommand)]
@@ -63,8 +75,46 @@ enum Cmd {
         #[arg(long)]
         no_switch: bool,
     },
-    /// Show VM state, versions and forwarded ports.
-    Status,
+    /// Show VM state, versions, forwarded ports, disk and file-cache stats.
+    Status {
+        /// Machine-readable output (the scriptable API, docs/phase5.md §8).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Save and restore a compose project's volumes (seeded databases, per-branch state).
+    #[command(subcommand)]
+    Snap(Snap),
+    /// Run a command in a container, no Dockerfile: `rekcod x npm run dev`.
+    #[command(trailing_var_arg = true)]
+    X {
+        /// Image to use instead of the detected one.
+        #[arg(long)]
+        image: Option<String>,
+        /// Publish this port on the Mac instead of forwarding listeners automatically.
+        #[arg(short = 'p', long = "publish")]
+        publish: Vec<String>,
+        /// Environment variable (KEY=VALUE).
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// Don't forward listening ports automatically.
+        #[arg(long)]
+        no_autoports: bool,
+        /// Run in a separate VM that sees only this directory (docs/sandbox.md).
+        #[arg(long)]
+        sandbox: bool,
+        /// No network at all.
+        #[arg(long)]
+        offline: bool,
+        /// Pass this variable from your shell into the container (sandbox: the only way in).
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+        /// Leave the sandbox VM running afterwards.
+        #[arg(long)]
+        keep: bool,
+        /// The command and its arguments.
+        #[arg(required = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
     /// Copy images and named volumes from another docker context (desktop-linux, orbstack, ...).
     Import {
         /// Source docker context.
@@ -84,8 +134,19 @@ enum Cmd {
     },
     /// Open a root shell in the VM.
     Shell,
+    /// Full-screen terminal UI: VM, containers, ports, snapshots (also bare `rekcod`).
+    Tui,
     /// Give unused data-disk space back to macOS now (also runs hourly).
     Compact,
+    /// Menu bar item: status, start/stop, forwarded ports.
+    Menubar {
+        /// Start the menu bar item at login (LaunchAgent).
+        #[arg(long, conflicts_with = "uninstall")]
+        install: bool,
+        /// Remove the login item.
+        #[arg(long)]
+        uninstall: bool,
+    },
     #[command(hide = true, subcommand)]
     Research(Research),
     #[command(hide = true)]
@@ -94,6 +155,41 @@ enum Cmd {
         cpus: usize,
         #[arg(long)]
         memory_mib: u64,
+        #[arg(long)]
+        project: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum Snap {
+    /// Snapshot the project's volumes (NAME defaults to the git branch).
+    Save {
+        name: Option<String>,
+        /// Compose project (default: the one started from this directory).
+        #[arg(short = 'p', long)]
+        project: Option<String>,
+    },
+    /// Put the project's volumes back to a snapshot.
+    Restore {
+        name: Option<String>,
+        #[arg(short = 'p', long)]
+        project: Option<String>,
+    },
+    /// List snapshots.
+    Ls {
+        #[arg(short = 'p', long)]
+        project: Option<String>,
+        /// Every project's snapshots.
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a snapshot.
+    Rm {
+        name: String,
+        #[arg(short = 'p', long)]
+        project: Option<String>,
     },
 }
 
@@ -114,23 +210,44 @@ fn main() {
         std::process::exit(1);
     }
     let args = Args::parse();
-    if !matches!(args.command, Cmd::Daemon { .. }) {
+    let command = match args.command {
+        Some(c) => c,
+        None if unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 } => Cmd::Tui,
+        None => {
+            use clap::CommandFactory;
+            let _ = Args::command().print_help();
+            std::process::exit(2);
+        }
+    };
+    if !matches!(command, Cmd::Daemon { .. }) {
         // Behave like other CLIs when piped into `head` (the daemon keeps Rust's SIGPIPE-ignore).
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
-    let result = paths::Paths::new().and_then(|paths| match args.command {
+    let result = paths::Paths::new().and_then(|paths| match command {
         Cmd::Start { cpus, memory, disk, no_switch } => cli::start(&paths, cpus, memory, disk, no_switch),
         Cmd::Stop { no_switch } => cli::stop(&paths, no_switch),
-        Cmd::Status => cli::status(&paths),
+        Cmd::Status { json } => cli::status(&paths, json),
+        Cmd::Snap(Snap::Save { name, project }) => snap::save(&paths, project.as_deref(), name.as_deref()),
+        Cmd::Snap(Snap::Restore { name, project }) => snap::restore(&paths, project.as_deref(), name.as_deref()),
+        Cmd::Snap(Snap::Ls { project, all, json }) => snap::list(&paths, project.as_deref(), all, json),
+        Cmd::Snap(Snap::Rm { name, project }) => snap::remove(&paths, project.as_deref(), &name),
+        Cmd::X { image, publish, env, no_autoports, sandbox, offline, secrets, keep, cmd } => {
+            let opts = xrun::Options { image, publish, env, no_autoports, sandbox, offline, secrets, keep };
+            xrun::run(&paths, &cmd, opts).map(|_| ())
+        }
         Cmd::Import { from, names, images_only, volumes_only, force } => {
             cli::import(&paths, &from, &names, !volumes_only, !images_only, force)
         }
         Cmd::Shell => cli::shell(&paths),
+        Cmd::Tui => tui::run(paths),
         Cmd::Compact => cli::compact(&paths),
+        Cmd::Menubar { install: true, .. } => menubar::install(),
+        Cmd::Menubar { uninstall: true, .. } => menubar::uninstall(),
+        Cmd::Menubar { .. } => menubar::run(paths),
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib } => daemon::run(paths, daemon::Options { cpus, memory_mib }),
+        Cmd::Daemon { cpus, memory_mib, project } => daemon::run(paths, daemon::Options { cpus, memory_mib, project }),
     });
     if let Err(e) = result {
         eprintln!("rekcod: {e:#}");
@@ -143,4 +260,23 @@ fn main() {
     let _ = Args::parse();
     eprintln!("rekcod currently supports macOS on Apple Silicon only");
     std::process::exit(1);
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// Every action the TUI and menu bar can run is a real CLI command line.
+    #[test]
+    fn every_action_is_a_cli_command() {
+        use clap::Parser;
+        for a in actions::tests::reachable_kinds() {
+            let actions::Run::Rekcod(argv) = &a.run else { continue };
+            if route::docker_args(argv).is_some() {
+                continue; // docker passthrough (container start/stop/rm/logs)
+            }
+            let full: Vec<&str> = std::iter::once("rekcod").chain(argv.iter().map(String::as_str)).collect();
+            assert!(Args::try_parse_from(&full).is_ok(), "{:?} doesn't parse: {argv:?}", a.kind);
+        }
+    }
 }

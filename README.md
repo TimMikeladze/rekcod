@@ -39,16 +39,17 @@ checks its sha256 before unpacking. `REKCOD_RELEASE_URL` points the download els
 
 ## What works
 
-Verified by `scripts/e2e.sh` (37 checks) and `tests/stress/` on an M5 Pro, macOS 27:
+Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS 27:
 
 - Upstream dockerd 29.9.0 with its embedded BuildKit. `docker build`, compose `build:` and `buildx bake` all work.
 - Published TCP and UDP ports on the Mac's `localhost`, mirrored from docker events. If a Mac port is already taken, rekcod reports it in `rekcod status` and leaves the other process alone.
 - Bind mounts from `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders` at the same paths, **cached in the
   guest and invalidated from FSEvents**. Warm work is 3–9× faster than OrbStack's bind
   mounts and faster than native macOS (table below). Mac-side edits, atomic saves, creates,
-  deletes and chmods reach containers within about 25 ms and **fire inotify**, so hot reload works.
-  Case-insensitive names behave like on the Mac (`Foo` is visible as `foo`). A newly
-  bind-mounted tree is pre-warmed in the background, so first access is up to 6× faster.
+  deletes and chmods reach containers within about 14 ms and **fire inotify**, so hot reload works.
+  Case-insensitive names behave like on the Mac (`Foo` is visible as `foo`). A bind-mounted
+  tree is pre-warmed in the background from the moment its container is created, and the
+  most recently used ones are warmed again right after `rekcod start`.
 - `linux/amd64` images through Rosetta.
 - `host.docker.internal` (including Mac services bound only to `127.0.0.1`) and `gateway.docker.internal`. Container DNS goes through the Mac's own resolvers (UDP and TCP), so VPN and link-local DNS work.
 - `docker run -i`/`attach`/`exec` with stdin half-close, healthcheck-gated `depends_on`, and idempotent `compose up`.
@@ -56,6 +57,73 @@ Verified by `scripts/e2e.sh` (37 checks) and `tests/stress/` on an M5 Pro, macOS
 - Idle VM memory is about 160 MiB RSS.
 - Database-style workloads run at native-Mac durability: guest `fsync` maps to macOS `fsync` (survives VM or app crashes, like any Mac app), not a full media flush on every commit. pgbench (8 clients, scale 20): about 15k TPS, versus 1k with Virtualization.framework's default. `REKCOD_DISK_SYNC=full` restores full flushes.
 - The data disk is sparse (256 GiB by default, grown in place by `--disk`), and the build cache is capped at 20 GB.
+
+## Beyond Docker Desktop
+
+**VM-local directories.** A container label keeps dependency and build directories
+inside the VM, so `npm install`, `rm -rf node_modules` and build output never cross into
+macOS. The Mac sees an empty directory there.
+
+```yaml
+services:
+  web:
+    build: .
+    volumes: [.:/app]
+    working_dir: /app
+    labels:
+      dev.rekcod.local: "node_modules,.next"   # relative to working_dir, or absolute
+```
+
+rekcod's socket proxy adds a named volume per path (`rekcod-local_<project>_<service>_<path>`)
+when the container is created, so the contents survive `compose up --force-recreate`.
+`docker volume rm` them to start over.
+
+**Volume snapshots.** Save a seeded database once, get back to it in a second:
+
+```sh
+rekcod snap save seeded        # pauses the project's containers, copies its volumes
+rekcod snap restore seeded     # stops them, copies back, starts them again
+rekcod snap save               # no name: the current git branch, for per-branch state
+rekcod snap ls [--all] [--json]
+rekcod snap rm seeded
+```
+
+The project is the compose project started from the current directory (`-p` to pick one).
+Snapshots are copies on the VM's disk (a 360 MB Postgres data dir saves or restores in
+under a second). A restore after `compose down -v` recreates the volumes so compose adopts them.
+
+**Run anything without a Dockerfile.** `rekcod x <command>` picks the image from the
+command and the project's version files (`.nvmrc`, `package.json` engines, `bun.lock`,
+`.python-version`, `pyproject.toml`, `uv.lock`, `go.mod`, `Cargo.toml`, `.tool-versions`,
+`mise.toml`, ...), mounts the current directory at the same path, and keeps `node_modules`,
+`.venv` and `target` on VM volumes so Mac and Linux builds of native modules never mix.
+Ports the command listens on, even on `127.0.0.1`, show up on the Mac's `localhost`.
+
+```sh
+rekcod x npm install && rekcod x npm run dev     # node:<your version>-slim
+rekcod x uv run pytest                          # uv image with your Python
+rekcod x cargo test                             # rust image, target/ stays in the VM
+rekcod x --image alpine:3.22 sh                 # any image
+```
+
+`-p PORT` publishes explicitly, `-e KEY=VALUE` sets variables, and `.env` is passed along.
+A warm `rekcod x node -v` adds about 65 ms over running node natively.
+
+**TUI and menu bar.** `rekcod` on its own opens a terminal UI; `rekcod menubar` puts the
+same thing in the menu bar. Both list the VM, containers, forwarded ports and compose
+projects with their snapshots, and offer the same actions: start/stop the VM, compact,
+root shell; start, stop, restart, logs or remove a container; open a port; save,
+restore or delete a snapshot. Every action runs the matching `rekcod` command, and
+anything destructive asks first. TUI keys: `1`–`3` or Tab for tabs, `j`/`k` to move,
+`⏎` for the selected row's actions, the letter shown next to an action to run it
+directly, `v` for the VM, `q` to quit. How the three stay in sync: [`docs/frontends.md`](docs/frontends.md).
+
+**Sandbox.** `rekcod x --sandbox <command>` runs in a second, throwaway VM whose only Mac
+directory is the current one. The rest of `$HOME` (`~/.ssh`, cloud credentials, other
+repos) doesn't exist there, and nothing on the Mac or the local network is reachable;
+the internet is. Variables get in only with `--secret NAME`; `--offline` cuts the network.
+Use it for `npm install` of something you don't trust, or for an AI agent's commands.
+Threat model and limits: [`docs/sandbox.md`](docs/sandbox.md).
 
 ## File-sharing speed
 
@@ -77,9 +145,13 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 |---|---|
 | `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--disk` (default 256, sparse) grows the data disk, never shrinks it |
 | `rekcod stop [--no-switch]` | Graceful power-off, restore the previous context |
-| `rekcod status` | Versions, VM size, forwarded ports (and any that couldn't be bound) |
+| `rekcod status [--json]` | Versions, VM size, forwarded ports (and any that couldn't be bound), data-disk use in the VM and on the Mac, file-cache trips to macOS, warming in progress, the sandbox VM. `--json` is the scriptable form |
+| `rekcod snap save\|restore\|ls\|rm [NAME] [-p PROJECT]` | Volume snapshots of a compose project (above) |
+| `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
+| `rekcod tui` (or bare `rekcod` in a terminal) | Full-screen UI: VM status, containers, ports, snapshots, with the same actions as the menu bar |
+| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the TUI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |
@@ -116,6 +188,9 @@ cargo test --workspace                       # unit tests
 scripts/e2e.sh                               # real CLI + compose against rekcod
 E2E_IMPORT_FROM=orbstack scripts/e2e.sh      # also exercises import
 python3 bench/headroom.py --context rekcod   # file-sharing benchmark (compare --context orbstack)
+python3 bench/inotify_rtt.py --context rekcod  # Mac edit -> container inotify latency
+bench/cold_start.sh                          # first access right after boot, warmed vs not
+rekcod x cargo test -p rekcod-agent          # the guest agent's Linux-only tests
 python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge
 tests/stress/overflow.sh                     # FSEvents burst; see the script for the forced-drop mode
 tests/stress/postgres.sh                     # PGDATA on a bind mount: pgbench, restart, kill -9, amcheck
@@ -133,21 +208,22 @@ FSEvents   ─▶ rekcodd ──vsock──▶ agent ─▶ fuse rekcod_notify: 
 guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ Mac resolvers
 ```
 
-- `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy, the port forwarder, file events, the DNS bridge and clock sync.
+- `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy (`proxy.rs`, rewrites `containers/create` for `dev.rekcod.local`), the port forwarder (published ports and `rekcod x` listeners), file events, the DNS bridge and clock sync. `snap.rs` and `xrun.rs` are the newer commands; `actions.rs` is the action list that `tui.rs` and `menubar.rs` render.
 - `crates/rekcod-agent`: static musl guest agent.
 - `crates/rekcod-proto`: vsock ports and wire formats.
 - `guest/`: Alpine `linux-virt` 6.12 kernel and initramfs, an ext4 root with upstream static docker binaries, and busybox init.
 - `guest/fuse/`: patched `fuse`/`virtiofs` modules (long TTLs, lazy open, host-driven invalidation), built against the guest kernel.
-- State lives in `~/.rekcod`: `vm/root.img` (replaced on upgrade), `vm/data.img` (256 GiB sparse by default, all docker data) and `logs/`.
+- State lives in `~/.rekcod`: `vm/root.img` (replaced on upgrade), `vm/data.img` (256 GiB sparse by default, all docker data), `vm/warm-paths` (bind sources warmed at boot) and `logs/`. The sandbox VM has its own copy under `~/.rekcod/sandbox`.
 
-Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md), [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md). Next steps: [`docs/handoff.md`](docs/handoff.md).
+Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md), [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md), [`docs/phase5.md`](docs/phase5.md), [`docs/sandbox.md`](docs/sandbox.md), [`docs/frontends.md`](docs/frontends.md). Next steps: [`docs/handoff.md`](docs/handoff.md).
 
 ## Known gaps
 
-- **First access can be slower than OrbStack** when a container touches files before background warming finishes (about 1 s per 20k files). Repeat work is 3–9× faster.
-- Mac→container change latency is about 25 ms (OrbStack: about 10 ms). Changes are visible after that bounded delay, not instantly.
-- **Memory isn't returned to macOS.** `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop (docs/phase2.md, docs/research.md).
-- No menu bar app, no brew formula. Releases are ad-hoc signed, not notarized.
+- **First access can be slower than OrbStack** for a tree rekcod hasn't seen since boot, when a container touches it before background warming finishes (about 1 s per 20k files). Recently used trees are warmed at boot (a 19.5k-file walk 3 s after `rekcod start`: 34 ms warmed vs 286 ms not). Repeat work is 3–9× faster.
+- Mac→container change latency is about 14 ms p50 (`bench/inotify_rtt.py`; OrbStack measured 12 ms). Changes are visible after that bounded delay, not instantly.
+- **Memory isn't returned to macOS.** `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop, even under memory pressure (docs/phase2.md, docs/phase5.md).
+- `--sandbox` hasn't had an external security review (docs/sandbox.md).
+- No brew formula. Releases are ad-hoc signed, not notarized.
 
 Debug knobs: `REKCOD_DEBUG=1` logs forwarded file events. `REKCOD_KERNEL_CMDLINE` overrides
 the guest command line. `REKCOD_NO_BALLOON=1` drops the balloon device. In the guest, `cat /sys/module/virtiofs/parameters/rekcod_stats`

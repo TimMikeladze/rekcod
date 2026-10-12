@@ -18,6 +18,11 @@ impl Paths {
             Some(h) => PathBuf::from(h),
             None => PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".rekcod"),
         };
+        Paths::at(home)
+    }
+
+    /// Another rekcod home (the sandbox VM's, `~/.rekcod/sandbox`).
+    pub fn at(home: PathBuf) -> Result<Paths> {
         for dir in ["run", "logs", "vm"] {
             std::fs::create_dir_all(home.join(dir))?;
         }
@@ -53,6 +58,10 @@ impl Paths {
     }
     pub fn mac_address(&self) -> PathBuf {
         self.home.join("vm/mac-address")
+    }
+    /// Recently bind-mounted Mac directories, most recent first; warmed at boot.
+    pub fn warm_paths(&self) -> PathBuf {
+        self.home.join("vm/warm-paths")
     }
     pub fn guest_version(&self) -> PathBuf {
         self.home.join("vm/guest-version")

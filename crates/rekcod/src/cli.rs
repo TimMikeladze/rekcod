@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::Read;
 use std::os::unix::process::CommandExt;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -21,14 +22,14 @@ fn block_on<F: Future>(f: F) -> F::Output {
 }
 
 /// GET on the rekcod docker socket.
-fn api_get(paths: &Paths, path: &str) -> Result<Vec<u8>> {
+pub(crate) fn api_get(paths: &Paths, path: &str) -> Result<Vec<u8>> {
     block_on(async {
         let stream = tokio::net::UnixStream::connect(paths.socket()).await?;
         tokio::time::timeout(Duration::from_secs(5), http::get(stream, path)).await?
     })
 }
 
-fn running_pid(paths: &Paths) -> Option<i32> {
+pub(crate) fn running_pid(paths: &Paths) -> Option<i32> {
     let pid: i32 = std::fs::read_to_string(paths.pid_file()).ok()?.trim().parse().ok()?;
     (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
 }
@@ -88,23 +89,47 @@ fn tail(path: &std::path::Path, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
+pub struct BootOptions {
+    pub cpus: Option<usize>,
+    pub memory_gib: Option<u64>,
+    pub disk_gib: u64,
+    /// Sandbox VM: share only this directory (docs/sandbox.md).
+    pub project: Option<PathBuf>,
+    /// Guest image to boot (the sandbox uses the main install's).
+    pub guest_dir: Option<PathBuf>,
+}
+
+impl Default for BootOptions {
+    fn default() -> Self {
+        BootOptions { cpus: None, memory_gib: None, disk_gib: crate::paths::DEFAULT_DISK_GIB, project: None, guest_dir: None }
+    }
+}
+
 /// Boots the VM unless it is running; returns the pid when it already was.
-fn boot(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64) -> Result<Option<i32>> {
+pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
     if let Some(pid) = running_pid(paths) {
         return Ok(Some(pid));
     }
     {
-        prepare_vm(paths, disk_gib)?;
-        let cpus = cpus.unwrap_or_else(default_cpus).clamp(1, vm::max_cpus());
+        if let Some(dir) = &opts.guest_dir {
+            // SAFETY: single-threaded CLI, before spawning anything.
+            unsafe { std::env::set_var("REKCOD_GUEST_DIR", dir) };
+        }
+        prepare_vm(paths, opts.disk_gib)?;
+        let cpus = opts.cpus.unwrap_or_else(default_cpus).clamp(1, vm::max_cpus());
         let host_mib = sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
-        let memory_mib = memory_gib.map(|g| g << 10).unwrap_or((host_mib / 2).min(8 << 10));
+        let memory_mib = opts.memory_gib.map(|g| g << 10).unwrap_or((host_mib / 2).min(8 << 10));
 
         let log = OpenOptions::new().create(true).append(true).open(paths.daemon_log())?;
         let mut cmd = Command::new(std::env::current_exe()?);
         cmd.args(["daemon", "--cpus", &cpus.to_string(), "--memory-mib", &memory_mib.to_string()])
+            .env("REKCOD_HOME", &paths.home)
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
+        if let Some(project) = &opts.project {
+            cmd.arg("--project").arg(project);
+        }
         // Detach from the terminal so closing it doesn't kill the VM.
         unsafe {
             cmd.pre_exec(|| {
@@ -137,9 +162,24 @@ fn boot(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u
     Ok(None)
 }
 
+/// SIGTERM the daemon and wait for the VM to power off; false if it wasn't running.
+pub(crate) fn stop_daemon(paths: &Paths) -> Result<bool> {
+    let Some(pid) = running_pid(paths) else { return Ok(false) };
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        if Instant::now() > deadline {
+            bail!("daemon (pid {pid}) did not exit; see {}", paths.daemon_log().display());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Ok(true)
+}
+
 pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, no_switch: bool) -> Result<()> {
     let t0 = Instant::now();
-    if let Some(pid) = boot(paths, cpus, memory_gib, disk_gib)? {
+    let opts = BootOptions { cpus, memory_gib, disk_gib, ..Default::default() };
+    if let Some(pid) = boot(paths, &opts)? {
         println!("rekcod is already running (pid {pid})");
     }
     let version = api_get(paths, "/version")
@@ -174,19 +214,16 @@ pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_g
 }
 
 pub fn stop(paths: &Paths, no_switch: bool) -> Result<()> {
-    match running_pid(paths) {
-        None => println!("rekcod is not running"),
-        Some(pid) => {
-            unsafe { libc::kill(pid, libc::SIGTERM) };
-            let deadline = Instant::now() + Duration::from_secs(45);
-            while unsafe { libc::kill(pid, 0) } == 0 {
-                if Instant::now() > deadline {
-                    bail!("daemon (pid {pid}) did not exit; see {}", paths.daemon_log().display());
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            println!("rekcod stopped");
-        }
+    if stop_daemon(paths)? {
+        println!("rekcod stopped");
+    } else {
+        println!("rekcod is not running");
+    }
+    if paths.home.join("sandbox").is_dir()
+        && let Ok(sandbox) = crate::xrun::sandbox_paths(paths)
+        && stop_daemon(&sandbox)?
+    {
+        println!("sandbox VM stopped");
     }
     if !no_switch && docker::available() && docker::current_context().is_ok_and(|c| c == CONTEXT) {
         let mut previous = std::fs::read_to_string(paths.prev_context()).unwrap_or_default().trim().to_string();
@@ -199,44 +236,148 @@ pub fn stop(paths: &Paths, no_switch: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn status(paths: &Paths) -> Result<()> {
-    let Some(pid) = running_pid(paths) else {
+/// FUSE opcodes worth naming in `rekcod status` (linux/fuse.h).
+fn fuse_op(op: &str) -> &str {
+    match op {
+        "1" => "lookup",
+        "3" => "getattr",
+        "14" => "open",
+        "15" => "read",
+        "16" => "write",
+        "26" => "init",
+        "27" => "opendir",
+        "28" => "readdir",
+        "35" => "create",
+        "44" => "readdirplus",
+        other => other,
+    }
+}
+
+/// Everything `rekcod status` knows, as one JSON value (`status --json`).
+pub(crate) fn status_value(paths: &Paths) -> serde_json::Value {
+    use serde_json::json;
+    use std::os::unix::fs::MetadataExt;
+    let Some(pid) = running_pid(paths) else { return json!({"running": false}) };
+    let file: serde_json::Value =
+        std::fs::read(paths.status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let version: serde_json::Value =
+        api_get(paths, "/version").ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    // Older guests answer `error: ...`; their stats are just missing.
+    let stats: serde_json::Value = crate::daemon::send_control(paths, &rekcod_proto::Control::Stats)
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or_default();
+    let on_mac = std::fs::metadata(paths.data_disk()).map(|m| m.blocks() * 512).unwrap_or(0);
+    let mut v = json!({
+        "running": true,
+        "pid": pid,
+        "dockerd": version["Version"],
+        "api": version["ApiVersion"],
+        "kernel": version["KernelVersion"],
+        "cpus": file["cpus"],
+        "memory_mib": file["memory_mib"],
+        "fs_cache": file["fs_cache"],
+        "socket": paths.docker_host(),
+        "ports": file["ports"],
+        "disk": {"used_in_vm": stats["disk_used"], "size": stats["disk_size"], "on_mac": on_mac},
+        "warming": stats["warming"],
+        "fs_requests": stats["fs_requests"],
+    });
+    if let Some(project) = file.get("project") {
+        v["project"] = project.clone();
+    }
+    if docker::available() {
+        v["context"] = docker::current_context().ok().into();
+    }
+    v
+}
+
+/// Port lines for `rekcod status`; a 127.0.0.1 + ::1 pair (autoports) is `localhost`.
+fn port_lines(ports: &[serde_json::Value]) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    for p in ports {
+        let addr = p["address"].as_str().unwrap_or("?");
+        let addr = match addr {
+            "::" => "*",
+            "127.0.0.1" | "::1" => "localhost",
+            a => a,
+        };
+        let note = p["error"].as_str().map(|e| format!("  ! not forwarded: {e}")).unwrap_or_default();
+        let udp = if p["proto"].as_str() == Some("udp") { "/udp" } else { "" };
+        let line = format!("{addr}:{}{udp} -> {}{note}", p["port"], p["container"].as_str().unwrap_or("?"));
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    lines
+}
+
+fn gib(bytes: u64) -> String {
+    format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
+}
+
+/// The sandbox VM's status, when it runs.
+pub(crate) fn sandbox_status(paths: &Paths) -> Option<serde_json::Value> {
+    paths
+        .home
+        .join("sandbox")
+        .is_dir()
+        .then(|| crate::xrun::sandbox_paths(paths).ok())
+        .flatten()
+        .map(|sb| status_value(&sb))
+        .filter(|s| s["running"] == true)
+}
+
+pub fn status(paths: &Paths, json: bool) -> Result<()> {
+    let v = status_value(paths);
+    let sandbox = sandbox_status(paths);
+    if json {
+        let mut out = v;
+        out["sandbox"] = sandbox.unwrap_or_else(|| serde_json::json!({"running": false}));
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+    if v["running"] != true {
         println!("rekcod is not running (`rekcod start`)");
         return Ok(());
-    };
-    let status: serde_json::Value = std::fs::read(paths.status_file())
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    let version: serde_json::Value = api_get(paths, "/version")
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default();
-    println!("rekcod running (pid {pid})");
-    println!("  dockerd   {} (API {})", version["Version"].as_str().unwrap_or("?"), version["ApiVersion"].as_str().unwrap_or("?"));
-    println!("  kernel    {}", version["KernelVersion"].as_str().unwrap_or("?"));
-    println!("  vm        {} CPUs, {} MiB", status["cpus"], status["memory_mib"]);
-    let sharing = if status["fs_cache"].as_bool() == Some(true) { "cached, invalidated by FSEvents" } else { "uncached (stock virtio-fs)" };
+    }
+    let s = |k: &str| v[k].as_str().unwrap_or("?").to_string();
+    println!("rekcod running (pid {})", v["pid"]);
+    println!("  dockerd   {} (API {})", s("dockerd"), s("api"));
+    println!("  kernel    {}", s("kernel"));
+    println!("  vm        {} CPUs, {} MiB", v["cpus"], v["memory_mib"]);
+    let sharing = if v["fs_cache"] == true { "cached, invalidated by FSEvents" } else { "uncached (stock virtio-fs)" };
     println!("  files     {sharing}");
-    if let (Some(target), Some(max)) = (status["balloon_mib"].as_u64(), status["memory_mib"].as_u64())
-        && target < max
-    {
-        println!("  balloon   guest limited to {target} of {max} MiB (REKCOD_BALLOON, experimental)");
+    if let Some(ops) = v["fs_requests"].as_object().filter(|o| !o.is_empty()) {
+        let total: u64 = ops.values().filter_map(|n| n.as_u64()).sum();
+        let mut top: Vec<(&str, u64)> = ops.iter().map(|(k, n)| (fuse_op(k), n.as_u64().unwrap_or(0))).collect();
+        top.sort_by_key(|t| std::cmp::Reverse(t.1));
+        let top: Vec<String> = top.iter().take(4).map(|(k, n)| format!("{k} {n}")).collect();
+        println!("  cache     {total} trips to macOS since boot ({})", top.join(", "));
     }
-    println!("  socket    {}", paths.docker_host());
-    if docker::available() {
-        println!("  context   {}", docker::current_context().unwrap_or_else(|_| "?".into()));
+    for w in v["warming"].as_array().into_iter().flatten() {
+        println!("  warming   {}", w.as_str().unwrap_or("?"));
     }
-    let ports = status["ports"].as_array().cloned().unwrap_or_default();
+    if let (Some(used), Some(size)) = (v["disk"]["used_in_vm"].as_u64(), v["disk"]["size"].as_u64()) {
+        let on_mac = v["disk"]["on_mac"].as_u64().unwrap_or(0);
+        println!("  disk      {} used of {}, {} on the Mac (`rekcod compact` returns the gap)", gib(used), gib(size), gib(on_mac));
+    }
+    println!("  socket    {}", s("socket"));
+    if let Some(c) = v["context"].as_str() {
+        println!("  context   {c}");
+    }
+    let ports = port_lines(v["ports"].as_array().map(Vec::as_slice).unwrap_or_default());
     if ports.is_empty() {
         println!("  ports     none published");
     }
     for p in ports {
-        let addr = p["address"].as_str().unwrap_or("?");
-        let addr = if addr == "::" { "*".to_string() } else { addr.to_string() };
-        let note = p["error"].as_str().map(|e| format!("  ! not forwarded: {e}")).unwrap_or_default();
-        let udp = if p["proto"].as_str() == Some("udp") { "/udp" } else { "" };
-        println!("  port      {addr}:{}{udp} -> {}{note}", p["port"], p["container"].as_str().unwrap_or("?"));
+        println!("  port      {p}");
+    }
+    if let Some(sb) = sandbox {
+        println!("  sandbox   running for {} ({} MiB)", sb["project"].as_str().unwrap_or("?"), sb["memory_mib"]);
+        for p in port_lines(sb["ports"].as_array().map(Vec::as_slice).unwrap_or_default()) {
+            println!("  port      {p} (sandbox)");
+        }
     }
     println!("  logs      {} , {}", paths.daemon_log().display(), paths.console_log().display());
     Ok(())
@@ -261,7 +402,7 @@ pub fn passthrough(paths: &Paths, args: &[String]) -> Result<std::convert::Infal
     if running_pid(paths).is_none() {
         let t0 = Instant::now();
         eprintln!("rekcod: starting the VM");
-        boot(paths, None, None, crate::paths::DEFAULT_DISK_GIB)?;
+        boot(paths, &BootOptions::default())?;
         eprintln!("rekcod: ready in {:.1}s", t0.elapsed().as_secs_f64());
     }
     let mut cmd = docker::any_cli(paths)?;
@@ -448,6 +589,17 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_lines_collapse_localhost_pairs() {
+        let ports: Vec<serde_json::Value> = serde_json::from_str(
+            r#"[{"proto":"tcp","address":"127.0.0.1","port":3000,"container":"x"},
+                {"proto":"tcp","address":"::1","port":3000,"container":"x"},
+                {"proto":"udp","address":"::","port":53,"container":"dns","error":"in use"}]"#,
+        )
+        .unwrap();
+        assert_eq!(port_lines(&ports), vec!["localhost:3000 -> x", "*:53/udp -> dns  ! not forwarded: in use"]);
+    }
 
     #[test]
     fn anonymous_volume_names() {

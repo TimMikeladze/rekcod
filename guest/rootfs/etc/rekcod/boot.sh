@@ -53,6 +53,13 @@ if mount -t virtiofs -o rekcod mac /mnt/mac 2>/dev/null || mount -t virtiofs mac
   # Mac /tmp is /private/tmp: `-v /tmp/x:/x` must mean the Mac's /tmp/x (as on
   # Docker Desktop/OrbStack). Guest services keep their state under /run and /var/lib.
   [ -d /private/tmp ] && mount --bind /private/tmp /tmp
+  # Sandbox VM (docs/sandbox.md): the share holds only the project directory,
+  # mounted at its real Mac path (base64 on the cmdline, paths may have spaces).
+  proj=$(sed -n 's/.*rekcod\.project=\([^ ]*\).*/\1/p' /proc/cmdline)
+  if [ -n "$proj" ] && [ -d /mnt/mac/project ]; then
+    dir=$(echo "$proj" | base64 -d)
+    mkdir -p "$dir" && mount --bind /mnt/mac/project "$dir" && log "project $dir"
+  fi
 else
   log "mac share unavailable"
 fi
@@ -83,10 +90,23 @@ if [ -n "$ip4" ]; then
   echo "nameserver $ip4" >/etc/resolv.conf
 fi
 
+# Sandbox: internet only. Nothing on the Mac (vmnet gateway, the Mac's LAN
+# addresses) or the local network; DNS still works (it goes over vsock).
+# DOCKER-USER exists before dockerd starts, and dockerd keeps it first.
+if grep -q 'rekcod.sandbox=1' /proc/cmdline; then
+  iptables -N DOCKER-USER 2>/dev/null
+  for net in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16 100.64.0.0/10; do
+    iptables -A OUTPUT -o eth0 -d "$net" -j REJECT
+    iptables -A DOCKER-USER -o eth0 -d "$net" -j REJECT
+  done
+  iptables -A DOCKER-USER -j RETURN
+  ip6tables -A OUTPUT -o eth0 -j REJECT
+  ip6tables -A FORWARD -o eth0 -j REJECT
+  log "sandbox network: internet only"
 # host.docker.internal is the gateway address. Its TCP goes to rekcod-agent,
 # which has the daemon connect to 127.0.0.1:<port> on the Mac, so services
 # listening only on the Mac's loopback are reachable too.
-if [ -n "$gw" ]; then
+elif [ -n "$gw" ]; then
   iptables -t nat -I PREROUTING -d "$gw" -p tcp -j REDIRECT --to-ports 2379
   iptables -t nat -I OUTPUT -d "$gw" -p tcp -j REDIRECT --to-ports 2379
 fi

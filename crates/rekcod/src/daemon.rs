@@ -50,6 +50,26 @@ macro_rules! log {
 pub struct Options {
     pub cpus: usize,
     pub memory_mib: u64,
+    /// Sandbox VM (docs/sandbox.md): share only this directory, and nothing
+    /// on the Mac is reachable from the guest.
+    pub project: Option<PathBuf>,
+}
+
+/// Standard base64, for passing a path on the kernel command line.
+fn base64(bytes: &[u8]) -> String {
+    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    for c in bytes.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            if i <= c.len() {
+                out.push(A[(n >> (18 - 6 * i) & 63) as usize] as char);
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 pub fn run(paths: Paths, opts: Options) -> Result<()> {
@@ -59,21 +79,30 @@ pub fn run(paths: Paths, opts: Options) -> Result<()> {
 async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let t0 = Instant::now();
     let guest = paths.guest_dir()?;
+    let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
+    let shares: Vec<(String, PathBuf)> = match &opts.project {
+        Some(dir) => {
+            let dir = dir.to_str().context("project path is not UTF-8")?;
+            cmdline.push_str(&format!(" rekcod.sandbox=1 rekcod.project={}", base64(dir.as_bytes())));
+            vec![("project".into(), PathBuf::from(dir))]
+        }
+        None => ["Users", "Volumes", "private"]
+            .iter()
+            .filter(|d| std::path::Path::new("/").join(d).exists())
+            .map(|d| (d.to_string(), std::path::Path::new("/").join(d)))
+            .collect(),
+    };
     let cfg = VmConfig {
         cpus: opts.cpus,
         memory_mib: opts.memory_mib,
         kernel: guest.join("Image"),
         initrd: guest.join("initramfs"),
-        cmdline: std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into()),
+        cmdline,
         root_disk: paths.root_disk(),
         data_disk: paths.data_disk(),
         mac_address: std::fs::read_to_string(paths.mac_address())?.trim().to_string(),
         console_log: paths.console_log(),
-        shares: ["Users", "Volumes", "private"]
-            .iter()
-            .filter(|d| std::path::Path::new("/").join(d).exists())
-            .map(|d| (d.to_string(), std::path::Path::new("/").join(d)))
-            .collect(),
+        shares,
     };
     let vm = Vm::create(&cfg)?;
     vm.start().await?;
@@ -91,8 +120,14 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     log!("guest agent up after {:.2}s (cached file sharing: {fs_cache})", t0.elapsed().as_secs_f64());
 
     let notify_vm = vm.clone();
-    let watch = Watch::start(fs_cache, move |changed: Vec<String>| {
+    let notify_conn: Arc<NotifyConn> = Arc::default();
+    let roots = match &opts.project {
+        Some(dir) => vec![dir.clone()],
+        None => watch::GLOBAL_ROOTS.iter().map(PathBuf::from).collect(),
+    };
+    let watch = Watch::start(fs_cache, roots, move |changed: Vec<String>| {
         let vm = notify_vm.clone();
+        let conn = notify_conn.clone();
         async move {
             if std::env::var_os("REKCOD_DEBUG").is_some() {
                 log!("file events: {changed:?}");
@@ -100,7 +135,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             for tree in changed.iter().filter(|l| l.ends_with('/')) {
                 log!("file events: invalidating everything under {tree}");
             }
-            if let Err(e) = notify_guest(&vm, &changed).await {
+            if let Err(e) = notify_guest(&vm, &conn, &changed).await {
                 log!("file events: {e:#}");
             }
         }
@@ -108,18 +143,24 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     for line in watch.set_roots(Default::default()) {
         log!("{line}");
     }
-    let status = Arc::new(Status::new(paths.clone(), cfg.cpus, cfg.memory_mib, fs_cache, watch));
+    let status = Arc::new(Status::new(paths.clone(), cfg.cpus, cfg.memory_mib, fs_cache, watch, opts.project.clone()));
     status.write();
     let ctl = paths.control_socket();
     let _ = std::fs::remove_file(&ctl);
     tokio::spawn(control_server(vm.clone(), UnixListener::bind(&ctl).with_context(|| format!("bind {}", ctl.display()))?));
     tokio::spawn(clock_sync(vm.clone()));
-    tokio::spawn(reverse_pool(vm.clone()));
+    if opts.project.is_none() {
+        // A sandbox must not reach the Mac's loopback services.
+        tokio::spawn(reverse_pool(vm.clone()));
+    }
     if std::env::var_os("REKCOD_RESEARCH").is_some() {
         tokio::spawn(meta_server(vm.clone()));
     }
     if std::env::var_os("REKCOD_BALLOON").is_some() {
         tokio::spawn(memory_manager(vm.clone(), cfg.memory_mib * 1024 * 1024, status.clone()));
+    }
+    if fs_cache {
+        tokio::spawn(warm_recent(vm.clone(), paths.warm_paths()));
     }
     tokio::spawn(dns_bridge(vm.clone()));
     tokio::spawn(port_forwarder(vm.clone(), status.clone()));
@@ -214,7 +255,7 @@ async fn control_server(vm: Vm, listener: UnixListener) {
                 return;
             }
             let reply = match Control::parse(&line) {
-                Some(cmd @ (Control::Trim | Control::BenchMeta(_))) => control_within(&vm, cmd, Duration::from_secs(600))
+                Some(cmd @ (Control::Trim | Control::BenchMeta(_) | Control::Stats)) => control_within(&vm, cmd, Duration::from_secs(600))
                     .await
                     .unwrap_or_else(|e| format!("error: {e:#}")),
                 _ => format!("error: unsupported command {:?}", line.trim_end()),
@@ -271,16 +312,57 @@ async fn memory_manager(vm: Vm, max: u64, status: Arc<Status>) {
     }
 }
 
+/// One control connection reused for every notify batch (a vsock connect per
+/// batch was a measurable part of the Mac→container latency).
+type NotifyConn = tokio::sync::Mutex<Option<BufReader<crate::vm::Conn>>>;
+
+/// Directories warmed right after boot: the most recently bind-mounted ones,
+/// so the first `compose up` after `rekcod start` finds a warm cache.
+const WARM_AT_BOOT: usize = 8;
+
+async fn warm_recent(vm: Vm, file: PathBuf) {
+    let list = std::fs::read_to_string(file).unwrap_or_default();
+    let dirs: Vec<&str> = list.lines().filter(|l| std::path::Path::new(l).is_dir()).take(WARM_AT_BOOT).collect();
+    for dir in &dirs {
+        let _ = control(&vm, Control::Warm(dir.to_string())).await;
+    }
+    if !dirs.is_empty() {
+        log!("warming {} recently used bind source(s)", dirs.len());
+    }
+}
+
 /// Forwards Mac-side file changes so watchers inside containers fire.
-async fn notify_guest(vm: &Vm, changed: &[String]) -> Result<()> {
-    let mut stream = BufReader::new(vm.connect(CONTROL_PORT).await?);
+async fn notify_guest(vm: &Vm, conn: &NotifyConn, changed: &[String]) -> Result<()> {
     let lines: String = changed.iter().map(|p| Control::Notify(p.clone()).encode()).collect();
-    stream.get_mut().write_all(lines.as_bytes()).await?;
-    let mut reply = String::new();
-    for _ in changed {
-        reply.clear();
-        if stream.read_line(&mut reply).await? == 0 {
-            break;
+    let mut slot = conn.lock().await;
+    for attempt in 0..2 {
+        if slot.is_none() {
+            *slot = Some(BufReader::new(vm.connect(CONTROL_PORT).await?));
+        }
+        let stream = slot.as_mut().expect("connected above");
+        let sent = async {
+            stream.get_mut().write_all(lines.as_bytes()).await?;
+            let mut reply = String::new();
+            for _ in changed {
+                reply.clear();
+                if stream.read_line(&mut reply).await? == 0 {
+                    bail!("control connection closed");
+                }
+            }
+            anyhow::Ok(())
+        };
+        match tokio::time::timeout(Duration::from_secs(10), sent).await {
+            Ok(Ok(())) => return Ok(()),
+            // Stale connection (agent restarted): reconnect once and resend.
+            Ok(Err(_)) if attempt == 0 => *slot = None,
+            Ok(Err(e)) => {
+                *slot = None;
+                return Err(e);
+            }
+            Err(_) => {
+                *slot = None;
+                bail!("guest did not acknowledge file events within 10s");
+            }
         }
     }
     Ok(())
@@ -374,12 +456,12 @@ async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
 
 async fn docker_proxy(vm: Vm, listener: UnixListener) {
     loop {
-        let Ok((mut client, _)) = listener.accept().await else { continue };
+        let Ok((client, _)) = listener.accept().await else { continue };
         let vm = vm.clone();
         tokio::spawn(async move {
             match vm.connect(DOCKER_PORT).await {
-                Ok(mut guest) => {
-                    let _ = copy_bidirectional(&mut client, &mut guest).await;
+                Ok(guest) => {
+                    let _ = crate::proxy::pipe(client, guest).await;
                 }
                 Err(e) => log!("docker proxy: {e:#}"),
             }
@@ -407,6 +489,8 @@ struct StatusFile<'a> {
     memory_mib: u64,
     fs_cache: bool,
     balloon_mib: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    project: Option<&'a std::path::Path>,
     ports: &'a [PortStatus],
 }
 
@@ -423,16 +507,38 @@ struct Status {
     cpus: usize,
     memory_mib: u64,
     fs_cache: bool,
+    /// Set for a sandbox VM: the only shared directory.
+    project: Option<PathBuf>,
     balloon: Mutex<u64>,
     forwards: Mutex<BTreeMap<Binding, Forward>>,
     /// Bind sources seen at the last reconcile; new ones get their caches warmed.
     binds: Mutex<BTreeSet<PathBuf>>,
+    /// Ports docker publishes (from the last reconcile).
+    published: Mutex<BTreeMap<Binding, String>>,
+    /// Running `dev.rekcod.autoports` containers: (id, name).
+    autoport: Mutex<Vec<(String, String)>>,
+    /// Ports those containers listen on (from the agent).
+    listening: Mutex<BTreeMap<Binding, String>>,
 }
 
 impl Status {
-    fn new(paths: Paths, cpus: usize, memory_mib: u64, fs_cache: bool, watch: Arc<Watch>) -> Status {
+    fn new(paths: Paths, cpus: usize, memory_mib: u64, fs_cache: bool, watch: Arc<Watch>, project: Option<PathBuf>) -> Status {
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-        Status { paths, watch, started_at, cpus, memory_mib, fs_cache, balloon: Mutex::new(memory_mib), forwards: Mutex::default(), binds: Mutex::default() }
+        Status {
+            paths,
+            watch,
+            started_at,
+            cpus,
+            memory_mib,
+            fs_cache,
+            project,
+            balloon: Mutex::new(memory_mib),
+            forwards: Mutex::default(),
+            binds: Mutex::default(),
+            published: Mutex::default(),
+            autoport: Mutex::default(),
+            listening: Mutex::default(),
+        }
     }
 
     fn write(&self) {
@@ -459,6 +565,7 @@ impl Status {
             memory_mib: self.memory_mib,
             fs_cache: self.fs_cache,
             balloon_mib: *self.balloon.lock().unwrap(),
+            project: self.project.as_deref(),
             ports: &ports,
         };
         let tmp = self.paths.status_file().with_extension("tmp");
@@ -471,6 +578,7 @@ impl Status {
 const EVENTS_PATH: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D";
 
 async fn port_forwarder(vm: Vm, status: Arc<Status>) {
+    tokio::spawn(autoports(vm.clone(), status.clone()));
     loop {
         if let Err(e) = watch_events(&vm, &status).await {
             log!("port forwarder: {e:#}");
@@ -496,26 +604,75 @@ async fn watch_events(vm: &Vm, status: &Arc<Status>) -> Result<()> {
 }
 
 async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
-    let body = http::get(vm.connect(DOCKER_PORT).await?, "/containers/json").await?;
-    let want = ports::desired(&body)?;
+    // all=1: created containers too, so a bind source is warmed before `start`.
+    let body = http::get(vm.connect(DOCKER_PORT).await?, "/containers/json?all=1").await?;
+    *status.published.lock().unwrap() = ports::desired(&body)?;
+    *status.autoport.lock().unwrap() = ports::autoport_containers(&body)?;
     let binds = watch::bind_sources(&body)?;
     if status.fs_cache {
-        let new: Vec<PathBuf> = binds.difference(&status.binds.lock().unwrap()).cloned().collect();
-        for path in new.into_iter().filter(|p| p.is_dir()) {
+        let new: Vec<PathBuf> =
+            binds.difference(&status.binds.lock().unwrap()).filter(|p| p.is_dir()).cloned().collect();
+        for path in &new {
             if let Some(p) = path.to_str() {
                 let _ = control(vm, Control::Warm(p.to_string())).await;
             }
+        }
+        if !new.is_empty() {
+            let file = status.paths.warm_paths();
+            let list = watch::remember(&std::fs::read_to_string(&file).unwrap_or_default(), &new);
+            let text: String = list.iter().filter_map(|p| p.to_str()).map(|p| format!("{p}\n")).collect();
+            let _ = std::fs::write(file, text);
         }
     }
     *status.binds.lock().unwrap() = binds.clone();
     for err in status.watch.set_roots(binds) {
         log!("{err}");
     }
+    apply_forwards(vm, status, true);
+    Ok(())
+}
+
+/// Every second while `dev.rekcod.autoports` containers run (`rekcod x`): ask
+/// the agent which ports they listen on, and forward those on the Mac's
+/// localhost (v4 and v6). Ports docker already publishes win.
+async fn autoports(vm: Vm, status: Arc<Status>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let containers = status.autoport.lock().unwrap().clone();
+        let mut want = BTreeMap::new();
+        for (id, name) in &containers {
+            let Ok(reply) = control(&vm, Control::Listeners(id.clone())).await else { continue };
+            let Some(list) = reply.strip_prefix("ok") else { continue };
+            for port in list.split_whitespace().filter_map(|p| p.parse::<u16>().ok()) {
+                for addr in [std::net::Ipv4Addr::LOCALHOST.into(), std::net::Ipv6Addr::LOCALHOST.into()] {
+                    want.insert(Binding { proto: Proto::Tcp, addr, port }, name.clone());
+                }
+            }
+        }
+        let published: BTreeSet<u16> = status.published.lock().unwrap().keys().map(|b| b.port).collect();
+        want.retain(|b, _| !published.contains(&b.port));
+        let changed = {
+            let mut listening = status.listening.lock().unwrap();
+            let changed = *listening != want;
+            *listening = want;
+            changed
+        };
+        if changed {
+            apply_forwards(&vm, &status, false);
+        }
+    }
+}
+
+/// Opens and closes Mac listeners to match published + auto-detected ports.
+/// `retry_failed`: try again on ports that couldn't be bound before.
+fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
+    let mut want = status.listening.lock().unwrap().clone();
+    want.extend(status.published.lock().unwrap().clone());
     let mut changed = false;
     {
         let mut active = status.forwards.lock().unwrap();
         active.retain(|binding, fwd| {
-            let keep = want.get(binding) == Some(&fwd.container) && fwd.task.is_some();
+            let keep = want.get(binding) == Some(&fwd.container) && (fwd.task.is_some() || !retry_failed);
             if !keep {
                 if let Some(task) = fwd.task.take() {
                     task.abort();
@@ -551,7 +708,6 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     if changed {
         status.write();
     }
-    Ok(())
 }
 
 enum Listener {

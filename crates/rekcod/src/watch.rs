@@ -17,7 +17,6 @@ use std::collections::{BTreeSet, HashMap};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use rekcod_proto::notify_line;
@@ -33,6 +32,8 @@ pub const GLOBAL_ROOTS: [&str; 2] = ["/Users", "/Volumes"];
 struct Container {
     #[serde(rename = "Mounts", default)]
     mounts: Option<Vec<Mount>>,
+    #[serde(rename = "State", default)]
+    state: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -43,12 +44,14 @@ struct Mount {
     source: String,
 }
 
-/// Bind-mount sources (under the shared roots) from `GET /containers/json`,
-/// with paths nested inside another source dropped.
+/// Bind-mount sources (under the shared roots) of containers that are created
+/// or running, from `GET /containers/json?all=1`, with paths nested inside
+/// another source dropped. Created counts so warming starts before `start`.
 pub fn bind_sources(containers_json: &[u8]) -> serde_json::Result<BTreeSet<PathBuf>> {
     let containers: Vec<Container> = serde_json::from_slice(containers_json)?;
     let all: BTreeSet<PathBuf> = containers
         .into_iter()
+        .filter(|c| c.state.as_deref().is_none_or(|s| matches!(s, "created" | "running" | "restarting")))
         .flat_map(|c| c.mounts.unwrap_or_default())
         .filter(|m| m.kind == "bind")
         .map(|m| mac_path(Path::new(&m.source)))
@@ -66,6 +69,23 @@ pub fn mac_path(source: &Path) -> PathBuf {
         }
     }
     source.to_path_buf()
+}
+
+/// Bind sources remembered across boots (`~/.rekcod/vm/warm-paths`).
+pub const REMEMBER_MAX: usize = 32;
+
+/// `new` first (most recent), then the previous list, without duplicates or
+/// paths nested in an earlier entry, capped at [`REMEMBER_MAX`].
+pub fn remember(previous: &str, new: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in new.iter().cloned().chain(previous.lines().filter(|l| l.starts_with('/')).map(PathBuf::from)) {
+        if !out.iter().any(|q| p.starts_with(q)) {
+            out.retain(|q| !q.starts_with(&p));
+            out.push(p);
+        }
+    }
+    out.truncate(REMEMBER_MAX);
+    out
 }
 
 fn outermost(all: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
@@ -108,14 +128,16 @@ pub struct Watch {
     /// Watched paths: the global roots (if any) plus current bind sources.
     roots: Mutex<BTreeSet<PathBuf>>,
     global: bool,
+    /// What "global" means: [`GLOBAL_ROOTS`], or the project of a sandbox VM.
+    global_roots: Vec<PathBuf>,
     tx: mpsc::UnboundedSender<Change>,
 }
 
 impl Watch {
     /// Starts the FSEvents watcher; changed paths are delivered in batches to
     /// `forward` (a trailing `/` marks a subtree). `global`: the guest caches,
-    /// so watch [`GLOBAL_ROOTS`] from now on.
-    pub fn start<F, Fut>(global: bool, forward: F) -> notify::Result<Arc<Watch>>
+    /// so watch `global_roots` (normally [`GLOBAL_ROOTS`]) from now on.
+    pub fn start<F, Fut>(global: bool, global_roots: Vec<PathBuf>, forward: F) -> notify::Result<Arc<Watch>>
     where
         F: Fn(Vec<String>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send,
@@ -143,15 +165,13 @@ impl Watch {
         tokio::spawn(async move {
             let mut seen: HashMap<PathBuf, Fingerprint> = HashMap::new();
             while let Some(first) = rx.recv().await {
-                // Collect a short burst (editors and git write several files at once).
+                // Send at once with whatever is already queued (FSEvents delivers a
+                // burst in one callback). Events arriving while this batch is in
+                // flight queue up and become the next batch, so bursts still coalesce.
                 let mut batch = vec![first];
-                let window = tokio::time::sleep(Duration::from_millis(10));
-                tokio::pin!(window);
-                loop {
-                    tokio::select! {
-                        _ = &mut window => break,
-                        Some(c) = rx.recv() => batch.push(c),
-                    }
+                tokio::task::yield_now().await;
+                while let Ok(c) = rx.try_recv() {
+                    batch.push(c);
                 }
                 if seen.len() > 200_000 {
                     seen.clear();
@@ -180,7 +200,7 @@ impl Watch {
                 }
             }
         });
-        let watch = Arc::new(Watch { watcher: Mutex::new(watcher), roots: Mutex::default(), global, tx });
+        let watch = Arc::new(Watch { watcher: Mutex::new(watcher), roots: Mutex::default(), global, global_roots, tx });
         if global {
             watch.set_roots(BTreeSet::new());
         }
@@ -191,7 +211,7 @@ impl Watch {
     /// covered by them; files are watched via their directory. Returns log lines.
     pub fn set_roots(&self, bind_sources: BTreeSet<PathBuf>) -> Vec<String> {
         let globals: BTreeSet<PathBuf> = if self.global {
-            GLOBAL_ROOTS.iter().map(PathBuf::from).filter(|p| p.is_dir()).collect()
+            self.global_roots.iter().filter(|p| p.is_dir()).cloned().collect()
         } else {
             BTreeSet::new()
         };
@@ -240,10 +260,22 @@ mod tests {
             {"Mounts":[{"Type":"bind","Source":"/private/var/folders/x/T/proj","Destination":"/p"}]},
             {"Mounts":[{"Type":"bind","Source":"/tmp/scratch","Destination":"/s"}]},
             {"Mounts":[{"Type":"bind","Source":"/tmpfoo","Destination":"/s"}]},
+            {"State":"exited","Mounts":[{"Type":"bind","Source":"/Users/me/old","Destination":"/o"}]},
+            {"State":"created","Mounts":[{"Type":"bind","Source":"/Users/me/new","Destination":"/n"}]},
             {"Mounts":null}
         ]"#;
         let got: Vec<String> = bind_sources(json).unwrap().iter().map(|p| p.display().to_string()).collect();
-        assert_eq!(got, vec!["/Users/me/app", "/private/tmp/scratch", "/private/var/folders/x/T/proj"]);
+        assert_eq!(got, vec!["/Users/me/app", "/Users/me/new", "/private/tmp/scratch", "/private/var/folders/x/T/proj"]);
+    }
+
+    #[test]
+    fn remember_puts_new_first_and_dedupes() {
+        let prev = "/Users/me/a\n/Users/me/b\n/Users/me/c/sub\n";
+        let got = remember(prev, &[PathBuf::from("/Users/me/b"), PathBuf::from("/Users/me/c")]);
+        let got: Vec<&str> = got.iter().map(|p| p.to_str().unwrap()).collect();
+        assert_eq!(got, vec!["/Users/me/b", "/Users/me/c", "/Users/me/a"]);
+        let many: Vec<PathBuf> = (0..40).map(|i| PathBuf::from(format!("/Users/me/p{i}"))).collect();
+        assert_eq!(remember("", &many).len(), REMEMBER_MAX);
     }
 
     #[test]

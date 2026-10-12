@@ -112,6 +112,12 @@ pub enum Control {
     Trim,
     /// Research: time cold lstats via the host metadata server vs virtio-fs.
     BenchMeta(String),
+    /// TCP ports listened on by the processes of this container (by id).
+    /// Reply: `ok <port> <port> ...` (`rekcod x` autoports).
+    Listeners(String),
+    /// Reply: one line of JSON: `{"fs_requests": {"<fuse opcode>": n}, "warming": [path],
+    /// "disk_used": bytes, "disk_size": bytes}`.
+    Stats,
 }
 
 impl Control {
@@ -126,6 +132,8 @@ impl Control {
             Control::Warm(path) => format!("warm {path}\n"),
             Control::Trim => "trim\n".into(),
             Control::BenchMeta(path) => format!("benchmeta {path}\n"),
+            Control::Listeners(id) => format!("listeners {id}\n"),
+            Control::Stats => "stats\n".into(),
         }
     }
 
@@ -136,6 +144,10 @@ impl Control {
             None if line == "shutdown" => Some(Control::Shutdown),
             None if line == "meminfo" => Some(Control::Meminfo),
             None if line == "trim" => Some(Control::Trim),
+            None if line == "stats" => Some(Control::Stats),
+            Some(("listeners", id)) if !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()) => {
+                Some(Control::Listeners(id.to_string()))
+            }
             Some(("warm", path)) if path.starts_with('/') => Some(Control::Warm(path.to_string())),
             Some(("benchmeta", path)) if path.starts_with('/') => Some(Control::BenchMeta(path.to_string())),
             Some(("reclaim", bytes)) => bytes.parse().ok().map(Control::Reclaim),
@@ -185,12 +197,13 @@ mod tests {
     #[test]
     fn control_round_trips() {
         let spaced = Control::Notify("/Users/me/My Project/a.ts".into());
-        let all = [Control::Ping, Control::Shutdown, Control::Time(1_791_735_420_830_000_000), spaced, Control::Meminfo, Control::Reclaim(1 << 30), Control::Trim, Control::Warm("/Users/me/My App".into())];
+        let all = [Control::Ping, Control::Shutdown, Control::Time(1_791_735_420_830_000_000), spaced, Control::Meminfo, Control::Reclaim(1 << 30), Control::Trim, Control::Warm("/Users/me/My App".into()), Control::Stats, Control::Listeners("ab12".into())];
         for c in all {
             assert_eq!(Control::parse(&c.encode()), Some(c));
         }
         assert_eq!(Control::parse("time abc\n"), None);
         assert_eq!(Control::parse("reboot\n"), None);
         assert_eq!(Control::parse("notify relative/path\n"), None);
+        assert_eq!(Control::parse("listeners ../etc\n"), None);
     }
 }

@@ -14,6 +14,8 @@ check() { local name=$1; shift; if "$@" >/dev/null 2>&1; then ok "$name"; else b
 
 unset DOCKER_HOST DOCKER_CONTEXT
 prev=$(docker context show)
+# Start from another context so the switch and the restore are both tested.
+if [[ $prev == rekcod ]]; then docker context use default >/dev/null; switched_back=1; prev=default; fi
 work=$(mktemp -d "$HOME/.rekcod-e2e.XXXX")
 trap 'docker compose -p rekcod-e2e -f "$work/compose.yaml" down -v >/dev/null 2>&1; rm -rf "$work"' EXIT
 
@@ -108,6 +110,26 @@ echo x >"$coh/case3" && mv "$coh/case3" "$coh/Case3"
 check "Mac case-only rename visible" see 'ls /c | grep -qx Case3 && test "$(cat /c/CASE3)" = x'
 docker rm -f rekcod-e2e-coh >/dev/null 2>&1
 
+echo "phase 5 (docs/phase5.md)"
+check "status --json" sh -c '"$0" status --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert d[\"running\"] and d[\"disk\"][\"size\"] > 0"' "$R"
+lw="$work/local"; mkdir -p "$lw"
+check "dev.rekcod.local puts node_modules on a VM volume" sh -c "docker run --rm --name rekcod-e2e-lbl -l dev.rekcod.local=node_modules -w /app -v '$lw:/app' alpine:3.22 sh -c 'echo x > node_modules/f && mount | grep -q \" /app/node_modules type ext4\"' && test ! -e '$lw/node_modules/f'"
+docker volume rm -f rekcod-local_rekcod-e2e-lbl_app-node_modules >/dev/null 2>&1
+sp="$work/snap"; mkdir -p "$sp"
+printf 'services:\n  a:\n    image: alpine:3.22\n    command: sleep 600\n    init: true\n    volumes: [data:/d]\nvolumes:\n  data:\n' >"$sp/compose.yaml"
+(cd "$sp" && docker compose -p rekcod-e2e-snap up -d >/dev/null 2>&1 && docker compose -p rekcod-e2e-snap exec -T a sh -c 'echo v1 > /d/f')
+check "snap save, change, restore" sh -c "cd '$sp' && '$R' snap save -p rekcod-e2e-snap s1 && docker compose -p rekcod-e2e-snap exec -T a sh -c 'echo v2 > /d/f' && '$R' snap restore -p rekcod-e2e-snap s1 && test \"\$(docker compose -p rekcod-e2e-snap exec -T a cat /d/f)\" = v1"
+check "snap ls --json" sh -c "cd '$sp' && '$R' snap ls -p rekcod-e2e-snap --json | grep -q '\"name\": \"s1\"'"
+(cd "$sp" && "$R" snap rm -p rekcod-e2e-snap s1 >/dev/null 2>&1; docker compose -p rekcod-e2e-snap down -v -t 1 >/dev/null 2>&1)
+xp="$work/x"; mkdir -p "$xp"
+check "rekcod x keeps the exit code" sh -c "cd '$xp' && '$R' x --image alpine:3.22 sh -c 'exit 3'; test \$? = 3"
+(cd "$xp" && "$R" x --image python:3.13-slim python3 -m http.server 18093 --bind 127.0.0.1 >/dev/null 2>&1 &)
+check "rekcod x forwards a 127.0.0.1 listener to the Mac" sh -c 'for i in $(seq 1 60); do curl -sf -o /dev/null localhost:18093 && exit 0; sleep 1; done; exit 1'
+docker rm -f $(docker ps -q --filter label=dev.rekcod.x) >/dev/null 2>&1
+echo inside >"$xp/f.txt"
+check "x --sandbox sees the project, not the rest of \$HOME" sh -c "cd '$xp' && test \"\$('$R' x --sandbox --image alpine:3.22 sh -c 'cat f.txt; ls -A /Users/*/ | wc -l' | tr '\n' ' ')\" = 'inside 1 '"
+check "x --sandbox can't reach the Mac" sh -c "cd '$xp' && '$R' x --sandbox --image alpine:3.22 sh -c '! wget -qO- -T 3 http://host.docker.internal:22/'"
+
 if [[ -n "${E2E_IMPORT_FROM:-}" ]]; then
   echo "import from $E2E_IMPORT_FROM"
   src=(docker --context "$E2E_IMPORT_FROM")
@@ -125,6 +147,7 @@ fi
 echo "stop"
 "$R" stop >/dev/null
 check "context restored to $prev" test "$(docker context show)" = "$prev"
+[[ -n ${switched_back:-} ]] && docker context use rekcod >/dev/null
 
 echo
 if [[ $failures -eq 0 ]]; then echo "all checks passed"; else echo "$failures check(s) failed"; exit 1; fi

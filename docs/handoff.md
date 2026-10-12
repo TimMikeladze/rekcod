@@ -102,7 +102,13 @@ UDP ports, `host.docker.internal` → Mac loopback, Mac `/tmp`, DNS over TCP, `r
 plus hourly trim, and bind-mount warming are shipped and checked in `scripts/e2e.sh`.
 `init_on_free=1` was measured and rejected.
 
-### Phase 5: differentiators (`docs/plan.md` §3)
+### Phase 5: done (2026-10-12, see `docs/phase5.md`)
+
+Snapshots (`rekcod snap`), the zero-config runner (`rekcod x`, with autoports and
+`--sandbox`), `dev.rekcod.local` VM-local dirs via the socket proxy, `status --json`,
+the menu bar item, warm-at-boot, and ~14 ms change latency. Memory return is still open.
+
+### Phase 5 (original plan): differentiators (`docs/plan.md` §3)
 
 1. **`rekcod run <cmd>`** (§3b): zero-config containerize. Then `--sandbox`, a separate VM sharing only the project dir. This is a security claim, so write a threat model first.
 2. **Data snapshots** (§3a): `rekcod snap save/restore`, using a reflink copy of volume dirs while paused, with optional git-branch binding.

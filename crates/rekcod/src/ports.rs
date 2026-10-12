@@ -19,6 +19,27 @@ struct Container {
     names: Vec<String>,
     #[serde(rename = "Ports", default)]
     ports: Option<Vec<Port>>,
+    /// Absent in old fixtures; `GET /containers/json?all=1` lists stopped ones too.
+    #[serde(rename = "State", default)]
+    state: Option<String>,
+    #[serde(rename = "Id", default)]
+    id: String,
+    #[serde(rename = "Labels", default)]
+    labels: Option<BTreeMap<String, String>>,
+}
+
+/// Containers that want their listening ports forwarded without `-p` (`rekcod x`).
+pub const AUTOPORTS_LABEL: &str = "dev.rekcod.autoports";
+
+/// Running containers labelled [`AUTOPORTS_LABEL`]: (id, name).
+pub fn autoport_containers(containers_json: &[u8]) -> serde_json::Result<Vec<(String, String)>> {
+    let containers: Vec<Container> = serde_json::from_slice(containers_json)?;
+    Ok(containers
+        .into_iter()
+        .filter(|c| c.state.as_deref() == Some("running"))
+        .filter(|c| c.labels.as_ref().is_some_and(|l| l.contains_key(AUTOPORTS_LABEL)))
+        .map(|c| (c.id, c.names.first().map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default()))
+        .collect())
 }
 
 #[derive(Deserialize)]
@@ -44,7 +65,7 @@ pub fn mac_addr(host_ip: &str) -> Option<IpAddr> {
 pub fn desired(containers_json: &[u8]) -> serde_json::Result<BTreeMap<Binding, String>> {
     let containers: Vec<Container> = serde_json::from_slice(containers_json)?;
     let mut out = BTreeMap::new();
-    for c in containers {
+    for c in containers.into_iter().filter(|c| c.state.as_deref().is_none_or(|s| s == "running")) {
         let name = c.names.first().map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
         for p in c.ports.unwrap_or_default() {
             let proto = match p.kind.as_str() {
@@ -81,6 +102,22 @@ mod tests {
         let got: Vec<(Proto, String, u16)> = d.keys().map(|b| (b.proto, b.addr.to_string(), b.port)).collect();
         assert_eq!(got, want);
         assert!(d.values().all(|n| n == "web-1"));
+    }
+
+    #[test]
+    fn only_running_containers_publish() {
+        let json = br#"[{"Names":["/a"],"State":"created","Ports":[{"IP":"0.0.0.0","PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]},
+            {"Names":["/b"],"State":"running","Ports":[{"IP":"0.0.0.0","PrivatePort":80,"PublicPort":8081,"Type":"tcp"}]}]"#;
+        let ports: Vec<u16> = desired(json).unwrap().keys().map(|b| b.port).collect();
+        assert_eq!(ports, vec![8081]);
+    }
+
+    #[test]
+    fn autoport_containers_need_label_and_running() {
+        let json = br#"[{"Id":"a1","Names":["/x"],"State":"running","Labels":{"dev.rekcod.autoports":"1"}},
+            {"Id":"b2","Names":["/y"],"State":"exited","Labels":{"dev.rekcod.autoports":"1"}},
+            {"Id":"c3","Names":["/z"],"State":"running","Labels":{}}]"#;
+        assert_eq!(autoport_containers(json).unwrap(), vec![("a1".to_string(), "x".to_string())]);
     }
 
     #[test]

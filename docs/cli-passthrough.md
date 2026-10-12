@@ -21,7 +21,7 @@ rekcod build -t app .
 | `start` / `stop` with a container name or any other flag (`stop -t 5 web`) | `docker start/stop` |
 | `import --from <ctx> ...` | rekcod import |
 | `import <file>` (no `--from`) | `docker import` |
-| `status`, `shell`, `compact`, `help`, `-h`, `--help`, `-V`, `--version`, `daemon`, `research` | rekcod |
+| `status`, `shell`, `compact`, `menubar`, `snap`, `x`, `tui`, `help`, `-h`, `--help`, `-V`, `--version`, `daemon`, `research` | rekcod |
 | `docker <args>` | always docker (escape hatch, e.g. `rekcod docker start`) |
 | anything else | docker |
 

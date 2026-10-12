@@ -200,6 +200,10 @@ async fn control(vsock: VsockStream) -> Result<()> {
             Some(Control::Warm(path)) => warm(path),
             Some(Control::BenchMeta(dir)) => crate::meta::bench(&dir).await.unwrap_or_else(|e| format!("error: {e:#}")),
             Some(Control::Trim) => tokio::task::spawn_blocking(trim).await.unwrap_or_else(|e| format!("error: {e}")),
+            Some(Control::Listeners(id)) => {
+                tokio::task::spawn_blocking(move || listeners(&id)).await.unwrap_or_else(|e| format!("error: {e}"))
+            }
+            Some(Control::Stats) => stats(),
             Some(Control::Reclaim(bytes)) => match std::fs::write("/sys/fs/cgroup/memory.reclaim", bytes.to_string()) {
                 // EAGAIN just means less than asked could be reclaimed.
                 Ok(()) => "ok".into(),
@@ -350,6 +354,95 @@ fn warm_tree(root: &std::path::Path) -> (usize, usize) {
         }
     });
     (entries.into_inner(), dirs.into_inner())
+}
+
+// ------------------------------------------------------------ listeners
+//
+// `rekcod x` runs containers on the VM's host network; the daemon asks which
+// TCP ports a container's processes listen on and forwards them to the Mac's
+// localhost through FORWARD_PORT (which dials 127.0.0.1 here).
+
+fn listeners(id: &str) -> String {
+    let mut inodes = std::collections::HashSet::new();
+    let mut netns_pid = None;
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry.file_name().to_str().and_then(|p| p.parse::<u32>().ok()) else { continue };
+        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+        if !cgroup.contains(id) {
+            continue;
+        }
+        netns_pid.get_or_insert(pid);
+        for fd in std::fs::read_dir(format!("/proc/{pid}/fd")).into_iter().flatten().flatten() {
+            let Ok(link) = std::fs::read_link(fd.path()) else { continue };
+            if let Some(ino) = link.to_str().and_then(|l| l.strip_prefix("socket:[")?.strip_suffix(']')?.parse::<u64>().ok()) {
+                inodes.insert(ino);
+            }
+        }
+    }
+    let Some(pid) = netns_pid else { return "ok".into() };
+    let mut ports = std::collections::BTreeSet::new();
+    for table in ["tcp", "tcp6"] {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/net/{table}")).unwrap_or_default();
+        ports.extend(listening_ports(&text, &inodes));
+    }
+    let list: Vec<String> = ports.iter().map(u16::to_string).collect();
+    format!("ok {}", list.join(" ")).trim_end().to_string()
+}
+
+/// Ports in LISTEN state (`0A`) owned by `inodes`, from `/proc/net/tcp{,6}`.
+fn listening_ports(table: &str, inodes: &std::collections::HashSet<u64>) -> Vec<u16> {
+    table
+        .lines()
+        .skip(1)
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            if f.get(3) != Some(&"0A") || !inodes.contains(&f.get(9)?.parse().ok()?) {
+                return None;
+            }
+            u16::from_str_radix(f.get(1)?.rsplit(':').next()?, 16).ok()
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------- stats
+
+fn json_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// One JSON line for `rekcod status`: host requests by FUSE opcode (cache
+/// misses since boot), trees being warmed, data-disk usage.
+fn stats() -> String {
+    let ops = std::fs::read_to_string("/sys/module/virtiofs/parameters/rekcod_stats").unwrap_or_default();
+    let ops: Vec<String> = ops
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .map(|(op, n)| format!("{}:{}", json_str(op), n.trim().parse::<u64>().unwrap_or(0)))
+        .collect();
+    let warming: Vec<String> = WARMING.lock().unwrap().iter().map(|p| json_str(p)).collect();
+    let (mut used, mut size) = (0u64, 0u64);
+    let path = std::ffi::CString::new("/var/lib/docker").unwrap();
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: valid path and out-pointer.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut st) } == 0 {
+        size = st.f_blocks as u64 * st.f_frsize as u64;
+        used = size.saturating_sub(st.f_bfree as u64 * st.f_frsize as u64);
+    }
+    format!(
+        "{{\"fs_requests\":{{{}}},\"warming\":[{}],\"disk_used\":{used},\"disk_size\":{size}}}",
+        ops.join(","),
+        warming.join(",")
+    )
 }
 
 // ------------------------------------------------------------- trimming
@@ -550,6 +643,22 @@ async fn dns_channel(vsock: VsockStream, dns: Arc<Dns>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listening_ports_filters_state_and_owner() {
+        let table = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0BB8 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 111 1 0
+   1: 00000000:1435 00000000:0000 0A 00000000:00000000 00:00000000 00000000     0        0 222 1 0
+   2: 0100007F:0BB8 0100007F:D431 01 00000000:00000000 00:00000000 00000000     0        0 111 1 0
+";
+        let mine: std::collections::HashSet<u64> = [111].into();
+        assert_eq!(listening_ports(table, &mine), vec![3000]);
+    }
+
+    #[test]
+    fn json_strings_are_escaped() {
+        assert_eq!(json_str("a\"b\\c\n"), "\"a\\\"b\\\\c\\u000a\"");
+    }
 
     #[test]
     fn truncated_keeps_question_and_sets_tc() {

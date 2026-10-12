@@ -60,13 +60,13 @@ fn download(gv: &str, sha: &str, tmp: &Path) -> Result<()> {
     eprintln!("rekcod: downloading the guest image ({file})");
     let curl = Command::new("curl").args(["-fL", "--progress-bar", "-o"]).arg(&tarball).arg(&url).status();
     if !curl.is_ok_and(|s| s.success()) {
-        // Private repo: release assets need auth; gh has it if the user is logged in.
+        // Fallback for networks where curl to GitHub fails but an authenticated gh works.
         let gh = Command::new("gh")
             .args(["release", "download", &format!("v{version}"), "-R", REPO, "-p", &file, "-D"])
             .arg(tmp)
             .status();
         if !gh.is_ok_and(|s| s.success()) {
-            bail!("could not download {url} (set REKCOD_RELEASE_URL, or `gh auth login` while the repo is private)");
+            bail!("could not download {url} (check your connection, or set REKCOD_RELEASE_URL)");
         }
     }
     let out = Command::new("shasum").args(["-a", "256"]).arg(&tarball).output().context("run shasum")?;

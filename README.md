@@ -25,11 +25,11 @@ If `docker` isn't on your `PATH`, rekcod downloads docker 29.9.0, compose and bu
 
 ## Install
 
-From a GitHub release (the repo is private for now, so use `gh`):
+From the latest GitHub release:
 
 ```sh
-gh release download -R TimMikeladze/rekcod -p 'rekcod-*-darwin-arm64.tar.gz'
-tar -xzf rekcod-*-darwin-arm64.tar.gz && sudo mv bin/rekcod /usr/local/bin/
+curl -fsSL https://github.com/TimMikeladze/rekcod/releases/download/v0.1.0/rekcod-0.1.0-darwin-arm64.tar.gz | tar -xz
+sudo mv bin/rekcod /usr/local/bin/
 xattr -d com.apple.quarantine /usr/local/bin/rekcod 2>/dev/null   # not notarized yet
 rekcod start      # first run downloads and verifies the guest image (~100 MB)
 ```
@@ -151,3 +151,7 @@ Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md)
 Debug knobs: `REKCOD_DEBUG=1` logs forwarded file events. `REKCOD_KERNEL_CMDLINE` overrides
 the guest command line. `REKCOD_NO_BALLOON=1` drops the balloon device. In the guest, `cat /sys/module/virtiofs/parameters/rekcod_stats`
 shows host requests by FUSE opcode.
+
+## License
+
+Apache-2.0, see [`LICENSE`](LICENSE).

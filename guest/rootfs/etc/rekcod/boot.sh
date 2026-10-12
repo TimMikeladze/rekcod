@@ -38,6 +38,8 @@ if ! blkid /dev/vdb 2>/dev/null | grep -q 'TYPE="ext4"'; then
   mkfs.ext4 -q -L rekcod-data -m 0 -E lazy_itable_init=1,lazy_journal_init=1 /dev/vdb
 fi
 mount -o noatime /dev/vdb /var/lib/docker || log "data disk mount failed"
+# The Mac side may have grown data.img (`rekcod start --disk`); ext4 grows online.
+resize2fs /dev/vdb >/dev/null 2>&1 || log "data disk resize failed"
 log "data disk mounted"
 
 # Mac directories at the same paths as on the Mac, so bind mounts need no translation.
@@ -89,9 +91,11 @@ if [ -n "$gw" ]; then
   iptables -t nat -I OUTPUT -d "$gw" -p tcp -j REDIRECT --to-ports 2379
 fi
 
+# Build cache would otherwise grow until the data disk is full.
+gc='"builder": {"gc": {"enabled": true, "defaultMaxUsedSpace": "20GB"}}'
 if [ -n "$gw" ]; then
-  echo "{\"host-gateway-ips\": [\"$gw\"]}" >/etc/docker/daemon.json
+  echo "{\"host-gateway-ips\": [\"$gw\"], $gc}" >/etc/docker/daemon.json
 else
-  echo "{}" >/etc/docker/daemon.json
+  echo "{$gc}" >/etc/docker/daemon.json
 fi
 log "ready (ip ${ip4:-none}, gateway ${gw:-none})"

@@ -11,9 +11,12 @@ mod http;
 mod memory;
 mod paths;
 mod ports;
+mod route;
 
 #[cfg(target_os = "macos")]
 mod cli;
+#[cfg(target_os = "macos")]
+mod cli_fetch;
 #[cfg(target_os = "macos")]
 mod daemon;
 #[cfg(target_os = "macos")]
@@ -24,7 +27,14 @@ mod vm;
 mod watch;
 
 #[derive(Parser)]
-#[command(name = "rekcod", version, about = "Docker on macOS: real dockerd in a fast VM, switched in one command")]
+#[command(
+    name = "rekcod",
+    version,
+    about = "Docker on macOS: real dockerd in a fast VM, switched in one command",
+    after_help = "Any other command runs as `docker <command>` against rekcod (booting it if needed):\n  \
+                  rekcod ps, rekcod run -it alpine sh, rekcod compose up -d, rekcod build -t app .\n\
+                  `rekcod start web` / `rekcod stop -t 5 web` are docker's; `rekcod docker <args>` always is."
+)]
 struct Args {
     #[command(subcommand)]
     command: Cmd,
@@ -40,8 +50,8 @@ enum Cmd {
         /// Memory in GiB (default: half of host RAM, at most 8). Unused memory is not reserved.
         #[arg(long)]
         memory: Option<u64>,
-        /// Size of the data disk in GiB, used when it is first created (sparse).
-        #[arg(long, default_value_t = 64)]
+        /// Data disk size in GiB (sparse: only used space takes room on the Mac). Grows an existing disk; never shrinks.
+        #[arg(long, default_value_t = paths::DEFAULT_DISK_GIB)]
         disk: u64,
         /// Do not change the active docker context.
         #[arg(long)]
@@ -96,6 +106,13 @@ enum Research {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(docker_args) = route::docker_args(&argv) {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+        let err = paths::Paths::new().and_then(|paths| cli::passthrough(&paths, docker_args)).unwrap_err();
+        eprintln!("rekcod: {err:#}");
+        std::process::exit(1);
+    }
     let args = Args::parse();
     if !matches!(args.command, Cmd::Daemon { .. }) {
         // Behave like other CLIs when piped into `head` (the daemon keeps Rust's SIGPIPE-ignore).

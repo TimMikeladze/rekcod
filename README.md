@@ -11,6 +11,18 @@ docker compose up -d                  # unchanged
 rekcod stop                           # powers off, restores your previous context
 ```
 
+No docker CLI? `rekcod` is one. Any docker command works after `rekcod`, boots the VM if
+it's off, and always targets rekcod whatever context is active:
+
+```sh
+rekcod run --rm -it alpine sh
+rekcod compose up -d
+rekcod ps
+```
+
+If `docker` isn't on your `PATH`, rekcod downloads docker 29.9.0, compose and buildx
+(sha256-pinned) to `~/.rekcod/cli` on first use. Details: [`docs/cli-passthrough.md`](docs/cli-passthrough.md).
+
 ## Install
 
 From a GitHub release (the repo is private for now, so use `gh`):
@@ -40,8 +52,9 @@ Verified by `scripts/e2e.sh` (37 checks) and `tests/stress/` on an M5 Pro, macOS
 - `linux/amd64` images through Rosetta.
 - `host.docker.internal` (including Mac services bound only to `127.0.0.1`) and `gateway.docker.internal`. Container DNS goes through the Mac's own resolvers (UDP and TCP), so VPN and link-local DNS work.
 - `docker run -i`/`attach`/`exec` with stdin half-close, healthcheck-gated `depends_on`, and idempotent `compose up`.
-- `rekcod import`: images (`save | load`) and named volumes (data, labels), so compose reuses them. Volumes in use at the source are skipped unless you pass `--force`.
+- `rekcod import`: images (`save | load`) and named volumes (data, labels; copied with `docker cp` and checked by file count and bytes), so compose reuses them. Volumes in use at the source are skipped unless you pass `--force`.
 - Idle VM memory is about 160 MiB RSS.
+- The data disk is sparse (256 GiB by default, grown in place by `--disk`), and the build cache is capped at 20 GB.
 
 ## File-sharing speed
 
@@ -61,14 +74,18 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 
 | Command | |
 |---|---|
-| `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context |
+| `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--disk` (default 256, sparse) grows the data disk, never shrinks it |
 | `rekcod stop [--no-switch]` | Graceful power-off, restore the previous context |
 | `rekcod status` | Versions, VM size, forwarded ports (and any that couldn't be bound) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
+| `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
+| `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |
 
-Without the docker CLI, run `export DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock`.
+`start`/`stop` with a container name or docker flag (`rekcod stop -t 5 web`) and `import`
+without `--from` are docker's. `REKCOD_DOCKER_CLI=/path/to/docker` picks the CLI.
+Other API clients: `export DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock`.
 If `DOCKER_HOST` is already set, it overrides contexts, and `rekcod start` warns you.
 
 ## Build
@@ -120,7 +137,7 @@ guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ 
 - `crates/rekcod-proto`: vsock ports and wire formats.
 - `guest/`: Alpine `linux-virt` 6.12 kernel and initramfs, an ext4 root with upstream static docker binaries, and busybox init.
 - `guest/fuse/`: patched `fuse`/`virtiofs` modules (long TTLs, lazy open, host-driven invalidation), built against the guest kernel.
-- State lives in `~/.rekcod`: `vm/root.img` (replaced on upgrade), `vm/data.img` (64 GiB sparse, all docker data) and `logs/`.
+- State lives in `~/.rekcod`: `vm/root.img` (replaced on upgrade), `vm/data.img` (256 GiB sparse by default, all docker data) and `logs/`.
 
 Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md), [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md). Next steps: [`docs/handoff.md`](docs/handoff.md).
 

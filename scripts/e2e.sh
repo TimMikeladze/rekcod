@@ -42,6 +42,13 @@ check "Mac /tmp bind mount" sh -c "test \"\$(docker run --rm -v $tmpf:/f alpine:
 rm -f "$tmpf"
 check "rekcod compact" "$R" compact
 
+echo "docker passthrough (docs/cli-passthrough.md)"
+check "rekcod run keeps docker's exit code" sh -c '"$0" run --rm alpine:3.22 sh -c "exit 7"; test $? = 7' "$R"
+check "rekcod compose version" "$R" compose version
+"$R" run -d --name rekcod-e2e-pt alpine:3.22 sleep 60 >/dev/null
+check "rekcod stop <container> is docker's" sh -c '"$0" stop -t 1 rekcod-e2e-pt && "$0" status | grep -q "rekcod running"' "$R"
+docker container rm -f rekcod-e2e-pt >/dev/null 2>&1
+
 echo "compose"
 cp -R tests/e2e/stack/. "$work/"
 compose="docker compose -p rekcod-e2e -f $work/compose.yaml"

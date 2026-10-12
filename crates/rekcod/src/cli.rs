@@ -1,4 +1,4 @@
-//! User-facing commands: start, stop, status, import, shell.
+//! User-facing commands: start, stop, status, import, shell, and docker passthrough.
 
 use std::collections::BTreeMap;
 use std::fs::OpenOptions;
@@ -60,8 +60,9 @@ fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
         std::fs::copy(guest.join("root.img"), paths.root_disk()).context("install root disk")?;
         std::fs::write(paths.guest_version(), &version)?;
     }
-    if !paths.data_disk().exists() {
-        let f = std::fs::File::create(paths.data_disk())?;
+    // Sparse; the guest grows the filesystem to match at boot.
+    let f = OpenOptions::new().create(true).truncate(false).write(true).open(paths.data_disk())?;
+    if f.metadata()?.len() < disk_gib << 30 {
         f.set_len(disk_gib << 30)?;
     }
     if !paths.mac_address().exists() {
@@ -76,11 +77,12 @@ fn tail(path: &std::path::Path, lines: usize) -> String {
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
-pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, no_switch: bool) -> Result<()> {
-    let t0 = Instant::now();
+/// Boots the VM unless it is running; returns the pid when it already was.
+fn boot(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64) -> Result<Option<i32>> {
     if let Some(pid) = running_pid(paths) {
-        println!("rekcod is already running (pid {pid})");
-    } else {
+        return Ok(Some(pid));
+    }
+    {
         prepare_vm(paths, disk_gib)?;
         let host_cpus = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
         let cpus = cpus.unwrap_or(host_cpus).clamp(1, vm::max_cpus());
@@ -122,7 +124,14 @@ pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_g
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+    Ok(None)
+}
 
+pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, no_switch: bool) -> Result<()> {
+    let t0 = Instant::now();
+    if let Some(pid) = boot(paths, cpus, memory_gib, disk_gib)? {
+        println!("rekcod is already running (pid {pid})");
+    }
     let version = api_get(paths, "/version")
         .ok()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
@@ -131,8 +140,8 @@ pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_g
     println!("rekcod ready in {:.1}s · dockerd {version}", t0.elapsed().as_secs_f64());
 
     if !docker::available() {
-        println!("docker CLI not found. Install it (`brew install docker docker-compose`) or use:");
-        println!("  export DOCKER_HOST={}", paths.docker_host());
+        println!("no docker CLI installed: use `rekcod <docker command>` (e.g. `rekcod ps`, `rekcod compose up`),");
+        println!("or point other clients at it: export DOCKER_HOST={}", paths.docker_host());
         return Ok(());
     }
     docker::ensure_context(&paths.docker_host())?;
@@ -237,10 +246,23 @@ pub fn compact(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
+/// `docker <args>` against rekcod's socket, booting the VM first if needed.
+pub fn passthrough(paths: &Paths, args: &[String]) -> Result<std::convert::Infallible> {
+    if running_pid(paths).is_none() {
+        let t0 = Instant::now();
+        eprintln!("rekcod: starting the VM");
+        boot(paths, None, None, crate::paths::DEFAULT_DISK_GIB)?;
+        eprintln!("rekcod: ready in {:.1}s", t0.elapsed().as_secs_f64());
+    }
+    let mut cmd = docker::any_cli(paths)?;
+    cmd.env("DOCKER_HOST", paths.docker_host()).args(args);
+    Err(cmd.exec()).context("exec docker")
+}
+
 pub fn shell(paths: &Paths) -> Result<()> {
     let interactive = unsafe { libc::isatty(0) } == 1;
     let host = paths.docker_host();
-    let mut cmd = docker::cli();
+    let mut cmd = docker::any_cli(paths)?;
     cmd.args(["-H", &host, "run", "--rm", if interactive { "-it" } else { "-i" }]);
     cmd.args(["--privileged", "--pid=host", "--net=host", HELPER_IMAGE]);
     cmd.args(["nsenter", "-t", "1", "-m", "-u", "-i", "-n", "-p", "--", "sh"]);
@@ -251,6 +273,36 @@ pub fn shell(paths: &Paths) -> Result<()> {
 
 fn is_anonymous_volume(name: &str) -> bool {
     name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Copies volume `name` with `docker cp` (the archive API) between two idle
+/// helper containers, then checks that size and file count match. Streaming
+/// through `docker run` stdout wedges Docker Desktop's API after a few hundred
+/// MB, and a tar file on a shared Mac directory can be read stale by the guest.
+fn copy_volume(src: &[&str], dst: &[&str], name: &str) -> Result<()> {
+    let helper = |ctx: &[&str], mount: &str| -> Result<String> {
+        docker::run_ok(&[ctx, &["create", "-v", mount, HELPER_IMAGE, "true"]].concat())
+    };
+    let from = helper(src, &format!("{name}:/v:ro"))?;
+    let result = helper(dst, &format!("{name}:/v")).and_then(|to| {
+        // The target may hold a previous partial copy (or data under --force).
+        let r = docker::run_ok(&[dst, &["run", "--rm", "-v", &format!("{name}:/v"), HELPER_IMAGE, "find", "/v", "-mindepth", "1", "-delete"]].concat())
+            .and_then(|_| pipe(&[src, &["cp", "-a", &format!("{from}:/v/."), "-"]].concat(), &[dst, &["cp", "-a", "-", &format!("{to}:/v")]].concat()))
+            .and_then(|()| {
+                let measure = |ctx: &[&str]| {
+                    docker::run_ok(&[ctx, &["run", "--rm", "-v", &format!("{name}:/v:ro"), HELPER_IMAGE, "sh", "-c", "echo $(find /v | wc -l) entries, $(find /v -type f -exec stat -c %s {} + | awk '{s+=$1} END {print s+0}') bytes"]].concat())
+                };
+                let (a, b) = (measure(src)?, measure(dst)?);
+                if a != b {
+                    bail!("copy does not match: {a} at the source, {b} here");
+                }
+                Ok(())
+            });
+        let _ = docker::run(&[dst, &["rm", "-f", &to]].concat());
+        r
+    });
+    let _ = docker::run(&[src, &["rm", "-f", &from]].concat());
+    result
 }
 
 /// `docker <src...> | docker <dst...>`; returns stderr of whichever side failed.
@@ -369,12 +421,7 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
                 docker::run_ok(&create.iter().map(String::as_str).collect::<Vec<_>>())?;
             }
             let t = Instant::now();
-            let from_mount = format!("{name}:/from:ro");
-            let to_mount = format!("{name}:/to");
-            let result = pipe(
-                &[&src[..], &["run", "--rm", "-v", &from_mount, HELPER_IMAGE, "tar", "-C", "/from", "-cf", "-", "."]].concat(),
-                &[&dst[..], &["run", "--rm", "-i", "-v", &to_mount, HELPER_IMAGE, "tar", "-C", "/to", "-xpf", "-"]].concat(),
-            );
+            let result = copy_volume(&src, &dst, name);
             match result {
                 Ok(()) => {
                     imported += 1;

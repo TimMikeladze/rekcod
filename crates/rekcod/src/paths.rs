@@ -4,6 +4,9 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
+/// Data disk size; sparse, so only used space costs anything on the Mac.
+pub const DEFAULT_DISK_GIB: u64 = 256;
+
 #[derive(Clone)]
 pub struct Paths {
     pub home: PathBuf,

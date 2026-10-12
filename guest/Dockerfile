@@ -12,7 +12,7 @@ ARG FUSE_PATCH=1
 FROM alpine:${ALPINE} AS rootfs
 ARG DOCKER_VERSION
 ARG KERNEL_REPO
-RUN apk add --no-cache kmod e2fsprogs iptables ip6tables dnsmasq ca-certificates \
+RUN apk add --no-cache kmod e2fsprogs e2fsprogs-extra iptables ip6tables dnsmasq ca-certificates \
  && apk add --no-cache ${KERNEL_REPO:+--repository "$KERNEL_REPO"} linux-virt
 ADD https://download.docker.com/linux/static/stable/aarch64/docker-${DOCKER_VERSION}.tgz /tmp/docker.tgz
 RUN tar -xzf /tmp/docker.tgz -C /tmp \

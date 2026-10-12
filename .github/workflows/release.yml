@@ -11,13 +11,17 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+      # buildx + gha cache: the compiled guest kernel is reused until guest/kernel,
+      # guest/fuse or the Dockerfile's kernel stage changes.
+      - uses: docker/setup-buildx-action@v3
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
       - run: |
           cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
           mkdir -p out/agent && cp target/aarch64-unknown-linux-musl/release/rekcod-agent out/agent/
-          docker build --platform linux/arm64 --build-context agent=out/agent \
+          docker buildx build --platform linux/arm64 --build-context agent=out/agent \
+            --cache-from type=gha,scope=guest --cache-to type=gha,scope=guest,mode=max \
             --target out --output type=local,dest=out/guest guest
       - uses: actions/upload-artifact@v4
         with:

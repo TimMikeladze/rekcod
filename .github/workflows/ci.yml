@@ -4,6 +4,11 @@ on:
     branches: [main]
   pull_request:
 
+# A newer push makes the older run's result moot.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   host:
     runs-on: macos-15
@@ -24,6 +29,9 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+      # buildx + gha cache: the compiled guest kernel is reused until guest/kernel,
+      # guest/fuse or the Dockerfile's kernel stage changes.
+      - uses: docker/setup-buildx-action@v3
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
@@ -34,7 +42,8 @@ jobs:
           mkdir -p out/agent && cp target/aarch64-unknown-linux-musl/release/rekcod-agent out/agent/
       - name: guest image
         run: |
-          docker build --platform linux/arm64 --build-context agent=out/agent \
+          docker buildx build --platform linux/arm64 --build-context agent=out/agent \
+            --cache-from type=gha,scope=guest --cache-to type=gha,scope=guest,mode=max \
             --target out --output type=local,dest=out/guest guest
           ls -l out/guest
           size=$(stat -c %s out/guest/root.img)

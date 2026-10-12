@@ -44,7 +44,8 @@ branch `main`.
 
 - **An unread vsock connection freezes the whole VM.** VZ writes guest data with a blocking `writev` on the vsock device queue that vCPUs wait on. `Vm::connect` returns `vm::Conn`, which always drains.
 
-- **`virtio-rng` must load from the initramfs** (`modules=` on the kernel cmdline). Without it, boot stalls about 5.6 s waiting for entropy.
+- **`virtio-rng` must be up before userspace.** Without it, boot stalls about 5.6 s waiting for entropy. The custom kernel builds it in; stock-kernel guests (`KERNEL=alpine`) load it from the initramfs (`modules=` on the kernel cmdline).
+- **The guest kernel is ours** ([docs/custom-kernel.md](custom-kernel.md)). Anything boot.sh or dockerd needs on every boot goes in `guest/kernel/rekcod.config` as `=y`; the build fails if a fragment line doesn't stick.
 - **The initramfs autoloads virtiofs**, so the Dockerfile reruns `mkinitfs` after swapping in the patched modules.
 - **Apple's virtio-fs server:**
   - It remaps inode numbers, so compare size/mtime/ctime instead.

@@ -165,7 +165,7 @@ If `DOCKER_HOST` is already set, it overrides contexts, and `rekcod start` warns
 ## Build
 
 Needs Rust, Xcode command-line tools (`codesign`), and any docker engine for the
-first guest image build. After that, rekcod can rebuild its own guest.
+first guest image build (it compiles the guest kernel, so the first build takes a few minutes). After that, rekcod can rebuild its own guest.
 
 ```sh
 scripts/build.sh                                   # host binary (signed), agent, out/guest
@@ -212,8 +212,8 @@ guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ 
 - `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy (`proxy.rs`, rewrites `containers/create` for `dev.rekcod.local`), the port forwarder (published ports and `rekcod x` listeners), file events, the DNS bridge and clock sync. `snap.rs` and `xrun.rs` are the newer commands; `actions.rs` is the action list that `menubar.rs` renders.
 - `crates/rekcod-agent`: static musl guest agent.
 - `crates/rekcod-proto`: vsock ports and wire formats.
-- `guest/`: Alpine `linux-virt` 6.12 kernel and initramfs, an ext4 root with upstream static docker binaries, and busybox init.
-- `guest/fuse/`: patched `fuse`/`virtiofs` modules (long TTLs, lazy open, host-driven invalidation), built against the guest kernel.
+- `guest/`: a 6.12 LTS kernel built from Alpine's `linux-virt` config plus `guest/kernel/rekcod.config` (virtio, ext4, fuse and docker's netfilter built in, no initramfs; [docs/custom-kernel.md](docs/custom-kernel.md)), an Alpine ext4 root with upstream static docker binaries, and busybox init. `--build-arg KERNEL=alpine` builds the stock-kernel guest instead.
+- `guest/fuse/`: the fuse/virtiofs patch (long TTLs, lazy open, host-driven invalidation), applied in-tree to the guest kernel.
 - State lives in `~/.rekcod`: `vm/root.img` (replaced on upgrade), `vm/data.img` (256 GiB sparse by default, all docker data), `vm/warm-paths` (bind sources warmed at boot) and `logs/`. The sandbox VM has its own copy under `~/.rekcod/sandbox`.
 
 Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md), [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md), [`docs/phase5.md`](docs/phase5.md), [`docs/sandbox.md`](docs/sandbox.md), [`docs/frontends.md`](docs/frontends.md). Next steps: [`docs/handoff.md`](docs/handoff.md).

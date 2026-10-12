@@ -37,7 +37,8 @@ pub struct VmConfig {
     pub cpus: usize,
     pub memory_mib: u64,
     pub kernel: PathBuf,
-    pub initrd: PathBuf,
+    /// None for kernels that mount the root disk themselves (docs/custom-kernel.md).
+    pub initrd: Option<PathBuf>,
     pub cmdline: String,
     pub root_disk: PathBuf,
     pub data_disk: PathBuf,
@@ -244,7 +245,9 @@ unsafe fn disk(path: &Path) -> Result<Retained<VZStorageDeviceConfiguration>> {
 unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfiguration>, bool)> {
     unsafe {
         let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &url(&cfg.kernel));
-        boot.setInitialRamdiskURL(Some(&url(&cfg.initrd)));
+        if let Some(initrd) = &cfg.initrd {
+            boot.setInitialRamdiskURL(Some(&url(initrd)));
+        }
         boot.setCommandLine(&NSString::from_str(&cfg.cmdline));
 
         let c = VZVirtualMachineConfiguration::new();

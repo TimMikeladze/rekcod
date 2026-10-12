@@ -37,7 +37,8 @@ use crate::ports::{self, Binding};
 use crate::vm::{State, Vm, VmConfig};
 use crate::watch::{self, Watch};
 
-// virtio-rng must load from the initramfs: without it boot stalls ~5s waiting for entropy.
+// Stock-kernel guests: virtio-rng must load from the initramfs, or boot stalls ~5s
+// waiting for entropy. The custom kernel has it built in and ignores `modules=`.
 const KERNEL_CMDLINE: &str = "console=hvc0 root=/dev/vda rootfstype=ext4 modules=virtio_blk,ext4,virtio-rng rw quiet";
 
 macro_rules! log {
@@ -96,7 +97,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         cpus: opts.cpus,
         memory_mib: opts.memory_mib,
         kernel: guest.join("Image"),
-        initrd: guest.join("initramfs"),
+        initrd: Some(guest.join("initramfs")).filter(|p| p.exists()),
         cmdline,
         root_disk: paths.root_disk(),
         data_disk: paths.data_disk(),

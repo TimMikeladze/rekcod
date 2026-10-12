@@ -81,10 +81,22 @@ async fn forward(vsock: VsockStream) -> Result<()> {
     if proto == Proto::Udp {
         return forward_udp(vsock, port).await;
     }
-    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.with_context(|| format!("connect 127.0.0.1:{port}"))?;
+    let mut tcp = connect_published(port).await?;
     tcp.set_nodelay(true)?;
     copy_bidirectional(&mut vsock, &mut tcp).await?;
     Ok(())
+}
+
+/// The container behind a published port directly, else docker-proxy (or a host-network
+/// listener) on 127.0.0.1.
+async fn connect_published(port: u16) -> Result<TcpStream> {
+    if let Some(addr) = tokio::task::spawn_blocking(move || crate::proxyport::target(port)).await? {
+        match tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr)).await {
+            Ok(Ok(tcp)) => return Ok(tcp),
+            _ => eprintln!("forward :{port}: {addr} unreachable, using docker-proxy"),
+        }
+    }
+    TcpStream::connect(("127.0.0.1", port)).await.with_context(|| format!("connect 127.0.0.1:{port}"))
 }
 
 /// One Mac-side UDP client: framed datagrams on the vsock stream <-> a socket

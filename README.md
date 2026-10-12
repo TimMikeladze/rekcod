@@ -1,8 +1,8 @@
 # rekcod
 
-Docker on macOS (Apple Silicon): the real, unmodified `dockerd` in a lightweight
-Virtualization.framework VM, switched to in one command and away from in one command.
-Your `docker` CLI, `docker compose` and compose files stay exactly as they are.
+rekcod runs Docker on Apple Silicon Macs: the unmodified upstream `dockerd` in a
+Virtualization.framework VM. `rekcod start` switches your docker context to it and
+`rekcod stop` switches back. Your `docker` CLI, `docker compose` and compose files don't change.
 
 ```sh
 rekcod start                          # boots in ~1.3 s, selects the `rekcod` docker context
@@ -11,8 +11,8 @@ docker compose up -d                  # unchanged
 rekcod stop                           # powers off, restores your previous context
 ```
 
-No docker CLI? `rekcod` is one. Any docker command works after `rekcod`, boots the VM if
-it's off, and always targets rekcod whatever context is active:
+`rekcod` also works as the docker CLI. Put any docker command after it. The VM boots if
+it's off, and the command targets rekcod whatever context is active:
 
 ```sh
 rekcod run --rm -it alpine sh
@@ -22,6 +22,43 @@ rekcod ps
 
 If `docker` isn't on your `PATH`, rekcod downloads docker 29.9.0, compose and buildx
 (sha256-pinned) to `~/.rekcod/cli` on first use. Details: [`docs/cli-passthrough.md`](docs/cli-passthrough.md).
+
+## Why rekcod
+
+rekcod doesn't reimplement Docker. It runs the same upstream `dockerd` 29.9.0 you'd run on a
+Linux server, with its embedded BuildKit, so compose, `buildx bake`, SDKs and anything else
+that talks to the Docker API behave as they do there. All of rekcod's own code sits at the VM
+boundary (file sharing, ports, DNS, memory), because that's where Docker on a Mac is slow or
+breaks.
+
+Bind mounts are where you feel it. rekcod patches the guest kernel's FUSE/virtio-fs to cache
+file metadata until FSEvents says the file changed on the Mac. Warm work on a bind-mounted
+tree is 3–9× faster than OrbStack and faster than the same work natively on macOS
+([numbers](#file-sharing-speed)). The cost is the first read of a tree after boot, which is
+slower than OrbStack ([Limitations](#limitations)).
+
+On top of stock Docker it adds volume snapshots per compose project or git branch,
+`rekcod x` for running a command in the right toolchain image without a Dockerfile, a
+throwaway sandbox VM for code you don't trust, and VM-local `node_modules`
+([Beyond Docker Desktop](#beyond-docker-desktop)).
+
+It's Apache-2.0. Colima, Lima, Podman Desktop and Rancher Desktop are open source too. What
+rekcod is going for is open source at OrbStack's speed.
+
+## Goals
+
+- Switch from Docker Desktop or OrbStack in one command, bring images and volumes along with
+  `rekcod import`, and switch back in one command. Compose files and scripts don't change.
+- Full Docker API parity, by running upstream `dockerd` instead of reimplementing the engine,
+  Compose or BuildKit.
+- Be faster than OrbStack on what developers notice day to day, which is mostly bind-mounted
+  file access.
+- Dev-loop features that work on stock `dockerd`: snapshots, `rekcod x`, the sandbox.
+- The CLI and the menu bar offer the same actions ([`docs/frontends.md`](docs/frontends.md)).
+
+Not goals: Windows or Linux hosts, 16K-page guest kernels, lazy image pulls, or a microVM per
+container (only `--sandbox` gets its own VM). The reasoning behind these is in
+[`docs/plan.md`](docs/plan.md).
 
 ## Install
 
@@ -42,7 +79,7 @@ checks its sha256 before unpacking. `REKCOD_RELEASE_URL` points the download els
 Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS 27:
 
 - Upstream dockerd 29.9.0 with its embedded BuildKit. `docker build`, compose `build:` and `buildx bake` all work.
-- Published TCP and UDP ports on the Mac's `localhost`, mirrored from docker events. If a Mac port is already taken, rekcod reports it in `rekcod status` and leaves the other process alone.
+- Published TCP and UDP ports on the Mac's `localhost`, mirrored from docker events. If a Mac port is already taken, rekcod reports it in `rekcod status` and leaves the other process alone. Mac TCP connections go straight to the container's address, skipping docker-proxy (about 85 µs round trip vs 125 µs through it), so iptables rules in the guest's `DOCKER-USER` chain don't apply to them.
 - Bind mounts from `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders` at the same paths, cached in the
   guest and invalidated from FSEvents. Warm work is 3–9× faster than OrbStack's bind
   mounts and faster than native macOS (table below). Mac-side edits, atomic saves, creates,
@@ -117,8 +154,9 @@ A warm `rekcod x node -v` adds about 65 ms over running node natively.
 
 ### Menu bar
 
-`rekcod menubar` shows docker's whale upside down (dimmed while the VM is stopped). Its menu lists the VM, containers, forwarded ports and compose
-projects with their snapshots, with the same actions as the CLI: start/stop the VM,
+`rekcod menubar` shows docker's whale upside down (dimmed while the VM is stopped). Its
+menu lists the VM, containers, forwarded ports and compose projects with their snapshots,
+with the same actions as the CLI: start/stop the VM,
 compact, root shell; start, stop, restart, logs or remove a container; open a port;
 save, restore or delete a snapshot. Every item runs the matching `rekcod` command, and
 anything destructive asks first. How it stays in sync with the CLI: [`docs/frontends.md`](docs/frontends.md).
@@ -165,11 +203,13 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 
 `start`/`stop` with a container name or docker flag (`rekcod stop -t 5 web`) and `import`
 without `--from` are docker's. `REKCOD_DOCKER_CLI=/path/to/docker` picks the CLI.
+
 Clients that ignore docker contexts (oxker, SDKs, IDE plugins) dial `/var/run/docker.sock`.
-The first `rekcod start` in a terminal sets this up (one password prompt; or run `rekcod socket install` later). From then on `rekcod start` routes
-that socket to rekcod and `rekcod stop` hands it back to whatever had it (OrbStack, Docker Desktop).
+The first `rekcod start` in a terminal sets that up with one password prompt, or run
+`rekcod socket install` later. From then on `rekcod start` routes that socket to rekcod and
+`rekcod stop` hands it back to whatever had it (OrbStack, Docker Desktop).
 `rekcod socket uninstall` undoes it. See [docs/default-socket.md](docs/default-socket.md).
-Or per shell: `export DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock`.
+To point one shell at rekcod instead: `export DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock`.
 If `DOCKER_HOST` is already set, it overrides contexts, and `rekcod start` warns you.
 
 ## Build
@@ -204,6 +244,8 @@ E2E_IMPORT_FROM=orbstack scripts/e2e.sh      # also exercises import
 python3 bench/headroom.py --context rekcod   # file-sharing benchmark (compare --context orbstack)
 python3 bench/inotify_rtt.py --context rekcod  # Mac edit -> container inotify latency
 bench/cold_start.sh                          # first access right after boot, warmed vs not
+bench/postgres.sh rekcod desktop-linux       # pgbench on a named volume, per docker context
+python3 bench/tcp_rtt.py --context rekcod    # 64-byte round trip through a published port
 rekcod x cargo test -p rekcod-agent          # the guest agent's Linux-only tests
 python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge
 tests/stress/overflow.sh                     # FSEvents burst; see the script for the forced-drop mode
@@ -222,7 +264,7 @@ FSEvents   ─▶ rekcodd ──vsock──▶ agent ─▶ fuse rekcod_notify: 
 guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ Mac resolvers
 ```
 
-- `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy (`proxy.rs`, rewrites `containers/create` for `dev.rekcod.local`), the port forwarder (published ports and `rekcod x` listeners), file events, the DNS bridge and clock sync. `snap.rs` and `xrun.rs` are the newer commands; `actions.rs` is the action list that `menubar.rs` renders.
+- `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy (`proxy.rs`, rewrites `containers/create` for `dev.rekcod.local`), the port forwarder (published ports and `rekcod x` listeners), file events, the DNS bridge and clock sync. `snap.rs` and `xrun.rs` implement `rekcod snap` and `rekcod x`; `actions.rs` is the action list that `menubar.rs` renders.
 - `crates/rekcod-agent`: static musl guest agent.
 - `crates/rekcod-proto`: vsock ports and wire formats.
 - `guest/`: a 6.12 LTS kernel built from Alpine's `linux-virt` config plus `guest/kernel/rekcod.config` (virtio, ext4, fuse and docker's netfilter built in, no initramfs; [docs/custom-kernel.md](docs/custom-kernel.md)), an Alpine ext4 root with upstream static docker binaries, and busybox init. `--build-arg KERNEL=alpine` builds the stock-kernel guest instead.
@@ -234,14 +276,17 @@ Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md)
 ## Limitations
 
 - First access can be slower than OrbStack for a tree rekcod hasn't seen since boot, when a container touches it before background warming finishes (about 1 s per 20k files). Recently used trees are warmed at boot (a 19.5k-file walk 3 s after `rekcod start`: 34 ms warmed vs 286 ms not). Repeat work is 3–9× faster.
-- Mac→container change latency is about 14 ms p50 (`bench/inotify_rtt.py`; OrbStack measured 12 ms). Changes are visible after that bounded delay, not instantly.
+- Mac→container change latency is about 14 ms p50 (`bench/inotify_rtt.py`; OrbStack measured 12 ms).
 - Memory isn't returned to macOS. `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop, even under memory pressure (docs/phase2.md, docs/phase5.md).
 - `--sandbox` hasn't had an external security review (docs/sandbox.md).
 - No brew formula. Releases are ad-hoc signed, not notarized.
 
-Debug knobs: `REKCOD_DEBUG=1` logs forwarded file events. `REKCOD_KERNEL_CMDLINE` overrides
-the guest command line. `REKCOD_NO_BALLOON=1` drops the balloon device. In the guest, `cat /sys/module/virtiofs/parameters/rekcod_stats`
-shows host requests by FUSE opcode.
+Debug knobs:
+
+- `REKCOD_DEBUG=1` logs forwarded file events.
+- `REKCOD_KERNEL_CMDLINE` overrides the guest command line.
+- `REKCOD_NO_BALLOON=1` drops the balloon device.
+- In the guest, `cat /sys/module/virtiofs/parameters/rekcod_stats` shows host requests by FUSE opcode.
 
 ## License
 

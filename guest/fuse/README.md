@@ -4,8 +4,9 @@
 `rekcod.c` (new) are applied to the kernel tree in the `custom-kernel` stage of
 `guest/Dockerfile`, so fuse and virtiofs are built into the kernel. With
 `--build-arg KERNEL=alpine` they're built out of tree as `fuse.ko`, `virtiofs.ko` and
-`cuse.ko` instead, replacing Alpine's stock modules in the initramfs. Everything is gated on the virtio-fs `rekcod` mount option.
-Design and measurements: `docs/phase2.md`.
+`cuse.ko` instead, replacing Alpine's stock modules in the initramfs. All of the changed
+behavior is gated on the virtio-fs `rekcod` mount option. Design and measurements:
+[`docs/phase2.md`](../../docs/phase2.md).
 
 To change the patch:
 

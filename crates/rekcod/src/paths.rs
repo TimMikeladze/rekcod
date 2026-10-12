@@ -29,6 +29,12 @@ impl Paths {
         Ok(Paths { home })
     }
 
+    /// True for `~/.rekcod`. Other homes (tests, benches) must not repoint the shared
+    /// `rekcod` docker context unless asked to switch to it.
+    pub fn is_default_home(&self) -> bool {
+        std::env::var_os("HOME").is_some_and(|h| PathBuf::from(h).join(".rekcod") == self.home)
+    }
+
     pub fn socket(&self) -> PathBuf {
         self.home.join("run/docker.sock")
     }
@@ -99,5 +105,17 @@ impl Paths {
             "guest image not found (looked in {}); build it with scripts/build.sh",
             candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ")
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_home_dot_rekcod_is_default() {
+        let home = PathBuf::from(std::env::var_os("HOME").unwrap());
+        assert!(Paths { home: home.join(".rekcod") }.is_default_home());
+        assert!(!Paths { home: home.join(".rkab") }.is_default_home());
     }
 }

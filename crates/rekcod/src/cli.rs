@@ -194,6 +194,10 @@ pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_g
         default_socket_on_start(paths, no_switch)?;
         return Ok(());
     }
+    if no_switch && !paths.is_default_home() {
+        println!("docker context `{CONTEXT}` left alone (--no-switch, REKCOD_HOME); export DOCKER_HOST={}", paths.docker_host());
+        return Ok(());
+    }
     docker::ensure_context(&paths.docker_host())?;
     if no_switch {
         println!("docker context `{CONTEXT}` is available (not switched: --no-switch)");

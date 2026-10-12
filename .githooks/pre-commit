@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Same checks as CI's host job (.github/workflows/ci.yml), before every commit.
+# Enable once per clone: git config core.hooksPath .githooks
+# Skip once: git commit --no-verify
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --all --check || { echo "pre-commit: run \`cargo fmt --all\` and re-stage"; exit 1; }
+echo "pre-commit: clippy"
+cargo clippy -q -p rekcod -p rekcod-proto -- -D warnings
+if rustup target list --installed 2>/dev/null | grep -qx aarch64-unknown-linux-musl; then
+  cargo clippy -q -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings
+fi
+echo "pre-commit: tests"
+cargo test -q --workspace

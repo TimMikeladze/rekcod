@@ -184,6 +184,8 @@ that can run VMs, so it runs locally.
 
 ## Test
 
+`git config core.hooksPath .githooks` once per clone runs CI's host checks (fmt, clippy, tests) before every commit.
+
 ```sh
 cargo test --workspace                       # unit tests
 cargo fmt --all --check                      # formatting (rustfmt.toml; CI enforces it)

@@ -109,14 +109,11 @@ rekcod x --image alpine:3.22 sh                 # any image
 `-p PORT` publishes explicitly, `-e KEY=VALUE` sets variables, and `.env` is passed along.
 A warm `rekcod x node -v` adds about 65 ms over running node natively.
 
-**TUI and menu bar.** `rekcod` on its own opens a terminal UI; `rekcod menubar` puts the
-same thing in the menu bar. Both list the VM, containers, forwarded ports and compose
-projects with their snapshots, and offer the same actions: start/stop the VM, compact,
-root shell; start, stop, restart, logs or remove a container; open a port; save,
-restore or delete a snapshot. Every action runs the matching `rekcod` command, and
-anything destructive asks first. TUI keys: `1`–`3` or Tab for tabs, `j`/`k` to move,
-`⏎` for the selected row's actions, the letter shown next to an action to run it
-directly, `v` for the VM, `q` to quit. How the three stay in sync: [`docs/frontends.md`](docs/frontends.md).
+**Menu bar.** `rekcod menubar` shows docker's whale upside down (dimmed while the VM is stopped). Its menu lists the VM, containers, forwarded ports and compose
+projects with their snapshots, with the same actions as the CLI: start/stop the VM,
+compact, root shell; start, stop, restart, logs or remove a container; open a port;
+save, restore or delete a snapshot. Every item runs the matching `rekcod` command, and
+anything destructive asks first. How it stays in sync with the CLI: [`docs/frontends.md`](docs/frontends.md).
 
 **Sandbox.** `rekcod x --sandbox <command>` runs in a second, throwaway VM whose only Mac
 directory is the current one. The rest of `$HOME` (`~/.ssh`, cloud credentials, other
@@ -150,8 +147,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
-| `rekcod tui` (or bare `rekcod` in a terminal) | Full-screen UI: VM status, containers, ports, snapshots, with the same actions as the menu bar |
-| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the TUI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
+| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |
@@ -208,7 +204,7 @@ FSEvents   ─▶ rekcodd ──vsock──▶ agent ─▶ fuse rekcod_notify: 
 guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ Mac resolvers
 ```
 
-- `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy (`proxy.rs`, rewrites `containers/create` for `dev.rekcod.local`), the port forwarder (published ports and `rekcod x` listeners), file events, the DNS bridge and clock sync. `snap.rs` and `xrun.rs` are the newer commands; `actions.rs` is the action list that `tui.rs` and `menubar.rs` render.
+- `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy (`proxy.rs`, rewrites `containers/create` for `dev.rekcod.local`), the port forwarder (published ports and `rekcod x` listeners), file events, the DNS bridge and clock sync. `snap.rs` and `xrun.rs` are the newer commands; `actions.rs` is the action list that `menubar.rs` renders.
 - `crates/rekcod-agent`: static musl guest agent.
 - `crates/rekcod-proto`: vsock ports and wire formats.
 - `guest/`: Alpine `linux-virt` 6.12 kernel and initramfs, an ext4 root with upstream static docker binaries, and busybox init.

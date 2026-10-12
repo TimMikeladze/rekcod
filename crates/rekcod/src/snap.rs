@@ -85,7 +85,7 @@ fn git_branch() -> Option<String> {
 }
 
 /// `name`, else the git branch. Saving outside git falls back to a timestamp,
-/// so the menu bar and TUI can always save.
+/// so the menu bar can always save.
 fn snap_name(name: Option<&str>, saving: bool) -> Result<String> {
     let raw = match (name, git_branch()) {
         (Some(n), _) => n.to_string(),

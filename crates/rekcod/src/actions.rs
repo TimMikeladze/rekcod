@@ -1,9 +1,9 @@
-//! What the TUI and the menu bar show and can do (docs/frontends.md).
+//! What the menu bar shows and can do (docs/frontends.md).
 //!
 //! The CLI is the implementation: every [`Action`] is a `rekcod` command line
-//! (or opening a URL). The UIs render the lists returned by the `*_actions`
-//! functions as they are, so an action added here appears in both, and
-//! `tests::every_kind_reaches_both_uis` fails until every [`Kind`] is reachable.
+//! (or opening a URL). The menu bar renders the lists returned by the
+//! `*_actions` functions as they are, so an action added here appears there,
+//! and `tests::every_kind_is_offered` fails until every [`Kind`] is reachable.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -30,7 +30,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Every kind; the parity tests check each one reaches both UIs.
+    /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
     pub const ALL: [Kind; 13] = [
         Kind::VmStart,
@@ -48,23 +48,6 @@ impl Kind {
         Kind::SnapRemove,
     ];
 
-    /// TUI shortcut on the selected row (unique within each `*_actions` list).
-    pub fn key(self) -> char {
-        match self {
-            Kind::VmStart | Kind::VmStop => 'v',
-            Kind::Compact => 'c',
-            Kind::Shell => '!',
-            Kind::ContainerStart => 's',
-            Kind::ContainerStop => 'x',
-            Kind::ContainerRestart => 'r',
-            Kind::ContainerLogs => 'l',
-            Kind::ContainerRemove => 'd',
-            Kind::OpenPort => 'o',
-            Kind::SnapSave => 'n',
-            Kind::SnapRestore => 'r',
-            Kind::SnapRemove => 'd',
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -189,7 +172,7 @@ pub struct Snapshot {
     pub volumes: Vec<String>,
 }
 
-/// Everything the UIs show, loaded in one go.
+/// Everything the menu bar shows, loaded in one go.
 #[derive(Debug, Default)]
 pub struct Model {
     pub running: bool,
@@ -431,7 +414,7 @@ pub mod tests {
         assert_eq!(projects[0].snapshots[0].created, 12);
     }
 
-    /// Every action kind comes out of the lists both UIs render.
+    /// Every action kind comes out of the lists the menu bar renders.
     pub fn reachable_kinds() -> Vec<Action> {
         let (containers, ports, projects) = sample();
         let mut all = vm_actions(true);
@@ -452,24 +435,13 @@ pub mod tests {
     }
 
     #[test]
-    fn every_kind_reaches_both_uis() {
+    fn every_kind_is_offered() {
         let actions = reachable_kinds();
         for kind in Kind::ALL {
             assert!(actions.iter().any(|a| a.kind == kind), "{kind:?} is not offered by any *_actions list");
         }
     }
 
-    #[test]
-    fn shortcuts_are_unique_per_list() {
-        let (containers, _, projects) = sample();
-        let lists = [vm_actions(true), container_actions(&containers[0]), container_actions(&containers[1]), snapshot_actions(&projects[0].snapshots[0])];
-        for list in lists {
-            let mut keys: Vec<char> = list.iter().map(|a| a.kind.key()).collect();
-            keys.sort();
-            keys.dedup();
-            assert_eq!(keys.len(), list.len(), "{list:?}");
-        }
-    }
 
     #[test]
     fn destructive_actions_ask_first() {

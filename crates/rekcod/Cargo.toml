@@ -14,8 +14,6 @@ serde_json.workspace = true
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
-ratatui = "0.29"
-crossterm = "0.28"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"

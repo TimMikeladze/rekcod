@@ -1,9 +1,11 @@
-//! `rekcod menubar`: a menu bar item with the same actions as the CLI and the
-//! TUI (docs/frontends.md). The title follows the VM every 2 s; the menu is
+//! `rekcod menubar`: a menu bar item with the same actions as the CLI
+//! (docs/frontends.md). The title follows the VM every 2 s; the menu is
 //! built from `actions::Model` each time it opens, and every item runs an
 //! `actions::Action` (a `rekcod` command).
 
-use std::cell::{OnceCell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -12,21 +14,52 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSMenu, NSMenuDelegate, NSMenuItem,
-    NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSCellImagePosition, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate,
+    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
-use objc2_foundation::{NSObject, NSObjectProtocol, NSString, NSTimer};
+use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSSize, NSString, NSTimer};
 
 use crate::actions::{self, Action, Model};
 use crate::paths::Paths;
 
 const LABEL: &str = "dev.rekcod.menubar";
 
+/// docker's whale, upside down; a template image, so macOS tints it for the menu bar.
+const ICON_SVG: &str = include_str!("../assets/menubar-whale.svg");
+/// Frames of the busy animation (the whale bobs and rocks), shown every [`FRAME_SECS`].
+const FRAMES: usize = 12;
+const FRAME_SECS: f64 = 0.08;
+
+/// The icon moved by `dy` points and rocked by `degrees` around its centre.
+pub fn icon_frame(dy: f64, degrees: f64) -> String {
+    ICON_SVG
+        .replacen("<g transform=", &format!("<g transform=\"translate(0 {dy:.2}) rotate({degrees:.2} 11 9)\"><g transform="), 1)
+        .replacen("</svg>", "</g></svg>", 1)
+}
+
+/// The busy animation: one bob and rock per cycle.
+pub fn busy_frames() -> Vec<String> {
+    (0..FRAMES)
+        .map(|i| {
+            let t = i as f64 / FRAMES as f64 * std::f64::consts::TAU;
+            icon_frame(1.2 * t.sin(), 7.0 * t.cos())
+        })
+        .collect()
+}
+
 pub struct Ivars {
     paths: Paths,
     item: OnceCell<Retained<NSStatusItem>>,
     /// The actions behind the open menu's items (item tag = index).
     actions: RefCell<Vec<Action>>,
+    /// Still image, then the busy animation.
+    icon: OnceCell<Retained<NSImage>>,
+    frames: OnceCell<Vec<Retained<NSImage>>>,
+    frame: Cell<Option<usize>>,
+    /// Menu actions still running.
+    running_actions: Arc<AtomicUsize>,
+    /// The VM is booting or shutting down (daemon alive, docker not answering).
+    transitioning: Arc<AtomicBool>,
 }
 
 define_class!(
@@ -51,6 +84,11 @@ define_class!(
             self.update_title();
         }
 
+        #[unsafe(method(animate:))]
+        fn animate(&self, _sender: Option<&AnyObject>) {
+            self.step_animation();
+        }
+
         #[unsafe(method(runAction:))]
         fn run_action(&self, sender: Option<&NSMenuItem>) {
             let Some(item) = sender else { return };
@@ -63,12 +101,6 @@ define_class!(
         #[unsafe(method(openLogs:))]
         fn open_logs(&self, _sender: Option<&AnyObject>) {
             open(&self.ivars().paths.home.join("logs").display().to_string());
-        }
-
-        #[unsafe(method(openTui:))]
-        fn open_tui(&self, _sender: Option<&AnyObject>) {
-            let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "rekcod".into());
-            in_terminal(&format!("{} tui", actions::shell_quote(&exe)));
         }
 
         #[unsafe(method(quit:))]
@@ -157,7 +189,16 @@ pub fn entries(m: &Model) -> Vec<Entry> {
 
 impl Target {
     fn new(mtm: MainThreadMarker, paths: Paths) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(Ivars { paths, item: OnceCell::new(), actions: RefCell::default() });
+        let this = Self::alloc(mtm).set_ivars(Ivars {
+            paths,
+            item: OnceCell::new(),
+            actions: RefCell::default(),
+            icon: OnceCell::new(),
+            frames: OnceCell::new(),
+            frame: Cell::new(None),
+            running_actions: Arc::default(),
+            transitioning: Arc::default(),
+        });
         unsafe { msg_send![super(this), init] }
     }
 
@@ -209,16 +250,20 @@ impl Target {
         self.add(menu, &entries(&model));
         let mtm = self.mtm();
         menu.addItem(&NSMenuItem::separatorItem(mtm));
-        menu.addItem(&self.item("Open TUI in Terminal", Some(sel!(openTui:))));
         menu.addItem(&self.item("Open logs folder", Some(sel!(openLogs:))));
         menu.addItem(&self.item("Quit menu bar", Some(sel!(quit:))));
     }
 
+    /// Icon only, no name; dimmed while the VM is stopped.
     fn update_title(&self) {
+        if self.ivars().frame.get().is_some() {
+            return; // animating
+        }
         let mtm = self.mtm();
         let running = crate::cli::running_pid(&self.ivars().paths).is_some();
         if let Some(button) = self.ivars().item.get().and_then(|i| i.button(mtm)) {
-            button.setTitle(&NSString::from_str(if running { "◆ rekcod" } else { "◇ rekcod" }));
+            button.setAppearsDisabled(!running);
+            button.setToolTip(Some(&NSString::from_str(if running { "rekcod is running" } else { "rekcod is stopped" })));
         }
     }
 
@@ -236,7 +281,42 @@ impl Target {
         let mut cmd = action.command();
         cmd.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
         if let Ok(mut child) = cmd.spawn() {
-            std::thread::spawn(move || child.wait());
+            // The icon animates until the command is done.
+            let running = self.ivars().running_actions.clone();
+            running.fetch_add(1, Ordering::SeqCst);
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                running.fetch_sub(1, Ordering::SeqCst);
+            });
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.ivars().running_actions.load(Ordering::SeqCst) > 0 || self.ivars().transitioning.load(Ordering::SeqCst)
+    }
+
+    /// Next animation frame while busy; back to the still icon when done.
+    fn step_animation(&self) {
+        let mtm = self.mtm();
+        let ivars = self.ivars();
+        let (Some(button), Some(frames), Some(icon)) =
+            (ivars.item.get().and_then(|i| i.button(mtm)), ivars.frames.get(), ivars.icon.get())
+        else {
+            return;
+        };
+        match (self.busy(), ivars.frame.get()) {
+            (true, current) => {
+                let next = current.map_or(0, |i| (i + 1) % frames.len());
+                ivars.frame.set(Some(next));
+                button.setAppearsDisabled(false);
+                button.setImage(Some(&frames[next]));
+            }
+            (false, Some(_)) => {
+                ivars.frame.set(None);
+                button.setImage(Some(icon));
+                self.update_title();
+            }
+            (false, None) => {}
         }
     }
 
@@ -277,10 +357,45 @@ pub fn run(paths: Paths) -> Result<()> {
     menu.setAutoenablesItems(false);
     menu.setDelegate(Some(ProtocolObject::from_ref(&*target)));
     item.setMenu(Some(&menu));
+    let image = |svg: &str| {
+        let icon = NSImage::initWithData(mtm.alloc::<NSImage>(), &NSData::with_bytes(svg.as_bytes()))?;
+        icon.setSize(NSSize::new(22.0, 18.0));
+        icon.setTemplate(true);
+        Some(icon)
+    };
+    if let Some(button) = item.button(mtm) {
+        match image(ICON_SVG) {
+            Some(icon) => {
+                button.setImage(Some(&icon));
+                button.setTitle(&NSString::new());
+                button.setImagePosition(NSCellImagePosition::ImageOnly);
+                let _ = target.ivars().icon.set(icon);
+                let frames: Option<Vec<_>> = busy_frames().iter().map(|f| image(f)).collect();
+                if let Some(frames) = frames {
+                    let _ = target.ivars().frames.set(frames);
+                }
+            }
+            None => button.setTitle(&NSString::from_str("rekcod")),
+        }
+    }
+    // Booting or stopping: the daemon is alive but docker doesn't answer yet.
+    // Checked off the main thread (a ping can take a moment).
+    {
+        let (paths, flag) = (target.ivars().paths.clone(), target.ivars().transitioning.clone());
+        std::thread::spawn(move || loop {
+            let alive = crate::cli::running_pid(&paths).is_some();
+            let answering = alive && crate::cli::api_get(&paths, "/_ping").is_ok_and(|b| b == b"OK");
+            flag.store(alive && !answering, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        });
+    }
     let _ = target.ivars().item.set(item);
     target.update_title();
     let _timer = unsafe {
         NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(2.0, &target, sel!(tick:), None, true)
+    };
+    let _animation = unsafe {
+        NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(FRAME_SECS, &target, sel!(animate:), None, true)
     };
     app.run();
     Ok(())
@@ -367,6 +482,15 @@ mod tests {
         assert!(p.contains("<string>/opt/r&amp;d/rekcod</string>\n    <string>menubar</string>"));
         assert!(p.contains("<key>RunAtLoad</key><true/>"));
         assert!(p.contains(&format!("<string>{LABEL}</string>")));
+    }
+
+    #[test]
+    fn busy_frames_move_the_whole_icon() {
+        let frames = busy_frames();
+        assert_eq!(frames.len(), FRAMES);
+        assert!(frames[0].contains("<g transform=\"translate(0 0.00) rotate(7.00 11 9)\"><g transform=\"translate(0 18) scale(1 -1)\">"));
+        assert!(frames.iter().all(|f| f.matches("<g").count() == f.matches("</g>").count()));
+        assert_ne!(frames[0], frames[FRAMES / 4]);
     }
 
     #[test]

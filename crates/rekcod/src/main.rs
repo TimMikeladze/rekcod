@@ -31,8 +31,6 @@ mod snap;
 #[cfg(target_os = "macos")]
 mod vm;
 #[cfg(target_os = "macos")]
-mod tui;
-#[cfg(target_os = "macos")]
 mod watch;
 #[cfg(target_os = "macos")]
 mod xrun;
@@ -47,9 +45,8 @@ mod xrun;
                   `rekcod start web` / `rekcod stop -t 5 web` are docker's; `rekcod docker <args>` always is."
 )]
 struct Args {
-    /// Without a command: the TUI in a terminal, help otherwise.
     #[command(subcommand)]
-    command: Option<Cmd>,
+    command: Cmd,
 }
 
 #[derive(Subcommand)]
@@ -134,8 +131,6 @@ enum Cmd {
     },
     /// Open a root shell in the VM.
     Shell,
-    /// Full-screen terminal UI: VM, containers, ports, snapshots (also bare `rekcod`).
-    Tui,
     /// Give unused data-disk space back to macOS now (also runs hourly).
     Compact,
     /// Menu bar item: status, start/stop, forwarded ports.
@@ -210,15 +205,7 @@ fn main() {
         std::process::exit(1);
     }
     let args = Args::parse();
-    let command = match args.command {
-        Some(c) => c,
-        None if unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 } => Cmd::Tui,
-        None => {
-            use clap::CommandFactory;
-            let _ = Args::command().print_help();
-            std::process::exit(2);
-        }
-    };
+    let command = args.command;
     if !matches!(command, Cmd::Daemon { .. }) {
         // Behave like other CLIs when piped into `head` (the daemon keeps Rust's SIGPIPE-ignore).
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
@@ -239,7 +226,6 @@ fn main() {
             cli::import(&paths, &from, &names, !volumes_only, !images_only, force)
         }
         Cmd::Shell => cli::shell(&paths),
-        Cmd::Tui => tui::run(paths),
         Cmd::Compact => cli::compact(&paths),
         Cmd::Menubar { install: true, .. } => menubar::install(),
         Cmd::Menubar { uninstall: true, .. } => menubar::uninstall(),
@@ -266,7 +252,7 @@ fn main() {
 mod tests {
     use super::*;
 
-    /// Every action the TUI and menu bar can run is a real CLI command line.
+    /// Every action the menu bar can run is a real CLI command line.
     #[test]
     fn every_action_is_a_cli_command() {
         use clap::Parser;

@@ -197,7 +197,18 @@ mod tests {
     #[test]
     fn control_round_trips() {
         let spaced = Control::Notify("/Users/me/My Project/a.ts".into());
-        let all = [Control::Ping, Control::Shutdown, Control::Time(1_791_735_420_830_000_000), spaced, Control::Meminfo, Control::Reclaim(1 << 30), Control::Trim, Control::Warm("/Users/me/My App".into()), Control::Stats, Control::Listeners("ab12".into())];
+        let all = [
+            Control::Ping,
+            Control::Shutdown,
+            Control::Time(1_791_735_420_830_000_000),
+            spaced,
+            Control::Meminfo,
+            Control::Reclaim(1 << 30),
+            Control::Trim,
+            Control::Warm("/Users/me/My App".into()),
+            Control::Stats,
+            Control::Listeners("ab12".into()),
+        ];
         for c in all {
             assert_eq!(Control::parse(&c.encode()), Some(c));
         }

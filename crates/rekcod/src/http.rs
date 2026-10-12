@@ -76,11 +76,8 @@ pub fn parse_head(buf: &[u8]) -> Result<Option<(u16, usize)>> {
     };
     let head = std::str::from_utf8(&buf[..end]).context("non-UTF-8 HTTP header")?;
     let status_line = head.lines().next().unwrap_or_default();
-    let status = status_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
-        .with_context(|| format!("bad status line {status_line:?}"))?;
+    let status =
+        status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).with_context(|| format!("bad status line {status_line:?}"))?;
     Ok(Some((status, end + 4)))
 }
 

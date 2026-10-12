@@ -181,16 +181,26 @@ pub fn save(paths: &Paths, explicit_project: Option<&str>, name: Option<&str>) -
         let snap = snapshot_volume(&project, &name, v);
         let labels = docker(paths, &["volume", "inspect", "--format", "{{json .Labels}}", v])?;
         let _ = docker(paths, &["volume", "rm", "-f", &snap]);
-        docker(paths, &[
-            "volume", "create",
-            "--label", &format!("{SNAP}=1"),
-            "--label", &format!("{SNAP_PROJECT}={project}"),
-            "--label", &format!("{SNAP_NAME}={name}"),
-            "--label", &format!("{SNAP_VOLUME}={v}"),
-            "--label", &format!("{SNAP_CREATED}={created}"),
-            "--label", &format!("{SNAP_LABELS}={labels}"),
-            &snap,
-        ])?;
+        docker(
+            paths,
+            &[
+                "volume",
+                "create",
+                "--label",
+                &format!("{SNAP}=1"),
+                "--label",
+                &format!("{SNAP_PROJECT}={project}"),
+                "--label",
+                &format!("{SNAP_NAME}={name}"),
+                "--label",
+                &format!("{SNAP_VOLUME}={v}"),
+                "--label",
+                &format!("{SNAP_CREATED}={created}"),
+                "--label",
+                &format!("{SNAP_LABELS}={labels}"),
+                &snap,
+            ],
+        )?;
         pairs.push((v.clone(), snap));
     }
     let running = running_containers(paths, &project)?;

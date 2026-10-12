@@ -12,8 +12,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
       - run: cargo test --workspace
       - run: cargo clippy -p rekcod -p rekcod-proto -- -D warnings
       - run: cargo clippy -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings

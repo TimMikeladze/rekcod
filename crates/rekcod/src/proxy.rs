@@ -58,9 +58,7 @@ where
             wr.write_all(&head).await?;
             return Ok(());
         }
-        let create = req.method == "POST"
-            && is_create(&req.path)
-            && (req.chunked || req.content_length.is_some_and(|n| n <= CREATE_MAX));
+        let create = req.method == "POST" && is_create(&req.path) && (req.chunked || req.content_length.is_some_and(|n| n <= CREATE_MAX));
         if create {
             let body = read_body(rd, &req).await?;
             let rewritten = rewrite_create(&body, query(&req.path)).unwrap_or(body);
@@ -242,11 +240,8 @@ where
 
 /// Characters docker accepts in volume names; everything else becomes `-`.
 fn sanitize(s: &str) -> String {
-    let out: String = s
-        .trim_matches('/')
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '-' })
-        .collect();
+    let out: String =
+        s.trim_matches('/').chars().map(|c| if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') { c } else { '-' }).collect();
     out.trim_start_matches(['-', '.', '_']).to_string()
 }
 
@@ -374,7 +369,8 @@ mod tests {
     fn untouched_without_label_and_names_without_compose() {
         assert!(rewrite_create(br#"{"Image":"x","Labels":{"a":"b"}}"#, "").is_none());
         assert!(rewrite_create(b"not json", "").is_none());
-        let out = rewrite_create(br#"{"Image":"x","HostConfig":null,"Labels":{"dev.rekcod.local":"/w/../deps"}}"#, "name=api&platform=").unwrap();
+        let out =
+            rewrite_create(br#"{"Image":"x","HostConfig":null,"Labels":{"dev.rekcod.local":"/w/../deps"}}"#, "name=api&platform=").unwrap();
         assert_eq!(mounts(&out), vec![("rekcod-local_api_deps".into(), "/deps".into())]);
         let out = rewrite_create(br#"{"Image":"x","Labels":{"dev.rekcod.local":"/d"}}"#, "").unwrap();
         assert!(mounts(&out)[0].0.starts_with("rekcod-local_"));
@@ -407,7 +403,9 @@ mod tests {
     async fn rewrites_create_between_other_requests() {
         let create = br#"{"Image":"x","Labels":{"dev.rekcod.local":"/d"}}"#;
         let mut input = b"GET /_ping HTTP/1.1\r\nHost: docker\r\n\r\n".to_vec();
-        input.extend_from_slice(format!("POST /v1.52/containers/create?name=a HTTP/1.1\r\nHost: docker\r\nContent-Length: {}\r\n\r\n", create.len()).as_bytes());
+        input.extend_from_slice(
+            format!("POST /v1.52/containers/create?name=a HTTP/1.1\r\nHost: docker\r\nContent-Length: {}\r\n\r\n", create.len()).as_bytes(),
+        );
         input.extend_from_slice(create);
         input.extend_from_slice(b"POST /build HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n");
         let seen = String::from_utf8(through_proxy(&input).await).unwrap();
@@ -422,7 +420,8 @@ mod tests {
     #[tokio::test]
     async fn chunked_create_and_raw_after_upgrade() {
         let create = br#"{"Image":"x","Labels":{"dev.rekcod.local":"/d"}}"#;
-        let mut input = format!("POST /containers/create HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", create.len()).into_bytes();
+        let mut input =
+            format!("POST /containers/create HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", create.len()).into_bytes();
         input.extend_from_slice(create);
         input.extend_from_slice(b"\r\n0\r\n\r\n");
         input.extend_from_slice(b"POST /containers/x/attach?stream=1 HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n");

@@ -210,11 +210,8 @@ impl Watch {
     /// Watches the global roots (if enabled) plus `bind_sources` not already
     /// covered by them; files are watched via their directory. Returns log lines.
     pub fn set_roots(&self, bind_sources: BTreeSet<PathBuf>) -> Vec<String> {
-        let globals: BTreeSet<PathBuf> = if self.global {
-            self.global_roots.iter().filter(|p| p.is_dir()).cloned().collect()
-        } else {
-            BTreeSet::new()
-        };
+        let globals: BTreeSet<PathBuf> =
+            if self.global { self.global_roots.iter().filter(|p| p.is_dir()).cloned().collect() } else { BTreeSet::new() };
         let mut wanted: BTreeSet<PathBuf> = bind_sources
             .into_iter()
             .filter_map(|p| if p.is_file() { p.parent().map(Path::to_path_buf) } else { Some(p) })

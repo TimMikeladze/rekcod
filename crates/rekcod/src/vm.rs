@@ -15,20 +15,13 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
-    VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment,
-    VZDiskImageSynchronizationMode,
-    VZFileHandleSerialPortAttachment,
-    VZGenericPlatformConfiguration, VZLinuxBootLoader, VZLinuxRosettaAvailability,
-    VZLinuxRosettaDirectoryShare, VZMACAddress, 
-    VZMultipleDirectoryShare, VZNATNetworkDeviceAttachment,
-    VZSharedDirectory,
-    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration,
-    VZVirtioConsoleDeviceSerialPortConfiguration, VZVirtioEntropyDeviceConfiguration,
-    VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
-    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration,
-    VZVirtioTraditionalMemoryBalloonDevice, VZVirtioTraditionalMemoryBalloonDeviceConfiguration,
-    VZVirtualMachine,
-    VZVirtualMachineConfiguration, VZVirtualMachineState,
+    VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
+    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader, VZLinuxRosettaAvailability,
+    VZLinuxRosettaDirectoryShare, VZMACAddress, VZMultipleDirectoryShare, VZNATNetworkDeviceAttachment, VZSharedDirectory,
+    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
+    VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDevice,
+    VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
 use tokio::net::UnixStream;
 use tokio::sync::oneshot;
@@ -89,9 +82,7 @@ impl Vm {
         let mut vm = None;
         let q = OnQueue(&*queue);
         queue.exec_sync(|| {
-            vm = Some(OnQueue(unsafe {
-                VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config.get(), q.get())
-            }));
+            vm = Some(OnQueue(unsafe { VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config.get(), q.get()) }));
         });
         let vm = vm.expect("exec_sync ran the closure");
         Ok(Vm { queue: queue.clone(), vm: Arc::new(vm), rosetta })
@@ -147,9 +138,7 @@ impl Vm {
         let vm = self.vm.clone();
         self.queue.exec_async(move || unsafe {
             let devices = vm.0.memoryBalloonDevices();
-            if let Some(Ok(balloon)) =
-                devices.firstObject().map(|d| d.downcast::<VZVirtioTraditionalMemoryBalloonDevice>())
-            {
+            if let Some(Ok(balloon)) = devices.firstObject().map(|d| d.downcast::<VZVirtioTraditionalMemoryBalloonDevice>()) {
                 balloon.setTargetVirtualMachineMemorySize(bytes);
             }
         });
@@ -233,12 +222,7 @@ unsafe fn disk(path: &Path) -> Result<Retained<VZStorageDeviceConfiguration>> {
         )
     }
     .map_err(|e| anyhow!("disk {}: {}", path.display(), e.localizedDescription()))?;
-    let dev = unsafe {
-        VZVirtioBlockDeviceConfiguration::initWithAttachment(
-            VZVirtioBlockDeviceConfiguration::alloc(),
-            &attachment,
-        )
-    };
+    let dev = unsafe { VZVirtioBlockDeviceConfiguration::initWithAttachment(VZVirtioBlockDeviceConfiguration::alloc(), &attachment) };
     Ok(Retained::into_super(dev))
 }
 
@@ -268,11 +252,8 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
 
         // One virtio-fs device exposing the Mac directories by name.
         let names: Vec<Retained<NSString>> = cfg.shares.iter().map(|(n, _)| NSString::from_str(n)).collect();
-        let dirs: Vec<Retained<VZSharedDirectory>> = cfg
-            .shares
-            .iter()
-            .map(|(_, p)| VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &url(p), false))
-            .collect();
+        let dirs: Vec<Retained<VZSharedDirectory>> =
+            cfg.shares.iter().map(|(_, p)| VZSharedDirectory::initWithURL_readOnly(VZSharedDirectory::alloc(), &url(p), false)).collect();
         let name_refs: Vec<&NSString> = names.iter().map(|n| &**n).collect();
         let dir_refs: Vec<&VZSharedDirectory> = dirs.iter().map(|d| &**d).collect();
         let dict = NSDictionary::from_slices(&name_refs, &dir_refs);
@@ -297,12 +278,8 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
         }
         c.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
 
-        c.setSocketDevices(&NSArray::from_retained_slice(&[Retained::into_super(
-            VZVirtioSocketDeviceConfiguration::new(),
-        )]));
-        c.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(
-            VZVirtioEntropyDeviceConfiguration::new(),
-        )]));
+        c.setSocketDevices(&NSArray::from_retained_slice(&[Retained::into_super(VZVirtioSocketDeviceConfiguration::new())]));
+        c.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(VZVirtioEntropyDeviceConfiguration::new())]));
         // Debug knob (VM freeze bisect, docs/phase2b-4.md): REKCOD_NO_BALLOON=1.
         if std::env::var_os("REKCOD_NO_BALLOON").is_none() {
             c.setMemoryBalloonDevices(&NSArray::from_retained_slice(&[Retained::into_super(
@@ -369,9 +346,7 @@ impl Conn {
                     Ok(n) => {
                         // Reader stalled or gone: end its stream (EOF) but keep
                         // reading and discarding, so the guest never blocks.
-                        if counter.fetch_add(n, Ordering::Relaxed) + n > CONN_BUFFER_MAX
-                            || tx.send(buf[..n].to_vec()).is_err()
-                        {
+                        if counter.fetch_add(n, Ordering::Relaxed) + n > CONN_BUFFER_MAX || tx.send(buf[..n].to_vec()).is_err() {
                             drop(tx);
                             while matches!(read.read(&mut buf).await, Ok(n) if n > 0) {}
                             return;

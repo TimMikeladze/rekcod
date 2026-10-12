@@ -19,14 +19,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use rekcod_proto::{
-    CAP_FS_NOTIFY, CONTROL_PORT, Control, DNS_PORT, DOCKER_PORT, FORWARD_PORT, META_PORT, Proto, REVERSE_PORT,
-    forward_header, frame, parse_reverse_header,
+    CAP_FS_NOTIFY, CONTROL_PORT, Control, DNS_PORT, DOCKER_PORT, FORWARD_PORT, META_PORT, Proto, REVERSE_PORT, forward_header, frame,
+    parse_reverse_header,
 };
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixListener};
-use tokio::sync::mpsc;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::dns;
@@ -256,9 +256,9 @@ async fn control_server(vm: Vm, listener: UnixListener) {
                 return;
             }
             let reply = match Control::parse(&line) {
-                Some(cmd @ (Control::Trim | Control::BenchMeta(_) | Control::Stats)) => control_within(&vm, cmd, Duration::from_secs(600))
-                    .await
-                    .unwrap_or_else(|e| format!("error: {e:#}")),
+                Some(cmd @ (Control::Trim | Control::BenchMeta(_) | Control::Stats)) => {
+                    control_within(&vm, cmd, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"))
+                }
                 _ => format!("error: unsupported command {:?}", line.trim_end()),
             };
             let _ = conn.get_mut().write_all(format!("{reply}\n").as_bytes()).await;
@@ -269,8 +269,8 @@ async fn control_server(vm: Vm, listener: UnixListener) {
 /// Sends one command through the daemon's control socket (used by the CLI).
 pub fn send_control(paths: &Paths, cmd: &Control) -> Result<String> {
     use std::io::{BufRead, Write};
-    let mut conn = std::os::unix::net::UnixStream::connect(paths.control_socket())
-        .context("connect to the rekcod daemon (is rekcod running?)")?;
+    let mut conn =
+        std::os::unix::net::UnixStream::connect(paths.control_socket()).context("connect to the rekcod daemon (is rekcod running?)")?;
     conn.write_all(cmd.encode().as_bytes())?;
     let mut reply = String::new();
     std::io::BufReader::new(conn).read_line(&mut reply)?;
@@ -288,11 +288,8 @@ async fn memory_manager(vm: Vm, max: u64, status: Arc<Status>) {
         tokio::time::sleep(Duration::from_secs(1)).await;
         tick = tick.wrapping_add(1);
         // kern.memorystatus_vm_pressure_level: 1 normal, 2 warning, 4 critical.
-        let pressure = tick.is_multiple_of(10)
-            && crate::cli::sysctl_u64("kern.memorystatus_vm_pressure_level").unwrap_or(1) & 0xff >= 2;
-        if pressure
-            && let Some((_, cached)) = control(&vm, Control::Meminfo).await.ok().as_deref().and_then(memory::parse_meminfo)
-        {
+        let pressure = tick.is_multiple_of(10) && crate::cli::sysctl_u64("kern.memorystatus_vm_pressure_level").unwrap_or(1) & 0xff >= 2;
+        if pressure && let Some((_, cached)) = control(&vm, Control::Meminfo).await.ok().as_deref().and_then(memory::parse_meminfo) {
             let _ = control(&vm, Control::Reclaim(cached / 2)).await;
             log!("macOS memory pressure: reclaimed guest page cache");
         }
@@ -434,7 +431,8 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
         if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
             buf.truncate(n);
             // Truncated (TC): the full answer only comes over TCP.
-            if buf.len() > 2 && buf[2] & 0x02 != 0
+            if buf.len() > 2
+                && buf[2] & 0x02 != 0
                 && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
             {
                 return Some(full);
@@ -611,8 +609,7 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     *status.autoport.lock().unwrap() = ports::autoport_containers(&body)?;
     let binds = watch::bind_sources(&body)?;
     if status.fs_cache {
-        let new: Vec<PathBuf> =
-            binds.difference(&status.binds.lock().unwrap()).filter(|p| p.is_dir()).cloned().collect();
+        let new: Vec<PathBuf> = binds.difference(&status.binds.lock().unwrap()).filter(|p| p.is_dir()).cloned().collect();
         for path in &new {
             if let Some(p) = path.to_str() {
                 let _ = control(vm, Control::Warm(p.to_string())).await;

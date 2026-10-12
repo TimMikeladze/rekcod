@@ -49,7 +49,6 @@ impl Kind {
         Kind::SnapRemove,
         Kind::SocketInstall,
     ];
-
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,10 +204,8 @@ impl Model {
         let raw = crate::cli::api_get(paths, "/containers/json?all=1").unwrap_or_default();
         let containers = parse_containers(&raw);
         let filter = "%7B%22label%22%3A%5B%22dev.rekcod.snap%22%5D%7D"; // {"label":["dev.rekcod.snap"]}
-        let snapshots = crate::cli::api_get(paths, &format!("/volumes?filters={filter}"))
-            .ok()
-            .map(|b| parse_snapshots(&b))
-            .unwrap_or_default();
+        let snapshots =
+            crate::cli::api_get(paths, &format!("/volumes?filters={filter}")).ok().map(|b| parse_snapshots(&b)).unwrap_or_default();
         let projects = projects(&containers, &raw, snapshots);
         Model { running, status, containers, ports, projects, sandbox, socket_installed }
     }
@@ -329,9 +326,7 @@ pub fn vm_actions(running: bool, socket_installed: bool) -> Vec<Action> {
     };
     if !socket_installed {
         // sudo asks for a password, so it runs in Terminal.
-        out.push(
-            Action::rekcod(Kind::SocketInstall, "Use rekcod for /var/run/docker.sock", &["socket", "install"]).interactive(),
-        );
+        out.push(Action::rekcod(Kind::SocketInstall, "Use rekcod for /var/run/docker.sock", &["socket", "install"]).interactive());
     }
     out
 }
@@ -454,7 +449,6 @@ pub mod tests {
             assert!(actions.iter().any(|a| a.kind == kind), "{kind:?} is not offered by any *_actions list");
         }
     }
-
 
     #[test]
     fn destructive_actions_ask_first() {

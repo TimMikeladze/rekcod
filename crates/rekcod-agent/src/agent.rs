@@ -6,8 +6,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use rekcod_proto::{
-    CAP_FS_NOTIFY, CONTROL_PORT, Control, DNS_PORT, DNS_STUB_ADDR, DOCKER_PORT, FORWARD_PORT, META_PORT, Proto,
-    REVERSE_LISTEN_PORT, REVERSE_PORT, frame, parse_forward_header, reverse_header,
+    CAP_FS_NOTIFY, CONTROL_PORT, Control, DNS_PORT, DNS_STUB_ADDR, DOCKER_PORT, FORWARD_PORT, META_PORT, Proto, REVERSE_LISTEN_PORT,
+    REVERSE_PORT, frame, parse_forward_header, reverse_header,
 };
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixStream};
@@ -19,37 +19,33 @@ const DOCKER_SOCK: &str = "/var/run/docker.sock";
 const CLOCK_SLACK_NS: i128 = 100_000_000;
 
 pub fn run() -> Result<()> {
-    tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?
-        .block_on(async {
-            let dns = Arc::new(Dns {
-                sock: UdpSocket::bind(DNS_STUB_ADDR).await.context("bind DNS stub")?,
-                writer: Mutex::default(),
-                pending: Mutex::default(),
-                next_id: AtomicU16::new(1),
-            });
-            let (stub, tcp_stub) = (dns.clone(), dns.clone());
-            let (park, parked) = mpsc::unbounded_channel();
-            let parked = Arc::new(tokio::sync::Mutex::new(parked));
-            tokio::spawn(trim_periodically());
-            tokio::try_join!(
-                serve(DOCKER_PORT, docker),
-                serve(FORWARD_PORT, forward),
-                serve(CONTROL_PORT, control),
-                serve(DNS_PORT, move |s| dns_channel(s, dns.clone())),
-                serve(REVERSE_PORT, move |s| {
-                    let _ = park.send(s);
-                    async { Ok(()) }
-                }),
-                serve(META_PORT, crate::meta::serve_client),
-                reverse_listener(parked),
-                dns_stub(stub),
-                dns_tcp_stub(tcp_stub),
-            )?;
-            Ok(())
-        })
+    tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build()?.block_on(async {
+        let dns = Arc::new(Dns {
+            sock: UdpSocket::bind(DNS_STUB_ADDR).await.context("bind DNS stub")?,
+            writer: Mutex::default(),
+            pending: Mutex::default(),
+            next_id: AtomicU16::new(1),
+        });
+        let (stub, tcp_stub) = (dns.clone(), dns.clone());
+        let (park, parked) = mpsc::unbounded_channel();
+        let parked = Arc::new(tokio::sync::Mutex::new(parked));
+        tokio::spawn(trim_periodically());
+        tokio::try_join!(
+            serve(DOCKER_PORT, docker),
+            serve(FORWARD_PORT, forward),
+            serve(CONTROL_PORT, control),
+            serve(DNS_PORT, move |s| dns_channel(s, dns.clone())),
+            serve(REVERSE_PORT, move |s| {
+                let _ = park.send(s);
+                async { Ok(()) }
+            }),
+            serve(META_PORT, crate::meta::serve_client),
+            reverse_listener(parked),
+            dns_stub(stub),
+            dns_tcp_stub(tcp_stub),
+        )?;
+        Ok(())
+    })
 }
 
 async fn serve<F, Fut>(port: u32, handler: F) -> Result<()>
@@ -57,8 +53,7 @@ where
     F: Fn(VsockStream) -> Fut,
     Fut: Future<Output = Result<()>> + Send + 'static,
 {
-    let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port))
-        .with_context(|| format!("bind vsock port {port}"))?;
+    let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port)).with_context(|| format!("bind vsock port {port}"))?;
     eprintln!("rekcod-agent: listening on vsock port {port}");
     loop {
         let (stream, _) = listener.accept().await?;
@@ -86,9 +81,7 @@ async fn forward(vsock: VsockStream) -> Result<()> {
     if proto == Proto::Udp {
         return forward_udp(vsock, port).await;
     }
-    let mut tcp = TcpStream::connect(("127.0.0.1", port))
-        .await
-        .with_context(|| format!("connect 127.0.0.1:{port}"))?;
+    let mut tcp = TcpStream::connect(("127.0.0.1", port)).await.with_context(|| format!("connect 127.0.0.1:{port}"))?;
     tcp.set_nodelay(true)?;
     copy_bidirectional(&mut vsock, &mut tcp).await?;
     Ok(())
@@ -176,9 +169,7 @@ fn original_dst_port(tcp: &TcpStream) -> Result<u16> {
     let mut addr: libc::sockaddr_in = unsafe { std::mem::zeroed() };
     let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
     // SAFETY: valid fd and an out-buffer of the advertised size.
-    let rc = unsafe {
-        libc::getsockopt(tcp.as_raw_fd(), libc::SOL_IP, SO_ORIGINAL_DST, (&raw mut addr).cast(), &mut len)
-    };
+    let rc = unsafe { libc::getsockopt(tcp.as_raw_fd(), libc::SOL_IP, SO_ORIGINAL_DST, (&raw mut addr).cast(), &mut len) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("SO_ORIGINAL_DST");
     }
@@ -304,10 +295,7 @@ fn warm(path: String) -> String {
         unsafe { libc::setpriority(libc::PRIO_PROCESS, libc::gettid() as libc::id_t, 10) };
         let t0 = Instant::now();
         let (entries, dirs) = warm_tree(std::path::Path::new(&path));
-        eprintln!(
-            "rekcod-agent: warmed {path}: {entries} entries in {dirs} dirs, {} ms",
-            t0.elapsed().as_millis()
-        );
+        eprintln!("rekcod-agent: warmed {path}: {entries} entries in {dirs} dirs, {} ms", t0.elapsed().as_millis());
         WARMING.lock().unwrap().retain(|p| p != &path);
     });
     "ok".into()
@@ -322,34 +310,36 @@ fn warm_tree(root: &std::path::Path) -> (usize, usize) {
     let (entries, dirs, busy) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
     std::thread::scope(|s| {
         for _ in 0..8 {
-            s.spawn(|| loop {
-                let next = {
-                    let mut q = queue.lock().unwrap();
-                    let d = q.pop();
-                    if d.is_some() {
-                        busy.fetch_add(1, Ordering::SeqCst);
-                    }
-                    d
-                };
-                let Some(dir) = next else {
-                    if busy.load(Ordering::SeqCst) == 0 {
-                        return;
-                    }
-                    std::thread::sleep(Duration::from_millis(1));
-                    continue;
-                };
-                if entries.load(Ordering::Relaxed) < WARM_MAX_ENTRIES
-                    && let Ok(rd) = std::fs::read_dir(&dir)
-                {
-                    dirs.fetch_add(1, Ordering::Relaxed);
-                    for entry in rd.flatten() {
-                        entries.fetch_add(1, Ordering::Relaxed);
-                        if std::fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
-                            queue.lock().unwrap().push(entry.path());
+            s.spawn(|| {
+                loop {
+                    let next = {
+                        let mut q = queue.lock().unwrap();
+                        let d = q.pop();
+                        if d.is_some() {
+                            busy.fetch_add(1, Ordering::SeqCst);
+                        }
+                        d
+                    };
+                    let Some(dir) = next else {
+                        if busy.load(Ordering::SeqCst) == 0 {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                        continue;
+                    };
+                    if entries.load(Ordering::Relaxed) < WARM_MAX_ENTRIES
+                        && let Ok(rd) = std::fs::read_dir(&dir)
+                    {
+                        dirs.fetch_add(1, Ordering::Relaxed);
+                        for entry in rd.flatten() {
+                            entries.fetch_add(1, Ordering::Relaxed);
+                            if std::fs::symlink_metadata(entry.path()).is_ok_and(|m| m.is_dir()) {
+                                queue.lock().unwrap().push(entry.path());
+                            }
                         }
                     }
+                    busy.fetch_sub(1, Ordering::SeqCst);
                 }
-                busy.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
@@ -438,11 +428,7 @@ fn stats() -> String {
         size = st.f_blocks as u64 * st.f_frsize as u64;
         used = size.saturating_sub(st.f_bfree as u64 * st.f_frsize as u64);
     }
-    format!(
-        "{{\"fs_requests\":{{{}}},\"warming\":[{}],\"disk_used\":{used},\"disk_size\":{size}}}",
-        ops.join(","),
-        warming.join(",")
-    )
+    format!("{{\"fs_requests\":{{{}}},\"warming\":[{}],\"disk_used\":{used},\"disk_size\":{size}}}", ops.join(","), warming.join(","))
 }
 
 // ------------------------------------------------------------- trimming
@@ -488,10 +474,7 @@ fn set_clock(host_ns: u128) -> String {
     if drift.abs() < CLOCK_SLACK_NS {
         return "ok".into();
     }
-    let ts = libc::timespec {
-        tv_sec: (host_ns / 1_000_000_000) as _,
-        tv_nsec: (host_ns % 1_000_000_000) as _,
-    };
+    let ts = libc::timespec { tv_sec: (host_ns / 1_000_000_000) as _, tv_nsec: (host_ns % 1_000_000_000) as _ };
     // SAFETY: plain syscall with a valid timespec.
     if unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) } == 0 {
         format!("ok adjusted {}ms", drift / 1_000_000)

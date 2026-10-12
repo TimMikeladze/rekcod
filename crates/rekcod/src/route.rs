@@ -2,7 +2,8 @@
 //! (docs/cli-passthrough.md).
 
 /// rekcod's own top-level commands that docker doesn't have.
-const OWN: &[&str] = &["status", "shell", "compact", "menubar", "snap", "socket", "x", "help", "daemon", "research", "-h", "--help", "-V", "--version"];
+const OWN: &[&str] =
+    &["status", "shell", "compact", "menubar", "snap", "socket", "x", "help", "daemon", "research", "-h", "--help", "-V", "--version"];
 
 /// `start`/`stop` flags; anything else means docker's container start/stop.
 const VM_FLAGS_WITH_VALUE: &[&str] = &["--cpus", "--memory", "--disk"];
@@ -47,7 +48,21 @@ mod tests {
 
     #[test]
     fn own_commands_stay() {
-        for s in ["", "start", "stop", "start --cpus 4 --memory=8", "stop --no-switch", "status", "shell", "menubar --install", "--version", "import --from orbstack", "import --from=x redis:7", "snap save", "x npm run dev"] {
+        for s in [
+            "",
+            "start",
+            "stop",
+            "start --cpus 4 --memory=8",
+            "stop --no-switch",
+            "status",
+            "shell",
+            "menubar --install",
+            "--version",
+            "import --from orbstack",
+            "import --from=x redis:7",
+            "snap save",
+            "x npm run dev",
+        ] {
             assert_eq!(route(s), None, "{s:?}");
         }
     }

@@ -4,17 +4,17 @@
 //! `actions::Action` (a `rekcod` command).
 
 use std::cell::{Cell, OnceCell, RefCell};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSCellImagePosition, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuDelegate,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSImage, NSMenu, NSMenuDelegate,
     NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSSize, NSString, NSTimer};
@@ -140,7 +140,13 @@ pub fn entries(m: &Model) -> Vec<Entry> {
         out.push(Entry::Label("Ports".into()));
     }
     for p in &m.ports {
-        let name = format!("localhost:{}{} → {}{}", p.port, if p.udp { "/udp" } else { "" }, p.container, if p.sandbox { " (sandbox)" } else { "" });
+        let name = format!(
+            "localhost:{}{} → {}{}",
+            p.port,
+            if p.udp { "/udp" } else { "" },
+            p.container,
+            if p.sandbox { " (sandbox)" } else { "" }
+        );
         match (&p.error, actions::port_actions(p).into_iter().next()) {
             (Some(e), _) => out.push(Entry::Label(format!("{name}  (not forwarded: {e})"))),
             (None, Some(open)) => out.push(Entry::Action(Action { label: name, ..open })),
@@ -153,7 +159,10 @@ pub fn entries(m: &Model) -> Vec<Entry> {
         .iter()
         .map(|c| {
             let dot = if c.state == "running" { "●" } else { "○" };
-            Entry::Submenu(format!("{dot} {}  ({})", c.name, c.image), actions::container_actions(c).into_iter().map(Entry::Action).collect())
+            Entry::Submenu(
+                format!("{dot} {}  ({})", c.name, c.image),
+                actions::container_actions(c).into_iter().map(Entry::Action).collect(),
+            )
         })
         .collect();
     out.push(if containers.is_empty() {
@@ -204,9 +213,8 @@ impl Target {
 
     fn item(&self, text: &str, action: Option<Sel>) -> Retained<NSMenuItem> {
         let mtm = self.mtm();
-        let item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), &NSString::from_str(text), action, &NSString::new())
-        };
+        let item =
+            unsafe { NSMenuItem::initWithTitle_action_keyEquivalent(mtm.alloc(), &NSString::from_str(text), action, &NSString::new()) };
         if action.is_some() {
             unsafe { item.setTarget(Some(self)) };
         } else {
@@ -299,8 +307,7 @@ impl Target {
     fn step_animation(&self) {
         let mtm = self.mtm();
         let ivars = self.ivars();
-        let (Some(button), Some(frames), Some(icon)) =
-            (ivars.item.get().and_then(|i| i.button(mtm)), ivars.frames.get(), ivars.icon.get())
+        let (Some(button), Some(frames), Some(icon)) = (ivars.item.get().and_then(|i| i.button(mtm)), ivars.frames.get(), ivars.icon.get())
         else {
             return;
         };
@@ -382,18 +389,18 @@ pub fn run(paths: Paths) -> Result<()> {
     // Checked off the main thread (a ping can take a moment).
     {
         let (paths, flag) = (target.ivars().paths.clone(), target.ivars().transitioning.clone());
-        std::thread::spawn(move || loop {
-            let alive = crate::cli::running_pid(&paths).is_some();
-            let answering = alive && crate::cli::api_get(&paths, "/_ping").is_ok_and(|b| b == b"OK");
-            flag.store(alive && !answering, Ordering::SeqCst);
-            std::thread::sleep(std::time::Duration::from_millis(500));
+        std::thread::spawn(move || {
+            loop {
+                let alive = crate::cli::running_pid(&paths).is_some();
+                let answering = alive && crate::cli::api_get(&paths, "/_ping").is_ok_and(|b| b == b"OK");
+                flag.store(alive && !answering, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
         });
     }
     let _ = target.ivars().item.set(item);
     target.update_title();
-    let _timer = unsafe {
-        NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(2.0, &target, sel!(tick:), None, true)
-    };
+    let _timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(2.0, &target, sel!(tick:), None, true) };
     let _animation = unsafe {
         NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(FRAME_SECS, &target, sel!(animate:), None, true)
     };
@@ -496,7 +503,15 @@ mod tests {
     #[test]
     fn menu_offers_every_action_kind() {
         let (containers, ports, projects) = crate::actions::tests::sample();
-        let model = Model { running: true, status: serde_json::json!({"cpus": 6, "memory_mib": 8192}), containers, ports, projects, sandbox: None, socket_installed: false };
+        let model = Model {
+            running: true,
+            status: serde_json::json!({"cpus": 6, "memory_mib": 8192}),
+            containers,
+            ports,
+            projects,
+            sandbox: None,
+            socket_installed: false,
+        };
         fn kinds(e: &[Entry], out: &mut Vec<crate::actions::Kind>) {
             for e in e {
                 match e {

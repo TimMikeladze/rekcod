@@ -63,9 +63,7 @@ pub fn on_stop(paths: &Paths) -> Result<()> {
     if std::fs::read_link(&link).ok().as_deref() != Some(paths.socket().as_path()) {
         return Ok(());
     }
-    let prev = std::fs::read_to_string(prev_file(paths))
-        .or_else(|_| std::fs::read_to_string(original_file(paths)))
-        .unwrap_or_default();
+    let prev = std::fs::read_to_string(prev_file(paths)).or_else(|_| std::fs::read_to_string(original_file(paths))).unwrap_or_default();
     let prev = prev.trim();
     if prev.is_empty() {
         std::fs::remove_file(&link)?; // nothing else ever had it

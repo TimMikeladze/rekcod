@@ -186,6 +186,7 @@ that can run VMs, so it runs locally.
 
 ```sh
 cargo test --workspace                       # unit tests
+cargo fmt --all --check                      # formatting (rustfmt.toml; CI enforces it)
 scripts/e2e.sh                               # real CLI + compose against rekcod
 E2E_IMPORT_FROM=orbstack scripts/e2e.sh      # also exercises import
 python3 bench/headroom.py --context rekcod   # file-sharing benchmark (compare --context orbstack)

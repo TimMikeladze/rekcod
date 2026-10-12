@@ -151,13 +151,10 @@ fn version_for(dir: &Path, rt: Runtime) -> Option<String> {
         return from_tools;
     }
     match rt {
-        Runtime::Node => read(dir, ".nvmrc")
-            .or_else(|| read(dir, ".node-version"))
-            .and_then(|v| clean_version(&v, false))
-            .or_else(|| {
-                let pkg: serde_json::Value = serde_json::from_str(&read(dir, "package.json")?).ok()?;
-                clean_version(pkg["engines"]["node"].as_str()?, false)
-            }),
+        Runtime::Node => read(dir, ".nvmrc").or_else(|| read(dir, ".node-version")).and_then(|v| clean_version(&v, false)).or_else(|| {
+            let pkg: serde_json::Value = serde_json::from_str(&read(dir, "package.json")?).ok()?;
+            clean_version(pkg["engines"]["node"].as_str()?, false)
+        }),
         Runtime::Bun => read(dir, ".bun-version").and_then(|v| clean_version(&v, true)),
         Runtime::Python => read(dir, ".python-version").and_then(|v| clean_version(&v, true)).or_else(|| {
             let text = read(dir, "pyproject.toml")?;
@@ -210,7 +207,8 @@ pub fn plan(dir: &Path, cmd: &[String]) -> Option<Plan> {
 
 /// Stable per-project volume name for a dependency dir.
 pub fn local_volume(project: &Path, dir: &str) -> String {
-    let hash = project.as_os_str().as_encoded_bytes().iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
+    let hash =
+        project.as_os_str().as_encoded_bytes().iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3));
     let base: String = project
         .file_name()
         .and_then(|n| n.to_str())
@@ -278,7 +276,12 @@ pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, 
     }
     a.push(plan.image.clone());
     if plan.corepack {
-        a.extend(["sh".into(), "-c".into(), "corepack enable >/dev/null 2>&1 || npm install -g --silent pnpm yarn >/dev/null 2>&1; exec \"$@\"".into(), "--".into()]);
+        a.extend([
+            "sh".into(),
+            "-c".into(),
+            "corepack enable >/dev/null 2>&1 || npm install -g --silent pnpm yarn >/dev/null 2>&1; exec \"$@\"".into(),
+            "--".into(),
+        ]);
     }
     a.extend(cmd.iter().cloned());
     a
@@ -294,9 +297,7 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
     }
     let plan = match &opts.image {
         Some(image) => Plan { image: image.clone(), local_dirs: vec![], caches: vec![], corepack: false },
-        None => plan(&project, cmd).with_context(|| {
-            format!("can't tell which runtime `{}` needs here; pass --image <image>", cmd[0])
-        })?,
+        None => plan(&project, cmd).with_context(|| format!("can't tell which runtime `{}` needs here; pass --image <image>", cmd[0]))?,
     };
     for s in &opts.secrets {
         if std::env::var_os(s).is_none() {
@@ -366,7 +367,11 @@ mod tests {
     use super::*;
 
     fn project(files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("rekcod-x-{}-{}", std::process::id(), files.len() + files.first().map_or(0, |f| f.0.len() * 31 + f.1.len())));
+        let dir = std::env::temp_dir().join(format!(
+            "rekcod-x-{}-{}",
+            std::process::id(),
+            files.len() + files.first().map_or(0, |f| f.0.len() * 31 + f.1.len())
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         for (name, body) in files {
@@ -390,7 +395,10 @@ mod tests {
         assert_eq!(image(&[("package.json", "{}")], "node x.js"), "node:lts-slim");
         assert_eq!(image(&[("bun.lock", "")], "bun dev"), "oven/bun:1");
         assert_eq!(image(&[(".python-version", "3.12.4")], "python app.py"), "python:3.12-slim");
-        assert_eq!(image(&[("pyproject.toml", "requires-python = \">=3.11\"\n"), ("uv.lock", "")], "uv run app"), "ghcr.io/astral-sh/uv:python3.11-bookworm-slim");
+        assert_eq!(
+            image(&[("pyproject.toml", "requires-python = \">=3.11\"\n"), ("uv.lock", "")], "uv run app"),
+            "ghcr.io/astral-sh/uv:python3.11-bookworm-slim"
+        );
         assert_eq!(image(&[("go.mod", "module x\n\ngo 1.23.2\n")], "go test ./..."), "golang:1.23");
         assert_eq!(image(&[(".tool-versions", "nodejs 18.19.0\npython 3.11.2\n")], "make"), "node:18-slim");
         assert_eq!(image(&[("mise.toml", "[tools]\npython = \"3.10\"\n")], "pytest"), "python:3.10-slim");
@@ -403,7 +411,16 @@ mod tests {
     fn docker_args_mount_project_and_deps() {
         let project = Path::new("/Users/me/My App");
         let plan = Plan { image: "node:22-slim".into(), local_dirs: vec!["node_modules"], caches: vec![], corepack: true };
-        let opts = Options { image: None, publish: vec![], env: vec!["A=1".into()], no_autoports: false, sandbox: false, offline: false, secrets: vec!["TOKEN".into()], keep: false };
+        let opts = Options {
+            image: None,
+            publish: vec![],
+            env: vec!["A=1".into()],
+            no_autoports: false,
+            sandbox: false,
+            offline: false,
+            secrets: vec!["TOKEN".into()],
+            keep: false,
+        };
         let a = docker_args(project, &["pnpm".into(), "dev".into()], &plan, &opts, false).join(" ");
         assert!(a.contains("--network host --label dev.rekcod.autoports=1"), "{a}");
         assert!(a.contains("-v /Users/me/My App:/Users/me/My App -w /Users/me/My App"), "{a}");

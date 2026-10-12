@@ -38,9 +38,7 @@ pub(crate) fn sysctl_u64(name: &str) -> Option<u64> {
     let name = std::ffi::CString::new(name).ok()?;
     let mut value: u64 = 0;
     let mut len = std::mem::size_of::<u64>();
-    let rc = unsafe {
-        libc::sysctlbyname(name.as_ptr(), (&mut value as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0)
-    };
+    let rc = unsafe { libc::sysctlbyname(name.as_ptr(), (&mut value as *mut u64).cast(), &mut len, std::ptr::null_mut(), 0) };
     (rc == 0).then_some(value)
 }
 
@@ -288,10 +286,8 @@ pub(crate) fn status_value(paths: &Paths) -> serde_json::Value {
     use serde_json::json;
     use std::os::unix::fs::MetadataExt;
     let Some(pid) = running_pid(paths) else { return json!({"running": false}) };
-    let file: serde_json::Value =
-        std::fs::read(paths.status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    let version: serde_json::Value =
-        api_get(paths, "/version").ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let file: serde_json::Value = std::fs::read(paths.status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let version: serde_json::Value = api_get(paths, "/version").ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
     // Older guests answer `error: ...`; their stats are just missing.
     let stats: serde_json::Value = crate::daemon::send_control(paths, &rekcod_proto::Control::Stats)
         .ok()
@@ -425,7 +421,12 @@ pub fn compact(paths: &Paths) -> Result<()> {
     }
     let after = used();
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
-    println!("data disk: {:.2} GiB -> {:.2} GiB on the Mac ({:.2} GiB returned)", gib(before), gib(after), gib(before.saturating_sub(after)));
+    println!(
+        "data disk: {:.2} GiB -> {:.2} GiB on the Mac ({:.2} GiB returned)",
+        gib(before),
+        gib(after),
+        gib(before.saturating_sub(after))
+    );
     Ok(())
 }
 
@@ -463,9 +464,8 @@ fn is_anonymous_volume(name: &str) -> bool {
 /// through `docker run` stdout wedges Docker Desktop's API after a few hundred
 /// MB, and a tar file on a shared Mac directory can be read stale by the guest.
 fn copy_volume(src: &[&str], dst: &[&str], name: &str) -> Result<()> {
-    let helper = |ctx: &[&str], mount: &str| -> Result<String> {
-        docker::run_ok(&[ctx, &["create", "-v", mount, HELPER_IMAGE, "true"]].concat())
-    };
+    let helper =
+        |ctx: &[&str], mount: &str| -> Result<String> { docker::run_ok(&[ctx, &["create", "-v", mount, HELPER_IMAGE, "true"]].concat()) };
     let from = helper(src, &format!("{name}:/v:ro"))?;
     let result = helper(dst, &format!("{name}:/v")).and_then(|to| {
         // The target may hold a previous partial copy (or data under --force).

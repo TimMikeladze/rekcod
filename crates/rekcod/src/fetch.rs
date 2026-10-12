@@ -44,9 +44,8 @@ pub fn ensure_guest(rekcod_home: &Path) -> Result<Option<PathBuf>> {
     let tmp = parent.join(format!(".download-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
-    let result = download(gv, sha, &tmp).and_then(|()| {
-        std::fs::rename(tmp.join("unpacked"), &dir).with_context(|| format!("install {}", dir.display()))
-    });
+    let result = download(gv, sha, &tmp)
+        .and_then(|()| std::fs::rename(tmp.join("unpacked"), &dir).with_context(|| format!("install {}", dir.display())));
     let _ = std::fs::remove_dir_all(&tmp);
     result.map(|()| Some(dir))
 }
@@ -61,10 +60,7 @@ fn download(gv: &str, sha: &str, tmp: &Path) -> Result<()> {
     let curl = Command::new("curl").args(["-fL", "--progress-bar", "-o"]).arg(&tarball).arg(&url).status();
     if !curl.is_ok_and(|s| s.success()) {
         // Fallback for networks where curl to GitHub fails but an authenticated gh works.
-        let gh = Command::new("gh")
-            .args(["release", "download", &format!("v{version}"), "-R", REPO, "-p", &file, "-D"])
-            .arg(tmp)
-            .status();
+        let gh = Command::new("gh").args(["release", "download", &format!("v{version}"), "-R", REPO, "-p", &file, "-D"]).arg(tmp).status();
         if !gh.is_ok_and(|s| s.success()) {
             bail!("could not download {url} (check your connection, or set REKCOD_RELEASE_URL)");
         }

@@ -2,7 +2,7 @@
 //! (docs/cli-passthrough.md).
 
 /// rekcod's own top-level commands that docker doesn't have.
-const OWN: &[&str] = &["status", "shell", "compact", "menubar", "snap", "x", "help", "daemon", "research", "-h", "--help", "-V", "--version"];
+const OWN: &[&str] = &["status", "shell", "compact", "menubar", "snap", "socket", "x", "help", "daemon", "research", "-h", "--help", "-V", "--version"];
 
 /// `start`/`stop` flags; anything else means docker's container start/stop.
 const VM_FLAGS_WITH_VALUE: &[&str] = &["--cpus", "--memory", "--disk"];

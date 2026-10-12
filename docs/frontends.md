@@ -32,6 +32,7 @@ how that's enforced.
 | Start / stop VM | `start` / `stop` | top of menu |
 | Compact disk | `compact` | top of menu |
 | Root shell | `shell` | top of menu (opens Terminal) |
+| Route /var/run/docker.sock to rekcod | `socket install` | top of menu while not installed (opens Terminal for sudo) |
 | Containers: start, stop, restart, remove, logs | `rekcod start/stop/restart/rm -f/logs -f <name>` | Containers › container |
 | Ports: open in browser | `open http://localhost:N` | Ports |
 | Snapshots: save, restore, delete | `snap save/restore/rm -p <project>` | Snapshots › project |

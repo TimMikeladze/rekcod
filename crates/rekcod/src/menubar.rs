@@ -128,7 +128,7 @@ pub fn entries(m: &Model) -> Vec<Entry> {
     } else {
         out.push(Entry::Label("rekcod is stopped".into()));
     }
-    let vm = actions::vm_actions(m.running);
+    let vm = actions::vm_actions(m.running, m.socket_installed);
     out.extend(vm.into_iter().map(Entry::Action));
     if !m.running {
         return out;
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn menu_offers_every_action_kind() {
         let (containers, ports, projects) = crate::actions::tests::sample();
-        let model = Model { running: true, status: serde_json::json!({"cpus": 6, "memory_mib": 8192}), containers, ports, projects, sandbox: None };
+        let model = Model { running: true, status: serde_json::json!({"cpus": 6, "memory_mib": 8192}), containers, ports, projects, sandbox: None, socket_installed: false };
         fn kinds(e: &[Entry], out: &mut Vec<crate::actions::Kind>) {
             for e in e {
                 match e {

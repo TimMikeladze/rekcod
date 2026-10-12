@@ -145,6 +145,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod status [--json]` | Versions, VM size, forwarded ports (and any that couldn't be bound), data-disk use in the VM and on the Mac, file-cache trips to macOS, warming in progress, the sandbox VM. `--json` is the scriptable form |
 | `rekcod snap save\|restore\|ls\|rm [NAME] [-p PROJECT]` | Volume snapshots of a compose project (above) |
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
+| `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
 | `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
@@ -154,7 +155,11 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 
 `start`/`stop` with a container name or docker flag (`rekcod stop -t 5 web`) and `import`
 without `--from` are docker's. `REKCOD_DOCKER_CLI=/path/to/docker` picks the CLI.
-Other API clients: `export DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock`.
+Clients that ignore docker contexts (oxker, SDKs, IDE plugins) dial `/var/run/docker.sock`.
+The first `rekcod start` in a terminal sets this up (one password prompt; or run `rekcod socket install` later). From then on `rekcod start` routes
+that socket to rekcod and `rekcod stop` hands it back to whatever had it (OrbStack, Docker Desktop).
+`rekcod socket uninstall` undoes it. See [docs/default-socket.md](docs/default-socket.md).
+Or per shell: `export DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock`.
 If `DOCKER_HOST` is already set, it overrides contexts, and `rekcod start` warns you.
 
 ## Build

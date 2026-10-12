@@ -192,6 +192,8 @@ pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_g
     if !docker::available() {
         println!("no docker CLI installed: use `rekcod <docker command>` (e.g. `rekcod ps`, `rekcod compose up`),");
         println!("or point other clients at it: export DOCKER_HOST={}", paths.docker_host());
+        // Default socket still works for API clients without the CLI.
+        default_socket_on_start(paths, no_switch)?;
         return Ok(());
     }
     docker::ensure_context(&paths.docker_host())?;
@@ -207,8 +209,33 @@ pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_g
             println!("docker context: {CONTEXT}");
         }
     }
+    default_socket_on_start(paths, no_switch)?;
     if std::env::var_os("DOCKER_HOST").is_some() {
         println!("warning: DOCKER_HOST is set and overrides docker contexts; `unset DOCKER_HOST` to use rekcod");
+    }
+    Ok(())
+}
+
+fn default_socket_on_start(paths: &Paths, no_switch: bool) -> Result<()> {
+    if no_switch {
+        return Ok(());
+    }
+    if crate::syssock::on_start(paths)? {
+        println!("default socket: rekcod (/var/run/docker.sock, for clients that ignore contexts)");
+        return Ok(());
+    }
+    // First start from a terminal: set it up (sudo asks once). Never again after that,
+    // whether it worked or not; the menu bar (no terminal) only shows the menu item.
+    let asked = paths.home.join("default.sock.asked");
+    let tty = unsafe { libc::isatty(0) } == 1;
+    if tty && !asked.exists() {
+        std::fs::write(&asked, "")?;
+        println!("routing /var/run/docker.sock to rekcod too, for clients that ignore docker contexts");
+        if let Err(e) = crate::syssock::install(paths, true) {
+            println!("skipped ({e:#}); run `rekcod socket install` later");
+        }
+    } else {
+        println!("tip: `rekcod socket install` routes /var/run/docker.sock here too (oxker, SDKs, IDE plugins)");
     }
     Ok(())
 }
@@ -232,6 +259,9 @@ pub fn stop(paths: &Paths, no_switch: bool) -> Result<()> {
         }
         docker::use_context(&previous)?;
         println!("docker context: {previous}");
+    }
+    if !no_switch {
+        crate::syssock::on_stop(paths)?;
     }
     Ok(())
 }
@@ -286,6 +316,7 @@ pub(crate) fn status_value(paths: &Paths) -> serde_json::Value {
     if let Some(project) = file.get("project") {
         v["project"] = project.clone();
     }
+    v["default_socket"] = crate::syssock::state(paths).into();
     if docker::available() {
         v["context"] = docker::current_context().ok().into();
     }
@@ -366,6 +397,7 @@ pub fn status(paths: &Paths, json: bool) -> Result<()> {
     if let Some(c) = v["context"].as_str() {
         println!("  context   {c}");
     }
+    println!("  default   /var/run/docker.sock: {}", s("default_socket"));
     let ports = port_lines(v["ports"].as_array().map(Vec::as_slice).unwrap_or_default());
     if ports.is_empty() {
         println!("  ports     none published");

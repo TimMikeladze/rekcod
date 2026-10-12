@@ -27,12 +27,13 @@ pub enum Kind {
     SnapSave,
     SnapRestore,
     SnapRemove,
+    SocketInstall,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 13] = [
+    pub const ALL: [Kind; 14] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -46,6 +47,7 @@ impl Kind {
         Kind::SnapSave,
         Kind::SnapRestore,
         Kind::SnapRemove,
+        Kind::SocketInstall,
     ];
 
 }
@@ -183,6 +185,8 @@ pub struct Model {
     pub projects: Vec<Project>,
     /// The sandbox VM's status, when it runs.
     pub sandbox: Option<Value>,
+    /// `/var/run/docker.sock` goes through rekcod (`rekcod socket install` done).
+    pub socket_installed: bool,
 }
 
 impl Model {
@@ -190,12 +194,13 @@ impl Model {
         let status = crate::cli::status_value(paths);
         let running = status["running"] == true;
         let sandbox = crate::cli::sandbox_status(paths);
+        let socket_installed = crate::syssock::installed(paths);
         let mut ports = ports_of(&status, false);
         if let Some(sb) = &sandbox {
             ports.extend(ports_of(sb, true));
         }
         if !running {
-            return Model { running, status, ports, sandbox, ..Default::default() };
+            return Model { running, status, ports, sandbox, socket_installed, ..Default::default() };
         }
         let raw = crate::cli::api_get(paths, "/containers/json?all=1").unwrap_or_default();
         let containers = parse_containers(&raw);
@@ -205,7 +210,7 @@ impl Model {
             .map(|b| parse_snapshots(&b))
             .unwrap_or_default();
         let projects = projects(&containers, &raw, snapshots);
-        Model { running, status, containers, ports, projects, sandbox }
+        Model { running, status, containers, ports, projects, sandbox, socket_installed }
     }
 }
 
@@ -311,16 +316,24 @@ fn projects(containers: &[Container], containers_json: &[u8], snapshots: Vec<Sna
 
 // -------------------------------------------------------------- actions
 
-pub fn vm_actions(running: bool) -> Vec<Action> {
-    if !running {
-        return vec![Action::rekcod(Kind::VmStart, "Start rekcod", &["start"])];
+pub fn vm_actions(running: bool, socket_installed: bool) -> Vec<Action> {
+    let mut out = if !running {
+        vec![Action::rekcod(Kind::VmStart, "Start rekcod", &["start"])]
+    } else {
+        vec![
+            Action::rekcod(Kind::VmStop, "Stop rekcod", &["stop"])
+                .confirm("Stop rekcod? Running containers stop (and `--rm` ones are deleted).".into()),
+            Action::rekcod(Kind::Compact, "Compact data disk", &["compact"]),
+            Action::rekcod(Kind::Shell, "Root shell in the VM", &["shell"]).interactive(),
+        ]
+    };
+    if !socket_installed {
+        // sudo asks for a password, so it runs in Terminal.
+        out.push(
+            Action::rekcod(Kind::SocketInstall, "Use rekcod for /var/run/docker.sock", &["socket", "install"]).interactive(),
+        );
     }
-    vec![
-        Action::rekcod(Kind::VmStop, "Stop rekcod", &["stop"])
-            .confirm("Stop rekcod? Running containers stop (and `--rm` ones are deleted).".into()),
-        Action::rekcod(Kind::Compact, "Compact data disk", &["compact"]),
-        Action::rekcod(Kind::Shell, "Root shell in the VM", &["shell"]).interactive(),
-    ]
+    out
 }
 
 pub fn container_actions(c: &Container) -> Vec<Action> {
@@ -417,8 +430,8 @@ pub mod tests {
     /// Every action kind comes out of the lists the menu bar renders.
     pub fn reachable_kinds() -> Vec<Action> {
         let (containers, ports, projects) = sample();
-        let mut all = vm_actions(true);
-        all.extend(vm_actions(false));
+        let mut all = vm_actions(true, false);
+        all.extend(vm_actions(false, true));
         for c in &containers {
             all.extend(container_actions(c));
         }

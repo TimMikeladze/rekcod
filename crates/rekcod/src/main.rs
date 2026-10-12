@@ -29,6 +29,8 @@ mod menubar;
 #[cfg(target_os = "macos")]
 mod snap;
 #[cfg(target_os = "macos")]
+mod syssock;
+#[cfg(target_os = "macos")]
 mod vm;
 #[cfg(target_os = "macos")]
 mod watch;
@@ -133,6 +135,9 @@ enum Cmd {
     Shell,
     /// Give unused data-disk space back to macOS now (also runs hourly).
     Compact,
+    /// Route /var/run/docker.sock to rekcod while it runs, for clients that ignore docker contexts.
+    #[command(subcommand)]
+    Socket(Socket),
     /// Menu bar item: status, start/stop, forwarded ports.
     Menubar {
         /// Start the menu bar item at login (LaunchAgent).
@@ -188,6 +193,14 @@ enum Snap {
     },
 }
 
+#[derive(Subcommand)]
+enum Socket {
+    /// Point /var/run/docker.sock at ~/.rekcod/default.sock (sudo, once); start/stop then switch it.
+    Install,
+    /// Put /var/run/docker.sock back to what it was before `install` (sudo).
+    Uninstall,
+}
+
 /// Phase 6 prototypes (docs/research.md). The daemon must run with REKCOD_RESEARCH=1.
 #[derive(Subcommand)]
 enum Research {
@@ -227,6 +240,8 @@ fn main() {
         }
         Cmd::Shell => cli::shell(&paths),
         Cmd::Compact => cli::compact(&paths),
+        Cmd::Socket(Socket::Install) => syssock::install(&paths, cli::status_value(&paths)["running"] == true),
+        Cmd::Socket(Socket::Uninstall) => syssock::uninstall(&paths),
         Cmd::Menubar { install: true, .. } => menubar::install(),
         Cmd::Menubar { uninstall: true, .. } => menubar::uninstall(),
         Cmd::Menubar { .. } => menubar::run(paths),

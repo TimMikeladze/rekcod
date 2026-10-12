@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Release artifacts in out/release (docs/phase3.md):
 #   rekcod-<version>-darwin-arm64.tar.gz   bin/rekcod, with the guest version + sha embedded
+#   rekcod-darwin-arm64.tar.gz             the same, for releases/latest/download
 #   rekcod-guest-<guest version>.tar.gz    Image, initramfs, root.img, VERSION
 #   SHA256SUMS
 # Needs out/guest (scripts/build.sh, or GUEST_DIR=... from CI) and runs on macOS.
@@ -23,7 +24,9 @@ cp target/release/rekcod "$rel/stage/bin/"
 host_tar="rekcod-$version-darwin-arm64.tar.gz"
 COPYFILE_DISABLE=1 tar -C "$rel/stage" -czf "$rel/$host_tar" bin
 rm -rf "$rel/stage"
-(cd "$rel" && shasum -a 256 "$host_tar" "$guest_tar" > SHA256SUMS)
+# Versionless copy so releases/latest/download/rekcod-darwin-arm64.tar.gz always works.
+cp "$rel/$host_tar" "$rel/rekcod-darwin-arm64.tar.gz"
+(cd "$rel" && shasum -a 256 "$host_tar" rekcod-darwin-arm64.tar.gz "$guest_tar" > SHA256SUMS)
 # Leave target/release/rekcod as a dev build again (no embedded guest).
 cargo build --release -p rekcod >/dev/null 2>&1 && codesign --force --sign - --entitlements rekcod.entitlements target/release/rekcod
 ls -l "$rel"

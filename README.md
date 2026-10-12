@@ -28,7 +28,7 @@ If `docker` isn't on your `PATH`, rekcod downloads docker 29.9.0, compose and bu
 From the latest GitHub release:
 
 ```sh
-curl -fsSL https://github.com/TimMikeladze/rekcod/releases/download/v0.1.0/rekcod-0.1.0-darwin-arm64.tar.gz | tar -xz
+curl -fsSL https://github.com/TimMikeladze/rekcod/releases/latest/download/rekcod-darwin-arm64.tar.gz | tar -xz
 sudo mv bin/rekcod /usr/local/bin/
 xattr -d com.apple.quarantine /usr/local/bin/rekcod 2>/dev/null   # not notarized yet
 rekcod start      # first run downloads and verifies the guest image (~100 MB)

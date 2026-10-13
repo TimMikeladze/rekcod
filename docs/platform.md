@@ -72,7 +72,7 @@ instead of the local socket.
 |---|---|
 | `rekcod node` | runs on each Mac as a LaunchDaemon. Wraps `sandbox.rs`, reports capacity, pulls golden disks, accepts work from the controller |
 | `rekcod controller` | the API from track 1 plus placement, auth, quotas and the fleet's state. Runs on Linux or one of the Macs |
-| State store | Postgres. Holds nodes, sandboxes, users, tokens, quotas and an audit log |
+| State store | SQLite (`~/.rekcod/controller/fleet.db`, WAL). Holds nodes, sandboxes, users, tokens, quotas and an audit log |
 | Golden disk registry | an S3-compatible bucket (RustFS in dev and CI) of compressed golden `data.img` files, versioned by content hash |
 | Workspace transport | `git clone` of a ref, or a tarball upload. There's no `clonefile` across machines |
 
@@ -226,7 +226,7 @@ If health fails, the old release keeps serving and the deploy reports the instan
 
 ### Config and secrets
 
-- `rekcod env set APP K=V` and `rekcod secret set APP NAME` store values in Postgres.
+- `rekcod env set APP K=V` and `rekcod secret set APP NAME` store values in the controller's SQLite file.
   Secrets are encrypted with a controller key.
 - Changing either creates a new release from the same image and deploys it.
 
@@ -243,7 +243,7 @@ If health fails, the old release keeps serving and the deploy reports the instan
 
 - Instances are stateless. A volume inside an instance dies with it, and the deploy
   docs say so.
-- Databases: use an external Postgres (for me, the sandbox Postgres on Fly), or a
+- Databases: use an external database, or a
   compose service inside a single-instance app. In the second case it's pinned to one node
   and backed up with `rekcod snap` into the bucket on a schedule. That's a dirty
   implementation of durability, and it's for staging only.
@@ -360,7 +360,7 @@ where a mature crate exists. Every new service is a `rekcod` subcommand in the s
 | ACME certificates, wildcard via DNS-01 | `instant-acme` | Caddy's ACME |
 | Image registry (`rekcod registry`) | `axum` + `object_store`, OCI distribution spec | `registry:2` (Go) |
 | Object storage | RustFS (dev, CI, self-hosted) via `object_store` | MinIO |
-| Postgres client and migrations | `sqlx` | an ORM in another language |
+| Controller store | `rusqlite` (SQLite, bundled) | Postgres, an ORM |
 | Git clone, diff for workspaces | `gix` (gitoxide); `imara-diff` for `sandbox diff` | shelling out to `git` |
 | Guest DNS allowlist | `hickory-proto`/`hickory-server` stub inside `rekcod-agent`, writing to nftables | `dnsmasq --nftset` |
 | Guest firewall rules | `rustables` (netlink), or the `nftables` crate over `nft -j` | `iptables` shell in `boot.sh` |
@@ -373,7 +373,6 @@ where a mature crate exists. Every new service is a `rekcod` subcommand in the s
 Things that stay non-Rust, on purpose:
 - `dockerd`, BuildKit and containerd in the guest. Running upstream `dockerd` unmodified is
   rekcod's core promise; replacing it (e.g. with `youki`) breaks API parity.
-- Postgres as the controller's store. It's the thing I'd trust to hold the audit log.
 - The Linux kernel and busybox userland in the guest.
 
 Crates I haven't used in this repo yet and need a spike before committing to: `pingora`
@@ -403,7 +402,7 @@ uploads, cross-repo mounts) are where a hand-rolled one breaks. If the spike goe
 ## Tracks 2 and 3 as built
 
 `crates/rekcod/src/fleet.rs`. `scripts/e2e-fleet.sh` runs a controller, two nodes and an
-edge on one Mac against a real Postgres and passes all 27 checks:
+edge on one Mac, with the controller's SQLite file in its own home, and passes all 32 checks:
 - placement, drain, quota, ownership, apply refused remotely, a silent node marked lost;
 - deploy from a repo without a Dockerfile, zero non-200s across a redeploy (400 requests),
   a broken release refused while the old one serves, rollback, env and secrets, logs;
@@ -425,7 +424,8 @@ Where the code differs from the spec above:
   (cloudflared) points at. `--listen` serves everything and belongs on the tailnet.
 - **Instances are reached through a relay** on the node: the instance's port is published on
   the Mac's loopback by the sandbox daemon, and the node forwards `<node ip>:<port>` to it.
-- **Secrets are stored in Postgres in plain text** (a separate column, shown by key only).
+- **Secrets are stored in the controller's SQLite file in plain text** (a separate column,
+  shown by key only).
   Encrypting them with a controller key is still to do.
 - **`app status` replaces `status APP`**, since `rekcod status` is taken. Apps are under
   `rekcod app`; the spec's `rekcod deploy` is `rekcod app deploy`.
@@ -436,6 +436,9 @@ Where the code differs from the spec above:
   the controller's watchdog. The PR comment needs `GITHUB_TOKEN` in the controller's
   environment and uses `curl`.
 - **Controller is macOS-only for now**, like the rest of the binary.
+- **SQLite, not Postgres.** One controller writes through one connection behind a mutex, so
+  a local file is faster (no network round trip per query), has no server to run, and keeps
+  working when the internet doesn't. The cost: no second controller for failover.
 - **Services are per-user LaunchAgents** (`--install`, `crates/rekcod/src/service.rs`), not
   LaunchDaemons, so they start at login and the Mac needs automatic login. KeepAlive restarts
   them if they exit. `scripts/spare-setup.sh` sets up a one-machine fleet on the tailnet.

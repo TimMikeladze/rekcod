@@ -58,26 +58,13 @@ pub fn plist(name: &str, exe: &Path, args: &[String], log: &Path, rekcod_home: O
     )
 }
 
-/// The command line this process was started with, minus `--install` and `--db URL`
-/// (the URL goes to a 0600 file instead of the world-readable plist).
+/// The command line this process was started with, minus `--install`.
 pub fn args_without_install() -> Vec<String> {
     strip(&std::env::args().skip(1).collect::<Vec<_>>())
 }
 
 pub fn strip(argv: &[String]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut it = argv.iter();
-    while let Some(a) = it.next() {
-        if a == "--install" || a.starts_with("--db=") {
-            continue;
-        }
-        if a == "--db" {
-            it.next();
-            continue;
-        }
-        out.push(a.clone());
-    }
-    out
+    argv.iter().filter(|a| *a != "--install").cloned().collect()
 }
 
 fn domain() -> String {
@@ -128,11 +115,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn strips_install_and_db() {
-        let a: Vec<String> = ["controller", "serve", "--db", "postgres://u:p@h/db", "--install", "--listen", "1.2.3.4:7700", "--db=x"]
-            .map(String::from)
-            .into();
-        assert_eq!(strip(&a), ["controller", "serve", "--listen", "1.2.3.4:7700"]);
+    fn strips_install() {
+        let a: Vec<String> = ["controller", "serve", "--install", "--db", "/x/fleet.db"].map(String::from).into();
+        assert_eq!(strip(&a), ["controller", "serve", "--db", "/x/fleet.db"]);
     }
 
     #[test]

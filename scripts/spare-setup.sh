@@ -2,28 +2,27 @@
 # Turns this Mac into a one-machine rekcod fleet: controller, node and edge as LaunchAgents
 # on its Tailscale address, with only public apps on 127.0.0.1:8081 for cloudflared.
 #
-#   scripts/spare-setup.sh --db postgres://... --domain example.com
+#   scripts/spare-setup.sh --domain example.com
 #
 # Needs Tailscale up, and automatic login (LaunchAgents start at login). Safe to re-run:
 # each agent is replaced, and the node registers again only if it hasn't joined yet.
 set -euo pipefail
 R=${REKCOD:-rekcod}
-db="" domain=""
+domain=""
 while [[ $# -gt 0 ]]; do
   case $1 in
-    --db) db=$2; shift 2 ;;
     --domain) domain=$2; shift 2 ;;
-    *) echo "usage: $0 --db POSTGRES_URL --domain DOMAIN" >&2; exit 2 ;;
+    *) echo "usage: $0 --domain DOMAIN" >&2; exit 2 ;;
   esac
 done
-[[ -n $db && -n $domain ]] || { echo "usage: $0 --db POSTGRES_URL --domain DOMAIN" >&2; exit 2; }
+[[ -n $domain ]] || { echo "usage: $0 --domain DOMAIN" >&2; exit 2; }
 
 ts=$(command -v tailscale || echo /Applications/Tailscale.app/Contents/MacOS/Tailscale)
 ip=$("$ts" ip -4 2>/dev/null | head -1) || true
 [[ -n $ip ]] || { echo "no Tailscale address; run 'tailscale up' first" >&2; exit 1; }
 home=${REKCOD_HOME:-$HOME/.rekcod}
 
-"$R" controller serve --db "$db" --listen "$ip:7700" --domain "$domain" --install
+"$R" controller serve --listen "$ip:7700" --domain "$domain" --install
 for _ in $(seq 60); do [[ -s $home/controller/admin-token ]] && break; sleep 0.5; done
 [[ -s $home/controller/admin-token ]] || { echo "controller didn't start; see $home/logs/controller.log" >&2; exit 1; }
 admin=$(cat "$home/controller/admin-token")

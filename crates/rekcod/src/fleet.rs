@@ -1,6 +1,6 @@
 //! Self-hosted fleet and app hosting (docs/platform.md, tracks 2 and 3).
 //!
-//! - `rekcod controller serve`: the sandbox API for many Macs, plus apps. State in Postgres.
+//! - `rekcod controller serve`: the sandbox API for many Macs, plus apps. State in SQLite.
 //! - `rekcod node join|serve`: runs on each Mac; serves `sandbox_api` on its address with a
 //!   node secret, heartbeats capacity, and deploys app instances into sandboxes.
 //! - `rekcod edge serve`: routes `Host: <app>.<domain>` to live instances.
@@ -395,29 +395,72 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
 // ------------------------------------------------------------- controller
 
 const SCHEMA: &str = "
+pragma journal_mode = wal;
 create table if not exists config (key text primary key, value text not null);
 create table if not exists nodes (id text primary key, url text not null, secret text not null,
-  mem_total bigint not null default 0, mem_free bigint not null default 0, last_seen bigint not null default 0,
-  state text not null default 'ready');
-create table if not exists tokens (token text primary key, name text not null, admin boolean not null default false,
-  max_sandboxes int not null default 10);
+  mem_total integer not null default 0, mem_free integer not null default 0, last_seen integer not null default 0,
+  state text not null default 'ready', macos_free integer not null default 0);
+create table if not exists tokens (token text primary key, name text not null, admin integer not null default 0,
+  max_sandboxes integer not null default 10);
 create table if not exists sandboxes (id text primary key, node text not null, owner text not null,
-  state text not null default 'running', created bigint not null);
+  state text not null default 'running', created integer not null);
 create table if not exists apps (name text primary key, owner text not null, git_url text not null, git_ref text not null,
-  port int not null, instances int not null default 1, cpus int not null default 1, memory_gib int not null default 1,
+  port integer not null, instances integer not null default 1, cpus integer not null default 1, memory_gib integer not null default 1,
   health text not null default '/', start text, env text not null default '{}', secrets text not null default '{}',
-  live_release int, preview_of text, created bigint not null);
-create table if not exists releases (app text not null, n int not null, commit text not null, state text not null,
-  created bigint not null, primary key (app, n));
-create table if not exists instances (app text not null, release int not null, sandbox text primary key, node text not null,
+  live_release integer, preview_of text, created integer not null, public integer not null default 0);
+create table if not exists releases (app text not null, n integer not null, commit_sha text not null, state text not null,
+  created integer not null, primary key (app, n));
+create table if not exists instances (app text not null, release integer not null, sandbox text primary key, node text not null,
   endpoint text not null, state text not null);
-alter table nodes add column if not exists macos_free int not null default 0;
-alter table apps add column if not exists public boolean not null default false;
-create table if not exists audit (ts bigint not null, who text not null, action text not null, target text not null, ok boolean not null);
+create table if not exists audit (ts integer not null, who text not null, action text not null, target text not null, ok integer not null);
 ";
 
+/// The controller's SQLite database. Queries use `?N` parameters; rows come back whole so
+/// call sites read them with `row.get(i)` after the statement is done.
+pub struct Db(rusqlite::Connection);
+
+pub struct Row(Vec<rusqlite::types::Value>);
+
+impl Row {
+    /// Column `i`, converted; panics on a type mismatch, which is a bug in the query.
+    pub fn get<T: rusqlite::types::FromSql>(&self, i: usize) -> T {
+        T::column_result(rusqlite::types::ValueRef::from(&self.0[i])).unwrap_or_else(|e| panic!("column {i}: {e}"))
+    }
+}
+
+type Params<'a> = &'a [&'a dyn rusqlite::ToSql];
+
+impl Db {
+    pub fn open(path: &Path) -> Result<Db> {
+        let c = rusqlite::Connection::open(path).with_context(|| format!("open {}", path.display()))?;
+        c.busy_timeout(Duration::from_secs(5))?;
+        c.execute_batch(SCHEMA)?;
+        Ok(Db(c))
+    }
+
+    pub fn execute(&mut self, sql: &str, p: Params) -> Result<u64> {
+        Ok(self.0.execute(sql, p)? as u64)
+    }
+
+    pub fn query(&mut self, sql: &str, p: Params) -> Result<Vec<Row>> {
+        let mut st = self.0.prepare_cached(sql)?;
+        let n = st.column_count();
+        let rows =
+            st.query_map(p, |r| (0..n).map(|i| r.get::<_, rusqlite::types::Value>(i)).collect::<rusqlite::Result<Vec<_>>>().map(Row))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn query_opt(&mut self, sql: &str, p: Params) -> Result<Option<Row>> {
+        Ok(self.query(sql, p)?.into_iter().next())
+    }
+
+    pub fn query_one(&mut self, sql: &str, p: Params) -> Result<Row> {
+        self.query_opt(sql, p)?.ok_or_else(|| anyhow!("query returned no row"))
+    }
+}
+
 struct Controller {
-    db: Mutex<postgres::Client>,
+    db: Mutex<Db>,
     domain: String,
     drain_secs: u64,
 }
@@ -430,36 +473,36 @@ struct Caller {
 
 impl Controller {
     fn config(&self, key: &str) -> Result<Option<String>> {
-        Ok(self.db.lock().unwrap().query_opt("select value from config where key = $1", &[&key])?.map(|r| r.get(0)))
+        Ok(self.db.lock().unwrap().query_opt("select value from config where key = ?1", &[&key])?.map(|r| r.get(0)))
     }
 
     fn caller(&self, token: &str) -> Result<Option<Caller>> {
-        let row = self.db.lock().unwrap().query_opt("select name, admin, max_sandboxes from tokens where token = $1", &[&token])?;
+        let row = self.db.lock().unwrap().query_opt("select name, admin, max_sandboxes from tokens where token = ?1", &[&token])?;
         Ok(row.map(|r| Caller { name: r.get(0), admin: r.get(1), max: r.get(2) }))
     }
 
     fn audit(&self, who: &str, action: &str, target: &str, ok: bool) {
-        let _ = self.db.lock().unwrap().execute("insert into audit values ($1, $2, $3, $4, $5)", &[&now(), &who, &action, &target, &ok]);
+        let _ = self.db.lock().unwrap().execute("insert into audit values (?1, ?2, ?3, ?4, ?5)", &[&now(), &who, &action, &target, &ok]);
     }
 
     /// Ready nodes with at least `mib` free, most free first.
     fn place(&self, mib: i64, macos: bool) -> Result<Vec<(String, String, String)>> {
         let rows = self.db.lock().unwrap().query(
-            "select id, url, secret from nodes where state = 'ready' and last_seen > $1 and mem_free >= $2
-             and (not $3 or macos_free > 0) order by mem_free desc",
+            "select id, url, secret from nodes where state = 'ready' and last_seen > ?1 and mem_free >= ?2
+             and (not ?3 or macos_free > 0) order by mem_free desc",
             &[&(now() - 15), &mib, &macos],
         )?;
         Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
     }
 
     fn node(&self, id: &str) -> Result<(String, String, String)> {
-        let r = self.db.lock().unwrap().query_opt("select url, secret, state from nodes where id = $1", &[&id])?;
+        let r = self.db.lock().unwrap().query_opt("select url, secret, state from nodes where id = ?1", &[&id])?;
         r.map(|r| (r.get(0), r.get(1), r.get(2))).ok_or_else(|| anyhow!("no node {id}"))
     }
 
     /// The node holding sandbox `id`, if `who` may use it.
     fn sandbox_node(&self, id: &str, who: &Caller) -> Result<(String, String, String)> {
-        let r = self.db.lock().unwrap().query_opt("select node, owner, state from sandboxes where id = $1", &[&id])?;
+        let r = self.db.lock().unwrap().query_opt("select node, owner, state from sandboxes where id = ?1", &[&id])?;
         let Some(r) = r else { bail!(sandbox::NoSandbox(id.into())) };
         let (node, owner, state): (String, String, String) = (r.get(0), r.get(1), r.get(2));
         if owner != who.name && !who.admin {
@@ -479,12 +522,12 @@ fn watchdog(c: Arc<Controller>) {
         let lost = {
             let mut db = c.db.lock().unwrap();
             let lost = db
-                .query("update nodes set state = 'lost' where state <> 'lost' and last_seen < $1 returning id", &[&(now() - 15)])
+                .query("update nodes set state = 'lost' where state <> 'lost' and last_seen < ?1 returning id", &[&(now() - 15)])
                 .unwrap_or_default();
             for r in &lost {
                 let id: String = r.get(0);
-                let _ = db.execute("update sandboxes set state = 'lost' where node = $1 and state = 'running'", &[&id]);
-                let _ = db.execute("update instances set state = 'lost' where node = $1 and state = 'live'", &[&id]);
+                let _ = db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[&id]);
+                let _ = db.execute("update instances set state = 'lost' where node = ?1 and state = 'live'", &[&id]);
             }
             lost.len()
         };
@@ -494,7 +537,7 @@ fn watchdog(c: Arc<Controller>) {
         let old: Vec<String> =
             c.db.lock()
                 .unwrap()
-                .query("select name from apps where preview_of is not null and created < $1", &[&(now() - 7 * 86400)])
+                .query("select name from apps where preview_of is not null and created < ?1", &[&(now() - 7 * 86400)])
                 .map(|rows| rows.iter().map(|r| r.get(0)).collect())
                 .unwrap_or_default();
         for name in old {
@@ -550,7 +593,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 let url = body["url"].as_str().context("missing url")?;
                 let total = body["mem_total_mib"].as_i64().unwrap_or(0);
                 c.db.lock().unwrap().execute(
-                    "insert into nodes (id, url, secret, mem_total, last_seen) values ($1, $2, $3, $4, $5)",
+                    "insert into nodes (id, url, secret, mem_total, last_seen) values (?1, ?2, ?3, ?4, ?5)",
                     &[&id, &url, &sec, &total, &now()],
                 )?;
                 c.audit("node", "register", &id, true);
@@ -568,7 +611,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 let macos_free = body["macos_free"].as_i64().unwrap_or(0) as i32;
                 let next = if state == "lost" { "ready".to_string() } else { state };
                 c.db.lock().unwrap().execute(
-                    "update nodes set mem_free = $2, last_seen = $3, state = $4, macos_free = $5 where id = $1",
+                    "update nodes set mem_free = ?2, last_seen = ?3, state = ?4, macos_free = ?5 where id = ?1",
                     &[id, &free, &now(), &next, &macos_free],
                 )?;
                 Ok(json!({}))
@@ -589,14 +632,14 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             Ok(json!(
                 rows.iter()
                     .map(|r| json!({
-                        "id": r.get::<_, String>(0), "url": r.get::<_, String>(1), "mem_total_mib": r.get::<_, i64>(2),
-                        "mem_free_mib": r.get::<_, i64>(3), "last_seen": r.get::<_, i64>(4), "state": r.get::<_, String>(5)
+                        "id": r.get::<String>(0), "url": r.get::<String>(1), "mem_total_mib": r.get::<i64>(2),
+                        "mem_free_mib": r.get::<i64>(3), "last_seen": r.get::<i64>(4), "state": r.get::<String>(5)
                     }))
                     .collect::<Vec<_>>()
             ))
         }),
         ("POST", ["nodes", id, "drain"]) => admin_only().and_then(|_| {
-            let n = c.db.lock().unwrap().execute("update nodes set state = 'drain' where id = $1", &[id])?;
+            let n = c.db.lock().unwrap().execute("update nodes set state = 'drain' where id = ?1", &[id])?;
             if n == 0 {
                 bail!("no node {id}");
             }
@@ -607,7 +650,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             let (t, name) = (secret()?, body["name"].as_str().context("missing name")?.to_string());
             let max = body["max_sandboxes"].as_i64().unwrap_or(10) as i32;
             let admin = body["admin"].as_bool().unwrap_or(false);
-            c.db.lock().unwrap().execute("insert into tokens values ($1, $2, $3, $4)", &[&t, &name, &admin, &max])?;
+            c.db.lock().unwrap().execute("insert into tokens values (?1, ?2, ?3, ?4)", &[&t, &name, &admin, &max])?;
             c.audit(&who.name, "token", &name, true);
             Ok(json!({"token": t, "name": name}))
         }),
@@ -615,14 +658,14 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         ("POST", ["sandboxes"]) => create_sandbox(c, &who, &req, &mut w).map(|_| Value::Null),
         ("GET", ["sandboxes"]) => {
             let rows = c.db.lock().unwrap().query(
-                "select id, node, owner, state, created from sandboxes where state <> 'removed' and (owner = $1 or $2) order by created",
+                "select id, node, owner, state, created from sandboxes where state <> 'removed' and (owner = ?1 or ?2) order by created",
                 &[&who.name, &who.admin],
             )?;
             Ok(json!(
                 rows.iter()
                     .map(|r| json!({
-                        "id": r.get::<_, String>(0), "node": r.get::<_, String>(1), "owner": r.get::<_, String>(2),
-                        "state": r.get::<_, String>(3), "created": r.get::<_, i64>(4)
+                        "id": r.get::<String>(0), "node": r.get::<String>(1), "owner": r.get::<String>(2),
+                        "state": r.get::<String>(3), "created": r.get::<i64>(4)
                     }))
                     .collect::<Vec<_>>()
             ))
@@ -636,10 +679,10 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 Ok((url, sec, _)) if fork => (|| {
                     let mut v = call(&url, "POST", &req.path, Some(&sec), &body)?;
                     let child = v["id"].as_str().context("node returned no id")?.to_string();
-                    let node: String = c.db.lock().unwrap().query_one("select node from sandboxes where id = $1", &[id])?.get(0);
+                    let node: String = c.db.lock().unwrap().query_one("select node from sandboxes where id = ?1", &[id])?.get(0);
                     c.db.lock()
                         .unwrap()
-                        .execute("insert into sandboxes values ($1, $2, $3, 'running', $4)", &[&child, &node, &who.name, &now()])?;
+                        .execute("insert into sandboxes values (?1, ?2, ?3, 'running', ?4)", &[&child, &node, &who.name, &now()])?;
                     c.audit(&who.name, "fork", &child, true);
                     v["node"] = json!(node);
                     Ok(v)
@@ -647,7 +690,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 Ok((url, sec, _)) => {
                     proxy(&url, &sec, &req, &mut w)?;
                     if delete {
-                        c.db.lock().unwrap().execute("update sandboxes set state = 'removed' where id = $1", &[id])?;
+                        c.db.lock().unwrap().execute("update sandboxes set state = 'removed' where id = ?1", &[id])?;
                     }
                     c.audit(&who.name, &format!("{m} {}", rest.join("/")), id, true);
                     return Ok(());
@@ -668,7 +711,7 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, req: &crate::sandbox_api::R
         return respond(w, 400, "application/json", br#"{"error":"remote sandboxes need git.url (and git.ref)"}"#);
     }
     let count: i64 =
-        c.db.lock().unwrap().query_one("select count(*) from sandboxes where owner = $1 and state = 'running'", &[&who.name])?.get(0);
+        c.db.lock().unwrap().query_one("select count(*) from sandboxes where owner = ?1 and state = 'running'", &[&who.name])?.get(0);
     if count >= who.max as i64 {
         return respond(
             w,
@@ -688,7 +731,7 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, req: &crate::sandbox_api::R
         Err(e) => return respond(w, 400, "application/json", json!({"error": format!("node {node}: {e:#}")}).to_string().as_bytes()),
     };
     let id = v["id"].as_str().unwrap_or("").to_string();
-    c.db.lock().unwrap().execute("insert into sandboxes values ($1, $2, $3, 'running', $4)", &[&id, &node, &who.name, &now()])?;
+    c.db.lock().unwrap().execute("insert into sandboxes values (?1, ?2, ?3, 'running', ?4)", &[&id, &node, &who.name, &now()])?;
     c.audit(&who.name, "create", &id, true);
     v["node"] = json!(node);
     respond(w, 201, "application/json", v.to_string().as_bytes())
@@ -757,7 +800,7 @@ struct App {
 
 fn load_app(c: &Controller, name: &str, who: &Caller) -> Result<App> {
     let r = c.db.lock().unwrap().query_opt(
-        "select name, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, secrets, owner from apps where name = $1",
+        "select name, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, secrets, owner from apps where name = ?1",
         &[&name],
     )?;
     let r = r.ok_or_else(|| anyhow!("no app {name}"))?;
@@ -775,8 +818,8 @@ fn load_app(c: &Controller, name: &str, who: &Caller) -> Result<App> {
         memory_gib: r.get(6),
         health: r.get(7),
         start: r.get(8),
-        env: serde_json::from_str(&r.get::<_, String>(9)).unwrap_or(json!({})),
-        secrets: serde_json::from_str(&r.get::<_, String>(10)).unwrap_or(json!({})),
+        env: serde_json::from_str(&r.get::<String>(9)).unwrap_or(json!({})),
+        secrets: serde_json::from_str(&r.get::<String>(10)).unwrap_or(json!({})),
     })
 }
 
@@ -785,8 +828,8 @@ fn delete_instance(c: &Controller, node: &str, sandbox_id: &str) {
         let _ = call(&url, "DELETE", &format!("/sandboxes/{sandbox_id}"), Some(&sec), &Value::Null);
     }
     let mut db = c.db.lock().unwrap();
-    let _ = db.execute("update instances set state = 'removed' where sandbox = $1", &[&sandbox_id]);
-    let _ = db.execute("update sandboxes set state = 'removed' where id = $1", &[&sandbox_id]);
+    let _ = db.execute("update instances set state = 'removed' where sandbox = ?1", &[&sandbox_id]);
+    let _ = db.execute("update sandboxes set state = 'removed' where id = ?1", &[&sandbox_id]);
 }
 
 /// New release from `commit` (or the app's ref): start instances on distinct nodes where
@@ -796,11 +839,11 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         Some(c) => c,
         None => resolve(&app.git_url, &app.git_ref)?,
     };
-    let n: i32 = c.db.lock().unwrap().query_one("select coalesce(max(n), 0) + 1 from releases where app = $1", &[&app.name])?.get(0);
-    c.db.lock().unwrap().execute("insert into releases values ($1, $2, $3, 'building', $4)", &[&app.name, &n, &commit, &now()])?;
+    let n: i32 = c.db.lock().unwrap().query_one("select coalesce(max(n), 0) + 1 from releases where app = ?1", &[&app.name])?.get(0);
+    c.db.lock().unwrap().execute("insert into releases values (?1, ?2, ?3, 'building', ?4)", &[&app.name, &n, &commit, &now()])?;
     let nodes = c.place(app.memory_gib as i64 * 1024, false)?;
     if nodes.is_empty() {
-        c.db.lock().unwrap().execute("update releases set state = 'failed' where app = $1 and n = $2", &[&app.name, &n])?;
+        c.db.lock().unwrap().execute("update releases set state = 'failed' where app = ?1 and n = ?2", &[&app.name, &n])?;
         bail!("no node has {} GiB free", app.memory_gib);
     }
     let mut env = app.env.clone();
@@ -836,8 +879,8 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
     {
         let mut db = c.db.lock().unwrap();
         for (node, sb, ep) in &started {
-            db.execute("insert into sandboxes values ($1, $2, $3, 'running', $4)", &[sb, node, &who, &now()])?;
-            db.execute("insert into instances values ($1, $2, $3, $4, $5, 'starting')", &[&app.name, &n, sb, node, ep])?;
+            db.execute("insert into sandboxes values (?1, ?2, ?3, 'running', ?4)", &[sb, node, &who, &now()])?;
+            db.execute("insert into instances values (?1, ?2, ?3, ?4, ?5, 'starting')", &[&app.name, &n, sb, node, ep])?;
         }
     }
     if errors.is_empty() {
@@ -860,19 +903,19 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         for (node, sb, _) in &started {
             delete_instance(c, node, sb);
         }
-        c.db.lock().unwrap().execute("update releases set state = 'failed' where app = $1 and n = $2", &[&app.name, &n])?;
+        c.db.lock().unwrap().execute("update releases set state = 'failed' where app = ?1 and n = ?2", &[&app.name, &n])?;
         c.audit(who, "deploy", &format!("{} r{n}", app.name), false);
         bail!("release {n} failed, the previous release keeps serving:\n{}", errors.join("\n"));
     }
     let old: Vec<(String, String)> = {
         let mut db = c.db.lock().unwrap();
         let old = db.query(
-            "update instances set state = 'draining' where app = $1 and release <> $2 and state = 'live' returning node, sandbox",
+            "update instances set state = 'draining' where app = ?1 and release <> ?2 and state = 'live' returning node, sandbox",
             &[&app.name, &n],
         )?;
-        db.execute("update instances set state = 'live' where app = $1 and release = $2", &[&app.name, &n])?;
-        db.execute("update releases set state = 'live' where app = $1 and n = $2", &[&app.name, &n])?;
-        db.execute("update apps set live_release = $2 where name = $1", &[&app.name, &n])?;
+        db.execute("update instances set state = 'live' where app = ?1 and release = ?2", &[&app.name, &n])?;
+        db.execute("update releases set state = 'live' where app = ?1 and n = ?2", &[&app.name, &n])?;
+        db.execute("update apps set live_release = ?2 where name = ?1", &[&app.name, &n])?;
         old.iter().map(|r| (r.get(0), r.get(1))).collect()
     };
     let (c2, drain) = (c.clone(), c.drain_secs);
@@ -888,30 +931,30 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
 }
 
 fn destroy_app(c: &Arc<Controller>, name: &str) -> Result<Value> {
-    let rows = c.db.lock().unwrap().query("select node, sandbox from instances where app = $1 and state <> 'removed'", &[&name])?;
+    let rows = c.db.lock().unwrap().query("select node, sandbox from instances where app = ?1 and state <> 'removed'", &[&name])?;
     for r in rows {
-        delete_instance(c, &r.get::<_, String>(0), &r.get::<_, String>(1));
+        delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
     }
     let mut db = c.db.lock().unwrap();
-    db.execute("delete from releases where app = $1", &[&name])?;
-    db.execute("delete from instances where app = $1", &[&name])?;
-    db.execute("delete from apps where name = $1", &[&name])?;
+    db.execute("delete from releases where app = ?1", &[&name])?;
+    db.execute("delete from instances where app = ?1", &[&name])?;
+    db.execute("delete from apps where name = ?1", &[&name])?;
     Ok(json!({"destroyed": name}))
 }
 
 fn app_status(c: &Controller, app: &App) -> Result<Value> {
     let mut db = c.db.lock().unwrap();
-    let row = db.query_one("select live_release, public from apps where name = $1", &[&app.name])?;
+    let row = db.query_one("select live_release, public from apps where name = ?1", &[&app.name])?;
     let (live, public): (Option<i32>, bool) = (row.get(0), row.get(1));
-    let rel = db.query("select n, commit, state, created from releases where app = $1 order by n desc limit 20", &[&app.name])?;
+    let rel = db.query("select n, commit_sha, state, created from releases where app = ?1 order by n desc limit 20", &[&app.name])?;
     let inst =
-        db.query("select release, sandbox, node, endpoint, state from instances where app = $1 and state <> 'removed'", &[&app.name])?;
+        db.query("select release, sandbox, node, endpoint, state from instances where app = ?1 and state <> 'removed'", &[&app.name])?;
     Ok(json!({
         "name": app.name, "url": format!("http://{}.{}", app.name, c.domain), "git": {"url": app.git_url, "ref": app.git_ref},
         "port": app.port, "instances_wanted": app.instances, "live_release": live, "public": public,
         "env": app.env, "secrets": app.secrets.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
-        "releases": rel.iter().map(|r| json!({"n": r.get::<_, i32>(0), "commit": r.get::<_, String>(1), "state": r.get::<_, String>(2), "created": r.get::<_, i64>(3)})).collect::<Vec<_>>(),
-        "instances": inst.iter().map(|r| json!({"release": r.get::<_, i32>(0), "sandbox": r.get::<_, String>(1), "node": r.get::<_, String>(2), "endpoint": r.get::<_, String>(3), "state": r.get::<_, String>(4)})).collect::<Vec<_>>(),
+        "releases": rel.iter().map(|r| json!({"n": r.get::<i32>(0), "commit": r.get::<String>(1), "state": r.get::<String>(2), "created": r.get::<i64>(3)})).collect::<Vec<_>>(),
+        "instances": inst.iter().map(|r| json!({"release": r.get::<i32>(0), "sandbox": r.get::<String>(1), "node": r.get::<String>(2), "endpoint": r.get::<String>(3), "state": r.get::<String>(4)})).collect::<Vec<_>>(),
     }))
 }
 
@@ -933,20 +976,20 @@ fn upsert_app(c: &Controller, who: &Caller, b: &Value, preview_of: Option<&str>)
     // None keeps an existing app's visibility; new apps are private.
     let public = b["public"].as_bool();
     let mut db = c.db.lock().unwrap();
-    if let Some(r) = db.query_opt("select owner from apps where name = $1", &[&name])? {
+    if let Some(r) = db.query_opt("select owner from apps where name = ?1", &[&name])? {
         let owner: String = r.get(0);
         if owner != who.name && !who.admin {
             bail!("app {name} belongs to someone else");
         }
         db.execute(
-            "update apps set git_url = $2, git_ref = $3, port = $4, instances = $5, cpus = $6, memory_gib = $7, health = $8,
-             start = $9, env = coalesce($10, env), public = coalesce($11, public) where name = $1",
+            "update apps set git_url = ?2, git_ref = ?3, port = ?4, instances = ?5, cpus = ?6, memory_gib = ?7, health = ?8,
+             start = ?9, env = coalesce(?10, env), public = coalesce(?11, public) where name = ?1",
             &[&name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &public],
         )?;
     } else {
         db.execute(
             "insert into apps (name, owner, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, preview_of, created, public)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, coalesce($11, '{}'), $12, $13, coalesce($14, false))",
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, coalesce(?11, '{}'), ?12, ?13, coalesce(?14, false))",
             &[&name, &who.name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &preview_of, &now(), &public],
         )?;
     }
@@ -957,15 +1000,15 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str], b: 
     match (method, seg) {
         ("GET", ["apps"]) => {
             let rows = c.db.lock().unwrap().query(
-                "select name, git_url, live_release, instances, preview_of, public from apps where owner = $1 or $2 order by name",
+                "select name, git_url, live_release, instances, preview_of, public from apps where owner = ?1 or ?2 order by name",
                 &[&who.name, &who.admin],
             )?;
             Ok(json!(
                 rows.iter()
                     .map(|r| json!({
-                        "name": r.get::<_, String>(0), "git": r.get::<_, String>(1), "live_release": r.get::<_, Option<i32>>(2),
-                        "instances": r.get::<_, i32>(3), "preview_of": r.get::<_, Option<String>>(4), "public": r.get::<_, bool>(5),
-                        "url": format!("http://{}.{}", r.get::<_, String>(0), c.domain),
+                        "name": r.get::<String>(0), "git": r.get::<String>(1), "live_release": r.get::<Option<i32>>(2),
+                        "instances": r.get::<i32>(3), "preview_of": r.get::<Option<String>>(4), "public": r.get::<bool>(5),
+                        "url": format!("http://{}.{}", r.get::<String>(0), c.domain),
                     }))
                     .collect::<Vec<_>>()
             ))
@@ -979,7 +1022,7 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str], b: 
         ("POST", ["apps", name, "visibility"]) => {
             load_app(c, name, who)?;
             let public = b["public"].as_bool().context("missing public")?;
-            c.db.lock().unwrap().execute("update apps set public = $2 where name = $1", &[name, &public])?;
+            c.db.lock().unwrap().execute("update apps set public = ?2 where name = ?1", &[name, &public])?;
             c.audit(&who.name, if public { "make public" } else { "make private" }, name, true);
             Ok(json!({"app": name, "public": public}))
         }
@@ -988,22 +1031,25 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str], b: 
             let app = load_app(c, name, who)?;
             let target: Option<i32> = b["release"].as_i64().map(|n| n as i32);
             let row = c.db.lock().unwrap().query_opt(
-                "select commit from releases where app = $1 and state in ('live', 'old') and n = coalesce($2,
-                   (select max(n) from releases where app = $1 and n < (select live_release from apps where name = $1) and state in ('live', 'old')))",
+                "select commit_sha from releases where app = ?1 and state in ('live', 'old') and n = coalesce(?2,
+                   (select max(n) from releases where app = ?1 and n < (select live_release from apps where name = ?1) and state in ('live', 'old')))",
                 &[&app.name, &target],
             )?;
             let commit: String = row.ok_or_else(|| anyhow!("no earlier good release of {name}"))?.get(0);
-            c.db.lock().unwrap().execute("update releases set state = 'old' where app = $1 and state = 'live'", &[&app.name])?;
+            c.db.lock().unwrap().execute("update releases set state = 'old' where app = ?1 and state = 'live'", &[&app.name])?;
             deploy(c, &app, Some(commit), &who.name)
         }
         ("POST", ["apps", name, "scale"]) => {
             let n = b["instances"].as_i64().context("missing instances")? as i32;
             load_app(c, name, who)?;
-            c.db.lock().unwrap().execute("update apps set instances = $2 where name = $1", &[name, &n])?;
-            let live: Option<i32> = c.db.lock().unwrap().query_one("select live_release from apps where name = $1", &[name])?.get(0);
+            c.db.lock().unwrap().execute("update apps set instances = ?2 where name = ?1", &[name, &n])?;
+            let live: Option<i32> = c.db.lock().unwrap().query_one("select live_release from apps where name = ?1", &[name])?.get(0);
             let commit: Option<String> = match live {
                 Some(l) => {
-                    c.db.lock().unwrap().query_opt("select commit from releases where app = $1 and n = $2", &[name, &l])?.map(|r| r.get(0))
+                    c.db.lock()
+                        .unwrap()
+                        .query_opt("select commit_sha from releases where app = ?1 and n = ?2", &[name, &l])?
+                        .map(|r| r.get(0))
                 }
                 None => None,
             };
@@ -1020,18 +1066,18 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str], b: 
                 map.as_object_mut().map(|m| m.remove(k));
             }
             let col = if secrets { "secrets" } else { "env" };
-            c.db.lock().unwrap().execute(&format!("update apps set {col} = $2 where name = $1"), &[name, &map.to_string()])?;
-            let live: Option<i32> = c.db.lock().unwrap().query_one("select live_release from apps where name = $1", &[name])?.get(0);
+            c.db.lock().unwrap().execute(&format!("update apps set {col} = ?2 where name = ?1"), &[name, &map.to_string()])?;
+            let live: Option<i32> = c.db.lock().unwrap().query_one("select live_release from apps where name = ?1", &[name])?.get(0);
             if live.is_none() {
                 return Ok(json!({"updated": col}));
             }
             let commit: String =
-                c.db.lock().unwrap().query_one("select commit from releases where app = $1 and n = $2", &[name, &live])?.get(0);
+                c.db.lock().unwrap().query_one("select commit_sha from releases where app = ?1 and n = ?2", &[name, &live])?.get(0);
             deploy(c, &load_app(c, name, who)?, Some(commit), &who.name)
         }
         ("GET", ["apps", name, "logs"]) => {
             load_app(c, name, who)?;
-            let rows = c.db.lock().unwrap().query("select node, sandbox from instances where app = $1 and state = 'live'", &[name])?;
+            let rows = c.db.lock().unwrap().query("select node, sandbox from instances where app = ?1 and state = 'live'", &[name])?;
             let mut out = String::new();
             for r in rows {
                 let (node, sb): (String, String) = (r.get(0), r.get(1));
@@ -1079,7 +1125,7 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
     let pr = b["number"].as_i64().context("no PR number")?;
     let urls = [b["repository"]["clone_url"].as_str().unwrap_or(""), b["repository"]["html_url"].as_str().unwrap_or("")];
     let base = c.db.lock().unwrap().query_opt(
-        "select name, owner from apps where preview_of is null and (git_url = $1 or git_url = $2 or git_url = $3) limit 1",
+        "select name, owner from apps where preview_of is null and (git_url = ?1 or git_url = ?2 or git_url = ?3) limit 1",
         &[&urls[0], &urls[1], &format!("{}.git", urls[1])],
     )?;
     let Some(base) = base else { return Ok(json!({"ignored": "no app for this repository"})) };
@@ -1119,7 +1165,8 @@ mod subtle_eq {
 }
 
 pub struct ControllerOptions {
-    pub db: String,
+    /// SQLite file (default `~/.rekcod/controller/fleet.db`).
+    pub db: Option<PathBuf>,
     pub listen: String,
     pub domain: String,
     pub drain_secs: u64,
@@ -1127,16 +1174,15 @@ pub struct ControllerOptions {
 
 /// Starts the controller; on first run creates the schema, an admin token and a join token.
 pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
-    let mut db = postgres::Client::connect(&o.db, postgres::NoTls).context("connect to Postgres")?;
-    db.batch_execute(SCHEMA)?;
     let dir = paths.home.join("controller");
     std::fs::create_dir_all(&dir)?;
+    let mut db = Db::open(&o.db.unwrap_or_else(|| dir.join("fleet.db")))?;
     for (key, file) in [("join_token", "join-token"), ("webhook_secret", "webhook-secret")] {
-        let v = match db.query_opt("select value from config where key = $1", &[&key])? {
-            Some(r) => r.get::<_, String>(0),
+        let v = match db.query_opt("select value from config where key = ?1", &[&key])? {
+            Some(r) => r.get::<String>(0),
             None => {
                 let v = secret()?;
-                db.execute("insert into config values ($1, $2)", &[&key, &v])?;
+                db.execute("insert into config values (?1, ?2)", &[&key, &v])?;
                 v
             }
         };
@@ -1147,7 +1193,7 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
         Some(t) => t,
         None => {
             let t = secret()?;
-            db.execute("insert into tokens values ($1, 'admin', true, 100)", &[&t])?;
+            db.execute("insert into tokens values (?1, 'admin', true, 100)", &[&t])?;
             t
         }
     };
@@ -1283,6 +1329,31 @@ mod tests {
         assert_eq!(authority("http://10.0.0.2:7701/").unwrap(), "10.0.0.2:7701");
         assert!(authority("https://x").is_err());
         assert_eq!(percent_encode("/a b"), "%2Fa%20b");
+    }
+
+    #[test]
+    fn sqlite_store_placement_and_returning() {
+        let mut db = Db::open(Path::new(":memory:")).unwrap();
+        for (id, free, mac) in [("n1", 4096i64, 0i32), ("n2", 16384, 2)] {
+            db.execute(
+                "insert into nodes (id, url, secret, mem_free, last_seen, macos_free) values (?1, ?2, 's', ?3, ?4, ?5)",
+                &[&id, &format!("http://{id}"), &free, &now(), &mac],
+            )
+            .unwrap();
+        }
+        let c = Controller { db: Mutex::new(db), domain: "apps.test".into(), drain_secs: 0 };
+        let ids = |v: Vec<(String, String, String)>| v.into_iter().map(|n| n.0).collect::<Vec<_>>();
+        assert_eq!(ids(c.place(2048, false).unwrap()), ["n2", "n1"]);
+        assert_eq!(ids(c.place(8192, false).unwrap()), ["n2"]);
+        assert_eq!(ids(c.place(2048, true).unwrap()), ["n2"]);
+        // ?N binds by number, whatever order the SQL mentions them in.
+        c.db.lock().unwrap().execute("update nodes set state = ?2 where id = ?1", &[&"n1", &"drain"]).unwrap();
+        assert_eq!(ids(c.place(2048, false).unwrap()), ["n2"]);
+        let lost = c.db.lock().unwrap().query("update nodes set state = 'lost' where mem_free < ?1 returning id", &[&10000i64]).unwrap();
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].get::<String>(0), "n1");
+        let row = c.db.lock().unwrap().query_one("select count(*), max(state = 'lost') from nodes", &[]).unwrap();
+        assert_eq!((row.get::<i64>(0), row.get::<bool>(1)), (2, true));
     }
 
     #[test]

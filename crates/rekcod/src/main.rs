@@ -143,7 +143,7 @@ enum Cmd {
     /// Run this Mac as a fleet node.
     #[command(subcommand)]
     Node(NodeCmd),
-    /// The fleet controller: sandbox placement, apps, tokens (state in Postgres).
+    /// The fleet controller: sandbox placement, apps, tokens (state in SQLite).
     #[command(subcommand)]
     Controller(ControllerCmd),
     /// HTTP ingress for apps: routes <app>.<domain> to live instances.
@@ -485,9 +485,9 @@ enum NodeCmd {
 enum ControllerCmd {
     /// Run the controller.
     Serve {
-        /// Postgres URL (default: ~/.rekcod/controller/db-url, written by --install).
+        /// SQLite file (default: ~/.rekcod/controller/fleet.db).
         #[arg(long)]
-        db: Option<String>,
+        db: Option<std::path::PathBuf>,
         /// Run as a LaunchAgent: now, at login, and again if it exits.
         #[arg(long)]
         install: bool,
@@ -689,24 +689,11 @@ fn main() {
         Cmd::Node(NodeCmd::Drain { id, remote }) => {
             remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/drain"), &serde_json::json!({}))
         }
-        Cmd::Controller(ControllerCmd::Serve { db, install, listen, domain, drain }) => {
-            let file = paths.home.join("controller/db-url");
-            if install {
-                if let Some(db) = &db {
-                    std::fs::create_dir_all(paths.home.join("controller"))?;
-                    std::fs::write(&file, db)?;
-                    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
-                }
-                service::install(&paths, "controller", &service::args_without_install())
-            } else {
-                let db = match db {
-                    Some(d) => d,
-                    None => std::fs::read_to_string(&file)
-                        .map(|s| s.trim().to_string())
-                        .map_err(|_| anyhow::anyhow!("no --db and no {}", file.display()))?,
-                };
-                fleet::controller_serve(&paths, fleet::ControllerOptions { db, listen, domain, drain_secs: drain })
-            }
+        Cmd::Controller(ControllerCmd::Serve { install: true, .. }) => {
+            service::install(&paths, "controller", &service::args_without_install())
+        }
+        Cmd::Controller(ControllerCmd::Serve { db, listen, domain, drain, .. }) => {
+            fleet::controller_serve(&paths, fleet::ControllerOptions { db, listen, domain, drain_secs: drain })
         }
         Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, remote }) => remote_call(
             &paths,

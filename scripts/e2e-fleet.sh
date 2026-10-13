@@ -1,13 +1,9 @@
 #!/usr/bin/env bash
 # Fleet and app hosting checks (docs/platform.md, tracks 2-3): a controller, two nodes and
 # an edge on this Mac, each in its own REKCOD_HOME. Leaves the main VM alone.
-#
-#   REKCOD_E2E_DB=postgres://... scripts/e2e-fleet.sh
-#
-# The database is WIPED (schema public is dropped). Needs psql and git.
+# Needs git and sqlite3 (both ship with macOS).
 set -uo pipefail
 R=${REKCOD:-$(cd "$(dirname "$0")/.." && pwd)/target/release/rekcod}
-DB=${REKCOD_E2E_DB:?set REKCOD_E2E_DB to a Postgres URL this script may wipe}
 failures=0
 ok() { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
@@ -35,7 +31,6 @@ export REKCOD_HOME=$C
 for h in "$N1" "$N2"; do
   [[ -d $HOME/.rekcod/golden/default ]] && mkdir -p "$h/golden" && cp -cR "$HOME/.rekcod/golden/default" "$h/golden/"
 done
-psql -q "$DB" -c 'drop schema public cascade; create schema public' >/dev/null
 
 # A repo the nodes clone: Python app, no Dockerfile (rekcod.toml's start command).
 repo=$(mktemp -d "${TMPDIR:-/tmp}/rekcod-fleet-XXXXXX")
@@ -58,7 +53,7 @@ v1=$(commit v1)
 url="$repo/app.git"
 
 echo "fleet"
-REKCOD_HOME=$C "$R" controller serve --db "$DB" --listen 127.0.0.1:17700 --domain apps.test --drain 2s >"$C/controller.log" 2>&1 &
+REKCOD_HOME=$C "$R" controller serve --listen 127.0.0.1:17700 --domain apps.test --drain 2s >"$C/controller.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 50); do [[ -f $C/controller/admin-token ]] && break; sleep 0.2; done
 join=$(cat "$C/controller/join-token") admin=$(cat "$C/controller/admin-token")
@@ -87,7 +82,7 @@ s2=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.2
 check "drained node gets no new sandboxes" sh -c '"$0" sandbox ls --remote alice | grep -A1 "\"$1\"" | grep "\"node\"" | grep -vq "$2" || "$0" sandbox ls --remote alice | grep -B3 "\"$1\"" | grep "\"node\"" | grep -vq "$2"' "$R" "$s2" "$first"
 check "quota (2) refuses a third" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.22' "$R" "$url"
 check "remote rm" sh -c '"$0" sandbox rm --remote alice "$1" "$2"' "$R" "$s1" "$s2"
-psql -q "$DB" -c "update nodes set state = 'ready'" >/dev/null
+sqlite3 "$C/controller/fleet.db" "update nodes set state = 'ready'"
 
 echo "apps"
 REKCOD_HOME=$C "$R" edge serve --remote admin --listen 127.0.0.1:18088 --public-listen 127.0.0.1:18089 >"$C/edge.log" 2>&1 &

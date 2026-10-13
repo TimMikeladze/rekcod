@@ -233,13 +233,13 @@ computer-use agents. Details: [`docs/platform.md`](docs/platform.md#track-4-as-b
 ### Fleet and app hosting
 
 The same sandboxes can run on a team's own Macs, and apps can be deployed onto them. One
-controller (state in Postgres) places sandboxes and app instances on nodes; `rekcod edge`
+controller (state in a SQLite file, `~/.rekcod/controller/fleet.db`) places sandboxes and app instances on nodes; `rekcod edge`
 routes `<app>.<domain>` to them. Design: [`docs/platform.md`](docs/platform.md). Read the
 licence section there first: Apple's macOS licence restricts running it as a service.
 
 ```sh
 # the controller (any Mac), prints where its admin and join tokens are
-rekcod controller serve --db postgres://... --listen 0.0.0.0:7700 --domain apps.example.com
+rekcod controller serve --listen 0.0.0.0:7700 --domain apps.example.com
 # each Mac
 rekcod node join http://controller:7700 "$(cat join-token)" --listen 0.0.0.0:7701 --advertise http://mac2:7701
 # you
@@ -262,12 +262,12 @@ http://127.0.0.1:8081}]` and the controller started with `--domain example.com`.
 app answers `no app at ...` there, the same as one that doesn't exist. PR previews are
 private.
 
-On a spare Mac, `scripts/spare-setup.sh --db postgres://... --domain example.com` does
+On a spare Mac, `scripts/spare-setup.sh --domain example.com` does
 the first three commands as LaunchAgents on its Tailscale address (`--install` on
 `controller serve`, `node join`/`node serve` and `edge serve`): they start at login and
-restart if they exit, so turn on automatic login. The database URL goes to
-`~/.rekcod/controller/db-url` (0600), not into the plist. `rekcod controller|node|edge
-uninstall` removes them.
+restart if they exit, so turn on automatic login. `rekcod controller|node|edge uninstall`
+removes them. Back up the controller by copying `fleet.db` (and its `-wal` file) while it's
+stopped.
 
 A deploy starts new instances (on different nodes when it can), waits for the health check,
 switches the route, then stops the old ones after `--drain` (30 s). A failed health check
@@ -381,7 +381,7 @@ python3 bench/tcp_rtt.py --context rekcod    # 64-byte round trip through a publ
 bench/sandbox.sh                             # agent sandbox create/fork/rm timings, 16 at once
 scripts/e2e-sandbox.sh                       # agent sandbox checks only; leaves the main VM alone
 scripts/e2e-macos.sh                         # macOS sandbox checks; needs a ready base image
-REKCOD_E2E_DB=postgres://... scripts/e2e-fleet.sh   # controller, 2 nodes, edge, apps; WIPES that database
+scripts/e2e-fleet.sh                         # controller, 2 nodes, edge, apps; own homes and database
 rekcod x cargo test -p rekcod-agent          # the guest agent's Linux-only tests
 python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge
 tests/stress/overflow.sh                     # FSEvents burst; see the script for the forced-drop mode

@@ -1,6 +1,6 @@
 # Agent sandboxes: spec
 
-**Status:** spec, 2026-10-12. Builds on the research in [`paas.md`](paas.md). Nothing here is
+**Status:** spec, 2026-10-12. Track 1 of [`platform.md`](platform.md). Research: [`paas.md`](paas.md). Nothing here is
 implemented yet.
 
 ## What we're building

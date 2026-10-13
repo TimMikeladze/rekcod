@@ -271,7 +271,7 @@ guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ 
 - `guest/fuse/`: the fuse/virtiofs patch (long TTLs, lazy open, host-driven invalidation), applied in-tree to the guest kernel.
 - State lives in `~/.rekcod`: `vm/root.img` (replaced on upgrade), `vm/data.img` (256 GiB sparse by default, all docker data), `vm/warm-paths` (bind sources warmed at boot) and `logs/`. The sandbox VM has its own copy under `~/.rekcod/sandbox`.
 
-Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md), [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md), [`docs/phase5.md`](docs/phase5.md), [`docs/sandbox.md`](docs/sandbox.md), [`docs/frontends.md`](docs/frontends.md), [`docs/paas.md`](docs/paas.md). Next steps: [`docs/handoff.md`](docs/handoff.md).
+Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md), [`docs/phase2.md`](docs/phase2.md), [`docs/phase2b-4.md`](docs/phase2b-4.md), [`docs/research.md`](docs/research.md), [`docs/phase5.md`](docs/phase5.md), [`docs/sandbox.md`](docs/sandbox.md), [`docs/frontends.md`](docs/frontends.md), [`docs/paas.md`](docs/paas.md), [`docs/agent-sandboxes.md`](docs/agent-sandboxes.md). Next steps: [`docs/handoff.md`](docs/handoff.md).
 
 ## Limitations
 

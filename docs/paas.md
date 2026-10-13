@@ -154,3 +154,5 @@ returns everything when it stops. It does cap long-lived sandboxes at their conf
   possible.
 - Nested virt works on M3+ for Linux guests. Is Firecracker inside the rekcod VM fast enough
   to give per-sandbox snapshots without paying for a full VZ VM each?
+
+Spec for the recommended path: [`agent-sandboxes.md`](agent-sandboxes.md).

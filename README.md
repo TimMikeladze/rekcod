@@ -230,6 +230,31 @@ exec, diff, apply and fork work as for Linux sandboxes (over SSH; the workspace 
 into the guest's `~/ws`). The MCP server adds `sandbox_screenshot` and `sandbox_input` for
 computer-use agents. Details: [`docs/platform.md`](docs/platform.md#track-4-as-built).
 
+### Docker on another Mac
+
+`rekcod host` makes a spare Mac's rekcod VM your docker engine, over plain docker-over-SSH.
+On the spare, run `rekcod start` and turn on Remote Login (System Settings › General ›
+Sharing). Then on your Mac:
+
+```sh
+ssh-copy-id you@spare-mac              # docker's SSH helper can't answer a password prompt
+rekcod host add spare you@spare-mac    # sets up the spare, creates docker context rekcod-spare, switches to it
+docker ps                              # runs on the spare
+rekcod host forward spare              # the spare's published ports on 127.0.0.1 here, until Ctrl-C
+rekcod host use local                  # back to this Mac's rekcod
+```
+
+`host add` writes a marked block to the spare's `~/.zshenv`. For non-interactive SSH only, it
+puts the docker CLI on `PATH` (non-login SSH has no `/opt/homebrew/bin`) and points
+`DOCKER_HOST` at `~/.rekcod/run/docker.sock`, so it doesn't matter which context the spare
+has active. The spare's login shell has to be zsh; otherwise `add` prints the two lines to
+add by hand. `forward` follows containers as they start and stop, and reports a port that's
+already taken here once instead of retrying it.
+
+Bind mounts (`-v ./src:/app`) are paths on the spare, and `docker build` sends its context
+over SSH. The menu bar shows a Docker host submenu for switching and forwarding, but the rest
+of the menu is still this Mac's VM. Details: [`docs/remote-docker.md`](docs/remote-docker.md).
+
 ### Fleet and app hosting
 
 The same sandboxes can run on a team's own Macs, and apps can be deployed onto them. One
@@ -267,7 +292,35 @@ the first three commands as LaunchAgents on its Tailscale address (`--install` o
 `controller serve`, `node join`/`node serve` and `edge serve`): they start at login and
 restart if they exit, so turn on automatic login. `rekcod controller|node|edge uninstall`
 removes them. Back up the controller by copying `fleet.db` (and its `-wal` file) while it's
-stopped.
+stopped, and keep a copy of `controller/secret-key` somewhere else: app secrets in
+`fleet.db` are sealed with it, and they can't be read without it.
+
+### Namespaces
+
+A namespace is a team's apps, sandboxes, jobs, secrets and quota on a shared fleet. An app
+`web` in namespace `billing` is served at `web--billing.<domain>`; apps in `default` keep
+`<app>.<domain>`.
+
+```sh
+rekcod ns create billing --max-cpus 16 --max-memory 32 --remote admin   # admin token; any limit can be `unlimited`
+rekcod ns member add billing alice --role member                         # viewer, member or owner
+rekcod controller token dave --ns billing --role viewer                  # new token, already a member
+rekcod controller limit dave --max-sandboxes unlimited                   # change a token's own cap
+rekcod ns use billing                     # this remote's app/sandbox/job commands go to billing
+rekcod app deploy --ns billing            # or per command (REKCOD_NS works too)
+rekcod ns ls                              # your namespaces, role, quota and usage
+rekcod node pool n-abc123 --ns billing    # only billing runs on that node; no --ns undoes it
+rekcod ns rm billing --force              # destroys its apps, sandboxes and jobs
+```
+
+Viewers can list, read status and logs. Members deploy, set env and secrets, and run
+sandboxes and jobs. Owners also manage members. Everyone with a token is in `default`, and
+there each person only sees their own things, as before namespaces. In any other namespace
+members share everything. A namespace you aren't in answers `no namespace`, the same as one
+that doesn't exist. Quotas count apps with a live release (sleeping ones too), running
+sandboxes and jobs. Nodes only accept connections to app instances from the controller and
+from edges that have fetched routes, so nobody on the tailnet can skip the edge. Design:
+[`docs/namespaces.md`](docs/namespaces.md).
 
 A deploy starts new instances (on different nodes when it can), waits for the health check,
 switches the route, then stops the old ones after `--drain` (30 s). A failed health check
@@ -282,9 +335,37 @@ health = "/healthz"
 [resources]
 instances = 2
 memory = "1GiB"
+idle_stop = "15m"      # stop the VMs after 15 min without a request; off by default
+recycle = "24h"        # fresh VMs every day; off by default
 [env]
 GREETING = "hi"
 ```
+
+A VM doesn't give memory back to macOS while it runs, so these two are how a fleet gets it
+back. `idle_stop` routes the app away and stops its VMs; the disks stay. The next request
+through the edge is held while the controller boots them and waits for the health check,
+then it's forwarded. In `scripts/e2e-fleet.sh` that took 1 to 2 s for a small Python app. Only
+HTTP through the edge wakes an app, so background loops and open WebSockets stop with it.
+PR previews sleep after 15 minutes unless the base app sets its own `idle_stop`. `recycle`
+is a normal zero-downtime redeploy of the live commit, so it rebuilds. `rekcod app wake` and
+`rekcod app recycle` do either by hand. Details: [`docs/fleet-compute.md`](docs/fleet-compute.md).
+
+Jobs run a command to completion in a fresh sandbox, then delete it:
+
+```sh
+rekcod job run --memory 16 --cpus 8 --timeout 2h -- python etl.py      # follows output, exits with its code
+rekcod job run --name nightly --every 24h -- sh -c "pip install -r requirements.txt && python etl.py"
+rekcod job ls
+rekcod job logs j-abcd1234
+rekcod job cancel j-abcd1234
+rekcod job unschedule nightly
+```
+
+The workspace is the repo's pushed HEAD (or `--git/--ref`). The image comes from the version
+files like `rekcod x` (`--image` overrides it, alpine otherwise), and there's no install
+step, so put it in the command. `--timeout` exits 124. The controller keeps the last 64 KiB
+of output. A schedule never runs two at once, and running jobs count toward the token's
+`--max-sandboxes`.
 
 Point a GitHub webhook (pull_request events, the secret in `controller/webhook-secret`) at
 `/webhooks/github` and each PR gets `<app>-pr-<n>`, deleted when it closes or after 7 days.
@@ -318,14 +399,17 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod macos fetch\|install\|setup\|authorize\|ls\|rm` | macOS base images for `sandbox create --os macos` |
 | `rekcod sandbox screenshot\|input` | Screen and mouse/keyboard of a macOS sandbox |
 | `rekcod remote add\|ls\|rm` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`) |
-| `rekcod node join\|serve\|ls\|drain\|uninstall` | Run this Mac as a fleet node; list or drain nodes |
-| `rekcod controller serve\|token\|uninstall` | The fleet controller; create user tokens |
+| `rekcod ns create\|ls\|quota\|member\|use\|rm` | Namespaces on the fleet (`--ns` on `sandbox`, `app` and `job`) |
+| `rekcod node join\|serve\|ls\|drain\|pool\|uninstall` | Run this Mac as a fleet node; list, drain or dedicate nodes |
+| `rekcod controller serve\|token\|limit\|uninstall` | The fleet controller; create user tokens, change their caps |
 | `rekcod edge serve\|uninstall` | HTTP ingress for apps |
-| `rekcod app deploy\|ls\|status\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|destroy` | Apps on the fleet |
+| `rekcod app deploy\|ls\|status\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|destroy` | Apps on the fleet |
+| `rekcod job run\|ls\|logs\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every` |
+| `rekcod host add\|ls\|use\|rm\|forward` | Another Mac's rekcod as the docker engine, over SSH |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
-| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete), agent sandboxes (shell, diff, apply, stop, delete), apps on the default remote (open, logs, roll back, destroy). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
+| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete), agent sandboxes (shell, diff, apply, stop, delete), apps on the default remote (open, logs, roll back, wake, restart instances, destroy), jobs (output, cancel). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |

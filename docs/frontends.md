@@ -12,7 +12,8 @@ how that's enforced.
 2. One action list. `crates/rekcod/src/actions.rs` defines `Kind` (every action),
    `Action` (a kind plus its target), and what's available for each thing shown:
    `vm_actions`, `container_actions`, `port_actions`, `project_actions`,
-   `snapshot_actions`. The menu bar renders those lists as they are, so adding an
+   `snapshot_actions`, `sandbox_actions`, `app_actions`, `job_actions`,
+   `namespace_actions`, `host_actions`. The menu bar renders those lists as they are, so adding an
    action there needs no menu bar change.
 3. One data model. `actions::Model::load` reads everything the menu shows (VM status,
    containers, ports, compose projects, snapshots, sandbox). `rekcod status --json` is
@@ -38,11 +39,15 @@ how that's enforced.
 | Snapshots: save, restore, delete | `snap save/restore/rm -p <project>` | Snapshots › project |
 | Agent sandboxes: shell, diff, apply, stop, delete | `sandbox shell/diff/apply/stop/rm <id>` | Agent sandboxes › sandbox |
 | macOS sandboxes: screenshot (opens in Preview) | `sandbox screenshot <id> <file> --open` | Agent sandboxes › sandbox |
-| Apps on the default remote: open, logs, make public/private, roll back, destroy | `app open/logs/public/private/rollback/destroy <name>` | Apps › app (only with a remote) |
+| Apps on the default remote: open, logs, make public/private, roll back, destroy, wake (asleep) or restart instances (awake) | `app open/logs/public/private/rollback/destroy/wake/recycle <name>` | Apps › app (only with a remote) |
+| Jobs on the default remote: output, cancel (running only) | `job logs/cancel <id>` | Jobs › job (only with a remote) |
+| Switch the default remote's namespace | `ns use <name>` | Namespace: current › Switch to … (only when the token is in more than one) |
+| Switch docker between this Mac's rekcod and a remote host | `host use <name>\|local` | Docker host: current › Use … (only with a host added; shown while the VM is stopped too) |
+| Forward a remote host's published ports here | `host forward <name>` | Docker host › Forward ports from … (opens Terminal) |
 
 Creating, exec, fork, `cp` and golden disks are for agents and scripts, so they're CLI,
 HTTP and MCP only. So are deploys, scaling and env changes (they take arguments), the
-fleet's admin commands (`node`, `controller`, `edge`, `remote`), `--remote` sandboxes,
+fleet's admin commands (`node`, `controller`, `edge`, `remote`), `host add/rm`, `--remote` sandboxes,
 `sandbox input` (agents), and `macos` image setup (one-time, interactive). The menu bar lists what exists and offers what a person does to it.
 
 ## Changing things

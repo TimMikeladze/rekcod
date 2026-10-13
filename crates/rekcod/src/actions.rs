@@ -40,12 +40,19 @@ pub enum Kind {
     AppDestroy,
     AppPublic,
     AppPrivate,
+    AppWake,
+    AppRecycle,
+    JobLogs,
+    JobCancel,
+    NsUse,
+    HostUse,
+    HostForward,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 26] = [
+    pub const ALL: [Kind; 33] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -72,6 +79,13 @@ impl Kind {
         Kind::AppDestroy,
         Kind::AppPublic,
         Kind::AppPrivate,
+        Kind::AppWake,
+        Kind::AppRecycle,
+        Kind::JobLogs,
+        Kind::JobCancel,
+        Kind::NsUse,
+        Kind::HostUse,
+        Kind::HostForward,
     ];
 }
 
@@ -214,6 +228,19 @@ pub struct Model {
     pub sandboxes: Vec<AgentSandbox>,
     /// Apps on the default fleet remote (`rekcod app ls`), if one is configured.
     pub apps: Vec<RemoteApp>,
+    /// Recent jobs on the default fleet remote (`rekcod job ls`).
+    pub jobs: Vec<RemoteJob>,
+    /// The default remote's namespaces (`rekcod ns ls`); apps and jobs above are the current one's.
+    pub namespaces: Namespaces,
+    /// Remote docker hosts (`rekcod host ls`).
+    pub hosts: Hosts,
+}
+
+/// Docker contexts `rekcod-*`, and whether the local `rekcod` context is in use.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Hosts {
+    pub all: Vec<crate::host::Host>,
+    pub local_current: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -222,12 +249,57 @@ pub struct RemoteApp {
     pub url: String,
     pub live_release: Option<i64>,
     pub public: bool,
+    /// Scaled to zero; the next request (or `app wake`) starts it.
+    pub sleeping: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteJob {
+    pub id: String,
+    pub name: Option<String>,
+    pub state: String,
+    pub exit: Option<i64>,
+    pub created: u64,
+}
+
+/// Namespaces on the default remote: the current one and every one this token is in.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Namespaces {
+    pub current: String,
+    pub all: Vec<String>,
+}
+
+fn remote_namespaces(paths: &Paths) -> Namespaces {
+    let Ok(r) = crate::fleet::remote(paths, None) else { return Namespaces::default() };
+    let all = crate::fleet::call(&r.url, "GET", "/namespaces", Some(&r.token), &Value::Null)
+        .map(|v| v.as_array().into_iter().flatten().filter_map(|n| n["name"].as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    Namespaces { current: r.ns(), all }
+}
+
+/// `GET /jobs` on the default remote, newest first; empty without one.
+fn remote_jobs(paths: &Paths) -> Vec<RemoteJob> {
+    let Ok(r) = crate::fleet::remote(paths, None) else { return vec![] };
+    let Ok(v) = crate::fleet::call(&r.url, "GET", &r.scoped("/jobs"), Some(&r.token), &Value::Null) else { return vec![] };
+    v["jobs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(10)
+        .map(|j| RemoteJob {
+            id: j["id"].as_str().unwrap_or("").into(),
+            name: j["name"].as_str().map(String::from),
+            state: j["state"].as_str().unwrap_or("").into(),
+            exit: j["exit"].as_i64(),
+            created: j["created"].as_u64().unwrap_or(0),
+        })
+        .collect()
 }
 
 /// `GET /apps` on the default remote; empty without one or when it doesn't answer.
 fn remote_apps(paths: &Paths) -> Vec<RemoteApp> {
     let Ok(r) = crate::fleet::remote(paths, None) else { return vec![] };
-    let Ok(v) = crate::fleet::call(&r.url, "GET", "/apps", Some(&r.token), &Value::Null) else { return vec![] };
+    let Ok(v) = crate::fleet::call(&r.url, "GET", &r.scoped("/apps"), Some(&r.token), &Value::Null) else { return vec![] };
     v.as_array()
         .into_iter()
         .flatten()
@@ -236,6 +308,7 @@ fn remote_apps(paths: &Paths) -> Vec<RemoteApp> {
             url: a["url"].as_str().unwrap_or("").into(),
             live_release: a["live_release"].as_i64(),
             public: a["public"].as_bool().unwrap_or(false),
+            sleeping: a["sleeping"].as_bool().unwrap_or(false),
         })
         .collect()
 }
@@ -268,12 +341,28 @@ impl Model {
             })
             .collect();
         let apps = remote_apps(paths);
+        let jobs = remote_jobs(paths);
+        let namespaces = remote_namespaces(paths);
+        let (all, local_current) = crate::host::list();
+        let hosts = Hosts { all, local_current };
         let mut ports = ports_of(&status, false);
         if let Some(sb) = &sandbox {
             ports.extend(ports_of(sb, true));
         }
         if !running {
-            return Model { running, status, ports, sandbox, socket_installed, sandboxes, apps, ..Default::default() };
+            return Model {
+                running,
+                status,
+                ports,
+                sandbox,
+                socket_installed,
+                sandboxes,
+                apps,
+                jobs,
+                namespaces,
+                hosts,
+                ..Default::default()
+            };
         }
         let raw = crate::cli::api_get(paths, "/containers/json?all=1").unwrap_or_default();
         let containers = parse_containers(&raw);
@@ -281,7 +370,7 @@ impl Model {
         let snapshots =
             crate::cli::api_get(paths, &format!("/volumes?filters={filter}")).ok().map(|b| parse_snapshots(&b)).unwrap_or_default();
         let projects = projects(&containers, &raw, snapshots);
-        Model { running, status, containers, ports, projects, sandbox, socket_installed, sandboxes, apps }
+        Model { running, status, containers, ports, projects, sandbox, socket_installed, sandboxes, apps, jobs, namespaces, hosts }
     }
 }
 
@@ -484,6 +573,11 @@ pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
             confirm: None,
         },
         Action::rekcod(Kind::AppLogs, "Logs", &["app", "logs", n]).interactive(),
+        if a.sleeping {
+            Action::rekcod(Kind::AppWake, "Wake (it's scaled to zero)", &["app", "wake", n])
+        } else {
+            Action::rekcod(Kind::AppRecycle, "Restart instances (fresh VMs)", &["app", "recycle", n])
+        },
         Action::rekcod(Kind::AppRollback, "Roll back to the previous release", &["app", "rollback", n])
             .confirm(format!("Roll {n} back to its previous good release?")),
         if a.public {
@@ -495,6 +589,45 @@ pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
         Action::rekcod(Kind::AppDestroy, "Destroy", &["app", "destroy", n])
             .confirm(format!("Destroy {n}? Its instances and release history are deleted.")),
     ]
+}
+
+pub fn job_actions(j: &RemoteJob) -> Vec<Action> {
+    let id = j.id.as_str();
+    let mut out = vec![Action::rekcod(Kind::JobLogs, "Output", &["job", "logs", id]).interactive()];
+    if j.state == "running" {
+        out.push(
+            Action::rekcod(Kind::JobCancel, "Cancel", &["job", "cancel", id]).confirm(format!("Cancel job {id}? Its sandbox is deleted.")),
+        );
+    }
+    out
+}
+
+/// Switch the default remote to another namespace (the current one isn't offered).
+pub fn namespace_actions(n: &Namespaces) -> Vec<Action> {
+    n.all
+        .iter()
+        .filter(|ns| **ns != n.current)
+        .map(|ns| Action::rekcod(Kind::NsUse, format!("Switch to {ns}"), &["ns", "use", ns]))
+        .collect()
+}
+
+/// Switch the docker context between this Mac's rekcod and remote hosts; forward a host's ports.
+pub fn host_actions(h: &Hosts) -> Vec<Action> {
+    let mut out = Vec::new();
+    if !h.local_current {
+        out.push(Action::rekcod(Kind::HostUse, "Use local rekcod", &["host", "use", "local"]));
+    }
+    for host in &h.all {
+        if !host.current {
+            out.push(Action::rekcod(Kind::HostUse, format!("Use {}", host.name), &["host", "use", &host.name]));
+        }
+    }
+    for host in &h.all {
+        out.push(
+            Action::rekcod(Kind::HostForward, format!("Forward ports from {}", host.name), &["host", "forward", &host.name]).interactive(),
+        );
+    }
+    out
 }
 
 pub fn age(created: u64) -> String {
@@ -535,7 +668,20 @@ pub mod tests {
     }
 
     pub fn sample_app() -> RemoteApp {
-        RemoteApp { name: "dash".into(), url: "http://dash.apps.test".into(), live_release: Some(3), public: false }
+        RemoteApp { name: "dash".into(), url: "http://dash.apps.test".into(), live_release: Some(3), public: false, sleeping: false }
+    }
+
+    pub fn sample_job() -> RemoteJob {
+        RemoteJob { id: "j-abcdefgh".into(), name: Some("etl".into()), state: "running".into(), exit: None, created: 0 }
+    }
+
+    pub fn sample_namespaces() -> Namespaces {
+        Namespaces { current: "default".into(), all: vec!["default".into(), "team".into()] }
+    }
+
+    pub fn sample_hosts() -> Hosts {
+        let h = |n: &str, current| crate::host::Host { name: n.into(), endpoint: format!("ssh://me@{n}"), current };
+        Hosts { all: vec![h("spare", true), h("mini", false)], local_current: false }
     }
 
     pub fn sample_sandbox() -> AgentSandbox {
@@ -579,7 +725,10 @@ pub mod tests {
         }
         all.extend(sandbox_actions(&sample_sandbox()));
         all.extend(app_actions(&sample_app()));
-        all.extend(app_actions(&RemoteApp { public: true, ..sample_app() }));
+        all.extend(app_actions(&RemoteApp { public: true, sleeping: true, ..sample_app() }));
+        all.extend(job_actions(&sample_job()));
+        all.extend(namespace_actions(&sample_namespaces()));
+        all.extend(host_actions(&sample_hosts()));
         all
     }
 
@@ -605,6 +754,7 @@ pub mod tests {
                     | Kind::AppRollback
                     | Kind::AppDestroy
                     | Kind::AppPublic
+                    | Kind::JobCancel
             );
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }

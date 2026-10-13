@@ -133,6 +133,81 @@ sleep 2.5
 check "PR preview removed on close" sh -c 'curl -s -m 3 -H "Host: hello-pr-7.apps.test" http://127.0.0.1:18088/ | grep -q "no app"'
 check "destroy" cr app destroy --remote admin hello
 
+echo "scale to zero, recycle"
+check "deploy with --idle-stop 5s" cr app deploy --remote admin --git "$url" --ref "$v1" --name nap --idle-stop 5s
+napget() { curl -s -m 90 -H "Host: nap.apps.test" http://127.0.0.1:18088/; }
+sleep 3
+check "awake app serves" sh -c 'test "$(curl -s -m 3 -H "Host: nap.apps.test" http://127.0.0.1:18088/)" = "v1 "'
+asleep() { cr app ls --remote admin | grep -A8 '"name": "nap"' | grep -q '"sleeping": true'; }
+for _ in $(seq 30); do asleep && break; sleep 1; done
+check "idle app goes to sleep" asleep
+vmstopped() { for h in "$N1" "$N2"; do REKCOD_HOME=$h "$R" sandbox ls; done | grep "nap-" | grep -q stopped; }
+for _ in $(seq 40); do vmstopped && break; sleep 1; done
+check "its VM is stopped" vmstopped
+t0=$(date +%s)
+check "a request wakes it (held, then 200)" sh -c 'test "$(curl -s -m 90 -H "Host: nap.apps.test" http://127.0.0.1:18088/)" = "v1 "'
+echo "        woke in $(( $(date +%s) - t0 ))s"
+check "awake again in app status" sh -c '"$0" app status --remote admin nap | grep -q "\"state\": \"live\""' "$R"
+check "woke the same VMs (no redeploy)" sh -c '"$0" app status --remote admin nap | grep -q "\"live_release\": 1,"' "$R"
+before=$(cr app status --remote admin nap | sed -n 's/.*"sandbox": "\(.*\)".*/\1/p' | sort | tr '\n' ' ')
+: >"$C/codes"
+( for _ in $(seq 200); do curl -s -o /dev/null -w '%{http_code}\n' -m 3 -H "Host: nap.apps.test" http://127.0.0.1:18088/ >>"$C/codes"; sleep 0.05; done ) &
+loop=$!
+check "app recycle" cr app recycle --remote admin nap
+sleep 3
+kill $loop 2>/dev/null; wait $loop 2>/dev/null
+after=$(cr app status --remote admin nap | grep -B4 '"state": "live"' | sed -n 's/.*"sandbox": "\(.*\)".*/\1/p' | sort | tr '\n' ' ')
+check "recycle gave new instances" test "$before" != "$after"
+check "no non-200 during the recycle" sh -c '! grep -qv "^200$" "$0" && test -s "$0" || { sort "$0" | uniq -c; false; }' "$C/codes"
+check "destroy nap" cr app destroy --remote admin nap
+
+echo "jobs"
+job() { cr job run --remote alice --git "$url" --ref "$v1" --image alpine:3.22 "$@"; }
+out=$(job -- sh -c 'cat VERSION; echo hi; exit 3' 2>/dev/null); code=$?
+check "job exit code comes back" test "$code" = 3
+check "job output streams (sees the clone)" sh -c 'printf "%s" "$0" | grep -q hi && printf "%s" "$0" | grep -q v1' "$out"
+job --timeout 2s -- sleep 30 >/dev/null 2>&1; code=$?
+check "--timeout kills it with 124" test "$code" = 124
+jid=$(job --detach -- sleep 120 2>/dev/null | sed -n 's/.*"id": "\(.*\)".*/\1/p')
+check "detached job starts" test -n "$jid"
+sleep 4
+check "another user can't read it" sh -c '! "$0" job logs --remote bob "$1"' "$R" "$jid"
+check "job cancel" cr job cancel --remote alice "$jid"
+check "cancelled in job ls" sh -c '"$0" job ls --remote alice | grep -A8 "\"$1\"" | grep -q cancelled' "$R" "$jid"
+check "schedule every 3s" job --name tick --every 3s -- echo tick
+sleep 25
+check "schedule ran at least twice" sh -c 'test "$("$0" job ls --remote alice | grep -c "\"schedule\": \"tick\"")" -ge 2' "$R"
+check "unschedule" cr job unschedule --remote alice tick
+
+echo "namespaces"
+check "ns create (4 CPUs, 4 GiB)" cr ns create team --max-cpus 4 --max-memory 4 --remote admin
+check "member add" cr ns member add team alice --remote admin
+check "viewer add" cr ns member add team bob --role viewer --remote admin
+carol=$(cr controller token carol --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
+cr remote add carol http://127.0.0.1:17700 --token "$carol"
+check "members see it in ns ls" sh -c '"$0" ns ls --remote bob | grep -q "\"name\": \"team\""' "$R"
+check "others don't" sh -c '! "$0" ns ls --remote carol | grep -q "\"team\""' "$R"
+s3=$(cr sandbox create --remote alice --ns team --git "$url" --ref main --image alpine:3.22 --cpus 1 --memory 1 2>"$C/err")
+check "sandbox in a namespace" test -n "$s3"
+check "viewer lists it" sh -c '"$0" sandbox ls --remote bob --ns team | grep -q "$1"' "$R" "$s3"
+check "viewer can't exec" sh -c '! "$0" sandbox exec --remote bob --ns team "$1" -- true' "$R" "$s3"
+check "non-member can't reach it" sh -c '! "$0" sandbox exec --remote carol --ns team "$1" -- true' "$R" "$s3"
+check "it isn't in default" sh -c '! "$0" sandbox exec --remote alice "$1" -- true' "$R" "$s3"
+check "namespace quota refuses 4 more CPUs" sh -c '"$0" sandbox create --remote alice --ns team --git "$1" --ref main --image alpine:3.22 --cpus 4 --memory 1 2>&1 | grep -q "of 4 CPUs"' "$R" "$url"
+cr sandbox rm --remote alice --ns team "$s3" >/dev/null
+check "deploy into team" cr app deploy --remote alice --ns team --git "$url" --ref "$v1" --name hello
+sleep 2.5
+check "edge serves hello--team" sh -c 'test "$(curl -s -m 3 -H "Host: hello--team.apps.test" http://127.0.0.1:18088/)" = "v1 "'
+check "viewer can't deploy" sh -c '! "$0" app deploy --remote bob --ns team --git "$1" --ref "$2" --name other' "$R" "$url" "$v1"
+check "secret set" cr app secret set --remote alice --ns team hello GREETING=psst
+sleep 2.5
+check "sealed secret reaches the app" sh -c 'test "$(curl -s -m 3 -H "Host: hello--team.apps.test" http://127.0.0.1:18088/)" = "v1 psst"'
+check "fleet.db has no plain secret" sh -c '! sqlite3 "$0" "select secrets from apps" | grep -q psst' "$C/controller/fleet.db"
+check "ns rm refuses while it has apps" sh -c '! "$0" ns rm team --remote admin' "$R"
+check "ns rm --force" cr ns rm team --force --remote admin
+sleep 2.5
+check "its app is gone from the edge" sh -c 'curl -s -m 3 -H "Host: hello--team.apps.test" http://127.0.0.1:18088/ | grep -q "no app"'
+
 kill "$node2"
 sleep 22
 check "silent node marked lost" sh -c '"$0" node ls --remote admin | grep -q "\"lost\""' "$R"

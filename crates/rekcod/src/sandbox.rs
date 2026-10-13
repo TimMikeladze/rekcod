@@ -872,7 +872,13 @@ pub fn stop(paths: &Paths, id: &str) -> Result<()> {
 
 fn remove(s: &Sandbox) -> Result<()> {
     crate::cli::signal_daemon(&s.paths, libc::SIGUSR1)?;
-    std::fs::remove_dir_all(&s.paths.home).with_context(|| format!("remove {}", s.paths.home.display()))
+    // The daemon deletes its own run files as it exits, which can race the walk here.
+    let mut r = std::fs::remove_dir_all(&s.paths.home);
+    if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        r = std::fs::remove_dir_all(&s.paths.home).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
+    }
+    r.with_context(|| format!("remove {}", s.paths.home.display()))
 }
 
 pub fn rm(paths: &Paths, ids: &[String], every: bool) -> Result<()> {

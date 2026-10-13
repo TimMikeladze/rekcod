@@ -8,7 +8,7 @@ See `docs/frontends.md`.
 - Every user-facing action is a CLI command first.
 - The menu bar only renders the lists in `crates/rekcod/src/actions.rs`
   (`vm_actions`, `container_actions`, `port_actions`, `project_actions`,
-  `snapshot_actions`) and runs the action's `rekcod` command line.
+  `snapshot_actions`, `sandbox_actions`, `app_actions`, `job_actions`, `namespace_actions`, `host_actions`) and runs the action's `rekcod` command line.
 - When adding a CLI feature a user acts on, add a `Kind` and put it in the right list
   in the same change, then update `docs/frontends.md` and the README.
 - The parity tests (`actions::tests::every_kind_is_offered`,

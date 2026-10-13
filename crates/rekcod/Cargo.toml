@@ -11,7 +11,7 @@ tokio.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"
 socket2 = { version = "0.6", features = ["all"] }
 
@@ -25,4 +25,5 @@ notify = "8"
 rusqlite = { version = "0.37", features = ["bundled"] }
 hmac = "0.12"
 sha2 = "0.10"
+aes-gcm = "0.10"
 objc2-app-kit = "0.3"

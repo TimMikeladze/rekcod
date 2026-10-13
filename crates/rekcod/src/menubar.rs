@@ -130,6 +130,16 @@ pub fn entries(m: &Model) -> Vec<Entry> {
     }
     let vm = actions::vm_actions(m.running, m.socket_installed);
     out.extend(vm.into_iter().map(Entry::Action));
+    let hosts = actions::host_actions(&m.hosts);
+    if !m.hosts.all.is_empty() {
+        let current = m.hosts.all.iter().find(|h| h.current).map(|h| h.name.as_str());
+        let title = match (current, m.hosts.local_current) {
+            (Some(n), _) => format!("Docker host: {n}"),
+            (None, true) => "Docker host: local".into(),
+            (None, false) => "Docker host: other context".into(),
+        };
+        out.push(Entry::Submenu(title, hosts.into_iter().map(Entry::Action).collect()));
+    }
     if !m.running {
         return out;
     }
@@ -213,10 +223,30 @@ pub fn entries(m: &Model) -> Vec<Entry> {
             .map(|a| {
                 let rel = a.live_release.map(|r| format!("release {r}")).unwrap_or_else(|| "not deployed".into());
                 let rel = if a.public { format!("{rel}, public") } else { rel };
+                let rel = if a.sleeping { format!("{rel}, asleep") } else { rel };
                 Entry::Submenu(format!("{}  ({rel})", a.name), actions::app_actions(a).into_iter().map(Entry::Action).collect())
             })
             .collect();
         out.push(Entry::Submenu(format!("Apps ({})", m.apps.len()), items));
+    }
+    if !m.jobs.is_empty() {
+        let items = m
+            .jobs
+            .iter()
+            .map(|j| {
+                let state = match j.exit {
+                    Some(x) if j.state != "running" => format!("{}, exit {x}", j.state),
+                    _ => j.state.clone(),
+                };
+                let title = format!("{}  ({state}, {})", j.name.as_deref().unwrap_or(&j.id), actions::age(j.created));
+                Entry::Submenu(title, actions::job_actions(j).into_iter().map(Entry::Action).collect())
+            })
+            .collect();
+        out.push(Entry::Submenu("Jobs".into(), items));
+    }
+    if m.namespaces.all.len() > 1 {
+        let items = actions::namespace_actions(&m.namespaces).into_iter().map(Entry::Action).collect();
+        out.push(Entry::Submenu(format!("Namespace: {}", m.namespaces.current), items));
     }
     out
 }
@@ -539,8 +569,11 @@ mod tests {
             sandboxes: vec![crate::actions::tests::sample_sandbox()],
             apps: vec![
                 crate::actions::tests::sample_app(),
-                crate::actions::RemoteApp { name: "blog".into(), public: true, ..crate::actions::tests::sample_app() },
+                crate::actions::RemoteApp { name: "blog".into(), public: true, sleeping: true, ..crate::actions::tests::sample_app() },
             ],
+            jobs: vec![crate::actions::tests::sample_job()],
+            namespaces: crate::actions::tests::sample_namespaces(),
+            hosts: crate::actions::tests::sample_hosts(),
         };
         fn kinds(e: &[Entry], out: &mut Vec<crate::actions::Kind>) {
             for e in e {

@@ -4,6 +4,7 @@
 /// rekcod's own top-level commands that docker doesn't have.
 const OWN: &[&str] = &[
     "status",
+    "ns",
     "shell",
     "compact",
     "menubar",
@@ -13,10 +14,12 @@ const OWN: &[&str] = &[
     "sandbox",
     "mcp",
     "remote",
+    "host",
     "node",
     "controller",
     "edge",
     "app",
+    "job",
     "macos",
     "help",
     "daemon",

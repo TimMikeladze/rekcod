@@ -160,12 +160,13 @@ commands with `error:`, and the host degrades (no autoports, no stats).
 | 1. First access | Warming starts at `create`; the 8 most recent bind sources are warmed at boot. `bench/cold_start.sh` (19.5k files, walk 3 s after `rekcod start`): **34 ms** warmed at boot vs 286 ms not (warm repeat: 35 ms). |
 | 2. VM-local dirs | `dev.rekcod.local` label works through compose and `docker run`; attach/exec/BuildKit sessions still pass (full e2e green through the new proxy). |
 | 3. Change latency | `bench/inotify_rtt.py`, 40 round trips: p50 **26.1 → 13.8 ms**, p90 27.0 → 14.6 ms. OrbStack (phase 0): 12.4 ms. |
-| 4. Memory | **Still not returned.** With `REKCOD_BALLOON=1`, after 5 GB was touched and freed in the guest, the balloon capped the guest at 1.6 GB, but the VZ process footprint stayed at 7.2 GB. Under `memory_pressure -l warn` its RSS fell to 5.2 GB (compressed), footprint unchanged. The balloon stays opt-in. Remaining idea: zero ballooned pages so the compressor shrinks them to nothing. |
+| 4. Memory | **Still not returned.** With `REKCOD_BALLOON=1`, after 5 GB was touched and freed in the guest, the balloon capped the guest at 1.6 GB, but the VZ process footprint stayed at 7.2 GB. Under `memory_pressure -l warn` its RSS fell to 5.2 GB (compressed), footprint unchanged. The balloon stays opt-in. Zeroing freed pages (`init_on_free=1`) is worse: the guest touches all 8 GiB at boot. Stopping the VM is what returns memory (`fleet-compute.md`). |
 | 5. Snapshots | Postgres with 2M rows (361 MB data dir): save 0.5 s, restore 0.5 s (0.3 s after `down -v`), data back, compose adopts the recreated volume. Restore waits for `docker stop`, so a container that ignores SIGTERM costs its 10 s timeout. |
 | 6. `rekcod x` | Detection unit-tested per runtime. Warm `rekcod x node -v`: ~75 ms vs ~10 ms native (gate: ≤300 ms over native). A server bound to the container's `127.0.0.1:3999` answered on the Mac's `localhost:3999` with no `-p`; the forward closed when the container stopped. |
 | 7. Sandbox | Verified as in `sandbox.md`. Second VM boots in ~1 s. |
 | 8. API | `rekcod status --json`, `rekcod snap ls --json`. |
 | 9. Menu bar | Built; entries checked through the accessibility API (no screenshot: the terminal lacks Screen Recording permission). Start/Stop clicks and `--install` not exercised. |
 | 10. Status | Disk used in the VM vs on the Mac, file-cache trips to macOS by opcode, warming in progress, sandbox VM and its ports. |
+
 
 Naming: the runner is `rekcod x`, because `rekcod run` already means `docker run`.

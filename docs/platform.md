@@ -402,11 +402,13 @@ uploads, cross-repo mounts) are where a hand-rolled one breaks. If the spike goe
 ## Tracks 2 and 3 as built
 
 `crates/rekcod/src/fleet.rs`. `scripts/e2e-fleet.sh` runs a controller, two nodes and an
-edge on one Mac, with the controller's SQLite file in its own home, and passes all 32 checks:
+edge on one Mac, with the controller's SQLite file in its own home, and passes all 53 checks:
 - placement, drain, quota, ownership, apply refused remotely, a silent node marked lost;
 - deploy from a repo without a Dockerfile, zero non-200s across a redeploy (400 requests),
   a broken release refused while the old one serves, rollback, env and secrets, logs;
 - a signed PR webhook creating and deleting a preview.
+- scale to zero and wake through the edge, recycle, and jobs (exit codes, timeout, cancel,
+  schedules); see [`fleet-compute.md`](fleet-compute.md).
 
 Where the code differs from the spec above:
 
@@ -415,7 +417,8 @@ Where the code differs from the spec above:
   on a private network or VPN, or put TLS in front. `rustls` + `rcgen` is the upgrade path.
 - **No registry, no S3.** Each instance clones the release's commit and builds it in its
   own sandbox's BuildKit. A release is a commit, so rollback rebuilds it (the build cache in
-  that sandbox is gone, so it's a full build). Golden disks are copied to nodes by hand
+  that sandbox is gone, so it's a full build). RustFS is the planned bucket:
+  [`rustfs.md`](rustfs.md). Golden disks are copied to nodes by hand
   (`cp -cR ~/.rekcod/golden/default <node home>/golden/`).
 - **`rekcod edge` is a hand-written HTTP/1.1 proxy on `std`**, not pingora, with no TLS and
   no ACME. It routes on `Host`, round-robins live instances, and refreshes the table from
@@ -424,14 +427,19 @@ Where the code differs from the spec above:
   (cloudflared) points at. `--listen` serves everything and belongs on the tailnet.
 - **Instances are reached through a relay** on the node: the instance's port is published on
   the Mac's loopback by the sandbox daemon, and the node forwards `<node ip>:<port>` to it.
-- **Secrets are stored in the controller's SQLite file in plain text** (a separate column,
-  shown by key only).
-  Encrypting them with a controller key is still to do.
+- **Secrets are sealed with AES-256-GCM** under a per-namespace key, HMAC(`controller/secret-key`,
+  namespace salt). The key file lives next to `fleet.db`, not in it; secrets stored in the clear
+  by older controllers are sealed at startup. See [`namespaces.md`](namespaces.md).
+- **Instance relays only accept the controller and known edges** (plus the node itself), so a
+  tailnet peer can't skip the edge.
 - **`app status` replaces `status APP`**, since `rekcod status` is taken. Apps are under
   `rekcod app`; the spec's `rekcod deploy` is `rekcod app deploy`.
 - **Logs aren't kept for 7 days** on the node; `app logs` is the last 200 lines of each live
   instance. No Prometheus metrics endpoint yet.
 - **Remote sandboxes aren't in the menu bar**; apps on the default remote are.
+- **Scale to zero, recycling and jobs** are in [`fleet-compute.md`](fleet-compute.md): idle
+  apps' VMs stop and wake on the next request, `recycle` swaps in fresh VMs, and
+  `rekcod job` runs commands to completion.
 - **Previews inherit the base app's env** (not its secrets) and are deleted after 7 days by
   the controller's watchdog. The PR comment needs `GITHUB_TOKEN` in the controller's
   environment and uses `curl`.

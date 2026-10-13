@@ -27,6 +27,8 @@ mod fetch;
 #[cfg(target_os = "macos")]
 mod fleet;
 #[cfg(target_os = "macos")]
+mod host;
+#[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 mod menubar;
@@ -129,6 +131,9 @@ enum Cmd {
         /// Run on a fleet controller (`rekcod remote add`); no NAME means the default remote.
         #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
+        /// Namespace on the controller (default: the remote's, see `rekcod ns use`).
+        #[arg(long, global = true, env = "REKCOD_NS")]
+        ns: Option<String>,
         #[command(subcommand)]
         cmd: SandboxCmd,
     },
@@ -140,6 +145,9 @@ enum Cmd {
     /// Fleet controllers this CLI talks to (docs/platform.md).
     #[command(subcommand)]
     Remote(RemoteCmd),
+    /// Another Mac's rekcod as your docker engine, over SSH (docs/remote-docker.md).
+    #[command(subcommand)]
+    Host(HostCmd),
     /// Run this Mac as a fleet node.
     #[command(subcommand)]
     Node(NodeCmd),
@@ -153,8 +161,26 @@ enum Cmd {
     App {
         #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
+        #[arg(long, global = true, env = "REKCOD_NS")]
+        ns: Option<String>,
         #[command(subcommand)]
         cmd: AppCmd,
+    },
+    /// Commands that run to completion on the fleet, once or on a schedule.
+    Job {
+        #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+        #[arg(long, global = true, env = "REKCOD_NS")]
+        ns: Option<String>,
+        #[command(subcommand)]
+        cmd: JobCmd,
+    },
+    /// Namespaces on the fleet: apps, sandboxes and jobs shared by a team (docs/namespaces.md).
+    Ns {
+        #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+        #[command(subcommand)]
+        cmd: NsCmd,
     },
     /// Copy images and named volumes from another docker context (desktop-linux, orbstack, ...).
     Import {
@@ -239,6 +265,14 @@ enum Snap {
         #[arg(short = 'p', long)]
         project: Option<String>,
     },
+}
+
+/// A quota: a count, or `unlimited` (stored as -1).
+fn quota_value(s: &str) -> Result<i64, String> {
+    match s {
+        "unlimited" => Ok(-1),
+        _ => s.parse::<u32>().map(i64::from).map_err(|_| format!("{s}: a number or `unlimited`")),
+    }
 }
 
 /// `30m`, `2h`, `90s`, `0` (never).
@@ -437,6 +471,9 @@ enum RemoteCmd {
         url: String,
         #[arg(long)]
         token: String,
+        /// Namespace this remote's commands use (default: default).
+        #[arg(long)]
+        ns: Option<String>,
     },
     Ls,
     Rm {
@@ -479,6 +516,71 @@ enum NodeCmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
+    /// Dedicate a node to namespaces (admin token); no --ns gives it back to everyone.
+    Pool {
+        id: String,
+        #[arg(long)]
+        ns: Vec<String>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum NsCmd {
+    /// Create a namespace (admin token).
+    Create {
+        name: String,
+        #[arg(long, value_parser = quota_value)]
+        max_cpus: Option<i64>,
+        /// GiB.
+        #[arg(long, value_parser = quota_value)]
+        max_memory: Option<i64>,
+        #[arg(long, value_parser = quota_value)]
+        max_sandboxes: Option<i64>,
+        #[arg(long, value_parser = quota_value)]
+        max_apps: Option<i64>,
+    },
+    /// Namespaces you're in, with your role, quota and usage.
+    Ls,
+    /// Change a namespace's quota (admin token).
+    Quota {
+        name: String,
+        #[arg(long, value_parser = quota_value)]
+        max_cpus: Option<i64>,
+        #[arg(long, value_parser = quota_value)]
+        max_memory: Option<i64>,
+        #[arg(long, value_parser = quota_value)]
+        max_sandboxes: Option<i64>,
+        #[arg(long, value_parser = quota_value)]
+        max_apps: Option<i64>,
+    },
+    /// Members (owner role).
+    #[command(subcommand)]
+    Member(NsMember),
+    /// Send this remote's app, sandbox and job commands to NAME from now on.
+    Use { name: String },
+    /// Delete a namespace (admin token); --force destroys its apps, sandboxes and jobs.
+    Rm {
+        name: String,
+        #[arg(long)]
+        force: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum NsMember {
+    Add {
+        ns: String,
+        who: String,
+        /// viewer, member or owner.
+        #[arg(long, default_value = "member")]
+        role: String,
+    },
+    Rm {
+        ns: String,
+        who: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -502,13 +604,29 @@ enum ControllerCmd {
     },
     /// Remove the controller's LaunchAgent.
     Uninstall,
+    /// Change an existing token's cap (admin token); applies to every token with that name.
+    Limit {
+        name: String,
+        /// Running sandboxes plus jobs, in every namespace together; `unlimited` for no cap.
+        #[arg(long, value_parser = quota_value)]
+        max_sandboxes: i64,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
     /// Create a user token (admin token).
     Token {
         name: String,
-        #[arg(long, default_value_t = 10)]
+        /// Running sandboxes plus jobs, in every namespace together; `unlimited` for no cap.
+        #[arg(long, default_value = "10", value_parser = quota_value)]
         max_sandboxes: i64,
         #[arg(long)]
         admin: bool,
+        /// Also make the token a member of this namespace.
+        #[arg(long)]
+        ns: Option<String>,
+        /// Its role there: viewer, member or owner.
+        #[arg(long, default_value = "member", requires = "ns")]
+        role: String,
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
@@ -554,8 +672,22 @@ enum AppCmd {
         /// Only on the edge's private listener.
         #[arg(long)]
         private: bool,
+        /// Stop the VMs after this long without a request; the next one wakes them (0: never).
+        #[arg(long, value_parser = duration_secs)]
+        idle_stop: Option<u64>,
+        /// Replace the instances with fresh VMs this often, so their memory goes back to macOS (0: never).
+        #[arg(long, value_parser = duration_secs)]
+        recycle: Option<u64>,
     },
     Ls,
+    /// Start a sleeping app's instances now.
+    Wake {
+        name: String,
+    },
+    /// Replace the instances with fresh VMs (a zero-downtime redeploy of the live commit).
+    Recycle {
+        name: String,
+    },
     /// Serve an app on the edge's public listener.
     Public {
         name: String,
@@ -593,6 +725,54 @@ enum AppCmd {
 }
 
 #[derive(Subcommand)]
+enum JobCmd {
+    /// Run CMD in a new sandbox on the fleet, from this repo's pushed HEAD.
+    Run {
+        #[arg(long)]
+        name: Option<String>,
+        /// Default: from the repo's version files (as `rekcod x`), else alpine.
+        #[arg(long)]
+        image: Option<String>,
+        #[arg(long, default_value_t = 2)]
+        cpus: u64,
+        /// GiB.
+        #[arg(long, default_value_t = 2)]
+        memory: u64,
+        /// KEY=VALUE, repeatable.
+        #[arg(long)]
+        env: Vec<String>,
+        /// Kill it after this long (exit 124).
+        #[arg(long, value_parser = duration_secs)]
+        timeout: Option<u64>,
+        /// Run it on this schedule instead of once (needs --name).
+        #[arg(long, value_parser = duration_secs)]
+        every: Option<u64>,
+        #[arg(long)]
+        git: Option<String>,
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+        /// Print the job ID and return instead of following its output.
+        #[arg(long, short)]
+        detach: bool,
+        #[arg(last = true, required = true)]
+        cmd: Vec<String>,
+    },
+    /// Recent jobs and schedules.
+    Ls,
+    /// A job's output (the last 64 KiB once it's finished).
+    Logs {
+        id: String,
+    },
+    Cancel {
+        id: String,
+    },
+    /// Delete a schedule (its running job keeps going).
+    Unschedule {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum AppVars {
     /// KEY=VALUE...; redeploys the live release.
     Set {
@@ -618,6 +798,29 @@ enum Golden {
     Rm {
         name: String,
     },
+}
+
+#[derive(Subcommand)]
+enum HostCmd {
+    /// Set up DEST (user@mac) for docker over SSH and switch the docker context to it.
+    Add {
+        name: String,
+        dest: String,
+        /// Create the context without switching to it.
+        #[arg(long)]
+        no_use: bool,
+    },
+    /// Hosts (docker contexts rekcod-*); * marks the one in use.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Switch the docker context to a host, or `local` for this Mac's rekcod.
+    Use { name: String },
+    /// Delete a host's docker context.
+    Rm { name: String },
+    /// Forward the host's published ports to 127.0.0.1 here until Ctrl-C (default: all, followed live).
+    Forward { name: String, ports: Vec<u16> },
 }
 
 #[derive(Subcommand)]
@@ -662,8 +865,12 @@ fn main() {
             let opts = xrun::Options { image, publish, env, no_autoports, sandbox, offline, secrets, keep };
             xrun::run(&paths, &cmd, opts).map(|_| ())
         }
-        Cmd::Sandbox { remote: Some(r), cmd } => run_remote_sandbox(&paths, &r, cmd),
-        Cmd::Sandbox { remote: None, cmd } => run_sandbox(&paths, cmd),
+        Cmd::Sandbox { remote: Some(r), ns, cmd } => {
+            set_ns(ns);
+            run_remote_sandbox(&paths, &r, cmd)
+        }
+        Cmd::Sandbox { remote: None, ns: Some(_), .. } => Err(anyhow::anyhow!("--ns is for fleet sandboxes; add --remote")),
+        Cmd::Sandbox { remote: None, cmd, .. } => run_sandbox(&paths, cmd),
         Cmd::Mcp => sandbox_api::mcp(paths),
         Cmd::Macos(MacosCmd::Fetch) => macos::fetch(&paths),
         Cmd::Macos(MacosCmd::Install { name, disk, cpus, memory }) => macos::install(&paths, &name, disk, cpus, memory),
@@ -672,7 +879,7 @@ fn main() {
         Cmd::Macos(MacosCmd::Ls) => macos::list(&paths),
         Cmd::Macos(MacosCmd::Rm { name }) => macos::remove(&paths, &name),
         Cmd::Macos(MacosCmd::Run { home, idle_ttl }) => macos::run(home, idle_ttl),
-        Cmd::Remote(RemoteCmd::Add { name, url, token }) => fleet::remote_add(&paths, &name, &url, &token),
+        Cmd::Remote(RemoteCmd::Add { name, url, token, ns }) => fleet::remote_add(&paths, &name, &url, &token, ns.as_deref()),
         Cmd::Remote(RemoteCmd::Ls) => {
             fleet::remote_list(&paths);
             Ok(())
@@ -686,6 +893,9 @@ fn main() {
         Cmd::Node(NodeCmd::Uninstall) => service::uninstall("node"),
         Cmd::Controller(ControllerCmd::Uninstall) => service::uninstall("controller"),
         Cmd::Node(NodeCmd::Ls { remote }) => remote_call(&paths, &remote, "GET", "/nodes", &serde_json::Value::Null),
+        Cmd::Node(NodeCmd::Pool { id, ns, remote }) => {
+            remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/pool"), &serde_json::json!({"ns": ns}))
+        }
         Cmd::Node(NodeCmd::Drain { id, remote }) => {
             remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/drain"), &serde_json::json!({}))
         }
@@ -695,24 +905,43 @@ fn main() {
         Cmd::Controller(ControllerCmd::Serve { db, listen, domain, drain, .. }) => {
             fleet::controller_serve(&paths, fleet::ControllerOptions { db, listen, domain, drain_secs: drain })
         }
-        Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, remote }) => remote_call(
+        Cmd::Controller(ControllerCmd::Limit { name, max_sandboxes, remote }) => {
+            remote_call(&paths, &remote, "POST", &format!("/tokens/{name}"), &serde_json::json!({"max_sandboxes": max_sandboxes}))
+        }
+        Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, ns, role, remote }) => remote_call(
             &paths,
             &remote,
             "POST",
             "/tokens",
-            &serde_json::json!({"name": name, "max_sandboxes": max_sandboxes, "admin": admin}),
+            &serde_json::json!({"name": name, "max_sandboxes": max_sandboxes, "admin": admin, "ns": ns, "role": role}),
         ),
         Cmd::Edge(EdgeCmd::Serve { install: true, .. }) => service::install(&paths, "edge", &service::args_without_install()),
         Cmd::Edge(EdgeCmd::Serve { listen, public_listen, remote, .. }) => {
             fleet::edge_serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), &listen, public_listen.as_deref())
         }
         Cmd::Edge(EdgeCmd::Uninstall) => service::uninstall("edge"),
-        Cmd::App { remote, cmd } => run_app(&paths, &remote, cmd),
+        Cmd::App { remote, ns, cmd } => {
+            set_ns(ns);
+            run_app(&paths, &remote, cmd)
+        }
+        Cmd::Job { remote, ns, cmd } => {
+            set_ns(ns);
+            run_job(&paths, &remote, cmd)
+        }
+        Cmd::Ns { remote, cmd } => run_ns(&paths, &remote, cmd),
         Cmd::Import { from, names, images_only, volumes_only, force } => {
             cli::import(&paths, &from, &names, !volumes_only, !images_only, force)
         }
         Cmd::Shell => cli::shell(&paths),
         Cmd::Compact => cli::compact(&paths),
+        Cmd::Host(HostCmd::Add { name, dest, no_use }) => host::add(&name, &dest, !no_use),
+        Cmd::Host(HostCmd::Ls { json }) => {
+            host::print_list(json);
+            Ok(())
+        }
+        Cmd::Host(HostCmd::Use { name }) => host::use_host(&name),
+        Cmd::Host(HostCmd::Rm { name }) => host::rm(&name),
+        Cmd::Host(HostCmd::Forward { name, ports }) => host::forward(&paths, &name, &ports),
         Cmd::Socket(Socket::Install) => syssock::install(&paths, cli::status_value(&paths)["running"] == true),
         Cmd::Socket(Socket::Uninstall) => syssock::uninstall(&paths),
         Cmd::Menubar { install: true, .. } => menubar::install(),
@@ -731,11 +960,46 @@ fn main() {
     }
 }
 
+/// `--ns` (or `REKCOD_NS`) for this run; `fleet::Remote::ns` reads it back.
+#[cfg(target_os = "macos")]
+fn set_ns(ns: Option<String>) {
+    if let Some(n) = ns {
+        // Single-threaded here, before any command runs.
+        unsafe { std::env::set_var("REKCOD_NS", n) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_ns(paths: &paths::Paths, remote: &Option<String>, c: NsCmd) -> anyhow::Result<()> {
+    use serde_json::json;
+    let quota = |c: Option<i64>, m: Option<i64>, s: Option<i64>, a: Option<i64>| json!({"max_cpus": c, "max_memory_gib": m, "max_sandboxes": s, "max_apps": a});
+    match c {
+        NsCmd::Create { name, max_cpus, max_memory, max_sandboxes, max_apps } => {
+            let mut b = quota(max_cpus, max_memory, max_sandboxes, max_apps);
+            b["name"] = json!(name);
+            remote_call(paths, remote, "POST", "/namespaces", &b)
+        }
+        NsCmd::Ls => remote_call(paths, remote, "GET", "/namespaces", &serde_json::Value::Null),
+        NsCmd::Quota { name, max_cpus, max_memory, max_sandboxes, max_apps } => {
+            remote_call(paths, remote, "POST", &format!("/namespaces/{name}/quota"), &quota(max_cpus, max_memory, max_sandboxes, max_apps))
+        }
+        NsCmd::Member(NsMember::Add { ns, who, role }) => {
+            remote_call(paths, remote, "POST", &format!("/namespaces/{ns}/members"), &json!({"who": who, "role": role}))
+        }
+        NsCmd::Member(NsMember::Rm { ns, who }) => {
+            remote_call(paths, remote, "DELETE", &format!("/namespaces/{ns}/members/{who}"), &serde_json::Value::Null)
+        }
+        NsCmd::Use { name } => fleet::remote_use_ns(paths, remote.as_deref().filter(|r| !r.is_empty()), &name),
+        NsCmd::Rm { name, force } => remote_call(paths, remote, "DELETE", &format!("/namespaces/{name}"), &json!({"force": force})),
+    }
+}
+
 /// Calls the remote controller and prints the JSON answer.
 #[cfg(target_os = "macos")]
 fn remote_call(paths: &paths::Paths, remote: &Option<String>, method: &str, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
-    let v = fleet::call(&r.url, method, path, Some(&r.token), body)?;
+    let path = if fleet::is_scoped(path) { r.scoped(path) } else { path.to_string() };
+    let v = fleet::call(&r.url, method, &path, Some(&r.token), body)?;
     match v.get("logs").and_then(|l| l.as_str()).or(v.get("patch").and_then(|p| p.as_str())) {
         Some(text) => print!("{text}"),
         None => println!("{}", serde_json::to_string_pretty(&v)?),
@@ -761,7 +1025,7 @@ fn run_remote_sandbox(paths: &paths::Paths, remote: &str, c: SandboxCmd) -> anyh
             };
             let body = json!({"git": {"url": origin, "ref": head}, "name": name, "image": image, "cpus": cpus,
                               "memory_gib": memory, "allow_hosts": allow_hosts, "offline": offline, "ttl_secs": ttl, "os": os});
-            let v = fleet::call(&r.url, "POST", "/sandboxes", Some(&r.token), &body)?;
+            let v = fleet::call(&r.url, "POST", &r.scoped("/sandboxes"), Some(&r.token), &body)?;
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&v)?)
             } else {
@@ -771,7 +1035,7 @@ fn run_remote_sandbox(paths: &paths::Paths, remote: &str, c: SandboxCmd) -> anyh
         }
         SandboxCmd::Exec { id, workdir, env, timeout, cmd } => {
             let body = serde_json::to_vec(&json!({"cmd": cmd, "workdir": workdir, "env": env, "timeout_secs": timeout}))?;
-            let (code, reader) = fleet::send(&r.url, "POST", &format!("/sandboxes/{id}/exec"), Some(&r.token), &body)?;
+            let (code, reader) = fleet::send(&r.url, "POST", &r.scoped(format!("/sandboxes/{id}/exec")), Some(&r.token), &body)?;
             let mut exit = 1;
             for line in std::io::BufRead::lines(reader) {
                 let v: serde_json::Value = serde_json::from_str(&line?).unwrap_or_default();
@@ -794,7 +1058,7 @@ fn run_remote_sandbox(paths: &paths::Paths, remote: &str, c: SandboxCmd) -> anyh
         SandboxCmd::Stop { id } => remote_call(paths, &remote, "POST", &format!("/sandboxes/{id}/stop"), &json!({})),
         SandboxCmd::Rm { ids, .. } => {
             for id in ids {
-                fleet::call(&r.url, "DELETE", &format!("/sandboxes/{id}"), Some(&r.token), &serde_json::Value::Null)
+                fleet::call(&r.url, "DELETE", &r.scoped(format!("/sandboxes/{id}")), Some(&r.token), &serde_json::Value::Null)
                     .with_context(|| id.clone())?;
                 println!("{id}");
             }
@@ -805,13 +1069,71 @@ fn run_remote_sandbox(paths: &paths::Paths, remote: &str, c: SandboxCmd) -> anyh
 }
 
 #[cfg(target_os = "macos")]
+fn run_job(paths: &paths::Paths, remote: &Option<String>, c: JobCmd) -> anyhow::Result<()> {
+    use serde_json::json;
+    let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+    match c {
+        JobCmd::Run { name, image, cpus, memory, env, timeout, every, git, git_ref, detach, cmd } => {
+            let (origin, head) = match (&git, &git_ref) {
+                (Some(g), Some(r)) => (g.clone(), r.clone()),
+                _ => {
+                    let (o, h) = fleet::git_origin(&std::env::current_dir()?)?;
+                    (git.unwrap_or(o), git_ref.unwrap_or(h))
+                }
+            };
+            let body = json!({"name": name, "image": image, "cpus": cpus, "memory_gib": memory, "env": env,
+                              "timeout_secs": timeout, "every_secs": every, "git": {"url": origin, "ref": head}, "cmd": cmd});
+            let v = fleet::call(&r.url, "POST", &r.scoped("/jobs"), Some(&r.token), &body)?;
+            let Some(id) = v["id"].as_str().filter(|_| !detach) else {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                return Ok(());
+            };
+            eprintln!("rekcod: job {id} on {}", v["node"].as_str().unwrap_or("?"));
+            let mut shown = String::new();
+            loop {
+                let j = fleet::call(&r.url, "GET", &r.scoped(format!("/jobs/{id}")), Some(&r.token), &serde_json::Value::Null)?;
+                let log = j["log"].as_str().unwrap_or("");
+                print!("{}", new_output(&shown, log));
+                shown = log.to_string();
+                if j["state"] != "running" {
+                    let exit = j["exit"].as_i64().unwrap_or(1);
+                    eprintln!("rekcod: job {id} {} (exit {exit})", j["state"].as_str().unwrap_or(""));
+                    std::process::exit(exit as i32);
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+        JobCmd::Ls => remote_call(paths, remote, "GET", "/jobs", &serde_json::Value::Null),
+        JobCmd::Logs { id } => {
+            let j = fleet::call(&r.url, "GET", &r.scoped(format!("/jobs/{id}")), Some(&r.token), &serde_json::Value::Null)?;
+            print!("{}", j["log"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        JobCmd::Cancel { id } => remote_call(paths, remote, "POST", &format!("/jobs/{id}/cancel"), &json!({})),
+        JobCmd::Unschedule { name } => remote_call(paths, remote, "DELETE", &format!("/schedules/{name}"), &serde_json::Value::Null),
+    }
+}
+
+/// The part of `log` not printed yet, given the previous poll's `shown`. The node only
+/// returns the last 64 KiB, so a long log slides.
+fn new_output<'a>(shown: &str, log: &'a str) -> &'a str {
+    // The window slid by k bytes: log = shown[k..] + new output. Smallest k wins.
+    for (k, _) in shown.char_indices() {
+        if log.starts_with(&shown[k..]) {
+            return &log[shown.len() - k..];
+        }
+    }
+    log
+}
+
+#[cfg(target_os = "macos")]
 fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::Result<()> {
     use serde_json::json;
     let vars = |v: &[String]| -> serde_json::Value {
         json!(v.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>())
     };
     match c {
-        AppCmd::Deploy { name, port, instances, git, git_ref, public, private } => {
+        AppCmd::Deploy { name, port, instances, git, git_ref, public, private, idle_stop, recycle } => {
             let dir = std::env::current_dir()?;
             let t = fleet::parse_toml(&std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default());
             let (origin, head) = match (&git, &git_ref) {
@@ -823,6 +1145,7 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
             };
             let dir_name = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
             let num = |k: &str| t.get(k).and_then(|v| v.parse::<i64>().ok());
+            let dur = |k: &str| t.get(k).map(|v| duration_secs(v).map_err(|e| anyhow::anyhow!("rekcod.toml {k}: {e}"))).transpose();
             let env: serde_json::Map<String, serde_json::Value> =
                 t.iter().filter_map(|(k, v)| k.strip_prefix("env.").map(|k| (k.to_string(), json!(v)))).collect();
             let body = json!({
@@ -837,10 +1160,14 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 "env": env,
                 // Flags win over rekcod.toml; neither keeps the app's current visibility.
                 "public": if public { Some(true) } else if private { Some(false) } else { t.get("app.public").map(|v| v == "true") },
+                "idle_stop_secs": idle_stop.or(dur("resources.idle_stop")?),
+                "recycle_secs": recycle.or(dur("resources.recycle")?),
             });
             remote_call(paths, remote, "POST", "/apps", &body)
         }
         AppCmd::Ls => remote_call(paths, remote, "GET", "/apps", &serde_json::Value::Null),
+        AppCmd::Wake { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/wake"), &json!({})),
+        AppCmd::Recycle { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/recycle"), &json!({})),
         AppCmd::Public { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/visibility"), &json!({"public": true})),
         AppCmd::Private { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/visibility"), &json!({"public": false})),
         AppCmd::Status { name } => remote_call(paths, remote, "GET", &format!("/apps/{name}"), &serde_json::Value::Null),
@@ -865,7 +1192,7 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
         AppCmd::Logs { name } => remote_call(paths, remote, "GET", &format!("/apps/{name}/logs"), &serde_json::Value::Null),
         AppCmd::Open { name } => {
             let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
-            let v = fleet::call(&r.url, "GET", &format!("/apps/{name}"), Some(&r.token), &serde_json::Value::Null)?;
+            let v = fleet::call(&r.url, "GET", &r.scoped(format!("/apps/{name}")), Some(&r.token), &serde_json::Value::Null)?;
             let url = v["url"].as_str().unwrap_or_default().to_string();
             std::process::Command::new("/usr/bin/open").arg(&url).status()?;
             println!("{url}");
@@ -959,6 +1286,35 @@ mod tests {
     use super::*;
 
     /// Every action the menu bar can run is a real CLI command line.
+    #[test]
+    fn every_subcommand_reaches_rekcod() {
+        use clap::CommandFactory;
+        for c in Args::command().get_subcommands() {
+            let name = c.get_name().to_string();
+            // start/stop/import are shared with docker and decided by their flags.
+            if ["start", "stop", "import"].contains(&name.as_str()) {
+                continue;
+            }
+            assert!(route::docker_args(std::slice::from_ref(&name)).is_none(), "`rekcod {name}` would go to docker; add it to route::OWN");
+        }
+    }
+
+    #[test]
+    fn quota_values() {
+        assert_eq!(super::quota_value("unlimited"), Ok(-1));
+        assert_eq!(super::quota_value("8"), Ok(8));
+        assert!(super::quota_value("-1").is_err() && super::quota_value("lots").is_err());
+    }
+
+    #[test]
+    fn job_output_follows_a_sliding_log() {
+        assert_eq!(super::new_output("", "a\nb\n"), "a\nb\n");
+        assert_eq!(super::new_output("a\n", "a\nb\n"), "b\n");
+        // The node's 64 KiB window moved past the start of what was shown.
+        assert_eq!(super::new_output("xxhello\n", "hello\nworld\n"), "world\n");
+        assert_eq!(super::new_output("gone", "fresh\n"), "fresh\n");
+    }
+
     #[test]
     fn every_action_is_a_cli_command() {
         use clap::Parser;

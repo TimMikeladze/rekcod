@@ -131,6 +131,10 @@ pub fn op(paths: &Paths, name: &str, args: &Value) -> Result<Value> {
             json!({"done": true})
         }
         "deploy_instance" => crate::fleet::deploy_instance(paths, args)?,
+        "wake_instance" => crate::fleet::wake_instance(paths, &id_of(args)?)?,
+        "run_job" => crate::fleet::run_job(paths, args)?,
+        "job_get" => crate::fleet::job_get(paths, &id_of(args)?)?,
+        "job_cancel" => crate::fleet::job_cancel(paths, &id_of(args)?)?,
         "logs" => json!({"logs": crate::fleet::instance_logs(paths, &id_of(args)?)?}),
         _ => bail!("unknown operation {name}"),
     })
@@ -242,6 +246,10 @@ pub fn route(method: &str, path: &str, query: &[(String, String)], body: &Value)
         ("GET", ["sandboxes", _, "screenshot"]) => "screenshot",
         ("POST", ["sandboxes", _, "input"]) => "input",
         ("POST", ["instances"]) => "deploy_instance",
+        ("POST", ["instances", _, "wake"]) => "wake_instance",
+        ("POST", ["jobs"]) => "run_job",
+        ("GET", ["jobs", _]) => "job_get",
+        ("DELETE", ["jobs", _]) => "job_cancel",
         _ => return None,
     };
     Some((op, args))

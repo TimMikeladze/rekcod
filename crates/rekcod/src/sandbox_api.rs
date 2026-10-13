@@ -37,10 +37,9 @@ fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<&[u8]>) -> 
     if cmd.is_empty() {
         bail!("missing cmd");
     }
-    let (mut docker, meta) = sandbox::docker_cmd(paths, id)?;
+    let mut c = sandbox::exec_cmd(paths, id, &exec_opts(args), &cmd)?;
     let t0 = Instant::now();
-    let mut child = docker
-        .args(sandbox::exec_args(&meta, &exec_opts(args), &cmd))
+    let mut child = c
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -78,6 +77,7 @@ pub fn op(paths: &Paths, name: &str, args: &Value) -> Result<Value> {
                 offline: args["offline"].as_bool().unwrap_or(false),
                 secrets: strs(&args["secrets"]),
                 ttl_secs: args["ttl_secs"].as_u64().unwrap_or(d.ttl_secs),
+                os: args["os"].as_str().map(String::from),
             };
             serde_json::to_value(sandbox::create(paths, o)?)?
         }
@@ -118,6 +118,17 @@ pub fn op(paths: &Paths, name: &str, args: &Value) -> Result<Value> {
         "remove" => {
             sandbox::rm(paths, &[id_of(args)?], false)?;
             json!({"removed": true})
+        }
+        "screenshot" => {
+            let out = std::env::temp_dir().join(format!("rekcod-shot-{}.png", sandbox::new_id()?));
+            sandbox::screenshot(paths, &id_of(args)?, &out)?;
+            let png = std::fs::read(&out)?;
+            let _ = std::fs::remove_file(&out);
+            json!({"png_base64": crate::daemon::base64(&png)})
+        }
+        "input" => {
+            sandbox::input(paths, &id_of(args)?, &strs(&args["action"]))?;
+            json!({"done": true})
         }
         "deploy_instance" => crate::fleet::deploy_instance(paths, args)?,
         "logs" => json!({"logs": crate::fleet::instance_logs(paths, &id_of(args)?)?}),
@@ -228,6 +239,8 @@ pub fn route(method: &str, path: &str, query: &[(String, String)], body: &Value)
         ("POST", ["sandboxes", _, "apply"]) => "apply",
         ("POST", ["sandboxes", _, "stop"]) => "stop",
         ("GET", ["sandboxes", _, "logs"]) => "logs",
+        ("GET", ["sandboxes", _, "screenshot"]) => "screenshot",
+        ("POST", ["sandboxes", _, "input"]) => "input",
         ("POST", ["instances"]) => "deploy_instance",
         _ => return None,
     };
@@ -241,14 +254,9 @@ fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Resu
     if cmd.is_empty() {
         bail!("missing cmd");
     }
-    let (mut docker, meta) = sandbox::docker_cmd(paths, &id)?;
+    let mut c = sandbox::exec_cmd(paths, &id, &exec_opts(args), &cmd)?;
     let t0 = Instant::now();
-    let mut child = docker
-        .args(sandbox::exec_args(&meta, &exec_opts(args), &cmd))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")?;
     let (tx, rx) = std::sync::mpsc::channel::<(&'static str, Vec<u8>)>();
     let mut readers = Vec::new();
@@ -301,6 +309,10 @@ pub(crate) fn handle(paths: &Paths, stream: impl Read + Write + Send, token: Opt
         return Ok(());
     }
     match op(paths, name, &args) {
+        Ok(v) if name == "screenshot" => {
+            let png = base64_decode(v["png_base64"].as_str().unwrap_or(""));
+            respond(&mut w, 200, "image/png", &png)
+        }
         Ok(v) if name == "read_file" => respond(&mut w, 200, "application/octet-stream", v["content"].as_str().unwrap_or("").as_bytes()),
         Ok(v) => respond(&mut w, if name == "create" { 201 } else { 200 }, "application/json", v.to_string().as_bytes()),
         Err(e) => respond(&mut w, error_code(&e), "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes()),
@@ -342,6 +354,27 @@ pub fn serve(paths: Paths, listen: Option<String>) -> Result<()> {
     Ok(())
 }
 
+fn base64_decode(s: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.bytes().filter(|c| *c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            _ => 63,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    out
+}
+
 // -------------------------------------------------------------------- MCP
 
 const PROTOCOL: &str = "2025-06-18";
@@ -363,7 +396,8 @@ fn tools() -> Vec<Tool> {
                 "image": {"type": "string", "description": "Workspace image (default: picked from the project's version files)"},
                 "allow_hosts": {"type": "array", "items": {"type": "string"}, "description": "Extra hosts the sandbox may reach; '*' opens the internet"},
                 "offline": {"type": "boolean"},
-                "mount": {"type": "boolean", "description": "Share the live directory instead of a copy"}
+                "mount": {"type": "boolean", "description": "Share the live directory instead of a copy"},
+                "os": {"type": "string", "enum": ["linux", "macos"], "description": "macos: a macOS guest from `rekcod macos install` (two per Mac)"}
             }),
             vec!["dir"],
         ),
@@ -421,6 +455,15 @@ fn tools() -> Vec<Tool> {
             json!({"id": id, "check": {"type": "boolean", "description": "Only report what would change"}}),
             vec!["id"],
         ),
+        ("sandbox_screenshot", "screenshot", "PNG of a macOS sandbox's screen.", false, json!({"id": id}), vec!["id"]),
+        (
+            "sandbox_input",
+            "input",
+            "Mouse and keyboard for a macOS sandbox: [\"click\", X, Y], [\"type\", TEXT] or [\"key\", \"cmd+return\"].",
+            false,
+            json!({"id": id, "action": {"type": "array", "items": {"type": "string"}}}),
+            vec!["id", "action"],
+        ),
         ("sandbox_stop", "stop", "Power off a sandbox, keeping its state.", false, json!({"id": id}), vec!["id"]),
         ("sandbox_remove", "remove", "Delete a sandbox and everything in it.", true, json!({"id": id}), vec!["id"]),
     ]
@@ -447,6 +490,9 @@ pub fn mcp_reply(paths: &Paths, msg: &Value) -> Option<Value> {
             match tools().into_iter().find(|t| t.0 == name) {
                 None => Err(json!({"code": -32602, "message": format!("unknown tool {name}")})),
                 Some(t) => Ok(match op(paths, t.1, &args) {
+                    Ok(v) if t.1 == "screenshot" => {
+                        json!({"content": [{"type": "image", "mimeType": "image/png", "data": v["png_base64"]}], "isError": false})
+                    }
                     Ok(v) => {
                         json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&v).unwrap_or_default()}], "isError": false})
                     }
@@ -505,7 +551,7 @@ mod tests {
         assert_eq!(init["result"]["protocolVersion"], PROTOCOL);
         let list = mcp_reply(&paths, &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         let tools = list["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 12);
         let apply = tools.iter().find(|t| t["name"] == "sandbox_apply").unwrap();
         assert_eq!(apply["annotations"]["destructiveHint"], true);
         assert!(mcp_reply(&paths, &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());

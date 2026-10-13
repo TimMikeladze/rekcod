@@ -18,7 +18,7 @@ socket2 = { version = "0.6", features = ["all"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-foundation = "0.3"
-objc2-virtualization = { version = "0.3", features = ["dispatch2"] }
+objc2-virtualization = { version = "0.3", features = ["dispatch2", "objc2-app-kit"] }
 block2 = "0.6"
 dispatch2 = "0.3"
 notify = "8"

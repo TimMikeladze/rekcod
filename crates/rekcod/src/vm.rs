@@ -88,6 +88,31 @@ impl Vm {
         Ok(Vm { queue: queue.clone(), vm: Arc::new(vm), rosetta })
     }
 
+    /// A VM from a ready configuration (macOS guests, `macos.rs`).
+    pub fn from_config(config: Retained<VZVirtualMachineConfiguration>) -> Vm {
+        let config = OnQueue(config);
+        let queue = DispatchQueue::new("dev.rekcod.vm", None);
+        let mut vm = None;
+        let q = OnQueue(&*queue);
+        queue.exec_sync(|| {
+            vm = Some(OnQueue(unsafe { VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config.get(), q.get()) }));
+        });
+        Vm { queue: queue.clone(), vm: Arc::new(vm.expect("exec_sync ran the closure")), rosetta: false }
+    }
+
+    /// Runs `f` with the VM on its queue.
+    pub fn with<R: Send>(&self, f: impl FnOnce(&VZVirtualMachine) -> R + Send) -> R {
+        let vm = self.vm.clone();
+        let mut out = None;
+        self.queue.exec_sync(|| out = Some(f(&vm.0)));
+        out.expect("exec_sync ran the closure")
+    }
+
+    /// Asks the guest to shut down (the power button); false if it can't be asked.
+    pub fn request_stop(&self) -> bool {
+        self.with(|vm| unsafe { vm.canRequestStop() && vm.requestStopWithError().is_ok() })
+    }
+
     pub async fn start(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
         let tx = OnQueue(Mutex::new(Some(tx)));
@@ -187,7 +212,7 @@ impl Vm {
     }
 }
 
-fn ns_error(err: *mut NSError) -> anyhow::Error {
+pub(crate) fn ns_error(err: *mut NSError) -> anyhow::Error {
     if err.is_null() {
         return anyhow!("unknown Virtualization.framework error");
     }
@@ -195,7 +220,7 @@ fn ns_error(err: *mut NSError) -> anyhow::Error {
     anyhow!("{} (code {})", err.localizedDescription(), err.code())
 }
 
-fn url(path: &Path) -> Retained<NSURL> {
+pub(crate) fn url(path: &Path) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(&path.to_string_lossy()))
 }
 

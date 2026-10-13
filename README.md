@@ -211,6 +211,25 @@ curl --unix-socket ~/.rekcod/run/sandbox.sock -X POST localhost/sandboxes/$id/ex
 Measured on an M5 Pro (`bench/sandbox.sh`): create to first exec 1.3 s p50, fork 1.2 s,
 `rm` 0.12 s, 16 created at once all ready in 3.2 s, about 300 MB idle each.
 
+### macOS sandboxes
+
+`rekcod sandbox create --os macos` clones a macOS base image instead: for iOS and macOS
+builds, or an agent driving a real macOS app. Apple's licence allows two per Mac.
+
+```sh
+rekcod macos fetch && rekcod macos install   # ~25 GB download, then the installer
+rekcod macos setup                           # once, by hand: user "rekcod", Remote Login
+rekcod macos authorize                       # from another terminal while setup runs
+id=$(rekcod sandbox create --os macos)
+rekcod sandbox exec $id -- xcodebuild -version
+rekcod sandbox screenshot $id shot.png --open
+rekcod sandbox input $id type "hello"
+```
+
+exec, diff, apply and fork work as for Linux sandboxes (over SSH; the workspace is copied
+into the guest's `~/ws`). The MCP server adds `sandbox_screenshot` and `sandbox_input` for
+computer-use agents. Details: [`docs/platform.md`](docs/platform.md#track-4-as-built).
+
 ### Fleet and app hosting
 
 The same sandboxes can run on a team's own Macs, and apps can be deployed onto them. One
@@ -280,6 +299,8 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
 | `rekcod sandbox create\|exec\|shell\|cp\|fork\|diff\|apply\|ports\|log\|ls\|stop\|rm\|serve\|golden` | Agent sandboxes (above) |
 | `rekcod mcp` | MCP server on stdio for the sandbox commands |
+| `rekcod macos fetch\|install\|setup\|authorize\|ls\|rm` | macOS base images for `sandbox create --os macos` |
+| `rekcod sandbox screenshot\|input` | Screen and mouse/keyboard of a macOS sandbox |
 | `rekcod remote add\|ls\|rm` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`) |
 | `rekcod node join\|serve\|ls\|drain` | Run this Mac as a fleet node; list or drain nodes |
 | `rekcod controller serve\|token` | The fleet controller; create user tokens |
@@ -306,12 +327,15 @@ If `DOCKER_HOST` is already set, it overrides contexts, and `rekcod start` warns
 
 ## Build
 
-Needs Rust, Xcode command-line tools (`codesign`), and any docker engine for the
-first guest image build (it compiles the guest kernel, so the first build takes a few minutes). After that, rekcod can rebuild its own guest.
+Needs Rust and Xcode command-line tools (`codesign`). No Docker engine: `guest/build.sh`
+builds the guest image in chroots inside the running rekcod VM (`rekcod start` first;
+a fresh install boots the released guest). The first build compiles the guest kernel;
+later builds reuse it until `guest/kernel`, `guest/fuse` or `guest/build.sh` change.
+See `docs/guest-build.md`.
 
 ```sh
 scripts/build.sh                                   # host binary (signed), agent, out/guest
-REKCOD_BUILD_DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock scripts/build.sh   # self-hosted
+KERNEL=alpine scripts/build.sh                     # Alpine's stock linux-virt instead
 scripts/build.sh --host-only                       # skip the guest image
 scripts/package.sh                                 # release tarballs + SHA256SUMS in out/release
 ```
@@ -340,6 +364,7 @@ bench/postgres.sh rekcod desktop-linux       # pgbench on a named volume, per do
 python3 bench/tcp_rtt.py --context rekcod    # 64-byte round trip through a published port
 bench/sandbox.sh                             # agent sandbox create/fork/rm timings, 16 at once
 scripts/e2e-sandbox.sh                       # agent sandbox checks only; leaves the main VM alone
+scripts/e2e-macos.sh                         # macOS sandbox checks; needs a ready base image
 REKCOD_E2E_DB=postgres://... scripts/e2e-fleet.sh   # controller, 2 nodes, edge, apps; WIPES that database
 rekcod x cargo test -p rekcod-agent          # the guest agent's Linux-only tests
 python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge

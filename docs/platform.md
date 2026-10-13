@@ -11,7 +11,7 @@ whole platform: all four tracks, what each one needs, and the gate before each s
 | 1 | Local agent sandboxes | the user's Mac | one developer and their agents | **built** 2026-10-12; [`agent-sandboxes.md`](agent-sandboxes.md) |
 | 2 | Self-hosted fleet | a team's own Mac minis | a team's engineers and agents | **built** 2026-10-12; legal read of SLA §2I before running it |
 | 3 | App hosting (PaaS) | the fleet from track 2 | internal apps and preview environments | **built** 2026-10-12 |
-| 4 | macOS guests: CI and computer-use | dedicated Macs | iOS/macOS builds, agents driving macOS apps | track 2 in use, plus a demand check |
+| 4 | macOS guests: CI and computer-use | dedicated Macs | iOS/macOS builds, agents driving macOS apps | **built** 2026-10-12; base image needs one manual setup |
 
 Each track reuses the one before it. Sandboxes are the unit: a deployed app is a sandbox
 that's never torn down and has an ingress route. A fleet runs sandboxes on more than one
@@ -434,3 +434,42 @@ Where the code differs from the spec above:
   the controller's watchdog. The PR comment needs `GITHUB_TOKEN` in the controller's
   environment and uses `curl`.
 - **Controller is macOS-only for now**, like the rest of the binary.
+
+## Track 4 as built
+
+`crates/rekcod/src/macos.rs`. A macOS sandbox is the same `rekcod sandbox` with `--os macos`:
+
+```sh
+rekcod macos fetch          # newest restore image this Mac supports (~25 GB, resumable)
+rekcod macos install        # base image "default": 64 GiB disk, 4 CPUs, 8 GiB
+rekcod macos setup          # opens its screen; do Setup Assistant by hand (below)
+rekcod macos authorize      # from another terminal while it runs: installs rekcod's SSH key
+rekcod sandbox create --os macos
+rekcod sandbox exec ID -- xcodebuild -version
+rekcod sandbox screenshot ID shot.png
+rekcod sandbox input ID click 200 300      # or: type TEXT, key cmd+return
+```
+
+The manual part, once per base image: create the user `rekcod`, turn on Remote Login and
+automatic login for it, and for screenshots and input allow
+`/usr/libexec/sshd-keygen-wrapper` under Screen Recording and Accessibility. macOS 27's
+`VZMacGuestProvisioningOptions` would do this unattended, but objc2-virtualization 0.3.2 doesn't
+bind it yet.
+
+How it differs from the spec above:
+
+- **SSH, not a guest agent.** exec, cp, diff and apply go over SSH with a key under
+  `~/.rekcod/macos/id_ed25519`. The guest's address comes from `/var/db/dhcpd_leases` by MAC.
+  The workspace is copied in with rsync (`~/ws` in the guest) and copied back for diff and
+  apply, so the guest never sees a Mac directory.
+- **Clones, not ASIF overlays.** A sandbox is an APFS clone of the base image's disk and
+  auxiliary storage with a new machine identifier and MAC.
+- **No egress allowlist** for macOS guests yet (NAT, open internet). The Linux allowlist lives
+  in the Linux guest agent.
+- **Two at once**, counted per Mac before `create` and `fork`; Virtualization.framework would
+  refuse a third anyway. Fleet nodes report free macOS slots, and `--os macos` placement
+  needs one.
+- **Fork** flushes the guest and clones its disk while it runs (no pause), so it's
+  crash-consistent like a power cut.
+- **Input** runs JavaScript for Automation over SSH: `CGEvent` clicks and System Events
+  keystrokes.

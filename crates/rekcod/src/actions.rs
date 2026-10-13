@@ -33,6 +33,7 @@ pub enum Kind {
     SandboxApply,
     SandboxStop,
     SandboxRemove,
+    SandboxScreenshot,
     AppOpen,
     AppLogs,
     AppRollback,
@@ -42,7 +43,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 23] = [
+    pub const ALL: [Kind; 24] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -62,6 +63,7 @@ impl Kind {
         Kind::SandboxApply,
         Kind::SandboxStop,
         Kind::SandboxRemove,
+        Kind::SandboxScreenshot,
         Kind::AppOpen,
         Kind::AppLogs,
         Kind::AppRollback,
@@ -239,6 +241,7 @@ pub struct AgentSandbox {
     pub project: PathBuf,
     pub copy: bool,
     pub running: bool,
+    pub macos: bool,
 }
 
 impl Model {
@@ -254,6 +257,7 @@ impl Model {
                 name: l.meta.name,
                 project: l.meta.project,
                 copy: l.meta.mode == "copy",
+                macos: l.meta.os == "macos",
                 running: l.running,
             })
             .collect();
@@ -441,6 +445,10 @@ pub fn snapshot_actions(s: &Snapshot) -> Vec<Action> {
 pub fn sandbox_actions(s: &AgentSandbox) -> Vec<Action> {
     let id = s.id.as_str();
     let mut out = vec![Action::rekcod(Kind::SandboxShell, "Shell", &["sandbox", "shell", id]).interactive()];
+    if s.macos && s.running {
+        let png = std::env::temp_dir().join(format!("rekcod-{id}.png"));
+        out.push(Action::rekcod(Kind::SandboxScreenshot, "Screenshot", &["sandbox", "screenshot", id, &png.to_string_lossy(), "--open"]));
+    }
     if s.copy {
         out.push(Action::rekcod(Kind::SandboxDiff, "Diff", &["sandbox", "diff", id]).interactive());
         out.push(Action::rekcod(Kind::SandboxApply, "Apply to project", &["sandbox", "apply", id]).confirm(format!(
@@ -519,7 +527,14 @@ pub mod tests {
     }
 
     pub fn sample_sandbox() -> AgentSandbox {
-        AgentSandbox { id: "abcdefgh".into(), name: Some("try1".into()), project: "/Users/me/app".into(), copy: true, running: true }
+        AgentSandbox {
+            id: "abcdefgh".into(),
+            name: Some("try1".into()),
+            project: "/Users/me/app".into(),
+            copy: true,
+            running: true,
+            macos: true,
+        }
     }
 
     #[test]

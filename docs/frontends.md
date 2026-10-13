@@ -37,11 +37,13 @@ how that's enforced.
 | Ports: open in browser | `open http://localhost:N` | Ports |
 | Snapshots: save, restore, delete | `snap save/restore/rm -p <project>` | Snapshots › project |
 | Agent sandboxes: shell, diff, apply, stop, delete | `sandbox shell/diff/apply/stop/rm <id>` | Agent sandboxes › sandbox |
+| macOS sandboxes: screenshot (opens in Preview) | `sandbox screenshot <id> <file> --open` | Agent sandboxes › sandbox |
 | Apps on the default remote: open, logs, roll back, destroy | `app open/logs/rollback/destroy <name>` | Apps › app (only with a remote) |
 
 Creating, exec, fork, `cp` and golden disks are for agents and scripts, so they're CLI,
 HTTP and MCP only. So are deploys, scaling and env changes (they take arguments), the
-fleet's admin commands (`node`, `controller`, `edge`, `remote`), and `--remote` sandboxes. The menu bar lists what exists and offers what a person does to it.
+fleet's admin commands (`node`, `controller`, `edge`, `remote`), `--remote` sandboxes,
+`sandbox input` (agents), and `macos` image setup (one-time, interactive). The menu bar lists what exists and offers what a person does to it.
 
 ## Changing things
 

@@ -27,6 +27,8 @@ mod fetch;
 #[cfg(target_os = "macos")]
 mod fleet;
 #[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
 mod menubar;
 #[cfg(target_os = "macos")]
 mod sandbox;
@@ -130,6 +132,9 @@ enum Cmd {
     },
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp,
+    /// macOS guests: base images for `rekcod sandbox create --os macos`.
+    #[command(subcommand)]
+    Macos(MacosCmd),
     /// Fleet controllers this CLI talks to (docs/platform.md).
     #[command(subcommand)]
     Remote(RemoteCmd),
@@ -251,6 +256,9 @@ enum SandboxCmd {
     /// Create a sandbox for DIR (default: this directory) and print its ID.
     Create {
         dir: Option<std::path::PathBuf>,
+        /// linux (default) or macos: a guest cloned from `rekcod macos install` (--image picks it).
+        #[arg(long)]
+        os: Option<String>,
         /// --remote: repository to clone (default: this directory's origin).
         #[arg(long)]
         git: Option<String>,
@@ -327,6 +335,21 @@ enum SandboxCmd {
         #[arg(long)]
         check: bool,
     },
+    /// Save a macOS sandbox's screen as PNG.
+    Screenshot {
+        id: String,
+        #[arg(default_value = "screenshot.png")]
+        out: std::path::PathBuf,
+        /// Open it in Preview afterwards.
+        #[arg(long)]
+        open: bool,
+    },
+    /// Mouse and keyboard for a macOS sandbox: click X Y | type TEXT | key [cmd+]KEY.
+    Input {
+        id: String,
+        #[arg(required = true, num_args = 1.., allow_hyphen_values = true)]
+        action: Vec<String>,
+    },
     /// Forwarded ports and VM status.
     Ports {
         id: String,
@@ -365,6 +388,43 @@ enum SandboxCmd {
     /// Data disks with images already pulled, cloned per sandbox.
     #[command(subcommand)]
     Golden(Golden),
+}
+
+#[derive(Subcommand)]
+enum MacosCmd {
+    /// Download the newest macOS restore image this Mac supports (resumable).
+    Fetch,
+    /// Install the restore image into a new base image.
+    Install {
+        #[arg(default_value = "default")]
+        name: String,
+        #[arg(long, default_value_t = 64)]
+        disk: u64,
+        #[arg(long, default_value_t = 4)]
+        cpus: usize,
+        #[arg(long, default_value_t = 8)]
+        memory: u64,
+    },
+    /// Open the image's screen to finish setup by hand (Setup Assistant, Remote Login).
+    Setup {
+        #[arg(default_value = "default")]
+        name: String,
+    },
+    /// Install rekcod's SSH key in the running image (asks for the guest password).
+    Authorize {
+        #[arg(default_value = "default")]
+        name: String,
+    },
+    Ls,
+    Rm {
+        name: String,
+    },
+    #[command(hide = true)]
+    Run {
+        home: std::path::PathBuf,
+        #[arg(long, default_value_t = 0)]
+        idle_ttl: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -566,6 +626,13 @@ fn main() {
         Cmd::Sandbox { remote: Some(r), cmd } => run_remote_sandbox(&paths, &r, cmd),
         Cmd::Sandbox { remote: None, cmd } => run_sandbox(&paths, cmd),
         Cmd::Mcp => sandbox_api::mcp(paths),
+        Cmd::Macos(MacosCmd::Fetch) => macos::fetch(&paths),
+        Cmd::Macos(MacosCmd::Install { name, disk, cpus, memory }) => macos::install(&paths, &name, disk, cpus, memory),
+        Cmd::Macos(MacosCmd::Setup { name }) => macos::setup(&paths, &name),
+        Cmd::Macos(MacosCmd::Authorize { name }) => macos::authorize(&paths, &name),
+        Cmd::Macos(MacosCmd::Ls) => macos::list(&paths),
+        Cmd::Macos(MacosCmd::Rm { name }) => macos::remove(&paths, &name),
+        Cmd::Macos(MacosCmd::Run { home, idle_ttl }) => macos::run(home, idle_ttl),
         Cmd::Remote(RemoteCmd::Add { name, url, token }) => fleet::remote_add(&paths, &name, &url, &token),
         Cmd::Remote(RemoteCmd::Ls) => {
             fleet::remote_list(&paths);
@@ -634,7 +701,7 @@ fn run_remote_sandbox(paths: &paths::Paths, remote: &str, c: SandboxCmd) -> anyh
     let remote = Some(remote.to_string());
     let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
     match c {
-        SandboxCmd::Create { dir, git, git_ref, name, image, cpus, memory, allow_hosts, offline, ttl, json: as_json, .. } => {
+        SandboxCmd::Create { dir, git, git_ref, name, image, cpus, memory, allow_hosts, offline, ttl, json: as_json, os, .. } => {
             let (origin, head) = match (&git, &git_ref) {
                 (Some(g), Some(r)) => (g.clone(), r.clone()),
                 _ => {
@@ -644,7 +711,7 @@ fn run_remote_sandbox(paths: &paths::Paths, remote: &str, c: SandboxCmd) -> anyh
                 }
             };
             let body = json!({"git": {"url": origin, "ref": head}, "name": name, "image": image, "cpus": cpus,
-                              "memory_gib": memory, "allow_hosts": allow_hosts, "offline": offline, "ttl_secs": ttl});
+                              "memory_gib": memory, "allow_hosts": allow_hosts, "offline": offline, "ttl_secs": ttl, "os": os});
             let v = fleet::call(&r.url, "POST", "/sandboxes", Some(&r.token), &body)?;
             if as_json {
                 println!("{}", serde_json::to_string_pretty(&v)?)
@@ -758,7 +825,7 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
 #[cfg(target_os = "macos")]
 fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
     match c {
-        SandboxCmd::Create { dir, name, mount, image, golden, cpus, memory, allow_hosts, offline, secrets, ttl, json, .. } => {
+        SandboxCmd::Create { dir, name, mount, image, golden, cpus, memory, allow_hosts, offline, secrets, ttl, json, os, .. } => {
             let o = sandbox::CreateOptions {
                 dir,
                 name,
@@ -771,6 +838,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
                 offline,
                 secrets,
                 ttl_secs: ttl,
+                os,
             };
             let m = sandbox::create(paths, o)?;
             if json {
@@ -806,6 +874,15 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
             Ok(())
         }
         SandboxCmd::Ports { id, json } => sandbox::ports(paths, &id, json),
+        SandboxCmd::Screenshot { id, out, open } => {
+            sandbox::screenshot(paths, &id, &out)?;
+            if open {
+                std::process::Command::new("/usr/bin/open").arg(&out).status()?;
+            }
+            println!("{}", out.display());
+            Ok(())
+        }
+        SandboxCmd::Input { id, action } => sandbox::input(paths, &id, &action),
         SandboxCmd::Log { id, follow, json, net } => sandbox::log(paths, &id, follow, json, net),
         SandboxCmd::Ls { json } => sandbox::print_list(paths, json),
         SandboxCmd::Stop { id } => sandbox::stop(paths, &id),

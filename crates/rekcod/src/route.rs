@@ -17,6 +17,7 @@ const OWN: &[&str] = &[
     "controller",
     "edge",
     "app",
+    "macos",
     "help",
     "daemon",
     "research",

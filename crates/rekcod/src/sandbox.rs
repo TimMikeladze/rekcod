@@ -68,6 +68,9 @@ pub struct Meta {
     pub secrets: Vec<String>,
     /// Unix seconds; `apply` refuses files the project changed after this.
     pub created: u64,
+    /// "macos" for a macOS guest (`macos.rs`); empty for Linux.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub os: String,
 }
 
 pub struct CreateOptions {
@@ -82,6 +85,8 @@ pub struct CreateOptions {
     pub offline: bool,
     pub secrets: Vec<String>,
     pub ttl_secs: u64,
+    /// "macos" for a macOS guest; `image` then names the base image.
+    pub os: Option<String>,
 }
 
 impl Default for CreateOptions {
@@ -98,6 +103,7 @@ impl Default for CreateOptions {
             offline: false,
             secrets: vec![],
             ttl_secs: 30 * 60,
+            os: None,
         }
     }
 }
@@ -134,7 +140,7 @@ pub fn allowlist(extra: &[String]) -> Option<Vec<String>> {
     Some(out)
 }
 
-fn clonefile(src: &Path, dst: &Path) -> Result<()> {
+pub fn clonefile(src: &Path, dst: &Path) -> Result<()> {
     let (s, d) = (CString::new(src.as_os_str().as_bytes())?, CString::new(dst.as_os_str().as_bytes())?);
     if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) } != 0 {
         return Err(std::io::Error::last_os_error()).with_context(|| format!("clone {} to {}", src.display(), dst.display()));
@@ -166,11 +172,22 @@ impl Sandbox {
         c.env("DOCKER_HOST", self.paths.docker_host());
         Ok(c)
     }
+    fn macos(&self) -> bool {
+        self.meta.os == "macos"
+    }
+    /// The macOS guest's address, booting it if needed.
+    fn guest(&self, main: &Paths) -> Result<String> {
+        self.touch();
+        crate::macos::boot(main, &self.paths.home, self.meta.ttl_secs)
+    }
     fn touch(&self) {
         let _ = std::fs::write(self.paths.home.join("run/last-used"), b"");
     }
 
     fn boot(&self, main: &Paths) -> Result<()> {
+        if self.macos() {
+            return self.guest(main).map(|_| ());
+        }
         if self.running() {
             return Ok(());
         }
@@ -303,44 +320,73 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
             bail!("--secret {s}: not set in this shell's environment");
         }
     }
-    check_capacity(paths, o.memory_gib)?;
+    let macos = o.os.as_deref() == Some("macos");
+    if let Some(os) = o.os.as_deref().filter(|os| *os != "macos" && *os != "linux") {
+        bail!("--os takes linux or macos, not {os}");
+    }
+    if macos {
+        let running = macos_running(paths);
+        if running >= crate::macos::MAX_RUNNING {
+            bail!("{running} macOS sandboxes are running; Apple's licence allows {} per Mac", crate::macos::MAX_RUNNING);
+        }
+    }
+    if macos && !crate::macos::ready(paths, o.image.as_deref().unwrap_or("default")) {
+        bail!("macOS image {} isn't ready; see `rekcod macos ls`", o.image.as_deref().unwrap_or("default"));
+    }
+    let memory_gib = if macos { o.memory_gib.max(8) } else { o.memory_gib };
+    check_capacity(paths, memory_gib)?;
     let t0 = Instant::now();
     let id = new_id()?;
     std::fs::create_dir_all(root(paths))?;
     let sb = Paths::at(root(paths).join(&id))?;
     let golden = golden_home(paths, &o.golden).join("vm/data.img");
-    let golden = if golden.exists() {
+    let golden = if macos {
+        if let Err(e) = crate::macos::clone_image(paths, o.image.as_deref().unwrap_or("default"), &sb.home, o.cpus, memory_gib) {
+            let _ = std::fs::remove_dir_all(&sb.home);
+            return Err(e);
+        }
+        None
+    } else if golden.exists() {
         // APFS clone: instant, copy on write.
         clonefile(&golden, &sb.data_disk())?;
         Some(o.golden.clone())
     } else {
         None
     };
-    let image =
-        o.image.clone().or_else(|| crate::xrun::plan(&project, &["sh".into()]).map(|p| p.image)).unwrap_or_else(|| DEFAULT_IMAGE.into());
+    let image = o
+        .image
+        .clone()
+        .or_else(|| macos.then(|| "default".to_string()))
+        .or_else(|| crate::xrun::plan(&project, &["sh".into()]).map(|p| p.image))
+        .unwrap_or_else(|| DEFAULT_IMAGE.into());
     let s = Sandbox {
         meta: Meta {
             id: id.clone(),
             name: o.name,
             project: project.clone(),
-            mode: if o.mount { "mount" } else { "copy" }.into(),
+            mode: if o.mount && !macos { "mount" } else { "copy" }.into(),
             image,
             golden,
             allow: if o.offline { Some(vec![]) } else { allowlist(&o.allow_hosts) },
             offline: o.offline,
             cpus: o.cpus,
-            memory_gib: o.memory_gib,
+            memory_gib,
             ttl_secs: o.ttl_secs,
             secrets: o.secrets,
             created: now(),
+            os: if macos { "macos".into() } else { String::new() },
         },
         paths: sb,
     };
-    if !o.mount {
+    if !o.mount || macos {
         clonefile(&project, &s.ws())?;
     }
     s.save()?;
-    let result = s.boot(paths).and_then(|_| s.start_workspace());
+    let result = if macos {
+        s.guest(paths).and_then(|ip| crate::macos::push_ws(paths, &ip, &s.ws()))
+    } else {
+        s.boot(paths).and_then(|_| s.start_workspace())
+    };
     if let Err(e) = result {
         let _ = remove(&s);
         return Err(e);
@@ -393,13 +439,36 @@ pub fn exec(paths: &Paths, id: &str, o: ExecOptions, cmd: &[String]) -> Result<i
     s.boot(paths)?;
     s.touch();
     let t0 = Instant::now();
-    let args = exec_args(&s.meta, &o, cmd);
-    let status = s.docker()?.args(&args).status().context("run docker")?;
-    let code = status.code().unwrap_or(1);
+    let code = if s.macos() {
+        let ip = s.guest(paths)?;
+        let mut c = crate::macos::exec_command(paths, &ip, o.workdir.as_deref(), &o.env, cmd, o.tty)?;
+        run_with_timeout(&mut c, o.timeout_secs)?
+    } else {
+        let args = exec_args(&s.meta, &o, cmd);
+        let status = s.docker()?.args(&args).status().context("run docker")?;
+        status.code().unwrap_or(1)
+    };
     let cwd = o.workdir.clone().unwrap_or_else(|| s.meta.project.to_string_lossy().into());
     log_exec(&s, cmd, &cwd, code, t0.elapsed().as_millis());
     s.touch();
     Ok(code)
+}
+
+/// Runs `c`, killing it after `timeout` seconds (exit 124, like `timeout`).
+fn run_with_timeout(c: &mut Command, timeout: Option<u64>) -> Result<i32> {
+    let mut child = c.spawn().context("run ssh")?;
+    let t0 = Instant::now();
+    loop {
+        if let Some(st) = child.try_wait()? {
+            return Ok(st.code().unwrap_or(1));
+        }
+        if timeout.is_some_and(|t| t0.elapsed().as_secs() >= t) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(124);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// Records an exec the API ran.
@@ -413,6 +482,11 @@ pub fn record(paths: &Paths, id: &str, cmd: &[String], exit: i32, ms: u128) {
 
 pub fn shell(paths: &Paths, id: &str) -> Result<()> {
     let s = find(paths, id)?;
+    if s.macos() {
+        let ip = s.guest(paths)?;
+        let sh = ["/bin/zsh".to_string(), "-l".to_string()];
+        return Err(crate::macos::exec_command(paths, &ip, None, &[], &sh, true)?.exec()).context("exec ssh");
+    }
     s.boot(paths)?;
     s.touch();
     let tty = unsafe { libc::isatty(0) == 1 };
@@ -430,6 +504,22 @@ pub fn cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
         (Some(_), Some(_)) => bail!("copy between two sandboxes through the Mac"),
         (None, None) => bail!("one side must be ID:/path"),
     };
+    if s.macos() {
+        let ip = s.guest(paths)?;
+        let remote = |a: &str| a.strip_prefix(&format!("{WS}:")).map(|p| format!("{}@{ip}:{p}", crate::macos::USER));
+        let args: Vec<String> = args.iter().map(|a| remote(a).unwrap_or_else(|| a.clone())).collect();
+        let key = crate::macos::key(paths)?;
+        let ok = Command::new("scp")
+            .args(["-q", "-r", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-i"])
+            .arg(key)
+            .args(&args)
+            .status()?
+            .success();
+        if !ok {
+            bail!("scp failed");
+        }
+        return Ok(());
+    }
     s.boot(paths)?;
     s.touch();
     let ok = s.docker()?.arg("cp").args(&args).status()?.success();
@@ -452,6 +542,30 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
     let new = new_id()?;
     let child_paths = Paths::at(root(paths).join(&new))?;
     let running = parent.running();
+    if parent.macos() {
+        let n = macos_running(paths);
+        if n >= crate::macos::MAX_RUNNING {
+            bail!("{n} macOS sandboxes are running; Apple's licence allows {} per Mac", crate::macos::MAX_RUNNING);
+        }
+        if running {
+            // No pause for macOS guests: flush, then clone what's on disk.
+            let ip = parent.guest(paths)?;
+            let _ = crate::macos::exec_command(paths, &ip, Some("/"), &[], &["sync".into()], false)?.status();
+            crate::macos::pull_ws(paths, &ip, &parent.ws())?;
+        }
+        for f in ["disk.img", "aux.img", "hw.bin", "config.json"] {
+            clonefile(&parent.paths.home.join(f), &child_paths.home.join(f))?;
+        }
+        clonefile(&parent.ws(), &child_paths.home.join("ws"))?;
+        crate::macos::reidentify(&child_paths.home)?;
+        let child = Sandbox { meta: Meta { id: new.clone(), name, ..parent.meta.clone() }, paths: child_paths };
+        if let Err(e) = child.save().and_then(|_| child.boot(paths)) {
+            let _ = remove(&child);
+            return Err(e);
+        }
+        eprintln!("rekcod: sandbox {new} forked from {} in {:.1}s", parent.meta.id, t0.elapsed().as_secs_f64());
+        return Ok(child.meta);
+    }
     if running {
         // Flush, then freeze the workspace's processes while the disk is cloned. dockerd
         // keeps running, so the clone is crash-consistent, like a power cut.
@@ -530,6 +644,11 @@ fn copy_sandbox(paths: &Paths, id: &str) -> Result<Sandbox> {
     if s.meta.mode != "copy" {
         bail!("sandbox {} uses --mount; its edits are already in {}", s.meta.id, s.meta.project.display());
     }
+    if s.macos() {
+        // The guest's files live on its own disk; bring them back to compare.
+        let ip = s.guest(paths)?;
+        crate::macos::pull_ws(paths, &ip, &s.ws())?;
+    }
     Ok(s)
 }
 
@@ -571,9 +690,44 @@ pub fn diff(paths: &Paths, id: &str, stat: bool) -> Result<()> {
 /// A docker command aimed at the sandbox (booted if it was stopped), for the API.
 pub fn docker_cmd(paths: &Paths, id: &str) -> Result<(Command, Meta)> {
     let s = find(paths, id)?;
+    if s.macos() {
+        bail!("sandbox {id} is a macOS guest; it has no docker");
+    }
     s.boot(paths)?;
     s.touch();
     Ok((s.docker()?, s.meta))
+}
+
+/// The command that runs `cmd` in the sandbox: `docker exec` for Linux, ssh for macOS.
+pub fn exec_cmd(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Result<Command> {
+    let s = find(paths, id)?;
+    if s.macos() {
+        let ip = s.guest(paths)?;
+        return crate::macos::exec_command(paths, &ip, o.workdir.as_deref(), &o.env, cmd, false);
+    }
+    s.boot(paths)?;
+    s.touch();
+    let mut c = s.docker()?;
+    c.args(exec_args(&s.meta, o, cmd));
+    Ok(c)
+}
+
+pub fn screenshot(paths: &Paths, id: &str, out: &Path) -> Result<()> {
+    let s = find(paths, id)?;
+    if !s.macos() {
+        bail!("only macOS sandboxes have a screen");
+    }
+    let ip = s.guest(paths)?;
+    crate::macos::screenshot(paths, &ip, out)
+}
+
+pub fn input(paths: &Paths, id: &str, action: &[String]) -> Result<()> {
+    let s = find(paths, id)?;
+    if !s.macos() {
+        bail!("only macOS sandboxes take input");
+    }
+    let ip = s.guest(paths)?;
+    crate::macos::input(paths, &ip, action)
 }
 
 /// Project files changed on the Mac since the sandbox copied them.
@@ -629,7 +783,11 @@ pub fn print_changes(ch: &[Change]) {
 }
 
 pub fn ports(paths: &Paths, id: &str, json: bool) -> Result<()> {
-    crate::cli::status(&find(paths, id)?.paths, json)
+    let s = find(paths, id)?;
+    if s.macos() {
+        bail!("macOS sandboxes don't forward ports; reach the guest at the address `rekcod sandbox ls --json` shows");
+    }
+    crate::cli::status(&s.paths, json)
 }
 
 pub fn log(paths: &Paths, id: &str, follow: bool, json: bool, net: bool) -> Result<()> {
@@ -664,15 +822,32 @@ pub struct Listed {
     #[serde(flatten)]
     pub meta: Meta,
     pub running: bool,
+    /// macOS guests: the address SSH and the screen tools use.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub address: Option<String>,
+}
+
+fn listed(s: Sandbox) -> Listed {
+    let running = s.running();
+    let address = (s.macos() && running)
+        .then(|| std::fs::read(s.paths.home.join("config.json")).ok())
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
+        .and_then(|v| v["mac"].as_str().and_then(crate::macos::running_ip));
+    Listed { running, address, meta: s.meta }
+}
+
+/// Running macOS sandboxes (Apple's licence allows two per Mac).
+pub fn macos_running(paths: &Paths) -> usize {
+    all(paths).iter().filter(|s| s.macos() && s.running()).count()
 }
 
 pub fn list(paths: &Paths) -> Vec<Listed> {
-    all(paths).into_iter().map(|s| Listed { running: s.running(), meta: s.meta }).collect()
+    all(paths).into_iter().map(listed).collect()
 }
 
 pub fn get(paths: &Paths, id: &str) -> Result<Listed> {
-    let s = find(paths, id)?;
-    Ok(Listed { running: s.running(), meta: s.meta })
+    Ok(listed(find(paths, id)?))
 }
 
 pub fn print_list(paths: &Paths, json: bool) -> Result<()> {
@@ -685,7 +860,8 @@ pub fn print_list(paths: &Paths, json: bool) -> Result<()> {
     for s in l {
         let m = &s.meta;
         let state = if s.running { "running" } else { "stopped" };
-        println!("{:<9} {:<14} {:<8} {:<5} {}", m.id, m.name.as_deref().unwrap_or("-"), state, m.mode, m.project.display());
+        let mode = if m.os == "macos" { "macOS" } else { m.mode.as_str() };
+        println!("{:<9} {:<14} {:<8} {:<5} {}", m.id, m.name.as_deref().unwrap_or("-"), state, mode, m.project.display());
     }
     Ok(())
 }
@@ -826,6 +1002,7 @@ mod tests {
             ttl_secs: 0,
             secrets: vec![],
             created: 0,
+            os: String::new(),
         };
         let o = ExecOptions { workdir: None, env: vec!["A=1".into()], timeout_secs: Some(5), tty: false };
         let a = exec_args(&m, &o, &["npm".into(), "test".into()]).join(" ");

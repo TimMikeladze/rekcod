@@ -28,7 +28,7 @@ modules loaded at 0.19–0.21 s, guest agent up 0.54–0.64 s after VM start.
 - No initramfs: virtio-blk and ext4 are built in, so the kernel mounts `/dev/vda`
   itself. The host skips `setInitialRamdiskURL` when the guest dir has no `initramfs`.
   Older guests that ship one keep working.
-- Fallback: `docker build --build-arg KERNEL=alpine` still builds the stock-kernel
+- Fallback: `KERNEL=alpine scripts/build.sh` still builds the stock-kernel
   guest the old way.
 
 ## Verify

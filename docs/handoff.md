@@ -28,11 +28,11 @@ branch `main`.
 - Machine: M5 Pro, macOS 27.0.1.
   - Docker Desktop is installed but broken (`Docker Desktop is unable to start`).
   - OrbStack is installed and is the comparison baseline (`--context orbstack`).
-  - rekcod can rebuild its own guest image (`REKCOD_BUILD_DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock scripts/build.sh`).
+  - rekcod can rebuild its own guest image (`scripts/build.sh` runs `guest/build.sh` in the VM, docs/guest-build.md).
 
 ## Ground rules (don't relitigate)
 
-1. Never reimplement the Docker API, Compose or BuildKit. Parity comes from upstream dockerd (pinned in `guest/Dockerfile`).
+1. Never reimplement the Docker API, Compose or BuildKit. Parity comes from upstream dockerd (pinned in `guest/build.sh`).
 2. Virtualization.framework, not libkrun/HVF, because only VZ gets Rosetta (Docker VMM lacks it).
 3. Host↔guest traffic is vsock only: ports 2375 docker, 2376 port forward, 2377 control, 2378 DNS (`crates/rekcod-proto`). No TCP API and no reliance on vmnet routing.
 4. File-sharing semantics are bounded staleness (about 25 ms), not coherence. Guest writes are coherent. Never write to Mac files to signal the guest.
@@ -46,7 +46,7 @@ branch `main`.
 
 - `virtio-rng` must be up before userspace. Without it, boot stalls about 5.6 s waiting for entropy. The custom kernel builds it in; stock-kernel guests (`KERNEL=alpine`) load it from the initramfs (`modules=` on the kernel cmdline).
 - The guest kernel is ours ([docs/custom-kernel.md](custom-kernel.md)). Anything boot.sh or dockerd needs on every boot goes in `guest/kernel/rekcod.config` as `=y`; the build fails if a fragment line doesn't stick.
-- The initramfs autoloads virtiofs, so the Dockerfile reruns `mkinitfs` after swapping in the patched modules.
+- The initramfs autoloads virtiofs, so `guest/build.sh` reruns `mkinitfs` (KERNEL=alpine) after swapping in the patched modules.
 - Apple's virtio-fs server:
   - It remaps inode numbers, so compare size/mtime/ctime instead.
   - It costs about 25–60 µs per request.
@@ -72,7 +72,7 @@ branch `main`.
 
 ```sh
 cargo test --workspace && cargo clippy -p rekcod -p rekcod-proto
-scripts/build.sh                                    # needs a docker engine for the guest image
+scripts/build.sh                                    # needs `rekcod start` for the guest image
 E2E_IMPORT_FROM=orbstack scripts/e2e.sh             # 28 checks; run it 3x for anything touching fuse
 python3 bench/headroom.py --context rekcod          # compare: --context orbstack
 ```

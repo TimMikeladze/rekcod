@@ -103,8 +103,8 @@ min into docker/compose's e2e suite, on the last commit too (pre-existing).
 - Regression test: `tests/stress/slow-reader.sh` (old daemon: engine dead after
   5 s; fixed: responsive for 30 s, daemon RSS 48 MB).
 - Ruled out along the way: guest kernel (6.18.55 stock froze too), the fuse patch,
-  the balloon device, vCPU count, `nohz=off`. The Dockerfile keeps the
-  `KERNEL_REPO`/`FUSE_PATCH` build args and the daemon `REKCOD_NO_BALLOON` knob for
+  the balloon device, vCPU count, `nohz=off`. `guest/build.sh` keeps the
+  `KERNEL_REPO`/`FUSE_PATCH` settings and the daemon `REKCOD_NO_BALLOON` knob for
   future bisects. OrbStack had the same symptom class (orbstack#2471, fixed in 2.2.0).
 
 **Compose suite (docker/compose v5.4.0 `pkg/e2e`, 163 top-level tests):** **rekcod

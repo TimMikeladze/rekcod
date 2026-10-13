@@ -36,7 +36,7 @@ rekcod stop             # power off, restore the previous docker context
 - `crates/rekcod-proto`: port numbers and the forward header (`tcp:<port>\n`), shared and unit-tested.
 - `crates/rekcod-agent` (guest, static musl): vsock→docker.sock bridge, port-forward dialer, control (ping, time, shutdown, notify), and DNS stub.
 - `crates/rekcod` (host): CLI (`start`, `stop`, `status`, `import`, `shell`) plus a hidden `daemon` that owns the VM, the socket proxy, the port forwarder and the clock push. It must be codesigned with `com.apple.security.virtualization`.
-- `guest/`: Dockerfile that produces `Image` (decompressed from Alpine's EFI zboot vmlinuz), `initramfs` and `root.img`.
+- `guest/`: `build.sh` produces `Image` (decompressed from Alpine's EFI zboot vmlinuz), `initramfs` and `root.img`.
 - `scripts/build.sh` builds, signs and packs the guest. `scripts/e2e.sh` runs the verification below.
 
 ## Out of scope for the MVP

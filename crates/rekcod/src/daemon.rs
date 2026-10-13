@@ -64,7 +64,7 @@ pub struct Options {
 }
 
 /// Standard base64, for passing a path on the kernel command line.
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for c in bytes.chunks(3) {

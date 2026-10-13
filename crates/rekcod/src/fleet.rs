@@ -368,7 +368,12 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     std::thread::spawn(move || {
         loop {
             let sbs: Vec<String> = sandbox::list(&hb_paths).into_iter().map(|l| l.meta.id).collect();
-            let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "sandboxes": sbs});
+            let macos_free = if crate::macos::ready(&hb_paths, "default") {
+                crate::macos::MAX_RUNNING.saturating_sub(sandbox::macos_running(&hb_paths))
+            } else {
+                0
+            };
+            let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs});
             if let Err(e) = call(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body) {
                 eprintln!("rekcod: heartbeat: {e:#}");
             }
@@ -403,6 +408,7 @@ create table if not exists releases (app text not null, n int not null, commit t
   created bigint not null, primary key (app, n));
 create table if not exists instances (app text not null, release int not null, sandbox text primary key, node text not null,
   endpoint text not null, state text not null);
+alter table nodes add column if not exists macos_free int not null default 0;
 create table if not exists audit (ts bigint not null, who text not null, action text not null, target text not null, ok boolean not null);
 ";
 
@@ -433,10 +439,11 @@ impl Controller {
     }
 
     /// Ready nodes with at least `mib` free, most free first.
-    fn place(&self, mib: i64) -> Result<Vec<(String, String, String)>> {
+    fn place(&self, mib: i64, macos: bool) -> Result<Vec<(String, String, String)>> {
         let rows = self.db.lock().unwrap().query(
-            "select id, url, secret from nodes where state = 'ready' and last_seen > $1 and mem_free >= $2 order by mem_free desc",
-            &[&(now() - 15), &mib],
+            "select id, url, secret from nodes where state = 'ready' and last_seen > $1 and mem_free >= $2
+             and (not $3 or macos_free > 0) order by mem_free desc",
+            &[&(now() - 15), &mib, &macos],
         )?;
         Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
     }
@@ -554,10 +561,12 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                     bail!("bad node secret");
                 }
                 let free = body["mem_free_mib"].as_i64().unwrap_or(0);
+                let macos_free = body["macos_free"].as_i64().unwrap_or(0) as i32;
                 let next = if state == "lost" { "ready".to_string() } else { state };
-                c.db.lock()
-                    .unwrap()
-                    .execute("update nodes set mem_free = $2, last_seen = $3, state = $4 where id = $1", &[id, &free, &now(), &next])?;
+                c.db.lock().unwrap().execute(
+                    "update nodes set mem_free = $2, last_seen = $3, state = $4, macos_free = $5 where id = $1",
+                    &[id, &free, &now(), &next, &macos_free],
+                )?;
                 Ok(json!({}))
             })();
             return json_reply(&mut w, r);
@@ -664,9 +673,11 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, req: &crate::sandbox_api::R
             json!({"error": format!("quota: {count} of {} sandboxes in use", who.max)}).to_string().as_bytes(),
         );
     }
-    let mib = body["memory_gib"].as_i64().unwrap_or(2) * 1024;
-    let Some((node, url, sec)) = c.place(mib)?.into_iter().next() else {
-        return respond(w, 400, "application/json", json!({"error": format!("no node has {mib} MiB free")}).to_string().as_bytes());
+    let macos = body["os"].as_str() == Some("macos");
+    let mib = body["memory_gib"].as_i64().unwrap_or(2).max(if macos { 8 } else { 0 }) * 1024;
+    let Some((node, url, sec)) = c.place(mib, macos)?.into_iter().next() else {
+        let what = if macos { format!("a free macOS slot and {mib} MiB") } else { format!("{mib} MiB free") };
+        return respond(w, 400, "application/json", json!({"error": format!("no node has {what}")}).to_string().as_bytes());
     };
     let mut v = match call(&url, "POST", "/sandboxes", Some(&sec), &body) {
         Ok(v) => v,
@@ -771,7 +782,7 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
     };
     let n: i32 = c.db.lock().unwrap().query_one("select coalesce(max(n), 0) + 1 from releases where app = $1", &[&app.name])?.get(0);
     c.db.lock().unwrap().execute("insert into releases values ($1, $2, $3, 'building', $4)", &[&app.name, &n, &commit, &now()])?;
-    let nodes = c.place(app.memory_gib as i64 * 1024)?;
+    let nodes = c.place(app.memory_gib as i64 * 1024, false)?;
     if nodes.is_empty() {
         c.db.lock().unwrap().execute("update releases set state = 'failed' where app = $1 and n = $2", &[&app.name, &n])?;
         bail!("no node has {} GiB free", app.memory_gib);

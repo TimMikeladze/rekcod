@@ -11,20 +11,20 @@ jobs:
     runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
-      # buildx + gha cache: the compiled guest kernel is reused until guest/kernel,
-      # guest/fuse or the Dockerfile's kernel stage changes.
-      - uses: docker/setup-buildx-action@v3
-      # exposes the cache token to `run:` steps, which type=gha needs
-      - uses: crazy-max/ghaction-github-runtime@v3
+      # The compiled guest kernel, reused until guest/kernel, guest/fuse or
+      # guest/build.sh changes (guest/build.sh keys its cache the same way).
+      - uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kernel-cache
+          key: guest-kernel-${{ hashFiles('guest/build.sh', 'guest/kernel/**', 'guest/fuse/**') }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-unknown-linux-musl
       - run: |
           cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
           mkdir -p out/agent && cp target/aarch64-unknown-linux-musl/release/rekcod-agent out/agent/
-          docker buildx build --platform linux/arm64 --build-context agent=out/agent \
-            --cache-from type=gha,scope=guest --cache-to type=gha,scope=guest,mode=max \
-            --target out --output type=local,dest=out/guest guest
+          sudo REKCOD_KERNEL_CACHE="$RUNNER_TEMP/kernel-cache" guest/build.sh out/agent/rekcod-agent out/guest
+          sudo chown -R "$(id -u):$(id -g)" out/guest "$RUNNER_TEMP/kernel-cache"
       - uses: actions/upload-artifact@v4
         with:
           name: guest

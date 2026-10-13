@@ -1,0 +1,61 @@
+# Provisioning a spare Mac
+
+One command on your Mac turns a spare Mac into a deploy target and a docker host. After that
+the spare runs with its lid shut and nobody touches it.
+
+```sh
+rekcod host add spare me@spare-mac --fleet --domain apps.example.com
+```
+
+## What the spare needs first
+
+Done once, by hand, because they need its screen or an Apple ID:
+
+- Remote Login on, and your key on it (`ssh-copy-id me@spare-mac`).
+- Tailscale logged in, on the same tailnet as your Mac. `--addr IP` skips Tailscale and uses
+  that address instead (a LAN IP, say).
+- Automatic login on (System Settings › Users & Groups). LaunchAgents only run in a logged-in
+  session, so without it nothing comes back after a reboot. FileVault blocks automatic login.
+
+rekcod itself does **not** have to be installed there: `host add` copies this Mac's binary over.
+
+## What `host add --fleet` does
+
+1. Checks SSH works without a password.
+2. Finds `rekcod` on the spare (login shell `PATH`, then `~/.rekcod/bin/rekcod`). If there's
+   none, copies this binary to `~/.rekcod/bin/rekcod` with scp.
+3. Runs `rekcod spare setup --domain D` there over `ssh -t`, so sudo can ask for a password.
+4. Reads the `remote URL TOKEN` line the setup prints and runs `rekcod remote add NAME URL`
+   here. The spare's tailnet name goes in the URL, so it survives an IP change.
+5. Without `--no-docker`: runs `rekcod start` on the spare, then the plain `host add` steps
+   (docker context `rekcod-NAME`, switched to unless `--no-use`).
+
+Re-running it is safe: every step replaces what it made before.
+
+## `rekcod spare setup` (on the spare)
+
+The Rust version of the old `scripts/spare-setup.sh`, plus the headless bits.
+
+- Address: `--addr`, else `tailscale ip -4`.
+- `controller serve --install` on `ADDR:7700`, waits for the admin token.
+- `node join ... --install` on `ADDR:7701` the first time, `node serve --install` after.
+- `remote add local`, then `edge serve --install` on `ADDR:8080` and public apps on
+  `127.0.0.1:8081` for cloudflared.
+- Power, unless `--no-power`: `sudo pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1`.
+  `disablesleep` keeps a MacBook awake with the lid shut, `autorestart` boots it after a power
+  cut. Skipped with a warning when sudo can't prompt (no terminal).
+- Warns when automatic login is off (`autoLoginUser` in `com.apple.loginwindow`).
+- Last line on stdout: `remote http://NAME:7700 ADMIN_TOKEN`.
+
+`rekcod spare uninstall` removes the three agents. It leaves pmset and `~/.rekcod` alone.
+
+## Not done
+
+- Turning on automatic login, Remote Login or Tailscale. They need the GUI, an Apple ID or the
+  user's password in a form I'd rather not pass around.
+- cloudflared. The setup prints the commands; public traffic stays opt-in.
+- Menu bar: `host add` takes arguments the menu has no way to ask for, same as before.
+- Starting the docker VM at login. After a reboot apps come back (they're sandboxes the node
+  starts), but docker over SSH needs `rekcod start` on the spare first.
+- A dev build copied over has no embedded guest, so the spare's first `rekcod start` fails.
+  Copy a release build, or install rekcod there from the release.

@@ -230,6 +230,30 @@ exec, diff, apply and fork work as for Linux sandboxes (over SSH; the workspace 
 into the guest's `~/ws`). The MCP server adds `sandbox_screenshot` and `sandbox_input` for
 computer-use agents. Details: [`docs/platform.md`](docs/platform.md#track-4-as-built).
 
+### A spare Mac
+
+One command on your Mac makes a spare Mac a deploy target and a docker host that runs with its
+lid shut:
+
+```sh
+ssh-copy-id me@spare-mac
+rekcod host add spare me@spare-mac --fleet --domain apps.example.com
+rekcod app deploy --remote spare          # http://<spare's tailnet name>:8080, Host: <app>.apps.example.com
+docker ps                                 # runs on the spare too
+```
+
+The spare needs Remote Login, Tailscale on your tailnet (or `--addr IP`) and automatic login,
+because the services are LaunchAgents and those only run in a logged-in session. rekcod doesn't
+have to be installed there: `host add` copies this binary to `~/.rekcod/bin/rekcod` if it's
+missing. Then it runs `rekcod spare setup` over SSH, which installs the controller, node and
+edge as LaunchAgents on the Tailscale address and runs `sudo pmset -a sleep 0 disablesleep 1
+autorestart 1` so the lid can shut and a power cut doesn't leave it off (sudo asks for the
+spare's password; `--no-power` skips it). It adds the remote `spare` here, then starts the
+spare's VM and adds the docker host (`--no-docker` skips that). Re-running it is safe.
+`rekcod spare uninstall` on the spare removes the agents. Details: [`docs/spare.md`](docs/spare.md).
+
+The setup prints the `cloudflared` commands for public apps (`rekcod app public`).
+
 ### Docker on another Mac
 
 `rekcod host` makes a spare Mac's rekcod VM your docker engine, over plain docker-over-SSH.
@@ -287,11 +311,9 @@ http://127.0.0.1:8081}]` and the controller started with `--domain example.com`.
 app answers `no app at ...` there, the same as one that doesn't exist. PR previews are
 private.
 
-On a spare Mac, `scripts/spare-setup.sh --domain example.com` does
-the first three commands as LaunchAgents on its Tailscale address (`--install` on
-`controller serve`, `node join`/`node serve` and `edge serve`): they start at login and
-restart if they exit, so turn on automatic login. `rekcod controller|node|edge uninstall`
-removes them. Back up the controller by copying `fleet.db` (and its `-wal` file) while it's
+`--install` on `controller serve`, `node join`/`node serve` and `edge serve` runs each as a
+LaunchAgent; `rekcod controller|node|edge uninstall` removes it. [A spare Mac](#a-spare-mac)
+sets up all three with one command. Back up the controller by copying `fleet.db` (and its `-wal` file) while it's
 stopped, and keep a copy of `controller/secret-key` somewhere else: app secrets in
 `fleet.db` are sealed with it, and they can't be read without it.
 
@@ -405,7 +427,8 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod edge serve\|uninstall` | HTTP ingress for apps |
 | `rekcod app deploy\|ls\|status\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|destroy` | Apps on the fleet |
 | `rekcod job run\|ls\|logs\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every` |
-| `rekcod host add\|ls\|use\|rm\|forward` | Another Mac's rekcod as the docker engine, over SSH |
+| `rekcod host add\|ls\|use\|rm\|forward` | Another Mac's rekcod as the docker engine, over SSH; `add --fleet` also provisions it as a fleet |
+| `rekcod spare setup\|uninstall` | This Mac as a headless one-machine fleet (controller, node, edge, no sleep) |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |

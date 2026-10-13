@@ -449,7 +449,7 @@ Where the code differs from the spec above:
   working when the internet doesn't. The cost: no second controller for failover.
 - **Services are per-user LaunchAgents** (`--install`, `crates/rekcod/src/service.rs`), not
   LaunchDaemons, so they start at login and the Mac needs automatic login. KeepAlive restarts
-  them if they exit. `scripts/spare-setup.sh` sets up a one-machine fleet on the tailnet.
+  them if they exit. `rekcod spare setup` sets up a one-machine fleet on the tailnet, and `rekcod host add --fleet` runs it over SSH ([spare.md](spare.md)).
 
 ## Track 4 as built
 

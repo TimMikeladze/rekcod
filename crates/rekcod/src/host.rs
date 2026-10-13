@@ -55,8 +55,12 @@ fn ssh_dest(dest: &str) -> Vec<String> {
 }
 
 fn ssh(dest: &str) -> Command {
+    ssh_opts(dest, &[])
+}
+
+fn ssh_opts(dest: &str, extra: &[&str]) -> Command {
     let mut cmd = Command::new("ssh");
-    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]).args(ssh_dest(dest));
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]).args(extra).args(ssh_dest(dest));
     cmd
 }
 
@@ -85,8 +89,15 @@ pub fn list() -> (Vec<Host>, bool) {
     }
 }
 
-pub fn add(name: &str, dest: &str, switch: bool) -> Result<()> {
-    let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
+/// `host add --fleet`: what to set up on the spare besides docker.
+pub struct Fleet {
+    pub domain: String,
+    pub addr: Option<String>,
+    pub no_power: bool,
+    pub docker: bool,
+}
+
+fn check(name: &str, dest: &str) -> Result<()> {
     if name == "local" || name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("host name must be letters, digits, - or _ (and not `local`)");
     }
@@ -94,6 +105,31 @@ pub fn add(name: &str, dest: &str, switch: bool) -> Result<()> {
     if !ok {
         bail!("can't SSH to {dest} without a password; run `ssh-copy-id {dest}` and turn on Remote Login on that Mac");
     }
+    Ok(())
+}
+
+/// Provisions the spare as a fleet (docs/spare.md), adds it as remote NAME, then as a docker host.
+pub fn add_fleet(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet) -> Result<()> {
+    let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
+    check(name, dest)?;
+    let bin = crate::spare::ensure_binary(dest, || ssh(dest), &ssh_dest(dest))?;
+    let tty: &[&str] = if std::io::IsTerminal::is_terminal(&std::io::stdin()) { &["-t"] } else { &[] };
+    let (url, token) = crate::spare::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.no_power)?;
+    crate::fleet::remote_add(paths, name, &url, &token, None)?;
+    println!("remote {name}: {url}  (rekcod app deploy --remote {name})");
+    if !f.docker {
+        return Ok(());
+    }
+    // The docker socket only exists while the spare's VM runs.
+    if !ssh(dest).arg(format!("'{bin}' start")).stdin(Stdio::null()).status()?.success() {
+        bail!("`rekcod start` failed on {dest}; the fleet is set up, docker isn't (re-run with --no-docker to skip it)");
+    }
+    add(name, dest, switch)
+}
+
+pub fn add(name: &str, dest: &str, switch: bool) -> Result<()> {
+    let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
+    check(name, dest)?;
     let mut child = ssh(dest).args(["/bin/zsh", "-l", "-s"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
     child.stdin.take().context("ssh stdin")?.write_all(SETUP.as_bytes())?;
     let out = child.wait_with_output()?;

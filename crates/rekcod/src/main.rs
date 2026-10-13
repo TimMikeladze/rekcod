@@ -41,6 +41,8 @@ mod service;
 #[cfg(target_os = "macos")]
 mod snap;
 #[cfg(target_os = "macos")]
+mod spare;
+#[cfg(target_os = "macos")]
 mod syssock;
 #[cfg(target_os = "macos")]
 mod vm;
@@ -148,6 +150,9 @@ enum Cmd {
     /// Another Mac's rekcod as your docker engine, over SSH (docs/remote-docker.md).
     #[command(subcommand)]
     Host(HostCmd),
+    /// This Mac as a headless one-machine fleet (docs/spare.md); `host add --fleet` runs it over SSH.
+    #[command(subcommand)]
+    Spare(SpareCmd),
     /// Run this Mac as a fleet node.
     #[command(subcommand)]
     Node(NodeCmd),
@@ -809,6 +814,21 @@ enum HostCmd {
         /// Create the context without switching to it.
         #[arg(long)]
         no_use: bool,
+        /// Also make DEST a fleet you deploy apps to, running headless (docs/spare.md).
+        #[arg(long, requires = "domain")]
+        fleet: bool,
+        /// Apps are served at <app>.<domain> (with --fleet).
+        #[arg(long)]
+        domain: Option<String>,
+        /// The spare's address for the fleet (default: its Tailscale IP).
+        #[arg(long, requires = "fleet")]
+        addr: Option<String>,
+        /// Leave the spare's sleep settings alone.
+        #[arg(long, requires = "fleet")]
+        no_power: bool,
+        /// Only the fleet; no docker context.
+        #[arg(long, requires = "fleet")]
+        no_docker: bool,
     },
     /// Hosts (docker contexts rekcod-*); * marks the one in use.
     Ls {
@@ -821,6 +841,24 @@ enum HostCmd {
     Rm { name: String },
     /// Forward the host's published ports to 127.0.0.1 here until Ctrl-C (default: all, followed live).
     Forward { name: String, ports: Vec<u16> },
+}
+
+#[derive(Subcommand)]
+enum SpareCmd {
+    /// Controller, node and edge as LaunchAgents on the Tailscale address; no sleep with the lid shut.
+    Setup {
+        /// Apps are served at <app>.<domain>.
+        #[arg(long)]
+        domain: String,
+        /// Listen here instead of the Tailscale IP.
+        #[arg(long)]
+        addr: Option<String>,
+        /// Skip `sudo pmset`.
+        #[arg(long)]
+        no_power: bool,
+    },
+    /// Remove the controller, node and edge LaunchAgents.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -934,7 +972,13 @@ fn main() {
         }
         Cmd::Shell => cli::shell(&paths),
         Cmd::Compact => cli::compact(&paths),
-        Cmd::Host(HostCmd::Add { name, dest, no_use }) => host::add(&name, &dest, !no_use),
+        Cmd::Host(HostCmd::Add { name, dest, no_use, fleet: false, .. }) => host::add(&name, &dest, !no_use),
+        Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, no_power, no_docker, .. }) => {
+            let f = host::Fleet { domain: domain.unwrap_or_default(), addr, no_power, docker: !no_docker };
+            host::add_fleet(&paths, &name, &dest, !no_use, &f)
+        }
+        Cmd::Spare(SpareCmd::Setup { domain, addr, no_power }) => spare::setup(&paths, &domain, addr.as_deref(), no_power),
+        Cmd::Spare(SpareCmd::Uninstall) => spare::uninstall(),
         Cmd::Host(HostCmd::Ls { json }) => {
             host::print_list(json);
             Ok(())

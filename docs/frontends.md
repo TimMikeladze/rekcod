@@ -47,7 +47,7 @@ how that's enforced.
 
 Creating, exec, fork, `cp` and golden disks are for agents and scripts, so they're CLI,
 HTTP and MCP only. So are deploys, scaling and env changes (they take arguments), the
-fleet's admin commands (`node`, `controller`, `edge`, `remote`), `host add/rm`, `--remote` sandboxes,
+fleet's admin commands (`node`, `controller`, `edge`, `remote`, `spare`), `host add/rm`, `--remote` sandboxes,
 `sandbox input` (agents), and `macos` image setup (one-time, interactive). The menu bar lists what exists and offers what a person does to it.
 
 ## Changing things

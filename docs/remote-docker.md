@@ -2,7 +2,8 @@
 
 Use the rekcod VM on another Mac (a spare) as your docker engine, over SSH. This is plain
 docker-over-SSH (`ssh://` contexts). It's separate from the fleet (`rekcod remote`, apps),
-which deploys apps instead of handing out a docker socket.
+which deploys apps instead of handing out a docker socket. `host add --fleet` sets up both at
+once ([spare.md](spare.md)).
 
 ## What the user runs
 

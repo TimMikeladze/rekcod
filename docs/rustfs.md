@@ -13,7 +13,7 @@ No MinIO.
 `rekcod storage serve --listen 100.x.y.z:7710 --data ~/.rekcod/storage` downloads a
 pinned RustFS release binary (checksum checked) into `~/.rekcod/bin/rustfs` and runs it.
 `--install` makes it a LaunchAgent like the other fleet services, and
-`scripts/spare-setup.sh` adds it. The controller learns the endpoint and root credentials
+`rekcod spare setup` will add it. The controller learns the endpoint and root credentials
 from `rekcod controller serve --storage http://...:7710` and keeps them in `fleet.db`.
 
 One RustFS on one Mac to start. That Mac's disk is a single point of failure, which

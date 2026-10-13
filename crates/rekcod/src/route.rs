@@ -15,6 +15,7 @@ const OWN: &[&str] = &[
     "mcp",
     "remote",
     "host",
+    "spare",
     "node",
     "controller",
     "edge",

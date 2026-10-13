@@ -166,6 +166,10 @@ pub(crate) fn stop_daemon(paths: &Paths) -> Result<bool> {
     unsafe { libc::kill(pid, libc::SIGTERM) };
     let deadline = Instant::now() + Duration::from_secs(45);
     while unsafe { libc::kill(pid, 0) } == 0 {
+        // `rekcod x --sandbox` spawned this daemon itself: reap it, or its zombie answers kill(0).
+        if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
+            break;
+        }
         if Instant::now() > deadline {
             bail!("daemon (pid {pid}) did not exit; see {}", paths.daemon_log().display());
         }

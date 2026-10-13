@@ -212,6 +212,7 @@ pub fn entries(m: &Model) -> Vec<Entry> {
             .iter()
             .map(|a| {
                 let rel = a.live_release.map(|r| format!("release {r}")).unwrap_or_else(|| "not deployed".into());
+                let rel = if a.public { format!("{rel}, public") } else { rel };
                 Entry::Submenu(format!("{}  ({rel})", a.name), actions::app_actions(a).into_iter().map(Entry::Action).collect())
             })
             .collect();
@@ -536,7 +537,10 @@ mod tests {
             sandbox: None,
             socket_installed: false,
             sandboxes: vec![crate::actions::tests::sample_sandbox()],
-            apps: vec![crate::actions::tests::sample_app()],
+            apps: vec![
+                crate::actions::tests::sample_app(),
+                crate::actions::RemoteApp { name: "blog".into(), public: true, ..crate::actions::tests::sample_app() },
+            ],
         };
         fn kinds(e: &[Entry], out: &mut Vec<crate::actions::Kind>) {
             for e in e {

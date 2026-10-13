@@ -38,12 +38,14 @@ pub enum Kind {
     AppLogs,
     AppRollback,
     AppDestroy,
+    AppPublic,
+    AppPrivate,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 24] = [
+    pub const ALL: [Kind; 26] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -68,6 +70,8 @@ impl Kind {
         Kind::AppLogs,
         Kind::AppRollback,
         Kind::AppDestroy,
+        Kind::AppPublic,
+        Kind::AppPrivate,
     ];
 }
 
@@ -217,6 +221,7 @@ pub struct RemoteApp {
     pub name: String,
     pub url: String,
     pub live_release: Option<i64>,
+    pub public: bool,
 }
 
 /// `GET /apps` on the default remote; empty without one or when it doesn't answer.
@@ -230,6 +235,7 @@ fn remote_apps(paths: &Paths) -> Vec<RemoteApp> {
             name: a["name"].as_str().unwrap_or("").into(),
             url: a["url"].as_str().unwrap_or("").into(),
             live_release: a["live_release"].as_i64(),
+            public: a["public"].as_bool().unwrap_or(false),
         })
         .collect()
 }
@@ -480,6 +486,12 @@ pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
         Action::rekcod(Kind::AppLogs, "Logs", &["app", "logs", n]).interactive(),
         Action::rekcod(Kind::AppRollback, "Roll back to the previous release", &["app", "rollback", n])
             .confirm(format!("Roll {n} back to its previous good release?")),
+        if a.public {
+            Action::rekcod(Kind::AppPrivate, "Make private", &["app", "private", n])
+        } else {
+            Action::rekcod(Kind::AppPublic, "Make public", &["app", "public", n])
+                .confirm(format!("Serve {n} on the edge's public listener? Anyone with the URL can reach it."))
+        },
         Action::rekcod(Kind::AppDestroy, "Destroy", &["app", "destroy", n])
             .confirm(format!("Destroy {n}? Its instances and release history are deleted.")),
     ]
@@ -523,7 +535,7 @@ pub mod tests {
     }
 
     pub fn sample_app() -> RemoteApp {
-        RemoteApp { name: "dash".into(), url: "http://dash.apps.test".into(), live_release: Some(3) }
+        RemoteApp { name: "dash".into(), url: "http://dash.apps.test".into(), live_release: Some(3), public: false }
     }
 
     pub fn sample_sandbox() -> AgentSandbox {
@@ -567,6 +579,7 @@ pub mod tests {
         }
         all.extend(sandbox_actions(&sample_sandbox()));
         all.extend(app_actions(&sample_app()));
+        all.extend(app_actions(&RemoteApp { public: true, ..sample_app() }));
         all
     }
 
@@ -591,6 +604,7 @@ pub mod tests {
                     | Kind::SandboxRemove
                     | Kind::AppRollback
                     | Kind::AppDestroy
+                    | Kind::AppPublic
             );
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }

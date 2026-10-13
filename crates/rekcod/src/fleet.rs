@@ -409,6 +409,7 @@ create table if not exists releases (app text not null, n int not null, commit t
 create table if not exists instances (app text not null, release int not null, sandbox text primary key, node text not null,
   endpoint text not null, state text not null);
 alter table nodes add column if not exists macos_free int not null default 0;
+alter table apps add column if not exists public boolean not null default false;
 create table if not exists audit (ts bigint not null, who text not null, action text not null, target text not null, ok boolean not null);
 ";
 
@@ -692,14 +693,26 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, req: &crate::sandbox_api::R
 
 // ------------------------------------------------------------- apps
 
+/// `{host: {"public": bool, "endpoints": [...]}}` for every app with live instances.
 fn routes(c: &Controller) -> Result<Value> {
-    let rows = c.db.lock().unwrap().query("select app, endpoint from instances where state = 'live' order by app", &[])?;
-    let mut out: std::collections::BTreeMap<String, Vec<String>> = Default::default();
+    let rows = c.db.lock().unwrap().query(
+        "select i.app, i.endpoint, a.public from instances i join apps a on a.name = i.app where i.state = 'live' order by i.app",
+        &[],
+    )?;
+    let mut out: std::collections::BTreeMap<String, Route> = Default::default();
     for r in rows {
         let app: String = r.get(0);
-        out.entry(format!("{app}.{}", c.domain)).or_default().push(r.get(1));
+        let route = out.entry(format!("{app}.{}", c.domain)).or_default();
+        route.public = r.get(2);
+        route.endpoints.push(r.get(1));
     }
-    Ok(json!(out))
+    Ok(serde_json::to_value(out)?)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+pub struct Route {
+    pub public: bool,
+    pub endpoints: Vec<String>,
 }
 
 /// Resolves a branch or tag to a commit with `git ls-remote`; a commit passes through.
@@ -885,13 +898,14 @@ fn destroy_app(c: &Arc<Controller>, name: &str) -> Result<Value> {
 
 fn app_status(c: &Controller, app: &App) -> Result<Value> {
     let mut db = c.db.lock().unwrap();
-    let live: Option<i32> = db.query_one("select live_release from apps where name = $1", &[&app.name])?.get(0);
+    let row = db.query_one("select live_release, public from apps where name = $1", &[&app.name])?;
+    let (live, public): (Option<i32>, bool) = (row.get(0), row.get(1));
     let rel = db.query("select n, commit, state, created from releases where app = $1 order by n desc limit 20", &[&app.name])?;
     let inst =
         db.query("select release, sandbox, node, endpoint, state from instances where app = $1 and state <> 'removed'", &[&app.name])?;
     Ok(json!({
         "name": app.name, "url": format!("http://{}.{}", app.name, c.domain), "git": {"url": app.git_url, "ref": app.git_ref},
-        "port": app.port, "instances_wanted": app.instances, "live_release": live,
+        "port": app.port, "instances_wanted": app.instances, "live_release": live, "public": public,
         "env": app.env, "secrets": app.secrets.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
         "releases": rel.iter().map(|r| json!({"n": r.get::<_, i32>(0), "commit": r.get::<_, String>(1), "state": r.get::<_, String>(2), "created": r.get::<_, i64>(3)})).collect::<Vec<_>>(),
         "instances": inst.iter().map(|r| json!({"release": r.get::<_, i32>(0), "sandbox": r.get::<_, String>(1), "node": r.get::<_, String>(2), "endpoint": r.get::<_, String>(3), "state": r.get::<_, String>(4)})).collect::<Vec<_>>(),
@@ -913,6 +927,8 @@ fn upsert_app(c: &Controller, who: &Caller, b: &Value, preview_of: Option<&str>)
     let health = b["health"].as_str().unwrap_or("/");
     let start = b["start"].as_str();
     let env = b.get("env").filter(|e| e.is_object()).map(|e| e.to_string());
+    // None keeps an existing app's visibility; new apps are private.
+    let public = b["public"].as_bool();
     let mut db = c.db.lock().unwrap();
     if let Some(r) = db.query_opt("select owner from apps where name = $1", &[&name])? {
         let owner: String = r.get(0);
@@ -921,14 +937,14 @@ fn upsert_app(c: &Controller, who: &Caller, b: &Value, preview_of: Option<&str>)
         }
         db.execute(
             "update apps set git_url = $2, git_ref = $3, port = $4, instances = $5, cpus = $6, memory_gib = $7, health = $8,
-             start = $9, env = coalesce($10, env) where name = $1",
-            &[&name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env],
+             start = $9, env = coalesce($10, env), public = coalesce($11, public) where name = $1",
+            &[&name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &public],
         )?;
     } else {
         db.execute(
-            "insert into apps (name, owner, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, preview_of, created)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, coalesce($11, '{}'), $12, $13)",
-            &[&name, &who.name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &preview_of, &now()],
+            "insert into apps (name, owner, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, preview_of, created, public)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, coalesce($11, '{}'), $12, $13, coalesce($14, false))",
+            &[&name, &who.name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &preview_of, &now(), &public],
         )?;
     }
     Ok(name)
@@ -938,14 +954,14 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str], b: 
     match (method, seg) {
         ("GET", ["apps"]) => {
             let rows = c.db.lock().unwrap().query(
-                "select name, git_url, live_release, instances, preview_of from apps where owner = $1 or $2 order by name",
+                "select name, git_url, live_release, instances, preview_of, public from apps where owner = $1 or $2 order by name",
                 &[&who.name, &who.admin],
             )?;
             Ok(json!(
                 rows.iter()
                     .map(|r| json!({
                         "name": r.get::<_, String>(0), "git": r.get::<_, String>(1), "live_release": r.get::<_, Option<i32>>(2),
-                        "instances": r.get::<_, i32>(3), "preview_of": r.get::<_, Option<String>>(4),
+                        "instances": r.get::<_, i32>(3), "preview_of": r.get::<_, Option<String>>(4), "public": r.get::<_, bool>(5),
                         "url": format!("http://{}.{}", r.get::<_, String>(0), c.domain),
                     }))
                     .collect::<Vec<_>>()
@@ -957,6 +973,13 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str], b: 
             deploy(c, &load_app(c, &name, who)?, None, &who.name)
         }
         ("GET", ["apps", name]) => app_status(c, &load_app(c, name, who)?),
+        ("POST", ["apps", name, "visibility"]) => {
+            load_app(c, name, who)?;
+            let public = b["public"].as_bool().context("missing public")?;
+            c.db.lock().unwrap().execute("update apps set public = $2 where name = $1", &[name, &public])?;
+            c.audit(&who.name, if public { "make public" } else { "make private" }, name, true);
+            Ok(json!({"app": name, "public": public}))
+        }
         ("POST", ["apps", name, "deploy"]) => deploy(c, &load_app(c, name, who)?, b["ref"].as_str().map(String::from), &who.name),
         ("POST", ["apps", name, "rollback"]) => {
             let app = load_app(c, name, who)?;
@@ -1157,15 +1180,17 @@ pub fn host_of(head: &str) -> Option<String> {
 }
 
 /// `rekcod edge serve`: Host-based HTTP routing to live instances, refreshed every 2 s.
-pub fn edge_serve(paths: &Paths, remote_name: Option<&str>, listen: &str) -> Result<()> {
+/// `listen` routes every app (for the tailnet); `public_listen` only apps marked public
+/// (point cloudflared or another tunnel at it).
+pub fn edge_serve(paths: &Paths, remote_name: Option<&str>, listen: &str, public_listen: Option<&str>) -> Result<()> {
     let r = remote(paths, remote_name)?;
-    let table: Arc<RwLock<HashMap<String, Vec<String>>>> = Arc::default();
+    let table: Arc<RwLock<HashMap<String, Route>>> = Arc::default();
     let t = table.clone();
     std::thread::spawn(move || {
         loop {
             match call(&r.url, "GET", "/routes", Some(&r.token), &Value::Null) {
                 Ok(v) => {
-                    let m: HashMap<String, Vec<String>> = serde_json::from_value(v).unwrap_or_default();
+                    let m: HashMap<String, Route> = serde_json::from_value(v).unwrap_or_default();
                     *t.write().unwrap() = m;
                 }
                 Err(e) => eprintln!("rekcod: edge: routes: {e:#}"),
@@ -1173,19 +1198,34 @@ pub fn edge_serve(paths: &Paths, remote_name: Option<&str>, listen: &str) -> Res
             std::thread::sleep(Duration::from_secs(2));
         }
     });
-    let l = TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;
-    eprintln!("rekcod: edge on http://{listen}");
     let rr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    for s in l.incoming().flatten() {
-        let (table, rr) = (table.clone(), rr.clone());
-        std::thread::spawn(move || {
-            let _ = edge_conn(s, &table, &rr);
-        });
+    let accept =
+        |l: TcpListener, public_only: bool, table: Arc<RwLock<HashMap<String, Route>>>, rr: Arc<std::sync::atomic::AtomicUsize>| {
+            for s in l.incoming().flatten() {
+                let (table, rr) = (table.clone(), rr.clone());
+                std::thread::spawn(move || {
+                    let _ = edge_conn(s, &table, &rr, public_only);
+                });
+            }
+        };
+    if let Some(p) = public_listen {
+        let l = TcpListener::bind(p).with_context(|| format!("bind {p}"))?;
+        eprintln!("rekcod: edge (public apps only) on http://{p}");
+        let (t, rr) = (table.clone(), rr.clone());
+        std::thread::spawn(move || accept(l, true, t, rr));
     }
+    let l = TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;
+    eprintln!("rekcod: edge (all apps) on http://{listen}");
+    accept(l, false, table, rr);
     Ok(())
 }
 
-fn edge_conn(mut s: TcpStream, table: &RwLock<HashMap<String, Vec<String>>>, rr: &std::sync::atomic::AtomicUsize) -> Result<()> {
+fn edge_conn(
+    mut s: TcpStream,
+    table: &RwLock<HashMap<String, Route>>,
+    rr: &std::sync::atomic::AtomicUsize,
+    public_only: bool,
+) -> Result<()> {
     let mut head = Vec::new();
     let mut buf = [0u8; 4096];
     while !head.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -1196,7 +1236,8 @@ fn edge_conn(mut s: TcpStream, table: &RwLock<HashMap<String, Vec<String>>>, rr:
         head.extend_from_slice(&buf[..n]);
     }
     let host = host_of(&String::from_utf8_lossy(&head)).unwrap_or_default();
-    let eps = table.read().unwrap().get(&host).cloned().unwrap_or_default();
+    // A private app looks like no app at all on the public listener.
+    let eps = table.read().unwrap().get(&host).filter(|r| r.public || !public_only).map(|r| r.endpoints.clone()).unwrap_or_default();
     if eps.is_empty() {
         return respond(&mut s, 404, "text/plain", format!("no app at {host}\n").as_bytes());
     }

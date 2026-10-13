@@ -420,7 +420,9 @@ Where the code differs from the spec above:
   (`cp -cR ~/.rekcod/golden/default <node home>/golden/`).
 - **`rekcod edge` is a hand-written HTTP/1.1 proxy on `std`**, not pingora, with no TLS and
   no ACME. It routes on `Host`, round-robins live instances, and refreshes the table from
-  `GET /routes` every 2 s. No `forward_auth`.
+  `GET /routes` every 2 s. No `forward_auth`; instead apps are private by default and only
+  `rekcod app public` ones are served on `--public-listen`, the listener a tunnel
+  (cloudflared) points at. `--listen` serves everything and belongs on the tailnet.
 - **Instances are reached through a relay** on the node: the instance's port is published on
   the Mac's loopback by the sandbox daemon, and the node forwards `<node ip>:<port>` to it.
 - **Secrets are stored in Postgres in plain text** (a separate column, shown by key only).

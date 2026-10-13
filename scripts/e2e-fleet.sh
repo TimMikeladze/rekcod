@@ -90,12 +90,16 @@ check "remote rm" sh -c '"$0" sandbox rm --remote alice "$1" "$2"' "$R" "$s1" "$
 psql -q "$DB" -c "update nodes set state = 'ready'" >/dev/null
 
 echo "apps"
-REKCOD_HOME=$C "$R" edge serve --remote admin --listen 127.0.0.1:18088 >"$C/edge.log" 2>&1 &
+REKCOD_HOME=$C "$R" edge serve --remote admin --listen 127.0.0.1:18088 --public-listen 127.0.0.1:18089 >"$C/edge.log" 2>&1 &
 pids+=($!)
 get() { curl -s -m 3 -H "Host: $1.apps.test" http://127.0.0.1:18088/; }
 check "deploy (generated Dockerfile)" cr app deploy --remote admin --git "$url" --ref main --name hello --instances 2
 sleep 2.5
 check "edge serves the app" sh -c 'test "$(curl -s -m 3 -H "Host: hello.apps.test" http://127.0.0.1:18088/)" = "v1 "'
+check "new apps aren't on the public listener" sh -c 'curl -s -m 3 -H "Host: hello.apps.test" http://127.0.0.1:18089/ | grep -q "no app"'
+check "app public" cr app public --remote admin hello
+sleep 2.5
+check "public app on the public listener" sh -c 'test "$(curl -s -m 3 -H "Host: hello.apps.test" http://127.0.0.1:18089/)" = "v1 "'
 v2=$(commit v2)
 : >"$C/codes"
 ( for _ in $(seq 400); do curl -s -o /dev/null -w '%{http_code}\n' -m 3 -H "Host: hello.apps.test" http://127.0.0.1:18088/ >>"$C/codes"; sleep 0.05; done ) &
@@ -125,6 +129,8 @@ check "webhook with a bad signature is refused" sh -c '! curl -sf -m 5 -X POST -
 hook "$body" "$sig" >>"$C/hook.log"; echo >>"$C/hook.log"
 sleep 2.5
 check "PR preview deployed (inherits env)" sh -c 'test "$(curl -s -m 3 -H "Host: hello-pr-7.apps.test" http://127.0.0.1:18088/)" = "v2 hi"'
+check "PR previews stay private" sh -c 'curl -s -m 3 -H "Host: hello-pr-7.apps.test" http://127.0.0.1:18089/ | grep -q "no app"'
+check "app private" sh -c '"$0" app private --remote admin hello && sleep 2.5 && curl -s -m 3 -H "Host: hello.apps.test" http://127.0.0.1:18089/ | grep -q "no app"' "$R"
 body=${body/opened/closed}
 sig="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$ws" | awk '{print $NF}')"
 hook "$body" "$sig" >>"$C/hook.log"; echo >>"$C/hook.log"

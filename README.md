@@ -247,11 +247,20 @@ rekcod remote add team http://controller:7700 --token ADMIN_TOKEN
 rekcod controller token alice --max-sandboxes 5          # a user token
 rekcod sandbox --remote create                           # clones this repo's origin at HEAD on a node
 rekcod sandbox --remote exec ID -- npm test
-rekcod edge serve --listen 0.0.0.0:80                    # HTTP; put TLS in front of it
+rekcod edge serve --listen 100.x.y.z:8080 --public-listen 127.0.0.1:8081   # all apps / public apps only
 rekcod app deploy                                        # this repo's pushed HEAD + rekcod.toml
 rekcod app rollback dash
 rekcod app env set dash NODE_ENV=production              # redeploys the live release
+rekcod app public dash                                   # also serve it on --public-listen
 ```
+
+Apps are private until you make them public (`app public NAME`, `app deploy --public`, or
+`public = true` under `[app]` in `rekcod.toml`). `--listen` routes every app; bind it to
+your tailnet or loopback. `--public-listen` routes only public apps; point a tunnel at it,
+for example `cloudflared` with `ingress: [{hostname: "*.example.com", service:
+http://127.0.0.1:8081}]` and the controller started with `--domain example.com`. A private
+app answers `no app at ...` there, the same as one that doesn't exist. PR previews are
+private.
 
 A deploy starts new instances (on different nodes when it can), waits for the health check,
 switches the route, then stops the old ones after `--drain` (30 s). A failed health check
@@ -305,7 +314,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod node join\|serve\|ls\|drain` | Run this Mac as a fleet node; list or drain nodes |
 | `rekcod controller serve\|token` | The fleet controller; create user tokens |
 | `rekcod edge serve` | HTTP ingress for apps |
-| `rekcod app deploy\|ls\|status\|rollback\|scale\|env\|secret\|logs\|open\|destroy` | Apps on the fleet |
+| `rekcod app deploy\|ls\|status\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|destroy` | Apps on the fleet |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |

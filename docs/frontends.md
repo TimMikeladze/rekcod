@@ -38,7 +38,7 @@ how that's enforced.
 | Snapshots: save, restore, delete | `snap save/restore/rm -p <project>` | Snapshots › project |
 | Agent sandboxes: shell, diff, apply, stop, delete | `sandbox shell/diff/apply/stop/rm <id>` | Agent sandboxes › sandbox |
 | macOS sandboxes: screenshot (opens in Preview) | `sandbox screenshot <id> <file> --open` | Agent sandboxes › sandbox |
-| Apps on the default remote: open, logs, roll back, destroy | `app open/logs/rollback/destroy <name>` | Apps › app (only with a remote) |
+| Apps on the default remote: open, logs, make public/private, roll back, destroy | `app open/logs/public/private/rollback/destroy <name>` | Apps › app (only with a remote) |
 
 Creating, exec, fork, `cp` and golden disks are for agents and scripts, so they're CLI,
 HTTP and MCP only. So are deploys, scaling and env changes (they take arguments), the

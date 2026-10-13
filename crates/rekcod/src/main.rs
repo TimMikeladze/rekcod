@@ -502,8 +502,12 @@ enum ControllerCmd {
 enum EdgeCmd {
     /// Serve HTTP ingress (needs an admin-token remote).
     Serve {
+        /// Routes every app; bind it to the tailnet or loopback.
         #[arg(long, default_value = "127.0.0.1:8080")]
         listen: String,
+        /// Routes only apps marked public; point cloudflared at it.
+        #[arg(long)]
+        public_listen: Option<String>,
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
@@ -523,8 +527,22 @@ enum AppCmd {
         git: Option<String>,
         #[arg(long = "ref")]
         git_ref: Option<String>,
+        /// Serve it on the edge's public listener too (new apps are private).
+        #[arg(long, conflicts_with = "private")]
+        public: bool,
+        /// Only on the edge's private listener.
+        #[arg(long)]
+        private: bool,
     },
     Ls,
+    /// Serve an app on the edge's public listener.
+    Public {
+        name: String,
+    },
+    /// Take an app off the public listener (it stays on the private one).
+    Private {
+        name: String,
+    },
     /// Releases, instances, env and URL.
     Status {
         name: String,
@@ -657,7 +675,9 @@ fn main() {
             "/tokens",
             &serde_json::json!({"name": name, "max_sandboxes": max_sandboxes, "admin": admin}),
         ),
-        Cmd::Edge(EdgeCmd::Serve { listen, remote }) => fleet::edge_serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), &listen),
+        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, remote }) => {
+            fleet::edge_serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), &listen, public_listen.as_deref())
+        }
         Cmd::App { remote, cmd } => run_app(&paths, &remote, cmd),
         Cmd::Import { from, names, images_only, volumes_only, force } => {
             cli::import(&paths, &from, &names, !volumes_only, !images_only, force)
@@ -762,7 +782,7 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
         json!(v.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>())
     };
     match c {
-        AppCmd::Deploy { name, port, instances, git, git_ref } => {
+        AppCmd::Deploy { name, port, instances, git, git_ref, public, private } => {
             let dir = std::env::current_dir()?;
             let t = fleet::parse_toml(&std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default());
             let (origin, head) = match (&git, &git_ref) {
@@ -786,10 +806,14 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 "health": t.get("app.health").cloned(),
                 "start": t.get("app.start"),
                 "env": env,
+                // Flags win over rekcod.toml; neither keeps the app's current visibility.
+                "public": if public { Some(true) } else if private { Some(false) } else { t.get("app.public").map(|v| v == "true") },
             });
             remote_call(paths, remote, "POST", "/apps", &body)
         }
         AppCmd::Ls => remote_call(paths, remote, "GET", "/apps", &serde_json::Value::Null),
+        AppCmd::Public { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/visibility"), &json!({"public": true})),
+        AppCmd::Private { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/visibility"), &json!({"public": false})),
         AppCmd::Status { name } => remote_call(paths, remote, "GET", &format!("/apps/{name}"), &serde_json::Value::Null),
         AppCmd::Rollback { name, release } => {
             remote_call(paths, remote, "POST", &format!("/apps/{name}/rollback"), &json!({"release": release}))

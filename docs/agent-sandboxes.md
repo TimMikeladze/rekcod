@@ -152,7 +152,9 @@ rejected in `OUTPUT` and `DOCKER-USER`, and there's no `host.docker.internal`.
 
 New: an egress allowlist enforced in the guest.
 
-- `dnsmasq` puts addresses it resolves for allowed names into an nftables set (`nftset=`).
+- A DNS stub in `rekcod-agent` (`hickory-proto`) answers for allowed names only and adds
+  each resolved address to an nftables set. It replaces `dnsmasq` in sandboxes (see
+  `platform.md`, Rust-first tooling).
 - `eth0` output allows only that set, plus DNS to the agent stub. Everything else is
   rejected, which covers direct IP connections too.
 - Preset `dev`: npm, PyPI, crates.io, Go proxy, rubygems, Docker Hub, ghcr.io, quay.io,

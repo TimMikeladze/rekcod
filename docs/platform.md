@@ -176,8 +176,8 @@ compose project if the repo has `compose.yaml`.
 - If there's a `Dockerfile`, it's built as is. If there isn't, the build uses the same
   version-file detection as `rekcod x` and generates one from the detected toolchain image
   plus the start command from `rekcod.toml`.
-- The image is pushed to the fleet's registry: a `registry:2` instance with its storage in
-  the S3 bucket. Images are `linux/arm64`. `linux/amd64` works through Rosetta in the guest
+- The image is pushed to the fleet's registry: `rekcod registry`, a small OCI distribution
+  server (`axum` plus `object_store`) with its blobs in the S3 bucket. Images are `linux/arm64`. `linux/amd64` works through Rosetta in the guest
   but is slower, and the build warns about it.
 - Build cache is a BuildKit cache exported to the bucket per app, so a build on another
   node still hits cache.
@@ -212,16 +212,16 @@ If health fails, the old release keeps serving and the deploy reports the instan
 
 ### Ingress
 
-- One Caddy instance per fleet, on a Linux box or one Mac, holds the public or VPN-facing
+- `rekcod edge`, one per fleet, on a Linux box or one Mac, holds the public or VPN-facing
   address.
-- TLS: Caddy issues certificates automatically. Wildcard `*.<team domain>` uses the DNS-01
+- TLS: `rekcod edge` issues certificates through ACME (`instant-acme`). Wildcard `*.<team domain>` uses the DNS-01
   challenge, so previews don't each need a new certificate.
-- Routes: the controller writes Caddy's config through its admin API, mapping each host to
+- Routes: `rekcod edge` subscribes to the controller's route table over its mTLS connection, mapping each host to
   instance addresses as `node-ip:port`.
 - On each node, `rekcod node` forwards that port to the instance. This is the existing port
   forwarder, bound to the node's private address instead of `127.0.0.1`, and only for
   instance sandboxes.
-- Optional access control: Caddy `forward_auth` to the controller, so internal apps and
+- Optional access control: `rekcod edge` checks a team session cookie against the controller, so internal apps and
   previews need a team login.
 
 ### Config and secrets
@@ -321,7 +321,7 @@ macOS VMs on fleet Macs for two uses that nobody serves well:
 
 The orchestration, API, MCP, fleet, placement, egress presets and audit log carry over. The
 Linux guest work doesn't: the patched virtio-fs, `dockerd` and the bind-mount caches. Tart
-already does macOS VM images well and is community-maintained under FSL now. Reusing its
+already does macOS VM images well, but it's Swift; rekcod drives VZ from Rust already and is community-maintained under FSL now. Reusing its
 image format is worth checking before writing our own.
 
 ### Gate
@@ -345,6 +345,44 @@ If we ever host for others, tracks 1–3 port to Linux hosts:
 That port would be its own spec. Revisit if Apple's licence changes, or if track 3 has
 outside demand.
 
+## Rust-first tooling
+
+rekcod is Rust end to end today (host, guest agent, proto), and the platform stays that way
+where a mature crate exists. Every new service is a `rekcod` subcommand in the same binary
+(or the static musl agent in the guest), so the fleet ships one artifact per OS.
+
+| Need | Use | Instead of |
+|---|---|---|
+| HTTP API, controller, node | `axum` + `hyper` + `tokio` (already in the tree) | Go or Node services |
+| MCP server | `rmcp` (official Rust MCP SDK) | a TypeScript MCP server |
+| mTLS, internal CA, join tokens | `rustls` + `rcgen` | OpenSSL, cfssl |
+| Ingress proxy (`rekcod edge`) | `pingora` (Cloudflare's proxy framework) | Caddy |
+| ACME certificates, wildcard via DNS-01 | `instant-acme` | Caddy's ACME |
+| Image registry (`rekcod registry`) | `axum` + `object_store`, OCI distribution spec | `registry:2` (Go) |
+| Object storage | RustFS (dev, CI, self-hosted) via `object_store` | MinIO |
+| Postgres client and migrations | `sqlx` | an ORM in another language |
+| Git clone, diff for workspaces | `gix` (gitoxide); `imara-diff` for `sandbox diff` | shelling out to `git` |
+| Guest DNS allowlist | `hickory-proto`/`hickory-server` stub inside `rekcod-agent`, writing to nftables | `dnsmasq --nftset` |
+| Guest firewall rules | `rustables` (netlink), or the `nftables` crate over `nft -j` | `iptables` shell in `boot.sh` |
+| Metrics | `metrics` + `metrics-exporter-prometheus` | a Go exporter |
+| Logs | `tracing` + `tracing-subscriber` | ad hoc `log!` |
+| Tarball workspaces | `tar` + `zstd` | `tar` subprocess |
+| macOS guests (track 4) | `objc2-virtualization` (already used) | Tart (Swift, FSL) |
+| Linux-host backend (if ever hosted) | Firecracker or Cloud Hypervisor, both Rust, behind the `Vmm` trait | QEMU |
+
+Things that stay non-Rust, on purpose:
+- `dockerd`, BuildKit and containerd in the guest. Running upstream `dockerd` unmodified is
+  rekcod's core promise; replacing it (e.g. with `youki`) breaks API parity.
+- Postgres as the controller's store. It's the thing I'd trust to hold the audit log.
+- The Linux kernel and busybox userland in the guest.
+
+Crates I haven't used in this repo yet and need a spike before committing to: `pingora`
+(its ACME story is separate, hence `instant-acme`), `rustables` (younger than the
+JSON-over-`nft` route), and the hickory server pieces for a filtering stub. The registry is
+the biggest bet: the OCI distribution API is small, but push/pull edge cases (chunked
+uploads, cross-repo mounts) are where a hand-rolled one breaks. If the spike goes badly,
+`zot` (Go) is the fallback, not `registry:2`.
+
 ## Order of work
 
 1. Track 1, milestones M1–M6 (`agent-sandboxes.md`).
@@ -358,6 +396,6 @@ outside demand.
 - Does §2I cover an internal fleet? This blocks tracks 2–4.
 - Controller on Linux or on a Mac? Linux is cheaper and has ECC. A Mac means one less
   machine type to run. I lean Linux.
-- Is one Caddy enough, or does ingress need two for failover? For internal use, one with a
+- Is one `rekcod edge` enough, or does ingress need two for failover? For internal use, one with a
   fast restart is my default.
 - Can Tart's image format and tooling be reused for track 4, given its FSL licence?

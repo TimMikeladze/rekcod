@@ -158,6 +158,16 @@ impl Control {
     }
 }
 
+/// Agent sandbox egress allowlist (`rekcod.allow=` on the kernel command line): exact
+/// names, `*.example.com` for any subdomain, `*` for everything.
+pub fn host_allowed(allow: &[String], name: &str) -> bool {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    allow.iter().any(|p| {
+        let p = p.to_ascii_lowercase();
+        p == "*" || p == name || p.strip_prefix("*.").is_some_and(|base| name.ends_with(&format!(".{base}")))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -95,11 +95,26 @@ pub struct BootOptions {
     pub project: Option<PathBuf>,
     /// Guest image to boot (the sandbox uses the main install's).
     pub guest_dir: Option<PathBuf>,
+    /// Agent sandbox: share this copy as the project (docs/agent-sandboxes.md).
+    pub workspace: Option<PathBuf>,
+    /// Agent sandbox: egress allowlist, comma-separated.
+    pub allow: Option<String>,
+    /// Agent sandbox: power off after this many idle seconds.
+    pub idle_ttl: Option<u64>,
 }
 
 impl Default for BootOptions {
     fn default() -> Self {
-        BootOptions { cpus: None, memory_gib: None, disk_gib: crate::paths::DEFAULT_DISK_GIB, project: None, guest_dir: None }
+        BootOptions {
+            cpus: None,
+            memory_gib: None,
+            disk_gib: crate::paths::DEFAULT_DISK_GIB,
+            project: None,
+            guest_dir: None,
+            workspace: None,
+            allow: None,
+            idle_ttl: None,
+        }
     }
 }
 
@@ -127,6 +142,15 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
             .stderr(log);
         if let Some(project) = &opts.project {
             cmd.arg("--project").arg(project);
+        }
+        if let Some(ws) = &opts.workspace {
+            cmd.arg("--workspace").arg(ws);
+        }
+        if let Some(allow) = &opts.allow {
+            cmd.args(["--allow", allow]);
+        }
+        if let Some(ttl) = opts.idle_ttl {
+            cmd.args(["--idle-ttl", &ttl.to_string()]);
         }
         // Detach from the terminal so closing it doesn't kill the VM.
         unsafe {
@@ -162,8 +186,13 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
 
 /// SIGTERM the daemon and wait for the VM to power off; false if it wasn't running.
 pub(crate) fn stop_daemon(paths: &Paths) -> Result<bool> {
+    signal_daemon(paths, libc::SIGTERM)
+}
+
+/// Sends `sig` to the daemon and waits for it to exit (SIGUSR1: force stop the VM).
+pub(crate) fn signal_daemon(paths: &Paths, sig: libc::c_int) -> Result<bool> {
     let Some(pid) = running_pid(paths) else { return Ok(false) };
-    unsafe { libc::kill(pid, libc::SIGTERM) };
+    unsafe { libc::kill(pid, sig) };
     let deadline = Instant::now() + Duration::from_secs(45);
     while unsafe { libc::kill(pid, 0) } == 0 {
         // `rekcod x --sandbox` spawned this daemon itself: reap it, or its zombie answers kill(0).

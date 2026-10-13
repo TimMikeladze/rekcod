@@ -80,5 +80,7 @@ server on the Mac at `0.0.0.0:18099`:
 
 1. External review of the share setup (`daemon.rs` sandbox options, `boot.sh` project
    mount and firewall rules).
-2. An egress allowlist (`--allow-host`), enforced in the guest.
+2. An egress allowlist (`--allow-host`), enforced in the guest. Done for `rekcod sandbox`
+   (docs/agent-sandboxes.md), not yet for `rekcod x --sandbox`.
 3. A per-run disposable data disk, so one sandboxed run can't plant images for the next.
+   Done for `rekcod sandbox` (each one clones a golden disk and deletes it on `rm`).

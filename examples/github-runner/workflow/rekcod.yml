@@ -1,0 +1,22 @@
+# Copy to .github/workflows/rekcod.yml in the repo the runner is attached to.
+name: rekcod
+on: [push, workflow_dispatch]
+
+jobs:
+  host:
+    runs-on: [self-hosted, rekcod]
+    steps:
+      - uses: actions/checkout@v4
+      - run: uname -m && docker version --format '{{.Server.Version}}'
+      - run: docker run --rm -v "$PWD:/src" -w /src alpine ls
+
+  in-container:
+    runs-on: [self-hosted, rekcod]
+    container: node:22
+    services:
+      redis:
+        image: redis:7
+    steps:
+      - uses: actions/checkout@v4
+      - run: node --version
+      - run: apt-get update -qq && apt-get install -yqq redis-tools && redis-cli -h redis ping

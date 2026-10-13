@@ -1,0 +1,823 @@
+//! Agent sandboxes (docs/agent-sandboxes.md): many throwaway VMs, each a full dockerd
+//! that sees one copy of one project. State lives in `~/.rekcod/sb/<id>`, kept short
+//! because the docker socket path has to fit in `sun_path`.
+
+use std::ffi::CString;
+use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+use crate::paths::Paths;
+
+/// The long-running container `exec` runs in.
+pub const WS: &str = "rekcod-ws";
+const DISK_GIB: u64 = 64;
+const DEFAULT_IMAGE: &str = "debian:bookworm-slim";
+/// What `golden build` pulls when given no images.
+pub const GOLDEN_IMAGES: &[&str] = &["debian:bookworm-slim", "alpine:3.22", "node:lts-slim", "python:3.13-slim"];
+/// Not compared by `diff` or written by `apply`: VM-local dirs and git's own state.
+const SKIP: &[&str] = &[".git", "node_modules", ".venv", "target"];
+
+/// Egress preset `dev`: package registries, image registries, source hosts, distro mirrors.
+pub const DEV_HOSTS: &[&str] = &[
+    "registry.npmjs.org",
+    "registry.yarnpkg.com",
+    "pypi.org",
+    "files.pythonhosted.org",
+    "crates.io",
+    "*.crates.io",
+    "proxy.golang.org",
+    "sum.golang.org",
+    "rubygems.org",
+    "*.rubygems.org",
+    "*.docker.io",
+    "*.docker.com",
+    "ghcr.io",
+    "*.githubusercontent.com",
+    "github.com",
+    "*.github.com",
+    "quay.io",
+    "*.quay.io",
+    "deb.debian.org",
+    "security.debian.org",
+    "*.ubuntu.com",
+    "dl-cdn.alpinelinux.org",
+];
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Meta {
+    pub id: String,
+    pub name: Option<String>,
+    pub project: PathBuf,
+    /// "copy" or "mount".
+    pub mode: String,
+    pub image: String,
+    pub golden: Option<String>,
+    /// None: internet open. Empty with `offline`: no network.
+    pub allow: Option<Vec<String>>,
+    pub offline: bool,
+    pub cpus: usize,
+    pub memory_gib: u64,
+    pub ttl_secs: u64,
+    pub secrets: Vec<String>,
+    /// Unix seconds; `apply` refuses files the project changed after this.
+    pub created: u64,
+}
+
+pub struct CreateOptions {
+    pub dir: Option<PathBuf>,
+    pub name: Option<String>,
+    pub mount: bool,
+    pub image: Option<String>,
+    pub golden: String,
+    pub cpus: usize,
+    pub memory_gib: u64,
+    pub allow_hosts: Vec<String>,
+    pub offline: bool,
+    pub secrets: Vec<String>,
+    pub ttl_secs: u64,
+}
+
+impl Default for CreateOptions {
+    fn default() -> Self {
+        CreateOptions {
+            dir: None,
+            name: None,
+            mount: false,
+            image: None,
+            golden: "default".into(),
+            cpus: 2,
+            memory_gib: 2,
+            allow_hosts: vec![],
+            offline: false,
+            secrets: vec![],
+            ttl_secs: 30 * 60,
+        }
+    }
+}
+
+fn now() -> u64 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn root(paths: &Paths) -> PathBuf {
+    paths.home.join("sb")
+}
+
+fn golden_home(paths: &Paths, name: &str) -> PathBuf {
+    paths.home.join("golden").join(name)
+}
+
+/// 8 lowercase base32 characters.
+pub fn new_id() -> Result<String> {
+    let mut b = [0u8; 8];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut b))?;
+    Ok(b.iter().map(|x| b"abcdefghijklmnopqrstuvwxyz234567"[(*x & 31) as usize] as char).collect())
+}
+
+#[cfg(test)]
+use rekcod_proto::host_allowed;
+
+/// The allowlist a sandbox boots with: None opens the internet.
+pub fn allowlist(extra: &[String]) -> Option<Vec<String>> {
+    if extra.iter().any(|h| h == "*") {
+        return None;
+    }
+    let mut out: Vec<String> = DEV_HOSTS.iter().map(|s| s.to_string()).collect();
+    out.extend(extra.iter().cloned());
+    Some(out)
+}
+
+fn clonefile(src: &Path, dst: &Path) -> Result<()> {
+    let (s, d) = (CString::new(src.as_os_str().as_bytes())?, CString::new(dst.as_os_str().as_bytes())?);
+    if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("clone {} to {}", src.display(), dst.display()));
+    }
+    Ok(())
+}
+
+struct Sandbox {
+    paths: Paths,
+    meta: Meta,
+}
+
+impl Sandbox {
+    fn meta_file(home: &Path) -> PathBuf {
+        home.join("meta.json")
+    }
+    fn ws(&self) -> PathBuf {
+        self.paths.home.join("ws")
+    }
+    fn save(&self) -> Result<()> {
+        std::fs::write(Self::meta_file(&self.paths.home), serde_json::to_vec_pretty(&self.meta)?)?;
+        Ok(())
+    }
+    fn running(&self) -> bool {
+        crate::cli::running_pid(&self.paths).is_some()
+    }
+    fn docker(&self) -> Result<Command> {
+        let mut c = crate::docker::any_cli(&self.paths)?;
+        c.env("DOCKER_HOST", self.paths.docker_host());
+        Ok(c)
+    }
+    fn touch(&self) {
+        let _ = std::fs::write(self.paths.home.join("run/last-used"), b"");
+    }
+
+    fn boot(&self, main: &Paths) -> Result<()> {
+        if self.running() {
+            return Ok(());
+        }
+        let m = &self.meta;
+        self.touch();
+        let allow = match (&m.allow, m.offline) {
+            (_, true) => Some(String::new()),
+            (Some(a), _) => Some(a.join(",")),
+            (None, _) => None,
+        };
+        let opts = crate::cli::BootOptions {
+            cpus: Some(m.cpus),
+            memory_gib: Some(m.memory_gib),
+            disk_gib: DISK_GIB,
+            project: Some(m.project.clone()),
+            guest_dir: Some(main.guest_dir()?),
+            workspace: (m.mode == "copy").then(|| self.ws()),
+            allow,
+            idle_ttl: (m.ttl_secs > 0).then_some(m.ttl_secs),
+        };
+        crate::cli::boot(&self.paths, &opts)?;
+        // A restarted or forked VM: the workspace container comes back by its restart policy,
+        // but a fork's copy may have been cloned while paused.
+        let _ = self.docker()?.args(["unpause", WS]).stderr(Stdio::null()).stdout(Stdio::null()).status();
+        let _ = self.docker()?.args(["start", WS]).stderr(Stdio::null()).stdout(Stdio::null()).status();
+        Ok(())
+    }
+
+    fn start_workspace(&self) -> Result<()> {
+        let m = &self.meta;
+        let p = m.project.to_string_lossy().to_string();
+        let mut c = self.docker()?;
+        c.args(["run", "-d", "--name", WS, "--restart", "unless-stopped", "--init"]);
+        if m.offline {
+            c.args(["--network", "none"]);
+        } else {
+            c.args(["--network", "host", "--label", &format!("{}=1", crate::ports::AUTOPORTS_LABEL)]);
+        }
+        c.args(["-v", &format!("{p}:{p}"), "-w", &p]);
+        if let Some(plan) = crate::xrun::plan(&m.project, &["sh".into()]) {
+            for dir in &plan.local_dirs {
+                c.args(["-v", &format!("{}:{p}/{dir}", crate::xrun::local_volume(&m.project, dir))]);
+            }
+        }
+        for s in &m.secrets {
+            c.args(["-e", s]);
+        }
+        c.args([&m.image, "sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"]);
+        let out = c.stdin(Stdio::null()).output().context("run docker")?;
+        if !out.status.success() {
+            bail!("starting the workspace container failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+}
+
+fn load(home: &Path) -> Option<Meta> {
+    serde_json::from_slice(&std::fs::read(Sandbox::meta_file(home)).ok()?).ok()
+}
+
+/// Every sandbox, oldest first.
+fn all(paths: &Paths) -> Vec<Sandbox> {
+    let mut out: Vec<Sandbox> = std::fs::read_dir(root(paths))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some(Sandbox { meta: load(&e.path())?, paths: Paths { home: e.path() } }))
+        .collect();
+    out.sort_by_key(|s| s.meta.created);
+    out
+}
+
+fn find(paths: &Paths, id: &str) -> Result<Sandbox> {
+    all(paths)
+        .into_iter()
+        .find(|s| s.meta.id == id || s.meta.name.as_deref() == Some(id))
+        .ok_or_else(|| anyhow::Error::new(NoSandbox(id.into())))
+}
+
+#[derive(Debug)]
+pub struct NoSandbox(pub String);
+impl std::fmt::Display for NoSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "no sandbox {}", self.0)
+    }
+}
+impl std::error::Error for NoSandbox {}
+
+/// Refuses a sandbox that would push running VMs past 75% of the Mac's memory.
+fn check_capacity(paths: &Paths, gib: u64) -> Result<()> {
+    let host = crate::cli::sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
+    let main = crate::cli::status_value(paths)["memory_mib"].as_u64().unwrap_or(0);
+    let sandboxes: u64 = all(paths).iter().filter(|s| s.running()).map(|s| s.meta.memory_gib << 10).sum();
+    let budget = host * 3 / 4;
+    if main + sandboxes + (gib << 10) > budget {
+        bail!(
+            "not enough memory: the main VM has {main} MiB and running sandboxes {sandboxes} MiB; \
+             another {} MiB would pass {budget} MiB (75% of this Mac). `rekcod sandbox rm` one first",
+            gib << 10
+        );
+    }
+    Ok(())
+}
+
+pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
+    let project = o.dir.clone().map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
+    if !["/Users", "/Volumes", "/private"].iter().any(|r| project.starts_with(r)) {
+        bail!("{} isn't under /Users, /Volumes or /private", project.display());
+    }
+    if let Some(n) = &o.name
+        && find(paths, n).is_ok()
+    {
+        bail!("a sandbox named {n} already exists");
+    }
+    for s in &o.secrets {
+        if std::env::var_os(s).is_none() {
+            bail!("--secret {s}: not set in this shell's environment");
+        }
+    }
+    check_capacity(paths, o.memory_gib)?;
+    let t0 = Instant::now();
+    let id = new_id()?;
+    std::fs::create_dir_all(root(paths))?;
+    let sb = Paths::at(root(paths).join(&id))?;
+    let golden = golden_home(paths, &o.golden).join("vm/data.img");
+    let golden = if golden.exists() {
+        // APFS clone: instant, copy on write.
+        clonefile(&golden, &sb.data_disk())?;
+        Some(o.golden.clone())
+    } else {
+        None
+    };
+    let image =
+        o.image.clone().or_else(|| crate::xrun::plan(&project, &["sh".into()]).map(|p| p.image)).unwrap_or_else(|| DEFAULT_IMAGE.into());
+    let s = Sandbox {
+        meta: Meta {
+            id: id.clone(),
+            name: o.name,
+            project: project.clone(),
+            mode: if o.mount { "mount" } else { "copy" }.into(),
+            image,
+            golden,
+            allow: if o.offline { Some(vec![]) } else { allowlist(&o.allow_hosts) },
+            offline: o.offline,
+            cpus: o.cpus,
+            memory_gib: o.memory_gib,
+            ttl_secs: o.ttl_secs,
+            secrets: o.secrets,
+            created: now(),
+        },
+        paths: sb,
+    };
+    if !o.mount {
+        clonefile(&project, &s.ws())?;
+    }
+    s.save()?;
+    let result = s.boot(paths).and_then(|_| s.start_workspace());
+    if let Err(e) = result {
+        let _ = remove(&s);
+        return Err(e);
+    }
+    eprintln!("rekcod: sandbox {id} ready in {:.1}s", t0.elapsed().as_secs_f64());
+    Ok(s.meta)
+}
+
+fn log_exec(s: &Sandbox, cmd: &[String], cwd: &str, exit: i32, ms: u128) {
+    let line = serde_json::json!({
+        "ts": now(), "cmd": cmd, "cwd": cwd, "exit": exit, "ms": ms as u64,
+    });
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(s.paths.home.join("log.jsonl")) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+pub struct ExecOptions {
+    pub workdir: Option<String>,
+    pub env: Vec<String>,
+    pub timeout_secs: Option<u64>,
+    pub tty: bool,
+}
+
+/// `docker exec` arguments for a command in the workspace container.
+pub fn exec_args(meta: &Meta, o: &ExecOptions, cmd: &[String]) -> Vec<String> {
+    let mut a: Vec<String> = vec!["exec".into(), "-i".into()];
+    if o.tty {
+        a.push("-t".into());
+    }
+    a.extend(["-w".into(), o.workdir.clone().unwrap_or_else(|| meta.project.to_string_lossy().into())]);
+    for e in &o.env {
+        a.extend(["-e".into(), e.clone()]);
+    }
+    a.push(WS.into());
+    if let Some(t) = o.timeout_secs {
+        // In the container, so a timeout kills the command and not just the client.
+        a.extend(["timeout".into(), "-s".into(), "KILL".into(), t.to_string()]);
+    }
+    a.extend(cmd.iter().cloned());
+    a
+}
+
+/// Runs `cmd` in the sandbox; returns its exit code.
+pub fn exec(paths: &Paths, id: &str, o: ExecOptions, cmd: &[String]) -> Result<i32> {
+    if cmd.is_empty() {
+        bail!("usage: rekcod sandbox exec ID -- CMD...");
+    }
+    let s = find(paths, id)?;
+    s.boot(paths)?;
+    s.touch();
+    let t0 = Instant::now();
+    let args = exec_args(&s.meta, &o, cmd);
+    let status = s.docker()?.args(&args).status().context("run docker")?;
+    let code = status.code().unwrap_or(1);
+    let cwd = o.workdir.clone().unwrap_or_else(|| s.meta.project.to_string_lossy().into());
+    log_exec(&s, cmd, &cwd, code, t0.elapsed().as_millis());
+    s.touch();
+    Ok(code)
+}
+
+/// Records an exec the API ran.
+pub fn record(paths: &Paths, id: &str, cmd: &[String], exit: i32, ms: u128) {
+    if let Ok(s) = find(paths, id) {
+        let cwd = s.meta.project.to_string_lossy().to_string();
+        log_exec(&s, cmd, &cwd, exit, ms);
+        s.touch();
+    }
+}
+
+pub fn shell(paths: &Paths, id: &str) -> Result<()> {
+    let s = find(paths, id)?;
+    s.boot(paths)?;
+    s.touch();
+    let tty = unsafe { libc::isatty(0) == 1 };
+    let o = ExecOptions { workdir: None, env: vec![], timeout_secs: None, tty };
+    let sh = ["sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"].map(String::from);
+    Err(s.docker()?.args(exec_args(&s.meta, &o, &sh)).exec()).context("exec docker")
+}
+
+/// `ID:/path` becomes the workspace container's path; anything else is a Mac path.
+pub fn cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
+    let split = |a: &str| a.split_once(':').filter(|(id, _)| !id.contains('/')).map(|(id, p)| (id.to_string(), p.to_string()));
+    let (s, args) = match (split(src), split(dst)) {
+        (Some((id, p)), None) => (find(paths, &id)?, [format!("{WS}:{p}"), dst.to_string()]),
+        (None, Some((id, p))) => (find(paths, &id)?, [src.to_string(), format!("{WS}:{p}")]),
+        (Some(_), Some(_)) => bail!("copy between two sandboxes through the Mac"),
+        (None, None) => bail!("one side must be ID:/path"),
+    };
+    s.boot(paths)?;
+    s.touch();
+    let ok = s.docker()?.arg("cp").args(&args).status()?.success();
+    if !ok {
+        bail!("docker cp failed");
+    }
+    Ok(())
+}
+
+/// A new sandbox from `id`'s data disk and workspace. Running processes don't carry over.
+pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
+    let parent = find(paths, id)?;
+    if let Some(n) = &name
+        && find(paths, n).is_ok()
+    {
+        bail!("a sandbox named {n} already exists");
+    }
+    check_capacity(paths, parent.meta.memory_gib)?;
+    let t0 = Instant::now();
+    let new = new_id()?;
+    let child_paths = Paths::at(root(paths).join(&new))?;
+    let running = parent.running();
+    if running {
+        // Flush, then freeze the workspace's processes while the disk is cloned. dockerd
+        // keeps running, so the clone is crash-consistent, like a power cut.
+        let _ = parent.docker()?.args(["exec", WS, "sync"]).status();
+        let _ = parent.docker()?.args(["pause", WS]).stdout(Stdio::null()).status();
+    }
+    let cloned = clonefile(&parent.paths.data_disk(), &child_paths.data_disk())
+        .and_then(|_| if parent.meta.mode == "copy" { clonefile(&parent.ws(), &child_paths.home.join("ws")) } else { Ok(()) });
+    if running {
+        let _ = parent.docker()?.args(["unpause", WS]).stdout(Stdio::null()).status();
+    }
+    let child = Sandbox { meta: Meta { id: new.clone(), name, ..parent.meta.clone() }, paths: child_paths };
+    if let Err(e) = cloned.and_then(|_| child.save()).and_then(|_| child.boot(paths)) {
+        let _ = remove(&child);
+        return Err(e);
+    }
+    eprintln!("rekcod: sandbox {new} forked from {} in {:.1}s", parent.meta.id, t0.elapsed().as_secs_f64());
+    Ok(child.meta)
+}
+
+#[derive(Debug, PartialEq, Clone, Serialize)]
+pub struct Change {
+    /// 'A', 'M' or 'D', from the project's point of view.
+    pub kind: char,
+    pub path: String,
+}
+
+fn walk(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        if SKIP.iter().any(|s| name.as_bytes() == s.as_bytes()) {
+            continue;
+        }
+        let r = rel.join(&name);
+        match e.file_type() {
+            Ok(t) if t.is_dir() => walk(base, &r, out),
+            Ok(_) => out.push(r),
+            Err(_) => {}
+        }
+    }
+}
+
+fn same(a: &Path, b: &Path) -> bool {
+    let (Ok(ma), Ok(mb)) = (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) else { return false };
+    if ma.file_type().is_symlink() || mb.file_type().is_symlink() {
+        return std::fs::read_link(a).ok() == std::fs::read_link(b).ok();
+    }
+    ma.len() == mb.len() && ma.permissions() == mb.permissions() && std::fs::read(a).ok() == std::fs::read(b).ok()
+}
+
+/// What `apply` would do to `project` to make it match `ws`.
+pub fn changes(project: &Path, ws: &Path) -> Vec<Change> {
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    walk(project, Path::new(""), &mut a);
+    walk(ws, Path::new(""), &mut b);
+    let a: std::collections::BTreeSet<PathBuf> = a.into_iter().collect();
+    let b: std::collections::BTreeSet<PathBuf> = b.into_iter().collect();
+    let mut out: Vec<Change> = Vec::new();
+    for p in b.iter() {
+        if !a.contains(p) {
+            out.push(Change { kind: 'A', path: p.to_string_lossy().into() });
+        } else if !same(&project.join(p), &ws.join(p)) {
+            out.push(Change { kind: 'M', path: p.to_string_lossy().into() });
+        }
+    }
+    for p in a.difference(&b) {
+        out.push(Change { kind: 'D', path: p.to_string_lossy().into() });
+    }
+    out.sort_by(|x, y| x.path.cmp(&y.path));
+    out
+}
+
+fn copy_sandbox(paths: &Paths, id: &str) -> Result<Sandbox> {
+    let s = find(paths, id)?;
+    if s.meta.mode != "copy" {
+        bail!("sandbox {} uses --mount; its edits are already in {}", s.meta.id, s.meta.project.display());
+    }
+    Ok(s)
+}
+
+/// Unified diff of the workspace against the project (`git diff --no-index` per file).
+pub fn patch(paths: &Paths, id: &str) -> Result<(Vec<Change>, String)> {
+    let s = copy_sandbox(paths, id)?;
+    let ch = changes(&s.meta.project, &s.ws());
+    let mut out = String::new();
+    let null = PathBuf::from("/dev/null");
+    for c in &ch {
+        let (a, b) = (s.meta.project.join(&c.path), s.ws().join(&c.path));
+        let (a, b) = match c.kind {
+            'A' => (&null, &b),
+            'D' => (&a, &null),
+            _ => (&a, &b),
+        };
+        let o = Command::new("git").args(["diff", "--no-index", "--no-color", "--"]).arg(a).arg(b).output()?;
+        // git prints absolute paths minus the leading slash; make them project-relative.
+        let text = String::from_utf8_lossy(&o.stdout)
+            .replace(&format!("a{}/", s.meta.project.display()), "a/")
+            .replace(&format!("b{}/", s.ws().display()), "b/")
+            .replace(&format!("a{}/", s.ws().display()), "a/")
+            .replace(&format!("b{}/", s.meta.project.display()), "b/");
+        out.push_str(&text);
+    }
+    Ok((ch, out))
+}
+
+pub fn diff(paths: &Paths, id: &str, stat: bool) -> Result<()> {
+    let (ch, p) = patch(paths, id)?;
+    if stat {
+        print_changes(&ch);
+    } else {
+        print!("{p}");
+    }
+    Ok(())
+}
+
+/// A docker command aimed at the sandbox (booted if it was stopped), for the API.
+pub fn docker_cmd(paths: &Paths, id: &str) -> Result<(Command, Meta)> {
+    let s = find(paths, id)?;
+    s.boot(paths)?;
+    s.touch();
+    Ok((s.docker()?, s.meta))
+}
+
+/// Project files changed on the Mac since the sandbox copied them.
+fn conflicts(project: &Path, since: u64, ch: &[Change]) -> Vec<String> {
+    ch.iter()
+        .filter(|c| {
+            std::fs::symlink_metadata(project.join(&c.path))
+                .and_then(|m| m.modified())
+                .is_ok_and(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) > since)
+        })
+        .map(|c| c.path.clone())
+        .collect()
+}
+
+/// Writes the workspace's changes into the real project. Returns what changed.
+pub fn apply(paths: &Paths, id: &str, check: bool) -> Result<Vec<Change>> {
+    let mut s = copy_sandbox(paths, id)?;
+    let ch = changes(&s.meta.project, &s.ws());
+    let bad = conflicts(&s.meta.project, s.meta.created, &ch);
+    if !bad.is_empty() {
+        bail!("changed in {} since the sandbox copied it: {}", s.meta.project.display(), bad.join(", "));
+    }
+    if check {
+        return Ok(ch);
+    }
+    for c in &ch {
+        let (dst, src) = (s.meta.project.join(&c.path), s.ws().join(&c.path));
+        match c.kind {
+            'D' => std::fs::remove_file(&dst).with_context(|| format!("remove {}", dst.display()))?,
+            _ => {
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                if std::fs::symlink_metadata(&src)?.file_type().is_symlink() {
+                    let _ = std::fs::remove_file(&dst);
+                    std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+                } else {
+                    std::fs::copy(&src, &dst).with_context(|| format!("write {}", dst.display()))?;
+                }
+            }
+        }
+    }
+    // Files just written are newer than `created`; a later apply mustn't call them conflicts.
+    s.meta.created = now() + 1;
+    s.save()?;
+    Ok(ch)
+}
+
+pub fn print_changes(ch: &[Change]) {
+    for c in ch {
+        println!("{} {}", c.kind, c.path);
+    }
+}
+
+pub fn ports(paths: &Paths, id: &str, json: bool) -> Result<()> {
+    crate::cli::status(&find(paths, id)?.paths, json)
+}
+
+pub fn log(paths: &Paths, id: &str, follow: bool, json: bool, net: bool) -> Result<()> {
+    let s = find(paths, id)?;
+    if net {
+        // Denials the guest agent printed to the console.
+        let text = std::fs::read_to_string(s.paths.console_log()).unwrap_or_default();
+        for l in text.lines().filter(|l| l.contains("rekcod-egress:")) {
+            println!("{l}");
+        }
+        return Ok(());
+    }
+    let file = s.paths.home.join("log.jsonl");
+    if follow {
+        let _ = std::fs::OpenOptions::new().create(true).append(true).open(&file);
+        return Err(Command::new("tail").args(["-n", "+1", "-f"]).arg(&file).exec()).context("exec tail");
+    }
+    let text = std::fs::read_to_string(&file).unwrap_or_default();
+    for l in text.lines() {
+        if json {
+            println!("{l}");
+        } else if let Ok(v) = serde_json::from_str::<serde_json::Value>(l) {
+            let cmd: Vec<&str> = v["cmd"].as_array().into_iter().flatten().filter_map(|c| c.as_str()).collect();
+            println!("{} exit {:<3} {:>6} ms  {}", v["ts"], v["exit"], v["ms"], cmd.join(" "));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Serialize)]
+pub struct Listed {
+    #[serde(flatten)]
+    pub meta: Meta,
+    pub running: bool,
+}
+
+pub fn list(paths: &Paths) -> Vec<Listed> {
+    all(paths).into_iter().map(|s| Listed { running: s.running(), meta: s.meta }).collect()
+}
+
+pub fn get(paths: &Paths, id: &str) -> Result<Listed> {
+    let s = find(paths, id)?;
+    Ok(Listed { running: s.running(), meta: s.meta })
+}
+
+pub fn print_list(paths: &Paths, json: bool) -> Result<()> {
+    let l = list(paths);
+    if json {
+        println!("{}", serde_json::to_string_pretty(&l)?);
+        return Ok(());
+    }
+    println!("{:<9} {:<14} {:<8} {:<5} PROJECT", "ID", "NAME", "STATE", "MODE");
+    for s in l {
+        let m = &s.meta;
+        let state = if s.running { "running" } else { "stopped" };
+        println!("{:<9} {:<14} {:<8} {:<5} {}", m.id, m.name.as_deref().unwrap_or("-"), state, m.mode, m.project.display());
+    }
+    Ok(())
+}
+
+pub fn stop(paths: &Paths, id: &str) -> Result<()> {
+    crate::cli::stop_daemon(&find(paths, id)?.paths).map(|_| ())
+}
+
+fn remove(s: &Sandbox) -> Result<()> {
+    crate::cli::signal_daemon(&s.paths, libc::SIGUSR1)?;
+    std::fs::remove_dir_all(&s.paths.home).with_context(|| format!("remove {}", s.paths.home.display()))
+}
+
+pub fn rm(paths: &Paths, ids: &[String], every: bool) -> Result<()> {
+    let targets: Vec<Sandbox> = if every { all(paths) } else { ids.iter().map(|i| find(paths, i)).collect::<Result<_>>()? };
+    for s in targets {
+        remove(&s)?;
+        println!("{}", s.meta.id);
+    }
+    Ok(())
+}
+
+pub fn golden_build(paths: &Paths, name: &str, images: &[String]) -> Result<()> {
+    let home = golden_home(paths, name);
+    let g = Paths::at(home.clone())?;
+    if crate::cli::running_pid(&g).is_some() {
+        bail!("golden disk {name} is already being built");
+    }
+    // Sandbox-style boot: it shares an empty directory, not the Mac's home.
+    let empty = home.join("empty");
+    std::fs::create_dir_all(&empty)?;
+    let opts = crate::cli::BootOptions {
+        cpus: Some(4),
+        memory_gib: Some(4),
+        disk_gib: DISK_GIB,
+        project: Some(empty.canonicalize()?),
+        guest_dir: Some(paths.guest_dir()?),
+        ..Default::default()
+    };
+    crate::cli::boot(&g, &opts)?;
+    let images: Vec<String> = if images.is_empty() { GOLDEN_IMAGES.iter().map(|s| s.to_string()).collect() } else { images.to_vec() };
+    let mut result = Ok(());
+    for img in &images {
+        eprintln!("rekcod: pulling {img}");
+        let mut c = crate::docker::any_cli(paths)?;
+        if !c.env("DOCKER_HOST", g.docker_host()).args(["pull", "-q", img]).status()?.success() {
+            result = Err(anyhow::anyhow!("pull {img} failed"));
+            break;
+        }
+    }
+    crate::cli::stop_daemon(&g)?;
+    result?;
+    std::fs::write(home.join("images"), images.join("\n") + "\n")?;
+    println!("golden disk {name}: {}", images.join(", "));
+    Ok(())
+}
+
+pub fn golden_list(paths: &Paths) -> Result<()> {
+    for e in std::fs::read_dir(paths.home.join("golden")).into_iter().flatten().flatten() {
+        if e.path().join("vm/data.img").exists() {
+            let images = std::fs::read_to_string(e.path().join("images")).unwrap_or_default();
+            println!("{:<12} {}", e.file_name().to_string_lossy(), images.split_whitespace().collect::<Vec<_>>().join(", "));
+        }
+    }
+    Ok(())
+}
+
+pub fn golden_rm(paths: &Paths, name: &str) -> Result<()> {
+    let home = golden_home(paths, name);
+    if !home.exists() {
+        bail!("no golden disk {name}");
+    }
+    let _ = crate::cli::stop_daemon(&Paths { home: home.clone() });
+    std::fs::remove_dir_all(home)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids_are_short_base32() {
+        let id = new_id().unwrap();
+        assert_eq!(id.len(), 8);
+        assert!(id.bytes().all(|b| b.is_ascii_lowercase() || (b'2'..=b'7').contains(&b)), "{id}");
+        assert_ne!(id, new_id().unwrap());
+    }
+
+    #[test]
+    fn allowlist_matches_names_and_wildcards() {
+        let allow = allowlist(&["example.com".into()]).unwrap();
+        assert!(host_allowed(&allow, "registry.npmjs.org."));
+        assert!(host_allowed(&allow, "Registry-1.Docker.IO"));
+        assert!(host_allowed(&allow, "example.com"));
+        assert!(!host_allowed(&allow, "evil.example.com"));
+        assert!(!host_allowed(&allow, "docker.io.evil.net"));
+        assert!(!host_allowed(&allow, "gist.github.com.evil"));
+        assert_eq!(allowlist(&["*".into()]), None);
+    }
+
+    #[test]
+    fn changes_and_conflicts() {
+        let base = std::env::temp_dir().join(format!("rekcod-sb-{}", std::process::id()));
+        let (p, w) = (base.join("p"), base.join("w"));
+        for d in [&p, &w] {
+            std::fs::create_dir_all(d.join("src")).unwrap();
+            std::fs::create_dir_all(d.join("node_modules")).unwrap();
+            std::fs::write(d.join("same.txt"), "x").unwrap();
+            std::fs::write(d.join("node_modules/ignored"), d.to_string_lossy().as_bytes()).unwrap();
+        }
+        std::fs::write(p.join("src/a.rs"), "old").unwrap();
+        std::fs::write(w.join("src/a.rs"), "new").unwrap();
+        std::fs::write(p.join("gone.txt"), "x").unwrap();
+        std::fs::write(w.join("src/b.rs"), "added").unwrap();
+        let ch = changes(&p, &w);
+        let got: Vec<(char, &str)> = ch.iter().map(|c| (c.kind, c.path.as_str())).collect();
+        assert_eq!(got, vec![('D', "gone.txt"), ('M', "src/a.rs"), ('A', "src/b.rs")]);
+        // Everything in p was just written, so it all counts as changed after an old copy.
+        assert_eq!(conflicts(&p, 0, &ch).len(), 2);
+        assert!(conflicts(&p, now() + 10, &ch).is_empty());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn exec_args_use_workspace_container() {
+        let m = Meta {
+            id: "abcdefgh".into(),
+            name: None,
+            project: "/Users/me/app".into(),
+            mode: "copy".into(),
+            image: "node:22-slim".into(),
+            golden: None,
+            allow: None,
+            offline: false,
+            cpus: 2,
+            memory_gib: 2,
+            ttl_secs: 0,
+            secrets: vec![],
+            created: 0,
+        };
+        let o = ExecOptions { workdir: None, env: vec!["A=1".into()], timeout_secs: Some(5), tty: false };
+        let a = exec_args(&m, &o, &["npm".into(), "test".into()]).join(" ");
+        assert_eq!(a, "exec -i -w /Users/me/app -e A=1 rekcod-ws timeout -s KILL 5 npm test");
+        let back: Meta = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+    }
+}

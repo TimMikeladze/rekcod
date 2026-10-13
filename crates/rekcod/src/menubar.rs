@@ -193,6 +193,19 @@ pub fn entries(m: &Model) -> Vec<Entry> {
     if let Some(sb) = &m.sandbox {
         out.push(Entry::Label(format!("Sandbox VM: {}", sb["project"].as_str().unwrap_or("?"))));
     }
+    if !m.sandboxes.is_empty() {
+        let items = m
+            .sandboxes
+            .iter()
+            .map(|s| {
+                let dot = if s.running { "●" } else { "○" };
+                let dir = s.project.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+                let title = format!("{dot} {}  ({dir})", s.name.as_deref().unwrap_or(&s.id));
+                Entry::Submenu(title, actions::sandbox_actions(s).into_iter().map(Entry::Action).collect())
+            })
+            .collect();
+        out.push(Entry::Submenu(format!("Agent sandboxes ({})", m.sandboxes.len()), items));
+    }
     out
 }
 
@@ -511,6 +524,7 @@ mod tests {
             projects,
             sandbox: None,
             socket_installed: false,
+            sandboxes: vec![crate::actions::tests::sample_sandbox()],
         };
         fn kinds(e: &[Entry], out: &mut Vec<crate::actions::Kind>) {
             for e in e {

@@ -99,6 +99,16 @@ if grep -q 'rekcod.sandbox=1' /proc/cmdline; then
     iptables -A OUTPUT -o eth0 -d "$net" -j REJECT
     iptables -A DOCKER-USER -o eth0 -d "$net" -j REJECT
   done
+  # Agent sandbox allowlist (docs/agent-sandboxes.md): rekcod-agent adds an ACCEPT to
+  # REKCOD-ALLOW for each address an allowed name resolves to; everything else is rejected.
+  if grep -q 'rekcod.allow=' /proc/cmdline; then
+    iptables -N REKCOD-ALLOW
+    for chain in OUTPUT DOCKER-USER; do
+      iptables -A "$chain" -o eth0 -j REKCOD-ALLOW
+      iptables -A "$chain" -o eth0 -j REJECT
+    done
+    log "sandbox network: allowlist"
+  fi
   iptables -A DOCKER-USER -j RETURN
   ip6tables -A OUTPUT -o eth0 -j REJECT
   ip6tables -A FORWARD -o eth0 -j REJECT

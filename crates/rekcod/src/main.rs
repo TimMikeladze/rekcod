@@ -27,6 +27,10 @@ mod fetch;
 #[cfg(target_os = "macos")]
 mod menubar;
 #[cfg(target_os = "macos")]
+mod sandbox;
+#[cfg(target_os = "macos")]
+mod sandbox_api;
+#[cfg(target_os = "macos")]
 mod snap;
 #[cfg(target_os = "macos")]
 mod syssock;
@@ -114,6 +118,11 @@ enum Cmd {
         #[arg(required = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
+    /// Throwaway VMs for AI agents: a full dockerd that sees a copy of one project (docs/agent-sandboxes.md).
+    #[command(subcommand)]
+    Sandbox(SandboxCmd),
+    /// MCP server on stdio exposing the sandbox commands to agents.
+    Mcp,
     /// Copy images and named volumes from another docker context (desktop-linux, orbstack, ...).
     Import {
         /// Source docker context.
@@ -157,6 +166,12 @@ enum Cmd {
         memory_mib: u64,
         #[arg(long)]
         project: Option<std::path::PathBuf>,
+        #[arg(long)]
+        workspace: Option<std::path::PathBuf>,
+        #[arg(long)]
+        allow: Option<String>,
+        #[arg(long)]
+        idle_ttl: Option<u64>,
     },
 }
 
@@ -190,6 +205,148 @@ enum Snap {
         name: String,
         #[arg(short = 'p', long)]
         project: Option<String>,
+    },
+}
+
+/// `30m`, `2h`, `90s`, `0` (never).
+fn duration_secs(s: &str) -> Result<u64, String> {
+    let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
+    let n: u64 = n.parse().map_err(|_| format!("bad duration {s}"))?;
+    match unit {
+        "" | "s" => Ok(n),
+        "m" => Ok(n * 60),
+        "h" => Ok(n * 3600),
+        _ => Err(format!("bad duration {s} (use s, m or h)")),
+    }
+}
+
+#[derive(Subcommand)]
+enum SandboxCmd {
+    /// Create a sandbox for DIR (default: this directory) and print its ID.
+    Create {
+        dir: Option<std::path::PathBuf>,
+        #[arg(long)]
+        name: Option<String>,
+        /// Share the live directory instead of a copy (no diff/apply).
+        #[arg(long)]
+        mount: bool,
+        /// Workspace image (default: picked from the project's version files).
+        #[arg(long)]
+        image: Option<String>,
+        /// Golden disk to start from (`rekcod sandbox golden build`).
+        #[arg(long, default_value = "default")]
+        golden: String,
+        #[arg(long, default_value_t = 2)]
+        cpus: usize,
+        /// Memory in GiB; not returned to macOS until the sandbox stops.
+        #[arg(long, default_value_t = 2)]
+        memory: u64,
+        /// Also allow this host (`*.example.com` for subdomains, `*` for the whole internet).
+        #[arg(long = "allow-host")]
+        allow_hosts: Vec<String>,
+        /// No network at all.
+        #[arg(long)]
+        offline: bool,
+        /// Pass this variable from your shell into the workspace container.
+        #[arg(long = "secret")]
+        secrets: Vec<String>,
+        /// Power off after this long without an exec (`0`: never).
+        #[arg(long, default_value = "30m", value_parser = duration_secs)]
+        ttl: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a command in the sandbox; exits with its exit code.
+    #[command(trailing_var_arg = true)]
+    Exec {
+        id: String,
+        #[arg(short = 'w', long)]
+        workdir: Option<String>,
+        #[arg(short = 'e', long = "env")]
+        env: Vec<String>,
+        /// Kill the command after this long.
+        #[arg(long, value_parser = duration_secs)]
+        timeout: Option<u64>,
+        #[arg(required = true, allow_hyphen_values = true)]
+        cmd: Vec<String>,
+    },
+    /// Interactive shell in the sandbox.
+    Shell { id: String },
+    /// Copy files; one side is ID:/path.
+    Cp { src: String, dst: String },
+    /// New sandbox from this one's disk and workspace (processes don't carry over).
+    Fork {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Workspace changes against the real project.
+    Diff {
+        id: String,
+        #[arg(long)]
+        stat: bool,
+    },
+    /// Write the workspace's changes into the real project.
+    Apply {
+        id: String,
+        /// Only print what would change; exit 1 if anything would.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Forwarded ports and VM status.
+    Ports {
+        id: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Commands run in the sandbox (`--net`: blocked lookups).
+    Log {
+        id: String,
+        #[arg(short = 'f', long)]
+        follow: bool,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        net: bool,
+    },
+    /// List sandboxes.
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Power off, keeping state; the next exec boots it again.
+    Stop { id: String },
+    /// Force stop and delete.
+    Rm {
+        ids: Vec<String>,
+        #[arg(long, conflicts_with = "ids")]
+        all: bool,
+    },
+    /// Serve the sandbox API on ~/.rekcod/run/sandbox.sock.
+    Serve {
+        /// Also listen on 127.0.0.1:PORT, with a bearer token.
+        #[arg(long)]
+        listen: Option<String>,
+    },
+    /// Data disks with images already pulled, cloned per sandbox.
+    #[command(subcommand)]
+    Golden(Golden),
+}
+
+#[derive(Subcommand)]
+enum Golden {
+    /// Build (or rebuild) a golden disk.
+    Build {
+        #[arg(default_value = "default")]
+        name: String,
+        #[arg(long = "image")]
+        images: Vec<String>,
+    },
+    Ls,
+    Rm {
+        name: String,
     },
 }
 
@@ -235,6 +392,8 @@ fn main() {
             let opts = xrun::Options { image, publish, env, no_autoports, sandbox, offline, secrets, keep };
             xrun::run(&paths, &cmd, opts).map(|_| ())
         }
+        Cmd::Sandbox(c) => run_sandbox(&paths, c),
+        Cmd::Mcp => sandbox_api::mcp(paths),
         Cmd::Import { from, names, images_only, volumes_only, force } => {
             cli::import(&paths, &from, &names, !volumes_only, !images_only, force)
         }
@@ -248,11 +407,75 @@ fn main() {
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib, project } => daemon::run(paths, daemon::Options { cpus, memory_mib, project }),
+        Cmd::Daemon { cpus, memory_mib, project, workspace, allow, idle_ttl } => {
+            daemon::run(paths, daemon::Options { cpus, memory_mib, project, workspace, allow, idle_ttl })
+        }
     });
     if let Err(e) = result {
         eprintln!("rekcod: {e:#}");
-        std::process::exit(1);
+        std::process::exit(if e.downcast_ref::<sandbox::NoSandbox>().is_some() { 2 } else { 1 });
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
+    match c {
+        SandboxCmd::Create { dir, name, mount, image, golden, cpus, memory, allow_hosts, offline, secrets, ttl, json } => {
+            let o = sandbox::CreateOptions {
+                dir,
+                name,
+                mount,
+                image,
+                golden,
+                cpus,
+                memory_gib: memory,
+                allow_hosts,
+                offline,
+                secrets,
+                ttl_secs: ttl,
+            };
+            let m = sandbox::create(paths, o)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&m)?)
+            } else {
+                println!("{}", m.id)
+            }
+            Ok(())
+        }
+        SandboxCmd::Exec { id, workdir, env, timeout, cmd } => {
+            let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
+            let code = sandbox::exec(paths, &id, sandbox::ExecOptions { workdir, env, timeout_secs: timeout, tty }, &cmd)?;
+            std::process::exit(code)
+        }
+        SandboxCmd::Shell { id } => sandbox::shell(paths, &id),
+        SandboxCmd::Cp { src, dst } => sandbox::cp(paths, &src, &dst),
+        SandboxCmd::Fork { id, name, json } => {
+            let m = sandbox::fork(paths, &id, name)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&m)?)
+            } else {
+                println!("{}", m.id)
+            }
+            Ok(())
+        }
+        SandboxCmd::Diff { id, stat } => sandbox::diff(paths, &id, stat),
+        SandboxCmd::Apply { id, check } => {
+            let ch = sandbox::apply(paths, &id, check)?;
+            sandbox::print_changes(&ch);
+            if check && !ch.is_empty() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
+        SandboxCmd::Ports { id, json } => sandbox::ports(paths, &id, json),
+        SandboxCmd::Log { id, follow, json, net } => sandbox::log(paths, &id, follow, json, net),
+        SandboxCmd::Ls { json } => sandbox::print_list(paths, json),
+        SandboxCmd::Stop { id } => sandbox::stop(paths, &id),
+        SandboxCmd::Rm { ids, all } => sandbox::rm(paths, &ids, all),
+        SandboxCmd::Serve { listen } => sandbox_api::serve(paths.clone(), listen),
+        SandboxCmd::Golden(Golden::Build { name, images }) => sandbox::golden_build(paths, &name, &images),
+        SandboxCmd::Golden(Golden::Ls) => sandbox::golden_list(paths),
+        SandboxCmd::Golden(Golden::Rm { name }) => sandbox::golden_rm(paths, &name),
     }
 }
 

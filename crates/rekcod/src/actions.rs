@@ -28,12 +28,17 @@ pub enum Kind {
     SnapRestore,
     SnapRemove,
     SocketInstall,
+    SandboxShell,
+    SandboxDiff,
+    SandboxApply,
+    SandboxStop,
+    SandboxRemove,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 14] = [
+    pub const ALL: [Kind; 19] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -48,6 +53,11 @@ impl Kind {
         Kind::SnapRestore,
         Kind::SnapRemove,
         Kind::SocketInstall,
+        Kind::SandboxShell,
+        Kind::SandboxDiff,
+        Kind::SandboxApply,
+        Kind::SandboxStop,
+        Kind::SandboxRemove,
     ];
 }
 
@@ -186,6 +196,17 @@ pub struct Model {
     pub sandbox: Option<Value>,
     /// `/var/run/docker.sock` goes through rekcod (`rekcod socket install` done).
     pub socket_installed: bool,
+    /// Agent sandboxes (`rekcod sandbox ls`).
+    pub sandboxes: Vec<AgentSandbox>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AgentSandbox {
+    pub id: String,
+    pub name: Option<String>,
+    pub project: PathBuf,
+    pub copy: bool,
+    pub running: bool,
 }
 
 impl Model {
@@ -194,12 +215,22 @@ impl Model {
         let running = status["running"] == true;
         let sandbox = crate::cli::sandbox_status(paths);
         let socket_installed = crate::syssock::installed(paths);
+        let sandboxes = crate::sandbox::list(paths)
+            .into_iter()
+            .map(|l| AgentSandbox {
+                id: l.meta.id,
+                name: l.meta.name,
+                project: l.meta.project,
+                copy: l.meta.mode == "copy",
+                running: l.running,
+            })
+            .collect();
         let mut ports = ports_of(&status, false);
         if let Some(sb) = &sandbox {
             ports.extend(ports_of(sb, true));
         }
         if !running {
-            return Model { running, status, ports, sandbox, socket_installed, ..Default::default() };
+            return Model { running, status, ports, sandbox, socket_installed, sandboxes, ..Default::default() };
         }
         let raw = crate::cli::api_get(paths, "/containers/json?all=1").unwrap_or_default();
         let containers = parse_containers(&raw);
@@ -207,7 +238,7 @@ impl Model {
         let snapshots =
             crate::cli::api_get(paths, &format!("/volumes?filters={filter}")).ok().map(|b| parse_snapshots(&b)).unwrap_or_default();
         let projects = projects(&containers, &raw, snapshots);
-        Model { running, status, containers, ports, projects, sandbox, socket_installed }
+        Model { running, status, containers, ports, projects, sandbox, socket_installed, sandboxes }
     }
 }
 
@@ -374,6 +405,26 @@ pub fn snapshot_actions(s: &Snapshot) -> Vec<Action> {
     ]
 }
 
+pub fn sandbox_actions(s: &AgentSandbox) -> Vec<Action> {
+    let id = s.id.as_str();
+    let mut out = vec![Action::rekcod(Kind::SandboxShell, "Shell", &["sandbox", "shell", id]).interactive()];
+    if s.copy {
+        out.push(Action::rekcod(Kind::SandboxDiff, "Diff", &["sandbox", "diff", id]).interactive());
+        out.push(Action::rekcod(Kind::SandboxApply, "Apply to project", &["sandbox", "apply", id]).confirm(format!(
+            "Write sandbox {id}'s changes into {}? Files the sandbox changed or deleted are overwritten or removed.",
+            s.project.display()
+        )));
+    }
+    if s.running {
+        out.push(Action::rekcod(Kind::SandboxStop, "Stop", &["sandbox", "stop", id]));
+    }
+    out.push(
+        Action::rekcod(Kind::SandboxRemove, "Delete", &["sandbox", "rm", id])
+            .confirm(format!("Delete sandbox {id} and everything in it? Unapplied changes are lost.")),
+    );
+    out
+}
+
 pub fn age(created: u64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     match now.saturating_sub(created) {
@@ -411,6 +462,10 @@ pub mod tests {
         (containers, ports, projects)
     }
 
+    pub fn sample_sandbox() -> AgentSandbox {
+        AgentSandbox { id: "abcdefgh".into(), name: Some("try1".into()), project: "/Users/me/app".into(), copy: true, running: true }
+    }
+
     #[test]
     fn model_parsing() {
         let (containers, ports, projects) = sample();
@@ -439,6 +494,7 @@ pub mod tests {
                 all.extend(snapshot_actions(s));
             }
         }
+        all.extend(sandbox_actions(&sample_sandbox()));
         all
     }
 
@@ -453,7 +509,10 @@ pub mod tests {
     #[test]
     fn destructive_actions_ask_first() {
         for a in reachable_kinds() {
-            let destructive = matches!(a.kind, Kind::VmStop | Kind::ContainerRemove | Kind::SnapRestore | Kind::SnapRemove);
+            let destructive = matches!(
+                a.kind,
+                Kind::VmStop | Kind::ContainerRemove | Kind::SnapRestore | Kind::SnapRemove | Kind::SandboxApply | Kind::SandboxRemove
+            );
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }
         assert_eq!(shell_quote("a b"), "'a b'");

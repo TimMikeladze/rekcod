@@ -144,6 +144,8 @@ if [[ -n "${E2E_IMPORT_FROM:-}" ]]; then
   docker volume rm -f rekcod-e2e-vol >/dev/null 2>&1
 fi
 
+REKCOD="$R" "$(dirname "$0")/e2e-sandbox.sh" || failures=$((failures + 1))
+
 echo "stop"
 "$R" stop >/dev/null
 check "context restored to $prev" test "$(docker context show)" = "$prev"

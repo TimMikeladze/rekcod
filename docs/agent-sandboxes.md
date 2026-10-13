@@ -1,7 +1,7 @@
 # Agent sandboxes: spec
 
-**Status:** spec, 2026-10-12. Track 1 of [`platform.md`](platform.md). Research: [`paas.md`](paas.md). Nothing here is
-implemented yet.
+**Status:** built, 2026-10-12 (M1–M6). Track 1 of [`platform.md`](platform.md). Research: [`paas.md`](paas.md).
+"As built" at the end lists where the code differs from this spec.
 
 ## What we're building
 
@@ -321,3 +321,44 @@ ever host, it should be there.
   mode moving files over vsock instead? If it can, forks could keep memory.
 - How should golden disks be refreshed? Rebuild on `rekcod` upgrade, plus
   `golden build` on demand, is my default.
+
+## As built
+
+Measured with `bench/sandbox.sh` on the M5 Pro, all gates met:
+
+| Measurement | Gate | Result |
+|---|---|---|
+| create to first exec, warm golden disk | < 1.5 s | 1.32 s p50 |
+| fork to child exec | < 2 s | 1.18 s p50 |
+| `rm` | < 0.5 s | 0.12 s |
+| 16 created at once | < 5 s | 3.2 s |
+| idle footprint | < 350 MB | ~300 MB |
+
+`scripts/e2e-sandbox.sh` (19 checks, called from `e2e.sh`) passes.
+
+Where the code differs from the spec above:
+
+- **Golden disk isn't built on first use.** `create` clones `default` if it exists and starts
+  from an empty disk otherwise (the first `exec` then pulls its image). Building it takes
+  about 15 s, too long to hide inside a `create`. Run `rekcod sandbox golden build` once.
+- **Root image is a per-sandbox APFS clone**, not a read-only mount with a tmpfs overlay.
+  The existing `prepare_vm` already clones it, and a clone costs no space.
+- **Egress uses the agent's existing DNS stub and per-address iptables rules**, not
+  hickory or nftables sets. The stub answers REFUSED for names off the list and logs
+  `rekcod-egress: denied NAME` to the console; for allowed names it inserts
+  `-d IP -j ACCEPT` into `REKCOD-ALLOW` before handing back the answer. Direct connections
+  aren't logged, only lookups. Allowlist matching (`rekcod_proto::host_allowed`) is shared
+  between host and guest.
+- **Fork pauses the workspace container**, not the VM, and syncs first. dockerd keeps
+  running, so the clone is crash-consistent. There's no `fsfreeze` control message.
+- **Fork keeps the parent's secrets.** They're in the workspace container's config on the
+  cloned disk.
+- **HTTP and MCP are hand-written on `std`** (about 400 lines in `sandbox_api.rs`), not
+  axum and rmcp. Each request is one thread and `Connection: close`; exec streams NDJSON
+  until the command exits. MCP's `exec` returns output when the command finishes.
+- **No supervisor process.** The idle TTL is enforced by each sandbox's own daemon, which
+  checks `run/last-used`.
+- **`rekcod x --sandbox` is unchanged.** It still uses `~/.rekcod/sandbox` and a live mount.
+- **`diff` skips `.git`, `node_modules`, `.venv` and `target`**, and compares content, so
+  a file touched without changes doesn't show up. `apply`'s conflict check is by mtime
+  against the sandbox's creation (or last apply).

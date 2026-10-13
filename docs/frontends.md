@@ -36,6 +36,10 @@ how that's enforced.
 | Containers: start, stop, restart, remove, logs | `rekcod start/stop/restart/rm -f/logs -f <name>` | Containers › container |
 | Ports: open in browser | `open http://localhost:N` | Ports |
 | Snapshots: save, restore, delete | `snap save/restore/rm -p <project>` | Snapshots › project |
+| Agent sandboxes: shell, diff, apply, stop, delete | `sandbox shell/diff/apply/stop/rm <id>` | Agent sandboxes › sandbox |
+
+Creating, exec, fork, `cp` and golden disks are for agents and scripts, so they're CLI,
+HTTP and MCP only. The menu bar lists what exists and offers what a person does to it.
 
 ## Changing things
 

@@ -8,7 +8,7 @@ whole platform: all four tracks, what each one needs, and the gate before each s
 
 | # | Track | Runs on | Who uses it | Gate before starting |
 |---|---|---|---|---|
-| 1 | Local agent sandboxes | the user's Mac | one developer and their agents | none; [`agent-sandboxes.md`](agent-sandboxes.md) |
+| 1 | Local agent sandboxes | the user's Mac | one developer and their agents | **built** 2026-10-12; [`agent-sandboxes.md`](agent-sandboxes.md) |
 | 2 | Self-hosted fleet | a team's own Mac minis | a team's engineers and agents | legal read of SLA §2I |
 | 3 | App hosting (PaaS) | the fleet from track 2 | internal apps and preview environments | track 2 in use |
 | 4 | macOS guests: CI and computer-use | dedicated Macs | iOS/macOS builds, agents driving macOS apps | track 2 in use, plus a demand check |

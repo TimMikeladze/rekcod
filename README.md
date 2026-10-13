@@ -158,7 +158,7 @@ A warm `rekcod x node -v` adds about 65 ms over running node natively.
 menu lists the VM, containers, forwarded ports and compose projects with their snapshots,
 with the same actions as the CLI: start/stop the VM,
 compact, root shell; start, stop, restart, logs or remove a container; open a port;
-save, restore or delete a snapshot. Every item runs the matching `rekcod` command, and
+save, restore or delete a snapshot; open a shell in an agent sandbox, diff, apply, stop or delete it. Every item runs the matching `rekcod` command, and
 anything destructive asks first. How it stays in sync with the CLI: [`docs/frontends.md`](docs/frontends.md).
 
 ### Sandbox
@@ -169,6 +169,47 @@ repos) doesn't exist there, and nothing on the Mac or the local network is reach
 the internet is. Variables get in only with `--secret NAME`; `--offline` cuts the network.
 Use it for `npm install` of something you don't trust, or for an AI agent's commands.
 Threat model and limits: [`docs/sandbox.md`](docs/sandbox.md).
+
+### GitHub Actions runner
+
+A self-hosted runner can live in the VM as a container, using the VM's `dockerd` for jobs.
+Compose file and a sample workflow: [`examples/github-runner`](examples/github-runner).
+
+### Agent sandboxes
+
+`rekcod sandbox` gives an AI agent throwaway VMs, each a full `dockerd` that sees a
+copy-on-write copy of one project and nothing else on the Mac. The agent works on the copy;
+you look at the diff and apply it. Spec and design: [`docs/agent-sandboxes.md`](docs/agent-sandboxes.md).
+
+```sh
+rekcod sandbox golden build          # once: a data disk with common images, cloned per sandbox
+id=$(rekcod sandbox create)          # this directory; ~1.3 s to a first exec
+rekcod sandbox exec $id -- npm test  # exits with the command's code
+rekcod sandbox fork $id              # new sandbox from its disk + workspace (~1.2 s)
+rekcod sandbox diff $id              # the copy against your project
+rekcod sandbox apply $id             # write the changes back (refuses files you edited since)
+rekcod sandbox rm $id
+```
+
+The internet is limited to an allowlist of package and image registries and GitHub
+(`--allow-host` adds names, `--allow-host '*'` opens it, `--offline` cuts it).
+Names off the list don't resolve, and connections to addresses no allowed name resolved to
+are rejected; `rekcod sandbox log ID --net` shows what was blocked. A sandbox powers off
+after 30 minutes without an exec (`--ttl`) and boots again on the next one.
+
+For agents: `rekcod mcp` is an MCP server on stdio with tools for create, exec,
+read/write file, fork, diff, apply, stop and remove (`claude mcp add rekcod -- rekcod mcp`).
+`rekcod sandbox serve` serves the same operations over HTTP on
+`~/.rekcod/run/sandbox.sock` (`--listen 127.0.0.1:PORT` adds TCP with a bearer token):
+
+```sh
+curl --unix-socket ~/.rekcod/run/sandbox.sock -X POST localhost/sandboxes/$id/exec -d '{"cmd":["npm","test"]}'
+{"stdout":"..."}
+{"exit":0}
+```
+
+Measured on an M5 Pro (`bench/sandbox.sh`): create to first exec 1.3 s p50, fork 1.2 s,
+`rm` 0.12 s, 16 created at once all ready in 3.2 s, about 300 MB idle each.
 
 ## File-sharing speed
 
@@ -193,10 +234,12 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod status [--json]` | Versions, VM size, forwarded ports (and any that couldn't be bound), data-disk use in the VM and on the Mac, file-cache trips to macOS, warming in progress, the sandbox VM. `--json` is the scriptable form |
 | `rekcod snap save\|restore\|ls\|rm [NAME] [-p PROJECT]` | Volume snapshots of a compose project (above) |
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
+| `rekcod sandbox create\|exec\|shell\|cp\|fork\|diff\|apply\|ports\|log\|ls\|stop\|rm\|serve\|golden` | Agent sandboxes (above) |
+| `rekcod mcp` | MCP server on stdio for the sandbox commands |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
-| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
+| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete), agent sandboxes (shell, diff, apply, stop, delete). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |
@@ -246,6 +289,8 @@ python3 bench/inotify_rtt.py --context rekcod  # Mac edit -> container inotify l
 bench/cold_start.sh                          # first access right after boot, warmed vs not
 bench/postgres.sh rekcod desktop-linux       # pgbench on a named volume, per docker context
 python3 bench/tcp_rtt.py --context rekcod    # 64-byte round trip through a published port
+bench/sandbox.sh                             # agent sandbox create/fork/rm timings, 16 at once
+scripts/e2e-sandbox.sh                       # agent sandbox checks only; leaves the main VM alone
 rekcod x cargo test -p rekcod-agent          # the guest agent's Linux-only tests
 python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge
 tests/stress/overflow.sh                     # FSEvents burst; see the script for the forced-drop mode
@@ -278,7 +323,8 @@ Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md)
 - First access can be slower than OrbStack for a tree rekcod hasn't seen since boot, when a container touches it before background warming finishes (about 1 s per 20k files). Recently used trees are warmed at boot (a 19.5k-file walk 3 s after `rekcod start`: 34 ms warmed vs 286 ms not). Repeat work is 3–9× faster.
 - Mac→container change latency is about 14 ms p50 (`bench/inotify_rtt.py`; OrbStack measured 12 ms).
 - Memory isn't returned to macOS. `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop, even under memory pressure (docs/phase2.md, docs/phase5.md).
-- `--sandbox` hasn't had an external security review (docs/sandbox.md).
+- `--sandbox` and `rekcod sandbox` haven't had an external security review (docs/sandbox.md).
+- A sandbox fork copies the disk, not memory: processes restart in the child (Virtualization.framework can't restore a VM with a virtio-fs share).
 - No brew formula. Releases are ad-hoc signed, not notarized.
 
 Debug knobs:

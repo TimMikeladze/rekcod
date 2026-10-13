@@ -1,0 +1,22 @@
+# Self-hosted GitHub Actions runner inside the rekcod VM.
+# Usage: cp .env.example .env, fill it in, then `rekcod compose up -d`.
+services:
+  runner:
+    image: myoung34/github-runner:latest
+    restart: unless-stopped
+    environment:
+      REPO_URL: ${REPO_URL}
+      # Personal access token (repo scope). The image swaps it for a fresh
+      # registration token on every start, so restarts don't need a new one.
+      ACCESS_TOKEN: ${ACCESS_TOKEN}
+      RUNNER_NAME: rekcod
+      LABELS: rekcod,linux,arm64
+      RUNNER_WORKDIR: /tmp/gha-work
+      # Re-register after each job so state doesn't leak between jobs.
+      EPHEMERAL: "true"
+    volumes:
+      # The VM's dockerd runs the job's containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Must be the same path on both sides: dockerd resolves bind mounts
+      # from `container:` jobs and Docker actions in the VM, not in this container.
+      - /tmp/gha-work:/tmp/gha-work

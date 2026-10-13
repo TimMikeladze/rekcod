@@ -25,6 +25,7 @@ pub fn run() -> Result<()> {
             writer: Mutex::default(),
             pending: Mutex::default(),
             next_id: AtomicU16::new(1),
+            egress: Egress::from_cmdline(&std::fs::read_to_string("/proc/cmdline").unwrap_or_default()),
         });
         let (stub, tcp_stub) = (dns.clone(), dns.clone());
         let (park, parked) = mpsc::unbounded_channel();
@@ -507,6 +508,122 @@ struct Dns {
     /// Our query id -> (client's id, client, sent at).
     pending: Mutex<HashMap<u16, (u16, Client, Instant)>>,
     next_id: AtomicU16,
+    egress: Option<Egress>,
+}
+
+/// Agent sandbox egress (docs/agent-sandboxes.md): only allowed names resolve, and each
+/// address they resolve to is let through `REKCOD-ALLOW` before the client sees it.
+struct Egress {
+    allow: Vec<String>,
+    opened: Mutex<std::collections::HashSet<std::net::Ipv4Addr>>,
+}
+
+impl Egress {
+    fn from_cmdline(cmdline: &str) -> Option<Egress> {
+        let b64 = cmdline.split_whitespace().find_map(|a| a.strip_prefix("rekcod.allow="))?;
+        let list = String::from_utf8(base64_decode(b64)?).ok()?;
+        let allow = list.split(',').filter(|h| !h.is_empty()).map(String::from).collect();
+        Some(Egress { allow, opened: Mutex::default() })
+    }
+
+    /// Adds firewall rules for addresses not seen before; waits so the answer can't win the race.
+    async fn open(&self, ips: Vec<std::net::Ipv4Addr>) {
+        let new: Vec<_> = {
+            let mut opened = self.opened.lock().unwrap();
+            ips.into_iter().filter(|ip| opened.insert(*ip)).collect()
+        };
+        for ip in new {
+            let _ = tokio::process::Command::new("iptables")
+                .args(["-w", "-I", "REKCOD-ALLOW", "-d", &ip.to_string(), "-j", "ACCEPT"])
+                .status()
+                .await;
+        }
+    }
+}
+
+fn base64_decode(s: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    let (mut acc, mut bits) = (0u32, 0);
+    for c in s.bytes().filter(|c| *c != b'=') {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => return None,
+        } as u32;
+        acc = acc << 6 | v;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+        }
+    }
+    Some(out)
+}
+
+/// End of a (possibly compressed) name starting at `i`.
+fn skip_name(p: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        let len = *p.get(i)? as usize;
+        if len & 0xc0 == 0xc0 {
+            return Some(i + 2);
+        }
+        i += 1 + len;
+        if len == 0 {
+            return Some(i);
+        }
+    }
+}
+
+/// The first question's name, dotted.
+fn query_name(p: &[u8]) -> Option<String> {
+    let mut i = 12;
+    let mut labels = Vec::new();
+    loop {
+        let len = *p.get(i)? as usize;
+        if len == 0 || len & 0xc0 != 0 {
+            break;
+        }
+        labels.push(String::from_utf8_lossy(p.get(i + 1..i + 1 + len)?).into_owned());
+        i += 1 + len;
+    }
+    Some(labels.join("."))
+}
+
+/// IPv4 addresses in an answer's answer section.
+fn answer_ipv4s(p: &[u8]) -> Vec<std::net::Ipv4Addr> {
+    let mut out = Vec::new();
+    let (Some(qd), Some(an)) = (p.get(4..6), p.get(6..8)) else { return out };
+    let (qd, an) = (u16::from_be_bytes([qd[0], qd[1]]), u16::from_be_bytes([an[0], an[1]]));
+    let mut i = 12;
+    for _ in 0..qd {
+        let Some(e) = skip_name(p, i) else { return out };
+        i = e + 4;
+    }
+    for _ in 0..an {
+        let Some(e) = skip_name(p, i) else { return out };
+        let Some(h) = p.get(e..e + 10) else { return out };
+        let (rtype, rdlen) = (u16::from_be_bytes([h[0], h[1]]), u16::from_be_bytes([h[8], h[9]]) as usize);
+        if rtype == 1
+            && rdlen == 4
+            && let Some(a) = p.get(e + 10..e + 14)
+        {
+            out.push(std::net::Ipv4Addr::new(a[0], a[1], a[2], a[3]));
+        }
+        i = e + 10 + rdlen;
+    }
+    out
+}
+
+/// `query` with RCODE REFUSED and no records.
+fn refused(query: &[u8]) -> Vec<u8> {
+    let mut out = query.to_vec();
+    out[2] |= 0x80; // QR
+    out[3] = (out[3] & 0xf0) | 5;
+    out[6..12].fill(0);
+    out
 }
 
 enum Client {
@@ -521,10 +638,26 @@ const UDP_ANSWER_MAX: usize = 4096;
 impl Dns {
     /// Sends a client's query to the host; false if the host isn't connected.
     fn submit(&self, query: &[u8], client: Client) -> bool {
-        let Some(tx) = self.writer.lock().unwrap().clone() else { return false };
         if query.len() < 12 {
             return false;
         }
+        if let Some(eg) = &self.egress {
+            let name = query_name(query).unwrap_or_default();
+            if !rekcod_proto::host_allowed(&eg.allow, &name) {
+                eprintln!("rekcod-egress: denied {name}");
+                let answer = refused(query);
+                match client {
+                    Client::Tcp(tx) => {
+                        let _ = tx.send(answer);
+                    }
+                    Client::Udp(addr) => {
+                        let _ = self.sock.try_send_to(&answer, addr);
+                    }
+                }
+                return true;
+            }
+        }
+        let Some(tx) = self.writer.lock().unwrap().clone() else { return false };
         // Rewrite ids so queries from different clients can't collide.
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let original = u16::from_be_bytes([query[0], query[1]]);
@@ -615,6 +748,9 @@ async fn dns_channel(vsock: VsockStream, dns: Arc<Dns>) -> Result<()> {
             let id = u16::from_be_bytes([packet[0], packet[1]]);
             let Some((original, client, _)) = dns.pending.lock().unwrap().remove(&id) else { continue };
             packet[..2].copy_from_slice(&original.to_be_bytes());
+            if let Some(eg) = &dns.egress {
+                eg.open(answer_ipv4s(&packet)).await;
+            }
             match client {
                 Client::Tcp(tx) => {
                     let _ = tx.send(packet);
@@ -638,6 +774,24 @@ async fn dns_channel(vsock: VsockStream, dns: Arc<Dns>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn egress_parses_cmdline_and_dns() {
+        // "a.com,*.b.io" in base64
+        let eg = Egress::from_cmdline("console=hvc0 rekcod.allow=YS5jb20sKi5iLmlv quiet").unwrap();
+        assert_eq!(eg.allow, vec!["a.com", "*.b.io"]);
+        assert!(Egress::from_cmdline("console=hvc0").is_none());
+        assert!(Egress::from_cmdline("rekcod.allow=").unwrap().allow.is_empty());
+        // Query for x.b.io A, answer with a CNAME then an A record (compressed names).
+        let mut p = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0];
+        p.extend([1, b'x', 1, b'b', 2, b'i', b'o', 0, 0, 1, 0, 1]);
+        p.extend([0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 14]);
+        p.extend([0xc0, 14, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 93, 184, 216, 34]);
+        assert_eq!(query_name(&p).as_deref(), Some("x.b.io"));
+        assert_eq!(answer_ipv4s(&p), vec![std::net::Ipv4Addr::new(93, 184, 216, 34)]);
+        let r = refused(&p[..24]);
+        assert_eq!((r[3] & 0x0f, &r[6..12]), (5, &[0u8; 6][..]));
+    }
 
     #[test]
     fn listening_ports_filters_state_and_owner() {

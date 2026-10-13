@@ -54,6 +54,13 @@ pub struct Options {
     /// Sandbox VM (docs/sandbox.md): share only this directory, and nothing
     /// on the Mac is reachable from the guest.
     pub project: Option<PathBuf>,
+    /// Agent sandbox (docs/agent-sandboxes.md): the Mac directory shared as `project`,
+    /// when it's a copy of the project rather than the project itself.
+    pub workspace: Option<PathBuf>,
+    /// Egress allowlist (comma-separated names); none means the internet is open.
+    pub allow: Option<String>,
+    /// Power off after this many seconds without an exec (`run/last-used`).
+    pub idle_ttl: Option<u64>,
 }
 
 /// Standard base64, for passing a path on the kernel command line.
@@ -85,7 +92,10 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         Some(dir) => {
             let dir = dir.to_str().context("project path is not UTF-8")?;
             cmdline.push_str(&format!(" rekcod.sandbox=1 rekcod.project={}", base64(dir.as_bytes())));
-            vec![("project".into(), PathBuf::from(dir))]
+            if let Some(allow) = &opts.allow {
+                cmdline.push_str(&format!(" rekcod.allow={}", base64(allow.as_bytes())));
+            }
+            vec![("project".into(), opts.workspace.clone().unwrap_or_else(|| PathBuf::from(dir)))]
         }
         None => ["Users", "Volumes", "private"]
             .iter()
@@ -123,6 +133,8 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let notify_vm = vm.clone();
     let notify_conn: Arc<NotifyConn> = Arc::default();
     let roots = match &opts.project {
+        // A copied workspace changes only from inside the guest; events would name the copy's paths.
+        Some(_) if opts.workspace.is_some() => vec![],
         Some(dir) => vec![dir.clone()],
         None => watch::GLOBAL_ROOTS.iter().map(PathBuf::from).collect(),
     };
@@ -168,12 +180,27 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
 
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
+    // `rekcod sandbox rm`: nothing on the disk is kept, so skip the graceful shutdown.
+    let mut kill = signal(SignalKind::user_defined1())?;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
         tokio::select! {
             _ = term.recv() => break,
             _ = int.recv() => break,
+            _ = kill.recv() => {
+                log!("force stop");
+                let _ = vm.force_stop().await;
+                cleanup(&paths);
+                return Ok(());
+            }
             _ = tick.tick() => {
+                if let Some(ttl) = opts.idle_ttl
+                    && let Ok(used) = std::fs::metadata(paths.home.join("run/last-used")).and_then(|m| m.modified())
+                    && used.elapsed().is_ok_and(|e| e.as_secs() > ttl)
+                {
+                    log!("idle for {ttl}s, stopping");
+                    break;
+                }
                 let s = vm.state();
                 if matches!(s, State::Stopped | State::Error) {
                     log!("guest stopped on its own ({s:?})");

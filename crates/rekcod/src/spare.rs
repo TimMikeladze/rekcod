@@ -94,7 +94,17 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
     }
 
     let ctl = paths.home.join("controller");
-    run(&exe, &["controller", "serve", "--listen", &format!("{ip}:7700"), "--domain", domain, "--install"])?;
+    // RustFS first: the controller reads its keys on start.
+    run(&exe, &["storage", "serve", "--listen", &format!("{ip}:7710"), "--install"])?;
+    let creds = crate::storage::credentials_file(paths);
+    for _ in 0..240 {
+        if creds.exists() || std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let storage = format!("http://{ip}:7710");
+    run(&exe, &["controller", "serve", "--listen", &format!("{ip}:7700"), "--domain", domain, "--storage", &storage, "--install"])?;
     let admin_file = ctl.join("admin-token");
     for _ in 0..60 {
         if std::fs::metadata(&admin_file).is_ok_and(|m| m.len() > 0) {
@@ -126,12 +136,12 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
     let name = Command::new(&ts).args(["status", "--json"]).output().ok().and_then(|o| dns_name(&String::from_utf8_lossy(&o.stdout)));
     let host = if addr.is_some() { ip.clone() } else { name.unwrap_or(ip.clone()) };
     eprintln!(
-        "\nrekcod: this Mac is a fleet on {ip}: controller :7700, node :7701, edge :8080 (all apps), 127.0.0.1:8081 (public apps)\n\
+        "\nrekcod: this Mac is a fleet on {ip}: controller :7700, node :7701, RustFS :7710, edge :8080 (all apps), 127.0.0.1:8081 (public apps)\n\
          Public traffic, once {domain}'s DNS is on Cloudflare:\n\
          \x20 cloudflared tunnel login && cloudflared tunnel create rekcod && cloudflared tunnel route dns rekcod '*.{domain}'\n\
          \x20 # ~/.cloudflared/config.yml: tunnel: rekcod, ingress: *.{domain} -> http://127.0.0.1:8081\n\
          \x20 sudo cloudflared service install\n\
-         Logs: {}/logs/{{controller,node,edge}}.log   Undo: rekcod spare uninstall\n",
+         Logs: {}/logs/{{controller,node,edge,storage}}.log   Undo: rekcod spare uninstall\n",
         paths.home.display()
     );
     println!("remote http://{host}:7700 {admin}");
@@ -139,7 +149,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
 }
 
 pub fn uninstall() -> Result<()> {
-    for n in ["edge", "node", "controller"] {
+    for n in ["edge", "node", "controller", "storage"] {
         crate::service::uninstall(n)?;
     }
     Ok(())

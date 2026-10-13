@@ -11,9 +11,9 @@ how that's enforced.
    (`actions::Action`).
 2. One action list. `crates/rekcod/src/actions.rs` defines `Kind` (every action),
    `Action` (a kind plus its target), and what's available for each thing shown:
-   `vm_actions`, `container_actions`, `port_actions`, `project_actions`,
+   `vm_actions`, `storage_actions`, `container_actions`, `port_actions`, `project_actions`,
    `snapshot_actions`, `sandbox_actions`, `app_actions`, `job_actions`,
-   `namespace_actions`, `host_actions`. The menu bar renders those lists as they are, so adding an
+   `namespace_actions`, `host_actions`, `ban_actions`. The menu bar renders those lists as they are, so adding an
    action there needs no menu bar change.
 3. One data model. `actions::Model::load` reads everything the menu shows (VM status,
    containers, ports, compose projects, snapshots, sandbox). `rekcod status --json` is
@@ -34,6 +34,7 @@ how that's enforced.
 | Compact disk | `compact` | top of menu |
 | Root shell | `shell` | top of menu (opens Terminal) |
 | Route /var/run/docker.sock to rekcod | `socket install` | top of menu while not installed (opens Terminal for sudo) |
+| Local S3 storage: start, show env, stop | `storage up` / `storage env` / `storage down` | top of menu while the VM runs (start and env open Terminal) |
 | Containers: start, stop, restart, remove, logs | `rekcod start/stop/restart/rm -f/logs -f <name>` | Containers › container |
 | Ports: open in browser | `open http://localhost:N` | Ports |
 | Snapshots: save, restore, delete | `snap save/restore/rm -p <project>` | Snapshots › project |
@@ -44,10 +45,11 @@ how that's enforced.
 | Switch the default remote's namespace | `ns use <name>` | Namespace: current › Switch to … (only when the token is in more than one) |
 | Switch docker between this Mac's rekcod and a remote host | `host use <name>\|local` | Docker host: current › Use … (only with a host added; shown while the VM is stopped too) |
 | Forward a remote host's published ports here | `host forward <name>` | Docker host › Forward ports from … (opens Terminal) |
+| Ban an IP or range on every edge, lift a ban | `edge ban [<net>]` / `edge unban <net>` | Edge bans › Ban an IP or range (opens Terminal to ask), Unban … (only with an admin-token remote) |
 
 Creating, exec, fork, `cp` and golden disks are for agents and scripts, so they're CLI,
 HTTP and MCP only. So are deploys, scaling and env changes (they take arguments), the
-fleet's admin commands (`node`, `controller`, `edge`, `remote`, `spare`), `host add/rm`, `--remote` sandboxes,
+fleet's admin commands (`node`, `controller`, `edge serve`, `remote`, `spare`), `host add/rm`, `--remote` sandboxes,
 `sandbox input` (agents), and `macos` image setup (one-time, interactive). The menu bar lists what exists and offers what a person does to it.
 
 ## Changing things

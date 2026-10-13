@@ -59,8 +59,21 @@ pub struct Options {
     pub workspace: Option<PathBuf>,
     /// Egress allowlist (comma-separated names); none means the internet is open.
     pub allow: Option<String>,
+    /// `IP:PORT,...` the sandbox may reach although it's on the Mac or LAN.
+    pub reach: Option<String>,
     /// Power off after this many seconds without an exec (`run/last-used`).
     pub idle_ttl: Option<u64>,
+}
+
+/// `IP:PORT,...` checked, so nothing else lands on the kernel command line (boot.sh reads it).
+pub fn reach_arg(s: &str) -> Result<String> {
+    let all: Vec<String> = s
+        .split(',')
+        .map(|a| {
+            a.trim().parse::<std::net::SocketAddrV4>().map(|a| a.to_string()).map_err(|_| anyhow::anyhow!("--reach {a}: not IPv4:PORT"))
+        })
+        .collect::<Result<_>>()?;
+    Ok(all.join(","))
 }
 
 /// Standard base64, for passing a path on the kernel command line.
@@ -94,6 +107,9 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             cmdline.push_str(&format!(" rekcod.sandbox=1 rekcod.project={}", base64(dir.as_bytes())));
             if let Some(allow) = &opts.allow {
                 cmdline.push_str(&format!(" rekcod.allow={}", base64(allow.as_bytes())));
+            }
+            if let Some(reach) = opts.reach.as_deref().filter(|r| !r.is_empty()) {
+                cmdline.push_str(&format!(" rekcod.reach={}", reach_arg(reach)?));
             }
             vec![("project".into(), opts.workspace.clone().unwrap_or_else(|| PathBuf::from(dir)))]
         }

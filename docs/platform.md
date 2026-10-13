@@ -415,10 +415,9 @@ Where the code differs from the spec above:
 - **No mTLS, no internal CA.** Controller, nodes, edge and CLI speak plain HTTP with
   bearer tokens: user tokens in `tokens`, a node secret per node from the join token. Run it
   on a private network or VPN, or put TLS in front. `rustls` + `rcgen` is the upgrade path.
-- **No registry, no S3.** Each instance clones the release's commit and builds it in its
-  own sandbox's BuildKit. A release is a commit, so rollback rebuilds it (the build cache in
-  that sandbox is gone, so it's a full build). RustFS is the planned bucket:
-  [`rustfs.md`](rustfs.md). Golden disks are copied to nodes by hand
+- **No registry.** With `--storage`, a release's image is a `docker save | zstd` tarball
+  in RustFS that rollbacks and later instances load ([`rustfs.md`](rustfs.md)); without it
+  each instance clones the commit and builds it. Golden disks are copied to nodes by hand
   (`cp -cR ~/.rekcod/golden/default <node home>/golden/`).
 - **`rekcod edge` is a hand-written HTTP/1.1 proxy on `std`**, not pingora, with no TLS and
   no ACME. It routes on `Host`, round-robins live instances, and refreshes the table from

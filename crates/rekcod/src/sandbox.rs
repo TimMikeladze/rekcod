@@ -71,6 +71,9 @@ pub struct Meta {
     /// "macos" for a macOS guest (`macos.rs`); empty for Linux.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub os: String,
+    /// `IP:PORT`s on the Mac or LAN it may reach (an app instance's RustFS).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reach: Vec<String>,
 }
 
 pub struct CreateOptions {
@@ -87,6 +90,7 @@ pub struct CreateOptions {
     pub ttl_secs: u64,
     /// "macos" for a macOS guest; `image` then names the base image.
     pub os: Option<String>,
+    pub reach: Vec<String>,
 }
 
 impl Default for CreateOptions {
@@ -104,6 +108,7 @@ impl Default for CreateOptions {
             secrets: vec![],
             ttl_secs: 30 * 60,
             os: None,
+            reach: vec![],
         }
     }
 }
@@ -206,6 +211,7 @@ impl Sandbox {
             guest_dir: Some(main.guest_dir()?),
             workspace: (m.mode == "copy").then(|| self.ws()),
             allow,
+            reach: m.reach.clone(),
             idle_ttl: (m.ttl_secs > 0).then_some(m.ttl_secs),
         };
         crate::cli::boot(&self.paths, &opts)?;
@@ -375,6 +381,7 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
             secrets: o.secrets,
             created: now(),
             os: if macos { "macos".into() } else { String::new() },
+            reach: o.reach,
         },
         paths: sb,
     };
@@ -1009,6 +1016,7 @@ mod tests {
             secrets: vec![],
             created: 0,
             os: String::new(),
+            reach: vec![],
         };
         let o = ExecOptions { workdir: None, env: vec!["A=1".into()], timeout_secs: Some(5), tty: false };
         let a = exec_args(&m, &o, &["npm".into(), "test".into()]).join(" ");

@@ -37,7 +37,9 @@ Re-running it is safe: every step replaces what it made before.
 The Rust version of the old `scripts/spare-setup.sh`, plus the headless bits.
 
 - Address: `--addr`, else `tailscale ip -4`.
-- `controller serve --install` on `ADDR:7700`, waits for the admin token.
+- `storage serve --install` on `ADDR:7710` (RustFS, [`rustfs.md`](rustfs.md)), waits for its
+  keys in `storage/credentials.json`.
+- `controller serve --storage http://ADDR:7710 --install` on `ADDR:7700`, waits for the admin token.
 - `node join ... --install` on `ADDR:7701` the first time, `node serve --install` after.
 - `remote add local`, then `edge serve --install` on `ADDR:8080` and public apps on
   `127.0.0.1:8081` for cloudflared.
@@ -47,7 +49,7 @@ The Rust version of the old `scripts/spare-setup.sh`, plus the headless bits.
 - Warns when automatic login is off (`autoLoginUser` in `com.apple.loginwindow`).
 - Last line on stdout: `remote http://NAME:7700 ADMIN_TOKEN`.
 
-`rekcod spare uninstall` removes the three agents. It leaves pmset and `~/.rekcod` alone.
+`rekcod spare uninstall` removes the four agents. It leaves pmset and `~/.rekcod` alone.
 
 ## Not done
 

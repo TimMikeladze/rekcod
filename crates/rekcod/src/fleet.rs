@@ -3,7 +3,7 @@
 //! - `rekcod controller serve`: the sandbox API for many Macs, plus apps. State in SQLite.
 //! - `rekcod node join|serve`: runs on each Mac; serves `sandbox_api` on its address with a
 //!   node secret, heartbeats capacity, and deploys app instances into sandboxes.
-//! - `rekcod edge serve`: routes `Host: <app>.<domain>` to live instances.
+//! - `rekcod edge serve` lives in `edge/`.
 //!
 //! Everything speaks plain HTTP/1.1 with bearer tokens and `Connection: close`.
 
@@ -301,15 +301,190 @@ pub fn generated_dockerfile(dir: &Path, start: &str) -> Result<String> {
     Ok(format!("FROM {}\nWORKDIR /app\nCOPY . /app\n{install}CMD {}\n", plan.image, serde_json::to_string(&cmd)?))
 }
 
-/// Node op: builds `git` in a new sandbox and runs it; returns `{sandbox, endpoint}`.
+/// Where a release's image is kept in RustFS (docs/rustfs.md): `<bucket>/<key>.tar.zst` is
+/// `docker save | zstd`, `<key>.json` the commit's rekcod.toml. Sent by the controller.
+#[derive(serde::Deserialize)]
+struct ReleaseStore {
+    s3: crate::s3::S3,
+    bucket: String,
+    key: String,
+    /// Both objects are there: load them instead of cloning and building.
+    cached: bool,
+    /// BuildKit cache bucket.
+    cache: Option<String>,
+}
+
+/// The stored rekcod.toml of a cached release, if it can be read.
+fn stored_toml(st: &ReleaseStore) -> Option<HashMap<String, String>> {
+    let mut b = Vec::new();
+    st.s3.get(&st.bucket, &format!("{}.json", st.key), &mut b).map_err(|e| eprintln!("rekcod: {}: {e:#}", st.key)).ok()?;
+    serde_json::from_slice(&b).ok()
+}
+
+/// `docker save IMAGE | zstd` into the store, then the toml (its presence marks it complete).
+fn push_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore, toml: &HashMap<String, String>) -> Result<()> {
+    let tmp = paths.home.join("remote-ws").join(format!("{}.tar.zst", sandbox::new_id()?));
+    let r = (|| -> Result<()> {
+        let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
+        let mut child = d.args(["save", image]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let mut enc = zstd::Encoder::new(std::fs::File::create(&tmp)?, 3)?;
+        std::io::copy(child.stdout.as_mut().context("no stdout")?, &mut enc)?;
+        enc.finish()?;
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!("docker save: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        st.s3.put(&st.bucket, &format!("{}.tar.zst", st.key), crate::s3::Body::File(&tmp))?;
+        st.s3.put(&st.bucket, &format!("{}.json", st.key), crate::s3::Body::Bytes(&serde_json::to_vec(toml)?))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    r
+}
+
+/// Downloads a stored image into the sandbox's dockerd and tags it `image`.
+fn load_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore) -> Result<()> {
+    let tmp = paths.home.join("remote-ws").join(format!("{}.tar.zst", sandbox::new_id()?));
+    let r = (|| -> Result<()> {
+        st.s3.get(&st.bucket, &format!("{}.tar.zst", st.key), &mut std::fs::File::create(&tmp)?)?;
+        let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
+        let mut child = d.arg("load").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+        let mut stdin = child.stdin.take().context("no stdin")?;
+        zstd::stream::copy_decode(std::fs::File::open(&tmp)?, &mut stdin)?;
+        drop(stdin);
+        let out = child.wait_with_output()?;
+        if !out.status.success() {
+            bail!("docker load: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        let text = String::from_utf8_lossy(&out.stdout);
+        let loaded = text.lines().find_map(|l| l.strip_prefix("Loaded image: ")).context("docker load named no image")?.trim();
+        let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
+        if !d.args(["tag", loaded, image]).stdin(Stdio::null()).status()?.success() {
+            bail!("docker tag {loaded} {image} failed");
+        }
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    r
+}
+
+/// `tar -C dir -c . | zstd` into `bucket/key`.
+fn push_dir(s3: &crate::s3::S3, bucket: &str, key: &str, dir: &Path, tmp: &Path) -> Result<()> {
+    let mut child = Command::new("tar").arg("-C").arg(dir).args(["-cf", "-", "."]).stdout(Stdio::piped()).spawn()?;
+    let mut enc = zstd::Encoder::new(std::fs::File::create(tmp)?, 3)?;
+    std::io::copy(child.stdout.as_mut().context("no stdout")?, &mut enc)?;
+    enc.finish()?;
+    if !child.wait()?.success() {
+        bail!("tar of {} failed", dir.display());
+    }
+    s3.put(bucket, key, crate::s3::Body::File(tmp))
+}
+
+/// The reverse of `push_dir`; false when there's nothing stored yet.
+fn pull_dir(s3: &crate::s3::S3, bucket: &str, key: &str, dir: &Path, tmp: &Path) -> Result<bool> {
+    if !s3.exists(bucket, key)? {
+        return Ok(false);
+    }
+    s3.get(bucket, key, &mut std::fs::File::create(tmp)?)?;
+    std::fs::create_dir_all(dir)?;
+    let mut child = Command::new("tar").arg("-C").arg(dir).args(["-xf", "-"]).stdin(Stdio::piped()).spawn()?;
+    let mut stdin = child.stdin.take().context("no stdin")?;
+    zstd::stream::copy_decode(std::fs::File::open(tmp)?, &mut stdin)?;
+    drop(stdin);
+    if !child.wait()?.success() {
+        bail!("untar of {bucket}/{key} failed");
+    }
+    Ok(true)
+}
+
+/// `docker build`. With a store, BuildKit's cache goes to a local directory on this Mac
+/// (`type=local`, which dockerd's builder supports and `s3` isn't), kept in the cache
+/// bucket as `<app>.tar.zst` so a build on another node starts from it. A cache that
+/// doesn't work (no buildx) falls back to a plain build.
+fn build_image(paths: &Paths, sb: &str, image: &str, dir: &Path, st: Option<&ReleaseStore>) -> Result<()> {
+    let tail = |b: &[u8]| {
+        let err = String::from_utf8_lossy(b);
+        err.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+    };
+    if let Some((st, bucket)) = st.and_then(|s| Some((s, s.cache.as_deref()?))) {
+        let key = format!("{}.tar.zst", st.key.split('/').next().unwrap_or("app"));
+        let work = paths.home.join("remote-ws").join(format!("cache-{}", sandbox::new_id()?));
+        let (from, to, tmp) = (work.join("from"), work.join("to"), work.join("cache.tar.zst"));
+        std::fs::create_dir_all(&work)?;
+        let r = (|| -> Result<Option<String>> {
+            let had = pull_dir(&st.s3, bucket, &key, &from, &tmp).unwrap_or_else(|e| {
+                eprintln!("rekcod: build cache {bucket}/{key}: {e:#}");
+                false
+            });
+            let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
+            d.args(["buildx", "build", "--load", "-q", "-t", image]);
+            if had {
+                d.args(["--cache-from", &format!("type=local,src={}", from.display())]);
+            }
+            let out =
+                d.args(["--cache-to", &format!("type=local,dest={},mode=max", to.display())]).arg(dir).stdin(Stdio::null()).output()?;
+            if !out.status.success() {
+                let err = String::from_utf8_lossy(&out.stderr).to_lowercase();
+                if ["cache", "buildx", "unknown flag"].iter().any(|w| err.contains(w)) {
+                    return Ok(Some(tail(&out.stderr)));
+                }
+                bail!("build failed: {}", tail(&out.stderr));
+            }
+            if let Err(e) = push_dir(&st.s3, bucket, &key, &to, &tmp) {
+                eprintln!("rekcod: build cache {bucket}/{key}: {e:#}");
+            }
+            Ok(None)
+        })();
+        let _ = std::fs::remove_dir_all(&work);
+        match r? {
+            None => return Ok(()),
+            Some(err) => eprintln!("rekcod: build cache unavailable, building without it: {err}"),
+        }
+    }
+    let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
+    let out = d.args(["build", "-q", "-t", image]).arg(dir).stdin(Stdio::null()).output()?;
+    if !out.status.success() {
+        bail!("build failed: {}", tail(&out.stderr));
+    }
+    Ok(())
+}
+
+/// An app with a bucket reaches RustFS through the sandbox's Mac/LAN block: its `IPv4:PORT`.
+pub fn storage_reach(endpoint: Option<&str>) -> Vec<String> {
+    let Some(auth) = endpoint.and_then(|e| e.strip_prefix("http://")) else { return vec![] };
+    let addrs = auth.trim_end_matches('/').to_socket_addrs().into_iter().flatten();
+    addrs.filter(|a| a.is_ipv4()).take(1).map(|a| a.to_string()).collect()
+}
+
+/// Node op: builds `git` in a new sandbox and runs it; returns `{sandbox, endpoint}`. With a
+/// release store, a cached release is loaded instead of cloned and built, and a new build
+/// is pushed (`pushed` says whether that worked).
 pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
     let app = a["app"].as_str().context("missing app")?;
     let release = a["release"].as_i64().context("missing release")?;
-    let dir = clone(paths, a["git"]["url"].as_str().context("missing git.url")?, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
-    // The commit's own rekcod.toml fills in whatever the deploy didn't set.
-    let toml = parse_toml(&std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default());
+    let store: Option<ReleaseStore> = a.get("store").filter(|s| s.is_object()).and_then(|s| serde_json::from_value(s.clone()).ok());
+    let stored = store.as_ref().filter(|s| s.cached).and_then(stored_toml);
+    let (dir, toml) = match &stored {
+        Some(t) => {
+            eprintln!(
+                "rekcod: {app} r{release}: loading {}/{}",
+                store.as_ref().map_or("", |s| s.bucket.as_str()),
+                store.as_ref().map_or("", |s| s.key.as_str())
+            );
+            let dir = paths.home.join("remote-ws").join(sandbox::new_id()?);
+            std::fs::create_dir_all(&dir)?;
+            (dir.canonicalize()?, t.clone())
+        }
+        None => {
+            let url = a["git"]["url"].as_str().context("missing git.url")?;
+            eprintln!("rekcod: {app} r{release}: cloning {url}");
+            let dir = clone(paths, url, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
+            // The commit's own rekcod.toml fills in whatever the deploy didn't set.
+            let toml = parse_toml(&std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default());
+            (dir, toml)
+        }
+    };
     let port = a["port"].as_u64().filter(|p| *p > 0).or_else(|| toml.get("app.port").and_then(|p| p.parse().ok())).unwrap_or(3000) as u16;
-    if !dir.join("Dockerfile").exists() {
+    if stored.is_none() && !dir.join("Dockerfile").exists() {
         let start = a["start"].as_str().or(toml.get("app.start").map(String::as_str));
         let start = start.ok_or_else(|| anyhow!("no Dockerfile and no start command in rekcod.toml"))?;
         std::fs::write(dir.join("Dockerfile"), generated_dockerfile(&dir, start)?)?;
@@ -328,16 +503,24 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         memory_gib: a["memory_gib"].as_u64().unwrap_or(1),
         allow_hosts: vec!["*".into()],
         ttl_secs: 0,
+        reach: storage_reach(a["env"]["S3_ENDPOINT"].as_str()),
         ..Default::default()
     };
     let meta = sandbox::create(paths, o)?;
+    let mut pushed = false;
     let result = (|| -> Result<Value> {
         let image = format!("rekcod-app-{app}:{release}");
-        let (mut d, _) = sandbox::docker_cmd(paths, &meta.id)?;
-        let out = d.args(["build", "-q", "-t", &image]).arg(&dir).stdin(Stdio::null()).output()?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            bail!("build failed: {}", err.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n"));
+        match (&stored, &store) {
+            (Some(_), Some(st)) => load_image(paths, &meta.id, &image, st)?,
+            _ => {
+                build_image(paths, &meta.id, &image, &dir, store.as_ref())?;
+                if let Some(st) = &store {
+                    match push_image(paths, &meta.id, &image, st, &toml) {
+                        Ok(()) => pushed = true,
+                        Err(e) => eprintln!("rekcod: {app} r{release}: push to {}: {e:#}", st.bucket),
+                    }
+                }
+            }
         }
         let hp = free_port()?;
         let (mut d, _) = sandbox::docker_cmd(paths, &meta.id)?;
@@ -360,7 +543,7 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         let ip = *NODE_IP.get().unwrap_or(&IpAddr::from([127, 0, 0, 1]));
         let ext = start_relay(ip, 0, hp)?;
         std::fs::write(sandbox::home(paths, &meta.id)?.join("instance.json"), json!({"hp": hp, "ext": ext}).to_string())?;
-        Ok(json!({"sandbox": meta.id, "endpoint": format!("{ip}:{ext}"), "health": toml.get("app.health")}))
+        Ok(json!({"sandbox": meta.id, "endpoint": format!("{ip}:{ext}"), "health": toml.get("app.health"), "pushed": pushed}))
     })();
     if result.is_err() {
         let _ = sandbox::rm(paths, std::slice::from_ref(&meta.id), false);
@@ -618,6 +801,7 @@ create table if not exists namespaces (name text primary key, created integer no
   max_apps integer not null default 20);
 create table if not exists members (ns text not null, who text not null, role text not null, primary key (ns, who));
 create table if not exists node_pools (node text not null, ns text not null, primary key (node, ns));
+create table if not exists bans (net text primary key, reason text not null default '', until integer, created integer not null);
 insert or ignore into namespaces (name, created, salt) values ('default', 0, randomblob(16));
 ";
 
@@ -634,6 +818,12 @@ const MIGRATIONS: &[&str] = &[
     "alter table jobs add column ns text not null default 'default'",
     "alter table schedules add column ns text not null default 'default'",
     "alter table audit add column ns text not null default 'default'",
+    // Per-app edge settings (docs/edge-http.md).
+    "alter table apps add column http text not null default '{}'",
+    // Per-app buckets (docs/rustfs.md); the secret is sealed like app secrets.
+    "alter table apps add column bucket integer not null default 0",
+    "alter table apps add column storage_key text",
+    "alter table apps add column storage_secret text",
 ];
 
 /// The controller's SQLite database. Queries use `?N` parameters; rows come back whole so
@@ -694,6 +884,8 @@ struct Controller {
     key: [u8; 32],
     /// Addresses that fetched `/routes` (edges) and when; nodes let them reach instances.
     edges: Mutex<HashMap<IpAddr, i64>>,
+    /// RustFS with root keys (`--storage`): app buckets, release images, backups.
+    storage: Option<crate::s3::S3>,
 }
 
 struct Caller {
@@ -757,7 +949,7 @@ fn short_name(key: &str) -> &str {
 
 impl Controller {
     fn new(db: Db, domain: String, drain_secs: u64, key: [u8; 32]) -> Controller {
-        Controller { db: Mutex::new(db), domain, drain_secs, busy: Default::default(), key, edges: Default::default() }
+        Controller { db: Mutex::new(db), domain, drain_secs, busy: Default::default(), key, edges: Default::default(), storage: None }
     }
 
     fn config(&self, key: &str) -> Result<Option<String>> {
@@ -957,8 +1149,13 @@ fn can_touch(who: &Caller, ns: &str, owner: &str) -> bool {
 fn watchdog(c: Arc<Controller>) {
     loop {
         std::thread::sleep(Duration::from_secs(5));
-        for (what, r) in [("idle", sleep_idle(&c)), ("recycle", recycle_due(&c)), ("jobs", poll_jobs(&c)), ("schedules", run_schedules(&c))]
-        {
+        for (what, r) in [
+            ("idle", sleep_idle(&c)),
+            ("recycle", recycle_due(&c)),
+            ("jobs", poll_jobs(&c)),
+            ("schedules", run_schedules(&c)),
+            ("backup", backup_due(&c)),
+        ] {
             if let Err(e) = r {
                 eprintln!("rekcod: watchdog {what}: {e:#}");
             }
@@ -1157,6 +1354,11 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             routes(c)
         }),
         // The edge's hosts with requests since its last report; idle stop counts from these.
+        ("POST", ["backups"]) => admin_only().and_then(|_| backup(c)),
+        ("GET", ["backups"]) => admin_only().and_then(|_| {
+            let s = c.storage_or_err()?;
+            Ok(json!(s.list(BACKUPS, "")?))
+        }),
         ("POST", ["routes", "activity"]) => admin_only().and_then(|_| {
             let suffix = format!(".{}", c.domain);
             let mut db = c.db.lock().unwrap();
@@ -1166,6 +1368,37 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 }
             }
             Ok(json!({}))
+        }),
+        ("GET", ["bans"]) => admin_only().and_then(|_| {
+            let rows = c.db.lock().unwrap().query(
+                "select net, reason, until, created from bans where until is null or until > ?1 order by created",
+                &[&now()],
+            )?;
+            Ok(json!(
+                rows.iter()
+                    .map(|r| json!({"net": r.get::<String>(0), "reason": r.get::<String>(1), "until": r.get::<Option<i64>>(2), "created": r.get::<i64>(3)}))
+                    .collect::<Vec<_>>()
+            ))
+        }),
+        // A ban for an address that's already banned replaces it (new reason, new expiry).
+        ("POST", ["bans"]) => admin_only().and_then(|_| {
+            let net = crate::edge::ban::normalize(body["net"].as_str().context("missing net")?)?;
+            let until = body["secs"].as_i64().filter(|s| *s > 0).map(|s| now() + s);
+            let reason = body["reason"].as_str().unwrap_or("");
+            let mut db = c.db.lock().unwrap();
+            db.execute("delete from bans where until is not null and until <= ?1", &[&now()])?;
+            db.execute("insert or replace into bans values (?1, ?2, ?3, ?4)", &[&net, &reason, &until, &now()])?;
+            drop(db);
+            c.audit("-", &who.name, "ban", &net, true);
+            Ok(json!({"banned": net, "until": until}))
+        }),
+        ("DELETE", ["bans"]) => admin_only().and_then(|_| {
+            let net = crate::edge::ban::normalize(body["net"].as_str().context("missing net")?)?;
+            if c.db.lock().unwrap().execute("delete from bans where net = ?1", &[&net])? == 0 {
+                bail!("{net} isn't banned");
+            }
+            c.audit("-", &who.name, "unban", &net, true);
+            Ok(json!({"unbanned": net}))
         }),
         (_, ["namespaces", ..]) => namespaces_route(c, &who, &req.method, &seg, &body),
         (_, ["jobs", ..]) | (_, ["schedules", ..]) => jobs_route(c, &who, &ns, &req.method, &seg, &body),
@@ -1423,7 +1656,7 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
 /// sleeping instances. A sleeping app has no endpoints; the edge wakes it.
 fn routes(c: &Controller) -> Result<Value> {
     let rows = c.db.lock().unwrap().query(
-        "select i.app, i.endpoint, a.public, i.state, a.ns from instances i join apps a on a.name = i.app
+        "select i.app, i.endpoint, a.public, i.state, a.ns, a.http from instances i join apps a on a.name = i.app
          where i.state in ('live', 'sleeping') order by i.app",
         &[],
     )?;
@@ -1434,6 +1667,7 @@ fn routes(c: &Controller) -> Result<Value> {
         route.app = short_name(&app).to_string();
         route.ns = r.get(4);
         route.public = r.get(2);
+        route.http = serde_json::from_str(&r.get::<String>(5)).unwrap_or_default();
         if r.get::<String>(3) == "live" {
             route.endpoints.push(r.get(1));
         }
@@ -1454,6 +1688,21 @@ pub struct Route {
     pub endpoints: Vec<String>,
     #[serde(default)]
     pub sleeping: bool,
+    #[serde(default)]
+    pub http: HttpSettings,
+}
+
+/// `[http]` in rekcod.toml: what the edge enforces for this app.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, PartialEq)]
+pub struct HttpSettings {
+    /// Per client IP, `20/s`, `600/m` or `1000/h`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst: Option<u32>,
+    /// Request body cap in bytes (100 MiB when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_body: Option<u64>,
 }
 
 /// Resolves a branch or tag to a commit with `git ls-remote`; a commit passes through.
@@ -1568,22 +1817,38 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
     for (k, v) in app.secrets.as_object().into_iter().flatten() {
         env[k] = v.clone();
     }
-    let spec = json!({
+    let bucket = bucket_env(c, app).inspect_err(|_| {
+        let _ = c.db.lock().unwrap().execute("update releases set state = 'failed' where app = ?1 and n = ?2", &[&app.name, &n]);
+    })?;
+    for (k, v) in bucket {
+        env[k] = json!(v);
+    }
+    let mut spec = json!({
         "app": app.name, "release": n, "port": app.port, "git": {"url": app.git_url, "ref": commit},
-        "cpus": app.cpus, "memory_gib": app.memory_gib, "env": env, "start": app.start,
+        "cpus": app.cpus, "memory_gib": app.memory_gib, "env": env, "start": app.start, "store": release_store(c, &app.name, &commit),
     });
-    let handles: Vec<_> = (0..app.instances.max(1) as usize)
-        .map(|i| {
-            let (node, url, sec) = nodes[i % nodes.len()].clone();
-            let spec = spec.clone();
-            std::thread::spawn(move || (node.clone(), call(&url, "POST", "/instances", Some(&sec), &spec)))
-        })
-        .collect();
+    let launch = |i: usize, spec: &Value| {
+        let (node, url, sec) = nodes[i % nodes.len()].clone();
+        let spec = spec.clone();
+        std::thread::spawn(move || (node.clone(), call(&url, "POST", "/instances", Some(&sec), &spec)))
+    };
+    let count = app.instances.max(1) as usize;
+    let mut results = Vec::new();
+    // Not stored yet: the first instance builds and pushes it, the rest load it.
+    if spec["store"]["cached"] == json!(false) && count > 1 {
+        let first = launch(0, &spec).join();
+        if matches!(&first, Ok((_, Ok(v))) if v["pushed"] == json!(true)) {
+            spec["store"]["cached"] = json!(true);
+        }
+        results.push(first);
+    }
+    let handles: Vec<_> = (results.len()..count).map(|i| launch(i, &spec)).collect();
+    results.extend(handles.into_iter().map(|h| h.join()));
     let mut started = Vec::new();
     let mut errors = Vec::new();
     let mut health = app.health.clone();
-    for h in handles {
-        match h.join() {
+    for h in results {
+        match h {
             Ok((node, Ok(v))) => {
                 if let Some(h) = v["health"].as_str().filter(|_| app.health == "/") {
                     health = h.to_string();
@@ -1656,6 +1921,9 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
 }
 
 fn destroy_app(c: &Arc<Controller>, name: &str) -> Result<Value> {
+    if let Err(e) = drop_bucket(c, name) {
+        eprintln!("rekcod: {name}: bucket: {e:#}");
+    }
     let rows = c.db.lock().unwrap().query("select node, sandbox from instances where app = ?1 and state <> 'removed'", &[&name])?;
     for r in rows {
         delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
@@ -1806,7 +2074,9 @@ fn recycle_due(c: &Arc<Controller>) -> Result<()> {
 
 fn app_status(c: &Controller, app: &App) -> Result<Value> {
     let mut db = c.db.lock().unwrap();
-    let row = db.query_one("select live_release, public, idle_stop, recycle, last_request from apps where name = ?1", &[&app.name])?;
+    let row =
+        db.query_one("select live_release, public, idle_stop, recycle, last_request, http from apps where name = ?1", &[&app.name])?;
+    let http: Value = serde_json::from_str(&row.get::<String>(5)).unwrap_or(json!({}));
     let (live, public): (Option<i32>, bool) = (row.get(0), row.get(1));
     let (idle_stop, recycle, last_request): (i64, i64, i64) = (row.get(2), row.get(3), row.get(4));
     let rel = db.query("select n, commit_sha, state, created from releases where app = ?1 order by n desc limit 20", &[&app.name])?;
@@ -1815,7 +2085,7 @@ fn app_status(c: &Controller, app: &App) -> Result<Value> {
     Ok(json!({
         "name": app.short, "ns": app.ns, "url": format!("http://{}.{}", app.name, c.domain), "git": {"url": app.git_url, "ref": app.git_ref},
         "port": app.port, "instances_wanted": app.instances, "live_release": live, "public": public,
-        "idle_stop_secs": idle_stop, "recycle_secs": recycle, "last_request": last_request,
+        "idle_stop_secs": idle_stop, "recycle_secs": recycle, "last_request": last_request, "http": http,
         "env": app.env, "secrets": app.secrets.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
         "releases": rel.iter().map(|r| json!({"n": r.get::<i32>(0), "commit": r.get::<String>(1), "state": r.get::<String>(2), "created": r.get::<i64>(3)})).collect::<Vec<_>>(),
         "instances": inst.iter().map(|r| json!({"release": r.get::<i32>(0), "sandbox": r.get::<String>(1), "node": r.get::<String>(2), "endpoint": r.get::<String>(3), "state": r.get::<String>(4)})).collect::<Vec<_>>(),
@@ -1848,6 +2118,16 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
     // None keeps the current setting; 0 is off.
     let idle_stop = b["idle_stop_secs"].as_i64();
     let recycle = b["recycle_secs"].as_i64();
+    let http = match b.get("http").filter(|h| h.is_object()) {
+        Some(h) => {
+            let s: HttpSettings = serde_json::from_value(h.clone()).context("http")?;
+            if let Some(r) = &s.rate {
+                crate::edge::limit::parse_rate(r)?;
+            }
+            Some(serde_json::to_string(&s)?)
+        }
+        None => None,
+    };
     let exists = c.db.lock().unwrap().query_opt("select owner, ns from apps where name = ?1", &[&name])?;
     if exists.is_none() {
         let (n, max): (i64, i64) = {
@@ -1871,16 +2151,20 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
         db.execute(
             "update apps set git_url = ?2, git_ref = ?3, port = ?4, instances = ?5, cpus = ?6, memory_gib = ?7, health = ?8,
              start = ?9, env = coalesce(?10, env), public = coalesce(?11, public), idle_stop = coalesce(?12, idle_stop),
-             recycle = coalesce(?13, recycle) where name = ?1",
-            &[&name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &public, &idle_stop, &recycle],
+             recycle = coalesce(?13, recycle), http = coalesce(?14, http) where name = ?1",
+            &[&name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &public, &idle_stop, &recycle, &http],
         )?;
     } else {
         db.execute(
             "insert into apps (name, owner, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, preview_of, created, public,
-               idle_stop, recycle, ns)
-             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, coalesce(?11, '{}'), ?12, ?13, coalesce(?14, false), coalesce(?15, 0), coalesce(?16, 0), ?17)",
-            &[&name, &who.name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &preview_of, &now(), &public, &idle_stop, &recycle, &ns],
+               idle_stop, recycle, ns, http)
+             values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, coalesce(?11, '{}'), ?12, ?13, coalesce(?14, false), coalesce(?15, 0), coalesce(?16, 0), ?17,
+               coalesce(?18, '{}'))",
+            &[&name, &who.name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &preview_of, &now(), &public, &idle_stop, &recycle, &ns, &http],
         )?;
+    }
+    if let Some(on) = b["bucket"].as_bool() {
+        db.execute("update apps set bucket = ?2 where name = ?1", &[&name, &on])?;
     }
     Ok(short)
 }
@@ -1991,8 +2275,32 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             let _g = lock.lock().unwrap();
             deploy(c, &app, Some(commit), &who.name)
         }
+        ("GET", ["apps", name, "storage"]) => app_storage(c, &load(name, Role::Viewer)?),
+        ("POST", ["apps", name, "storage", "url"]) => {
+            let app = load(name, Role::Member)?;
+            let key = b["key"].as_str().context("missing key")?;
+            let secs = b["secs"].as_u64().unwrap_or(3600);
+            let (s, bucket) = app_s3(c, &app)?;
+            Ok(json!({"url": s.presign(&bucket, key, secs)?, "expires_secs": secs}))
+        }
+        ("POST", ["apps", name, "storage", "rotate"]) => {
+            let app = load(name, Role::Member)?;
+            app_s3(c, &app)?;
+            c.db.lock().unwrap().execute("update apps set storage_secret = null where name = ?1", &[&app.name])?;
+            c.audit(ns, &who.name, "rotate storage key", name, true);
+            let Some(commit) = live_commit(c, &app.name)? else {
+                bucket_env(c, &app)?;
+                return Ok(json!({"rotated": name}));
+            };
+            deploy(c, &app, Some(commit), &who.name)
+        }
         ("DELETE", ["apps", name]) => {
             let app = load(name, Role::Member)?;
+            if !b["force"].as_bool().unwrap_or(false)
+                && let Some(n) = bucket_objects(c, &app.name)?.filter(|n| *n > 0)
+            {
+                bail!("{name}'s bucket {} has {n} object(s); destroy --force deletes them too", app_bucket(&app.name));
+            }
             c.audit(ns, &who.name, "destroy", name, true);
             destroy_app(c, &app.name)?;
             Ok(json!({"destroyed": name, "ns": ns}))
@@ -2243,6 +2551,8 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
                 "cpus": app.cpus, "memory_gib": app.memory_gib, "health": app.health, "start": app.start, "env": app.env,
                 // Previews sleep after 15 minutes unless the base app picks its own idle time.
                 "idle_stop_secs": if app.idle_stop > 0 { app.idle_stop } else { 900 },
+                // Its own empty bucket, deleted with the preview.
+                "bucket": c.db.lock().unwrap().query_one("select bucket from apps where name = ?1", &[&base])?.get::<bool>(0),
             });
             upsert_app(c, &ns, &who, &cfg, Some(&base))?;
             let v = deploy(c, &load_app(c, &ns, &preview, &who, Role::Member)?, Some(head.into()), "github")?;
@@ -2259,6 +2569,221 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
     }
 }
 
+// ------------------------------------------------------------- storage (docs/rustfs.md)
+
+const RELEASES: &str = "rekcod-releases";
+const CACHE: &str = "rekcod-cache";
+const BACKUPS: &str = "rekcod-backups";
+const KEEP_BACKUPS: usize = 48;
+
+/// `app-<app key>`; a hash of the key when that isn't a valid bucket name (too long).
+pub fn app_bucket(app: &str) -> String {
+    let b = format!("app-{app}");
+    if crate::s3::valid_bucket(&b) {
+        return b;
+    }
+    use sha2::Digest;
+    format!("app-{}", &hex(&sha2::Sha256::digest(app.as_bytes()))[..32])
+}
+
+impl Controller {
+    fn storage_or_err(&self) -> Result<&crate::s3::S3> {
+        self.storage.as_ref().context("the controller has no storage; start it with --storage URL (see `rekcod storage serve`)")
+    }
+
+    /// `--storage URL` with the keys in `creds` (saved to fleet.db), else what fleet.db has.
+    fn load_storage(&self, url: Option<&str>, creds: &Path) -> Result<Option<crate::s3::S3>> {
+        let s = match url {
+            Some(url) => {
+                let mut s = crate::storage::read_credentials(creds)?;
+                s.endpoint = url.trim_end_matches('/').to_string();
+                let sealed = self.seal("default", &s.secret_key)?;
+                let mut db = self.db.lock().unwrap();
+                for (k, v) in [("storage_url", &s.endpoint), ("storage_access_key", &s.access_key), ("storage_secret_key", &sealed)] {
+                    db.execute("insert or replace into config values (?1, ?2)", &[&k, v])?;
+                }
+                s
+            }
+            None => {
+                let (Some(endpoint), Some(access_key), Some(sealed)) =
+                    (self.config("storage_url")?, self.config("storage_access_key")?, self.config("storage_secret_key")?)
+                else {
+                    return Ok(None);
+                };
+                crate::s3::S3 { endpoint, access_key, secret_key: self.open_sealed("default", &sealed)? }
+            }
+        };
+        // RustFS may come up after the controller at boot; deploys retry this.
+        for b in [RELEASES, CACHE, BACKUPS] {
+            if let Err(e) = s.create_bucket(b) {
+                eprintln!("rekcod: storage {}: {e:#}", s.endpoint);
+                break;
+            }
+        }
+        eprintln!("rekcod: storage on {}", s.endpoint);
+        Ok(Some(s))
+    }
+}
+
+/// For a node: where the image of `app` at `commit` goes, and whether it's there already.
+fn release_store(c: &Controller, app: &str, commit: &str) -> Value {
+    let Some(s) = &c.storage else { return Value::Null };
+    let key = format!("{app}/{commit}");
+    let cached = s
+        .create_bucket(RELEASES)
+        .and_then(|_| s.create_bucket(CACHE))
+        .and_then(|_| s.exists(RELEASES, &format!("{key}.json")))
+        .unwrap_or(false);
+    json!({"s3": s, "bucket": RELEASES, "key": key, "cached": cached, "cache": CACHE})
+}
+
+/// The bucket and its key of an app with `bucket = true`, created on first use; the env its
+/// instances get. The user and policy are written on every deploy, so a RustFS that lost
+/// them (reset, restored) gets them back. Nothing for apps without a bucket.
+fn bucket_env(c: &Controller, app: &App) -> Result<Vec<(&'static str, String)>> {
+    let r = c.db.lock().unwrap().query_one("select bucket, storage_key, storage_secret from apps where name = ?1", &[&app.name])?;
+    let (on, key, sealed): (bool, Option<String>, Option<String>) = (r.get(0), r.get(1), r.get(2));
+    if !on {
+        return Ok(vec![]);
+    }
+    let s = c.storage_or_err().context("the app has [storage] bucket = true")?;
+    let bucket = app_bucket(&app.name);
+    s.create_bucket(&bucket)?;
+    let key = match key {
+        Some(k) => k,
+        None => format!("app-{}", sandbox::new_id()?),
+    };
+    let secret_key = match sealed {
+        Some(sec) => c.open_sealed(&app.ns, &sec)?,
+        None => secret()?,
+    };
+    s.add_bucket_user(&key, &secret_key, &bucket)?;
+    let sealed = c.seal(&app.ns, &secret_key)?;
+    c.db.lock().unwrap().execute("update apps set storage_key = ?2, storage_secret = ?3 where name = ?1", &[&app.name, &key, &sealed])?;
+    Ok(vec![
+        ("S3_ENDPOINT", s.endpoint.clone()),
+        ("S3_BUCKET", bucket),
+        ("AWS_ACCESS_KEY_ID", key),
+        ("AWS_SECRET_ACCESS_KEY", secret_key),
+        ("AWS_REGION", crate::s3::REGION.into()),
+    ])
+}
+
+/// The app's bucket with root keys, for the CLI's `app storage`.
+fn app_s3(c: &Controller, app: &App) -> Result<(crate::s3::S3, String)> {
+    let on: bool = c.db.lock().unwrap().query_one("select bucket from apps where name = ?1", &[&app.name])?.get(0);
+    if !on {
+        bail!("{} has no bucket; set `[storage] bucket = true` in rekcod.toml and deploy", app.short);
+    }
+    Ok((c.storage_or_err()?.clone(), app_bucket(&app.name)))
+}
+
+fn app_storage(c: &Controller, app: &App) -> Result<Value> {
+    let (s, bucket) = app_s3(c, app)?;
+    let key: Option<String> = c.db.lock().unwrap().query_one("select storage_key from apps where name = ?1", &[&app.name])?.get(0);
+    let objects = if s.bucket_exists(&bucket)? { s.list(&bucket, "")? } else { vec![] };
+    Ok(json!({
+        "app": app.short, "endpoint": s.endpoint, "bucket": bucket, "access_key": key,
+        "objects": objects.len(), "bytes": objects.iter().map(|o| o.size).sum::<u64>(), "list": objects,
+    }))
+}
+
+/// How many objects the app's bucket holds; None when it has no bucket.
+fn bucket_objects(c: &Controller, app: &str) -> Result<Option<usize>> {
+    let on: bool = c.db.lock().unwrap().query_one("select bucket from apps where name = ?1", &[&app])?.get(0);
+    let Some(s) = c.storage.as_ref().filter(|_| on) else { return Ok(None) };
+    let bucket = app_bucket(app);
+    if !s.bucket_exists(&bucket)? {
+        return Ok(Some(0));
+    }
+    Ok(Some(s.list(&bucket, "")?.len()))
+}
+
+/// Deletes the app's bucket (objects too), its user and its policy.
+fn drop_bucket(c: &Controller, app: &str) -> Result<()> {
+    let r = c.db.lock().unwrap().query_opt("select bucket, storage_key from apps where name = ?1", &[&app])?;
+    let Some(r) = r else { return Ok(()) };
+    let (on, key): (bool, Option<String>) = (r.get(0), r.get(1));
+    if !on && key.is_none() {
+        return Ok(());
+    }
+    let s = c.storage_or_err()?;
+    let bucket = app_bucket(app);
+    s.delete_bucket(&bucket, true)?;
+    if let Some(k) = key {
+        let _ = s.remove_user(&k);
+    }
+    let _ = s.remove_policy(&bucket);
+    Ok(())
+}
+
+/// Uploads `fleet.db` (a `VACUUM INTO` copy, so nothing stops) as `fleet-<UTC time>.db` and
+/// keeps the newest 48. `controller/secret-key` isn't in it: keep that somewhere else.
+fn backup(c: &Controller) -> Result<Value> {
+    let s = c.storage_or_err()?;
+    s.create_bucket(BACKUPS)?;
+    let tmp = std::env::temp_dir().join(format!("rekcod-fleet-{}.db", sandbox::new_id()?));
+    let path = tmp.display().to_string();
+    let r = (|| -> Result<Value> {
+        c.db.lock().unwrap().execute("vacuum into ?1", &[&path])?;
+        let key = format!("fleet-{}.db", crate::s3::amz_date(now() as u64));
+        s.put(BACKUPS, &key, crate::s3::Body::File(&tmp))?;
+        let mut all: Vec<String> = s.list(BACKUPS, "fleet-")?.into_iter().map(|o| o.key).collect();
+        all.sort();
+        let old = all.len().saturating_sub(KEEP_BACKUPS);
+        for k in &all[..old] {
+            s.delete(BACKUPS, k)?;
+        }
+        Ok(json!({"backup": key, "bucket": BACKUPS, "kept": all.len() - old}))
+    })();
+    let _ = std::fs::remove_file(&tmp);
+    r
+}
+
+/// Hourly. The attempt is recorded first, so a failing upload is retried in an hour, not
+/// every watchdog tick.
+fn backup_due(c: &Controller) -> Result<()> {
+    if c.storage.is_none() {
+        return Ok(());
+    }
+    let last: i64 = c.config("last_backup")?.and_then(|v| v.parse().ok()).unwrap_or(0);
+    if now() - last < 3600 {
+        return Ok(());
+    }
+    c.db.lock().unwrap().execute("insert or replace into config values ('last_backup', ?1)", &[&now().to_string()])?;
+    backup(c).map(|_| ())
+}
+
+/// `rekcod controller restore`: puts a backup in place of fleet.db (the old file is kept
+/// next to it). The controller must be stopped; it needs the same `controller/secret-key`.
+pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>, creds: Option<PathBuf>) -> Result<()> {
+    let s = crate::storage::read_credentials(&creds.unwrap_or_else(|| crate::storage::credentials_file(paths)))?;
+    let key = match key {
+        Some(k) => k.to_string(),
+        None => {
+            let mut all: Vec<String> = s.list(BACKUPS, "fleet-")?.into_iter().map(|o| o.key).collect();
+            all.sort();
+            all.pop().context("no backups in rekcod-backups")?
+        }
+    };
+    let db = db.unwrap_or_else(|| paths.home.join("controller").join("fleet.db"));
+    std::fs::create_dir_all(db.parent().context("no parent")?)?;
+    let tmp = db.with_extension("restoring");
+    s.get(BACKUPS, &key, &mut std::fs::File::create(&tmp)?)?;
+    Db::open(&tmp).context("the backup isn't a usable database")?;
+    if db.exists() {
+        let keep = db.with_extension(format!("db.before-restore-{}", now()));
+        std::fs::rename(&db, &keep)?;
+        eprintln!("rekcod: the old database is at {}", keep.display());
+    }
+    for ext in ["db-wal", "db-shm"] {
+        let _ = std::fs::remove_file(db.with_extension(ext));
+    }
+    std::fs::rename(&tmp, &db)?;
+    println!("restored {key} to {}; start the controller again", db.display());
+    Ok(())
+}
+
 mod subtle_eq {
     /// Constant-time comparison, so signature checks don't leak timing.
     pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
@@ -2272,6 +2797,10 @@ pub struct ControllerOptions {
     pub listen: String,
     pub domain: String,
     pub drain_secs: u64,
+    /// RustFS URL (`rekcod storage serve`); remembered in fleet.db once given.
+    pub storage: Option<String>,
+    /// Its root keys (default `~/.rekcod/storage/credentials.json`, written by `storage serve`).
+    pub storage_credentials: Option<PathBuf>,
 }
 
 /// `controller/secret-key`: 32 random bytes, created on first run. App secrets in fleet.db
@@ -2318,7 +2847,10 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
         std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o600))?;
     }
     let key = secret_key(&dir.join("secret-key"))?;
-    let c = Arc::new(Controller::new(db, o.domain, o.drain_secs, key));
+    let mut ctl = Controller::new(db, o.domain, o.drain_secs, key);
+    let creds = o.storage_credentials.unwrap_or_else(|| crate::storage::credentials_file(paths));
+    ctl.storage = ctl.load_storage(o.storage.as_deref(), &creds)?;
+    let c = Arc::new(ctl);
     c.seal_plain_secrets()?;
     let l = TcpListener::bind(&o.listen).with_context(|| format!("bind {}", o.listen))?;
     eprintln!("rekcod: controller on http://{} (tokens in {})", o.listen, dir.display());
@@ -2335,134 +2867,21 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     Ok(())
 }
 
-// ------------------------------------------------------------- edge
-
-/// The host part of a Host header, lowercased.
-pub fn host_of(head: &str) -> Option<String> {
-    head.lines()
-        .find_map(|l| l.split_once(':').filter(|(k, _)| k.trim().eq_ignore_ascii_case("host")).map(|(_, v)| v.trim().to_string()))
-        .map(|h| h.rsplit_once(':').filter(|(_, p)| p.bytes().all(|b| b.is_ascii_digit())).map_or(h.clone(), |(h, _)| h.to_string()))
-        .map(|h| h.to_ascii_lowercase())
-}
-
-/// `rekcod edge serve`: Host-based HTTP routing to live instances, refreshed every 2 s.
-/// `listen` routes every app (for the tailnet); `public_listen` only apps marked public
-/// (point cloudflared or another tunnel at it).
-pub fn edge_serve(paths: &Paths, remote_name: Option<&str>, listen: &str, public_listen: Option<&str>) -> Result<()> {
-    let r = remote(paths, remote_name)?;
-    let edge = Arc::new(Edge { remote: r.clone(), table: Default::default(), seen: Default::default() });
-    let e = edge.clone();
-    std::thread::spawn(move || {
-        loop {
-            let hosts: Vec<String> = e.seen.lock().unwrap().drain().collect();
-            if !hosts.is_empty()
-                && let Err(err) = call(&r.url, "POST", "/routes/activity", Some(&r.token), &json!({"hosts": hosts}))
-            {
-                eprintln!("rekcod: edge: activity: {err:#}");
-            }
-            match call(&r.url, "GET", "/routes", Some(&r.token), &Value::Null) {
-                Ok(v) => {
-                    let m: HashMap<String, Route> = serde_json::from_value(v).unwrap_or_default();
-                    *e.table.write().unwrap() = m;
-                }
-                Err(e) => eprintln!("rekcod: edge: routes: {e:#}"),
-            }
-            std::thread::sleep(Duration::from_secs(2));
-        }
-    });
-    let rr = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let accept = |l: TcpListener, public_only: bool, edge: Arc<Edge>, rr: Arc<std::sync::atomic::AtomicUsize>| {
-        for s in l.incoming().flatten() {
-            let (edge, rr) = (edge.clone(), rr.clone());
-            std::thread::spawn(move || {
-                let _ = edge_conn(s, &edge, &rr, public_only);
-            });
-        }
-    };
-    if let Some(p) = public_listen {
-        let l = TcpListener::bind(p).with_context(|| format!("bind {p}"))?;
-        eprintln!("rekcod: edge (public apps only) on http://{p}");
-        let (e, rr) = (edge.clone(), rr.clone());
-        std::thread::spawn(move || accept(l, true, e, rr));
-    }
-    let l = TcpListener::bind(listen).with_context(|| format!("bind {listen}"))?;
-    eprintln!("rekcod: edge (all apps) on http://{listen}");
-    accept(l, false, edge, rr);
-    Ok(())
-}
-
-struct Edge {
-    remote: Remote,
-    table: RwLock<HashMap<String, Route>>,
-    /// Hosts with requests since the last activity report.
-    seen: Mutex<std::collections::HashSet<String>>,
-}
-
-impl Edge {
-    /// Asks the controller to wake `app` and waits (up to its health timeout, or a rebuild).
-    fn wake(&self, host: &str, ns: &str, app: &str) -> Vec<String> {
-        let ns = if ns.is_empty() { "default" } else { ns };
-        match call(&self.remote.url, "POST", &format!("/ns/{ns}/apps/{app}/wake"), Some(&self.remote.token), &Value::Null) {
-            Ok(v) => {
-                let eps: Vec<String> =
-                    v["endpoints"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
-                if let Some(r) = self.table.write().unwrap().get_mut(host) {
-                    r.endpoints = eps.clone();
-                    r.sleeping = eps.is_empty();
-                }
-                eps
-            }
-            Err(e) => {
-                eprintln!("rekcod: edge: wake {app}: {e:#}");
-                vec![]
-            }
-        }
-    }
-}
-
-fn edge_conn(mut s: TcpStream, edge: &Edge, rr: &std::sync::atomic::AtomicUsize, public_only: bool) -> Result<()> {
-    let mut head = Vec::new();
-    let mut buf = [0u8; 4096];
-    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-        let n = s.read(&mut buf)?;
-        if n == 0 || head.len() > 64 << 10 {
-            return Ok(());
-        }
-        head.extend_from_slice(&buf[..n]);
-    }
-    let host = host_of(&String::from_utf8_lossy(&head)).unwrap_or_default();
-    // A private app looks like no app at all on the public listener.
-    let route = edge.table.read().unwrap().get(&host).filter(|r| r.public || !public_only).cloned();
-    let Some(route) = route else {
-        return respond(&mut s, 404, "text/plain", format!("no app at {host}\n").as_bytes());
-    };
-    edge.seen.lock().unwrap().insert(host.clone());
-    let mut eps = route.endpoints.clone();
-    if eps.is_empty() && !route.app.is_empty() {
-        // Asleep: hold this request while the controller starts it.
-        eps = edge.wake(&host, &route.ns, &route.app);
-    }
-    // Twice: the second pass after a wake, for an app that went to sleep since the last
-    // route refresh.
-    for pass in 0..2 {
-        let start = rr.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        for i in 0..eps.len() {
-            if let Ok(mut up) = TcpStream::connect(&eps[(start + i) % eps.len()]) {
-                up.write_all(&head)?;
-                pipe(s, up);
-                return Ok(());
-            }
-        }
-        if pass == 0 && !route.app.is_empty() {
-            eps = edge.wake(&host, &route.ns, &route.app);
-        }
-    }
-    respond(&mut s, 503, "text/plain", format!("{host} didn't come up\n").as_bytes())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn storage_names_and_reach() {
+        assert_eq!(app_bucket("web--team"), "app-web--team");
+        let long = app_bucket(&format!("{}--{}", "a".repeat(40), "b".repeat(20)));
+        assert!(crate::s3::valid_bucket(&long) && long.len() == 36, "{long}");
+        assert_eq!(storage_reach(Some("http://127.0.0.1:7711")), ["127.0.0.1:7711"]);
+        assert!(storage_reach(None).is_empty());
+        assert_eq!(crate::daemon::reach_arg("100.64.0.1:7710, 10.0.0.2:9000").unwrap(), "100.64.0.1:7710,10.0.0.2:9000");
+        // Nothing but addresses reaches the kernel command line.
+        assert!(crate::daemon::reach_arg("1.2.3.4:5 rekcod.sandbox=0").is_err());
+    }
 
     #[test]
     fn toml_and_dockerfile() {
@@ -2482,9 +2901,7 @@ mod tests {
     }
 
     #[test]
-    fn host_header_and_urls() {
-        assert_eq!(host_of("GET / HTTP/1.1\r\nHOST: Dash.Apps.Test:8080\r\n\r\n").as_deref(), Some("dash.apps.test"));
-        assert_eq!(host_of("GET / HTTP/1.1\r\n\r\n"), None);
+    fn urls() {
         assert_eq!(authority("http://10.0.0.2:7701/").unwrap(), "10.0.0.2:7701");
         assert!(authority("https://x").is_err());
         assert_eq!(percent_encode("/a b"), "%2Fa%20b");

@@ -19,6 +19,7 @@ const OWN: &[&str] = &[
     "node",
     "controller",
     "edge",
+    "storage",
     "app",
     "job",
     "macos",
@@ -87,6 +88,7 @@ mod tests {
             "import --from orbstack",
             "import --from=x redis:7",
             "snap save",
+            "storage up",
             "x npm run dev",
         ] {
             assert_eq!(route(s), None, "{s:?}");

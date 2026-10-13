@@ -6,11 +6,15 @@
 //! containers for a crash-consistent copy (databases recover through their
 //! WAL, as after a power cut). Restore stops them, copies back, and starts the
 //! same containers again. Copies run in one helper container with `cp -a`.
+//!
+//! `save --push` also uploads each snapshot volume as `snaps/<project>/<name>/<volume>.tar.zst`
+//! with a `manifest.json`; `restore --pull` recreates the snapshot from them first, so it
+//! comes back on another Mac (docs/rustfs.md).
 
 use std::collections::BTreeMap;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::paths::Paths;
@@ -167,7 +171,101 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
-pub fn save(paths: &Paths, explicit_project: Option<&str>, name: Option<&str>) -> Result<()> {
+fn snap_prefix(project: &str, name: &str) -> String {
+    format!("snaps/{project}/{name}")
+}
+
+/// Uploads each snapshot volume (tar, zstd) and a manifest with the source volumes' labels.
+fn push(paths: &Paths, project: &str, name: &str, pairs: &[(String, String)]) -> Result<()> {
+    let (s3, bucket) = crate::storage::snap_target(paths)?;
+    let prefix = snap_prefix(project, name);
+    let mut manifest = serde_json::Map::new();
+    for (v, snap) in pairs {
+        let tmp = paths.home.join(format!("snap-push-{}.tar.zst", std::process::id()));
+        let r = (|| -> Result<()> {
+            let mut cmd = crate::docker::any_cli(paths)?;
+            let mut child = cmd
+                .args(["-H", &paths.docker_host(), "run", "--rm", "--network", "none", "-v", &format!("{snap}:/v:ro"), HELPER_IMAGE])
+                .args(["tar", "-C", "/v", "-cf", "-", "."])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .spawn()?;
+            let mut enc = zstd::Encoder::new(std::fs::File::create(&tmp)?, 3)?;
+            std::io::copy(child.stdout.as_mut().context("no stdout")?, &mut enc)?;
+            enc.finish()?;
+            if !child.wait()?.success() {
+                bail!("tar of {snap} failed");
+            }
+            s3.put(&bucket, &format!("{prefix}/{v}.tar.zst"), crate::s3::Body::File(&tmp))
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        r?;
+        let labels = docker(paths, &["volume", "inspect", "--format", "{{json .Labels}}", v])?;
+        manifest.insert(v.clone(), serde_json::from_str(&labels).unwrap_or(serde_json::Value::Null));
+    }
+    let m = serde_json::json!({"project": project, "name": name, "created": now(), "volumes": manifest});
+    s3.put(&bucket, &format!("{prefix}/manifest.json"), crate::s3::Body::Bytes(m.to_string().as_bytes()))?;
+    println!("pushed `{name}` to {}/{bucket}/{prefix}", s3.endpoint);
+    Ok(())
+}
+
+/// Recreates snapshot `name` of `project` from what `push` uploaded, replacing a local one.
+fn pull(paths: &Paths, project: &str, name: &str) -> Result<()> {
+    let (s3, bucket) = crate::storage::snap_target(paths)?;
+    let prefix = snap_prefix(project, name);
+    let mut b = Vec::new();
+    s3.get(&bucket, &format!("{prefix}/manifest.json"), &mut b).with_context(|| format!("no pushed snapshot {prefix}"))?;
+    let m: serde_json::Value = serde_json::from_slice(&b)?;
+    let created = m["created"].as_u64().unwrap_or_else(now).to_string();
+    ensure_helper(paths)?;
+    for (v, labels) in m["volumes"].as_object().into_iter().flatten() {
+        let snap = snapshot_volume(project, name, v);
+        let _ = docker(paths, &["volume", "rm", "-f", &snap]);
+        docker(
+            paths,
+            &[
+                "volume",
+                "create",
+                "--label",
+                &format!("{SNAP}=1"),
+                "--label",
+                &format!("{SNAP_PROJECT}={project}"),
+                "--label",
+                &format!("{SNAP_NAME}={name}"),
+                "--label",
+                &format!("{SNAP_VOLUME}={v}"),
+                "--label",
+                &format!("{SNAP_CREATED}={created}"),
+                "--label",
+                &format!("{SNAP_LABELS}={labels}"),
+                &snap,
+            ],
+        )?;
+        let tmp = paths.home.join(format!("snap-pull-{}.tar.zst", std::process::id()));
+        let r = (|| -> Result<()> {
+            s3.get(&bucket, &format!("{prefix}/{v}.tar.zst"), &mut std::fs::File::create(&tmp)?)?;
+            let mut cmd = crate::docker::any_cli(paths)?;
+            let mut child = cmd
+                .args(["-H", &paths.docker_host(), "run", "--rm", "-i", "--network", "none", "-v", &format!("{snap}:/v"), HELPER_IMAGE])
+                .args(["tar", "-C", "/v", "-xf", "-"])
+                .stdin(std::process::Stdio::piped())
+                .spawn()?;
+            let mut stdin = child.stdin.take().context("no stdin")?;
+            zstd::stream::copy_decode(std::fs::File::open(&tmp)?, &mut stdin)?;
+            drop(stdin);
+            if !child.wait()?.success() {
+                bail!("untar into {snap} failed");
+            }
+            Ok(())
+        })();
+        let _ = std::fs::remove_file(&tmp);
+        r?;
+    }
+    eprintln!("rekcod: pulled `{name}` for {project} from {}/{bucket}/{prefix}", s3.endpoint);
+    Ok(())
+}
+
+pub fn save(paths: &Paths, explicit_project: Option<&str>, name: Option<&str>, push_it: bool) -> Result<()> {
     let t0 = Instant::now();
     let project = project(paths, explicit_project)?;
     let name = snap_name(name, true)?;
@@ -221,13 +319,19 @@ pub fn save(paths: &Paths, explicit_project: Option<&str>, name: Option<&str>) -
         running.len(),
         t0.elapsed().as_secs_f64()
     );
+    if push_it {
+        push(paths, &project, &name, &pairs)?;
+    }
     Ok(())
 }
 
-pub fn restore(paths: &Paths, explicit_project: Option<&str>, name: Option<&str>) -> Result<()> {
+pub fn restore(paths: &Paths, explicit_project: Option<&str>, name: Option<&str>, pull_it: bool) -> Result<()> {
     let t0 = Instant::now();
     let project = project(paths, explicit_project)?;
     let name = snap_name(name, false)?;
+    if pull_it {
+        pull(paths, &project, &name)?;
+    }
     let all = snapshots(paths, Some(&project))?;
     let Some(snap) = all.iter().find(|s| s.name == name) else {
         let have: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();

@@ -99,6 +99,8 @@ pub struct BootOptions {
     pub workspace: Option<PathBuf>,
     /// Agent sandbox: egress allowlist, comma-separated.
     pub allow: Option<String>,
+    /// Sandbox: `IP:PORT`s on the Mac or LAN it may still reach (RustFS for app instances).
+    pub reach: Vec<String>,
     /// Agent sandbox: power off after this many idle seconds.
     pub idle_ttl: Option<u64>,
 }
@@ -113,6 +115,7 @@ impl Default for BootOptions {
             guest_dir: None,
             workspace: None,
             allow: None,
+            reach: vec![],
             idle_ttl: None,
         }
     }
@@ -148,6 +151,9 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         }
         if let Some(allow) = &opts.allow {
             cmd.args(["--allow", allow]);
+        }
+        if !opts.reach.is_empty() {
+            cmd.args(["--reach", &opts.reach.join(",")]);
         }
         if let Some(ttl) = opts.idle_ttl {
             cmd.args(["--idle-ttl", &ttl.to_string()]);

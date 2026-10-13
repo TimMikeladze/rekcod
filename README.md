@@ -127,11 +127,16 @@ rekcod snap restore seeded     # stops them, copies back, starts them again
 rekcod snap save               # no name: the current git branch, for per-branch state
 rekcod snap ls [--all] [--json]
 rekcod snap rm seeded
+rekcod snap save seeded --push     # also uploads it to S3 (below)
+rekcod snap restore seeded --pull  # on another Mac: downloads it first, then restores
 ```
 
 The project is the compose project started from the current directory (`-p` to pick one).
 Snapshots are copies on the VM's disk (a 360 MB Postgres data dir saves or restores in
 under a second). A restore after `compose down -v` recreates the volumes so compose adopts them.
+`--push` and `--pull` use `$S3_ENDPOINT`/`$S3_BUCKET` with the `AWS_*` keys when they're set
+(an app's bucket, say), else `rekcod storage up`'s RustFS and bucket `rekcod-snaps`. Each
+volume goes up as `snaps/<project>/<name>/<volume>.tar.zst`.
 
 ### Run anything without a Dockerfile
 
@@ -245,7 +250,7 @@ docker ps                                 # runs on the spare too
 The spare needs Remote Login, Tailscale on your tailnet (or `--addr IP`) and automatic login,
 because the services are LaunchAgents and those only run in a logged-in session. rekcod doesn't
 have to be installed there: `host add` copies this binary to `~/.rekcod/bin/rekcod` if it's
-missing. Then it runs `rekcod spare setup` over SSH, which installs the controller, node and
+missing. Then it runs `rekcod spare setup` over SSH, which installs RustFS, the controller, node and
 edge as LaunchAgents on the Tailscale address and runs `sudo pmset -a sleep 0 disablesleep 1
 autorestart 1` so the lid can shut and a power cut doesn't leave it off (sudo asks for the
 spare's password; `--no-power` skips it). It adds the remote `spare` here, then starts the
@@ -311,11 +316,43 @@ http://127.0.0.1:8081}]` and the controller started with `--domain example.com`.
 app answers `no app at ...` there, the same as one that doesn't exist. PR previews are
 private.
 
-`--install` on `controller serve`, `node join`/`node serve` and `edge serve` runs each as a
-LaunchAgent; `rekcod controller|node|edge uninstall` removes it. [A spare Mac](#a-spare-mac)
-sets up all three with one command. Back up the controller by copying `fleet.db` (and its `-wal` file) while it's
-stopped, and keep a copy of `controller/secret-key` somewhere else: app secrets in
-`fleet.db` are sealed with it, and they can't be read without it.
+The edge routes every request on its own Host header, also on a keep-alive connection a
+tunnel shares between hostnames. Each client IP gets 50 requests/s across all apps (burst
+100; `--rate 20/s --burst 40` changes it), and over that it gets a `429` with `Retry-After`.
+An IP that racks up 100 of those in a minute is banned on every edge for 10 minutes. An app can
+set its own limit and body cap:
+
+```toml
+[http]
+rate = "20/s"        # per client IP, on top of the edge's; N/s, N/m or N/h
+burst = 40
+max_body = "10MB"    # 413 over this; 100 MiB by default
+```
+
+```sh
+rekcod edge ban 203.0.113.0/24 --reason scraper   # every edge, within 2 s
+rekcod edge ban 198.51.100.7 --for 1h
+rekcod edge bans
+rekcod edge unban 203.0.113.0/24
+```
+
+A banned IP's connection is closed before anything is read. Behind cloudflared every
+connection comes from the tunnel, so the edge takes the client IP from `CF-Connecting-IP` or
+`X-Forwarded-For` when the peer is a trusted proxy. That's loopback by default, which covers
+cloudflared on the same Mac. A banned visitor behind it gets a `403`, and the tunnel itself is
+never banned. If the tunnel runs elsewhere, use `--trusted-proxy 10.0.0.5` (repeatable; it
+replaces the loopback default). Headers from any other peer are ignored, so nobody can pick
+their own IP. Use `--proxy-protocol` when a TCP load balancer in front of `--public-listen`
+sends PROXY v2. Limits are counted per edge process. Keep-alive connections are
+closed after 90 s without a request, and `--access-log` prints a line per request. Design:
+[`docs/edge-http.md`](docs/edge-http.md).
+
+`--install` on `controller serve`, `node join`/`node serve`, `edge serve` and `storage serve`
+runs each as a LaunchAgent; `rekcod controller|node|edge|storage uninstall` removes it.
+[A spare Mac](#a-spare-mac) sets up all four with one command. With storage the controller
+backs `fleet.db` up every hour (below). Without it, copy `fleet.db` (and its `-wal` file)
+while it's stopped. Either way keep a copy of `controller/secret-key` somewhere else: app
+secrets in `fleet.db` are sealed with it, and they can't be read without it.
 
 ### Namespaces
 
@@ -393,6 +430,54 @@ Point a GitHub webhook (pull_request events, the secret in `controller/webhook-s
 `/webhooks/github` and each PR gets `<app>-pr-<n>`, deleted when it closes or after 7 days.
 `rekcod node` replaces `docker node` here; use `rekcod docker node` for swarm.
 
+### S3 storage
+
+RustFS is the fleet's bucket: one S3-compatible binary next to the controller. It gives apps
+somewhere to keep files, keeps built images so rollbacks don't rebuild, and holds the
+controller's backups.
+
+```sh
+rekcod storage serve --listen 100.x.y.z:7710 --install          # downloads RustFS 1.0.1, keys in ~/.rekcod/storage/credentials.json
+rekcod controller serve ... --storage http://100.x.y.z:7710     # remembered in fleet.db after the first start
+```
+
+An app asks for a bucket in `rekcod.toml`:
+
+```toml
+[storage]
+bucket = true
+```
+
+Its instances get `S3_ENDPOINT`, `S3_BUCKET` (`app-<name>`), `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY` and `AWS_REGION=us-east-1`. The key only works on that bucket. The
+endpoint takes path-style requests, so set `forcePathStyle: true` in the AWS SDK. PR
+previews get their own empty bucket, deleted with the preview.
+
+```sh
+rekcod app storage dash              # endpoint, bucket, key, object count and bytes
+rekcod app storage dash ls
+rekcod app storage dash url avatars/1.png --expires 10m   # presigned GET
+rekcod app storage dash rotate       # new secret; redeploys the live release with it
+rekcod app destroy dash              # asks before deleting a bucket that isn't empty (--force doesn't)
+```
+
+After each build the node uploads the image (`docker save | zstd`) to
+`rekcod-releases/<app>/<commit>.tar.zst`. Rollbacks, `recycle`, scale-ups, wakes that need a
+redeploy, and the second and later instances of a deploy load it instead of cloning and
+building. BuildKit's cache goes to `rekcod-cache/<app>.tar.zst`, so a build on another node
+starts warm. The controller uploads `fleet.db` to `rekcod-backups/` every hour and keeps 48:
+
+```sh
+rekcod controller backup             # one now
+rekcod controller backups
+rekcod controller restore            # stop the controller first; the latest unless you name one
+```
+
+For local development, `rekcod storage up` runs RustFS in the VM on a free port from 9000
+(it never touches whatever has 9000) and prints the env block; `storage env` prints it again
+and `storage down` stops it, keeping the data in volume `rekcod-storage`. Design and
+limitations: [`docs/rustfs.md`](docs/rustfs.md).
+
 ## File-sharing speed
 
 `bench/headroom.py`, 20.5k files (`#2` = warm repeat):
@@ -414,7 +499,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--disk` (default 256, sparse) grows the data disk, never shrinks it |
 | `rekcod stop [--no-switch]` | Graceful power-off, restore the previous context |
 | `rekcod status [--json]` | Versions, VM size, forwarded ports (and any that couldn't be bound), data-disk use in the VM and on the Mac, file-cache trips to macOS, warming in progress, the sandbox VM. `--json` is the scriptable form |
-| `rekcod snap save\|restore\|ls\|rm [NAME] [-p PROJECT]` | Volume snapshots of a compose project (above) |
+| `rekcod snap save\|restore\|ls\|rm [NAME] [-p PROJECT] [--push\|--pull]` | Volume snapshots of a compose project, optionally through S3 (above) |
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
 | `rekcod sandbox create\|exec\|shell\|cp\|fork\|diff\|apply\|ports\|log\|ls\|stop\|rm\|serve\|golden` | Agent sandboxes (above) |
 | `rekcod mcp` | MCP server on stdio for the sandbox commands |
@@ -423,16 +508,17 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod remote add\|ls\|rm` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`) |
 | `rekcod ns create\|ls\|quota\|member\|use\|rm` | Namespaces on the fleet (`--ns` on `sandbox`, `app` and `job`) |
 | `rekcod node join\|serve\|ls\|drain\|pool\|uninstall` | Run this Mac as a fleet node; list, drain or dedicate nodes |
-| `rekcod controller serve\|token\|limit\|uninstall` | The fleet controller; create user tokens, change their caps |
-| `rekcod edge serve\|uninstall` | HTTP ingress for apps |
-| `rekcod app deploy\|ls\|status\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|destroy` | Apps on the fleet |
+| `rekcod controller serve\|token\|limit\|backup\|backups\|restore\|uninstall` | The fleet controller; create user tokens, change their caps, back up `fleet.db` |
+| `rekcod storage serve\|uninstall\|up\|down\|env` | RustFS: the fleet's S3 bucket, or one in the local VM |
+| `rekcod edge serve\|ban\|unban\|bans\|uninstall` | HTTP ingress for apps; ban IPs and ranges on every edge |
+| `rekcod app deploy\|ls\|status\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet |
 | `rekcod job run\|ls\|logs\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every` |
 | `rekcod host add\|ls\|use\|rm\|forward` | Another Mac's rekcod as the docker engine, over SSH; `add --fleet` also provisions it as a fleet |
-| `rekcod spare setup\|uninstall` | This Mac as a headless one-machine fleet (controller, node, edge, no sleep) |
+| `rekcod spare setup\|uninstall` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, no sleep) |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
-| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete), agent sandboxes (shell, diff, apply, stop, delete), apps on the default remote (open, logs, roll back, wake, restart instances, destroy), jobs (output, cancel). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
+| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, local S3 storage (start, env, stop), containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete), agent sandboxes (shell, diff, apply, stop, delete), apps on the default remote (open, logs, roll back, wake, restart instances, destroy), jobs (output, cancel). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |
@@ -489,6 +575,7 @@ bench/sandbox.sh                             # agent sandbox create/fork/rm timi
 scripts/e2e-sandbox.sh                       # agent sandbox checks only; leaves the main VM alone
 scripts/e2e-macos.sh                         # macOS sandbox checks; needs a ready base image
 scripts/e2e-fleet.sh                         # controller, 2 nodes, edge, apps; own homes and database
+scripts/e2e-storage.sh                       # RustFS: app buckets, stored images, backups; own homes
 rekcod x cargo test -p rekcod-agent          # the guest agent's Linux-only tests
 python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge
 tests/stress/overflow.sh                     # FSEvents burst; see the script for the forced-drop mode

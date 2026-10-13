@@ -23,6 +23,8 @@ mod cli_fetch;
 #[cfg(target_os = "macos")]
 mod daemon;
 #[cfg(target_os = "macos")]
+mod edge;
+#[cfg(target_os = "macos")]
 mod fetch;
 #[cfg(target_os = "macos")]
 mod fleet;
@@ -33,6 +35,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod menubar;
 #[cfg(target_os = "macos")]
+mod s3;
+#[cfg(target_os = "macos")]
 mod sandbox;
 #[cfg(target_os = "macos")]
 mod sandbox_api;
@@ -42,6 +46,8 @@ mod service;
 mod snap;
 #[cfg(target_os = "macos")]
 mod spare;
+#[cfg(target_os = "macos")]
+mod storage;
 #[cfg(target_os = "macos")]
 mod syssock;
 #[cfg(target_os = "macos")]
@@ -162,6 +168,9 @@ enum Cmd {
     /// HTTP ingress for apps: routes <app>.<domain> to live instances.
     #[command(subcommand)]
     Edge(EdgeCmd),
+    /// S3 storage (RustFS): the fleet's bucket, or one in the local VM for development (docs/rustfs.md).
+    #[command(subcommand)]
+    Storage(StorageCmd),
     /// Apps hosted on the fleet: deploy, rollback, scale, env, logs.
     App {
         #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
@@ -235,6 +244,8 @@ enum Cmd {
         #[arg(long)]
         allow: Option<String>,
         #[arg(long)]
+        reach: Option<String>,
+        #[arg(long)]
         idle_ttl: Option<u64>,
     },
 }
@@ -247,12 +258,18 @@ enum Snap {
         /// Compose project (default: the one started from this directory).
         #[arg(short = 'p', long)]
         project: Option<String>,
+        /// Also upload it to $S3_ENDPOINT/$S3_BUCKET (AWS_* keys), else to `rekcod storage up`'s rekcod-snaps.
+        #[arg(long)]
+        push: bool,
     },
     /// Put the project's volumes back to a snapshot.
     Restore {
         name: Option<String>,
         #[arg(short = 'p', long)]
         project: Option<String>,
+        /// Download it first from where `save --push` put it.
+        #[arg(long)]
+        pull: bool,
     },
     /// List snapshots.
     Ls {
@@ -606,9 +623,33 @@ enum ControllerCmd {
         /// How long old instances keep running after a deploy.
         #[arg(long, default_value = "30s", value_parser = duration_secs)]
         drain: u64,
+        /// RustFS URL (`rekcod storage serve`) for app buckets, stored images and backups; remembered once given.
+        #[arg(long)]
+        storage: Option<String>,
+        /// RustFS root keys (default: ~/.rekcod/storage/credentials.json, which `storage serve` writes).
+        #[arg(long)]
+        storage_credentials: Option<std::path::PathBuf>,
     },
     /// Remove the controller's LaunchAgent.
     Uninstall,
+    /// Upload fleet.db to rekcod-backups now (it also does every hour); admin token.
+    Backup {
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Backups in rekcod-backups.
+    Backups {
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Replace fleet.db with a backup (the latest unless KEY); stop the controller first.
+    Restore {
+        key: Option<String>,
+        #[arg(long)]
+        db: Option<std::path::PathBuf>,
+        #[arg(long)]
+        storage_credentials: Option<std::path::PathBuf>,
+    },
     /// Change an existing token's cap (admin token); applies to every token with that name.
     Limit {
         name: String,
@@ -647,6 +688,21 @@ enum EdgeCmd {
         /// Routes only apps marked public; point cloudflared at it.
         #[arg(long)]
         public_listen: Option<String>,
+        /// The public listener's clients send a PROXY v2 header (a TCP load balancer in front).
+        #[arg(long, requires = "public_listen")]
+        proxy_protocol: bool,
+        /// Peers (IP or CIDR) whose CF-Connecting-IP / X-Forwarded-For name the client, such
+        /// as cloudflared. Repeat it; giving any replaces the loopback default.
+        #[arg(long = "trusted-proxy", value_name = "NET", default_values = ["127.0.0.0/8", "::1"])]
+        trusted_proxies: Vec<String>,
+        /// Requests per client IP across all apps (N/s, N/m or N/h).
+        #[arg(long, default_value = "50/s")]
+        rate: String,
+        #[arg(long, default_value_t = 100)]
+        burst: u32,
+        /// Print a line per request: client, method, host and path, status, time.
+        #[arg(long)]
+        access_log: bool,
         /// Run as a LaunchAgent: now, at login, and again if it exits.
         #[arg(long)]
         install: bool,
@@ -655,6 +711,27 @@ enum EdgeCmd {
     },
     /// Remove the edge's LaunchAgent.
     Uninstall,
+    /// Ban an IP or CIDR range on every edge (asks for one when left out).
+    Ban {
+        net: Option<String>,
+        /// Lift the ban after this long (default: never).
+        #[arg(long = "for", value_parser = duration_secs)]
+        duration: Option<u64>,
+        #[arg(long, default_value = "")]
+        reason: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    Unban {
+        net: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Banned addresses, with reason and expiry.
+    Bans {
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -724,9 +801,57 @@ enum AppCmd {
     Open {
         name: String,
     },
+    /// Delete the app; a non-empty bucket needs --force (asked for on a terminal).
     Destroy {
         name: String,
+        #[arg(long)]
+        force: bool,
     },
+    /// The app's bucket: endpoint, key and size; `ls`, `url KEY`, `rotate`.
+    Storage {
+        name: String,
+        #[command(subcommand)]
+        cmd: Option<AppStorageCmd>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AppStorageCmd {
+    /// Objects in the bucket.
+    Ls,
+    /// A presigned GET URL for KEY.
+    Url {
+        key: String,
+        /// How long it works.
+        #[arg(long, default_value = "1h", value_parser = duration_secs)]
+        expires: u64,
+    },
+    /// New secret key for the app; redeploys the live release with it.
+    Rotate,
+}
+
+#[derive(Subcommand)]
+enum StorageCmd {
+    /// Run RustFS on this Mac for the fleet (downloads the pinned release on first run).
+    Serve {
+        /// The address nodes and instances reach it on (the Tailscale IP).
+        #[arg(long, default_value = "127.0.0.1:7710")]
+        listen: String,
+        /// Data directory (default: ~/.rekcod/storage/data).
+        #[arg(long)]
+        data: Option<std::path::PathBuf>,
+        /// Run as a LaunchAgent: now, at login, and again if it exits.
+        #[arg(long)]
+        install: bool,
+    },
+    /// Remove its LaunchAgent (the data stays).
+    Uninstall,
+    /// RustFS in the local VM on a free port (from 9000); prints the env block.
+    Up,
+    /// Stop the local one (the data stays in volume rekcod-storage).
+    Down,
+    /// The local one's env block.
+    Env,
 }
 
 #[derive(Subcommand)]
@@ -845,7 +970,7 @@ enum HostCmd {
 
 #[derive(Subcommand)]
 enum SpareCmd {
-    /// Controller, node and edge as LaunchAgents on the Tailscale address; no sleep with the lid shut.
+    /// Controller, node, edge and RustFS as LaunchAgents on the Tailscale address; no sleep with the lid shut.
     Setup {
         /// Apps are served at <app>.<domain>.
         #[arg(long)]
@@ -857,7 +982,7 @@ enum SpareCmd {
         #[arg(long)]
         no_power: bool,
     },
-    /// Remove the controller, node and edge LaunchAgents.
+    /// Remove the controller, node, edge and RustFS LaunchAgents (data stays).
     Uninstall,
 }
 
@@ -895,8 +1020,8 @@ fn main() {
         Cmd::Start { cpus, memory, disk, no_switch } => cli::start(&paths, cpus, memory, disk, no_switch),
         Cmd::Stop { no_switch } => cli::stop(&paths, no_switch),
         Cmd::Status { json } => cli::status(&paths, json),
-        Cmd::Snap(Snap::Save { name, project }) => snap::save(&paths, project.as_deref(), name.as_deref()),
-        Cmd::Snap(Snap::Restore { name, project }) => snap::restore(&paths, project.as_deref(), name.as_deref()),
+        Cmd::Snap(Snap::Save { name, project, push }) => snap::save(&paths, project.as_deref(), name.as_deref(), push),
+        Cmd::Snap(Snap::Restore { name, project, pull }) => snap::restore(&paths, project.as_deref(), name.as_deref(), pull),
         Cmd::Snap(Snap::Ls { project, all, json }) => snap::list(&paths, project.as_deref(), all, json),
         Cmd::Snap(Snap::Rm { name, project }) => snap::remove(&paths, project.as_deref(), &name),
         Cmd::X { image, publish, env, no_autoports, sandbox, offline, secrets, keep, cmd } => {
@@ -940,9 +1065,21 @@ fn main() {
         Cmd::Controller(ControllerCmd::Serve { install: true, .. }) => {
             service::install(&paths, "controller", &service::args_without_install())
         }
-        Cmd::Controller(ControllerCmd::Serve { db, listen, domain, drain, .. }) => {
-            fleet::controller_serve(&paths, fleet::ControllerOptions { db, listen, domain, drain_secs: drain })
+        Cmd::Controller(ControllerCmd::Serve { db, listen, domain, drain, storage, storage_credentials, .. }) => fleet::controller_serve(
+            &paths,
+            fleet::ControllerOptions { db, listen, domain, drain_secs: drain, storage, storage_credentials },
+        ),
+        Cmd::Controller(ControllerCmd::Backup { remote }) => remote_call(&paths, &remote, "POST", "/backups", &serde_json::json!({})),
+        Cmd::Controller(ControllerCmd::Backups { remote }) => remote_call(&paths, &remote, "GET", "/backups", &serde_json::Value::Null),
+        Cmd::Controller(ControllerCmd::Restore { key, db, storage_credentials }) => {
+            fleet::controller_restore(&paths, db, key.as_deref(), storage_credentials)
         }
+        Cmd::Storage(StorageCmd::Serve { install: true, .. }) => service::install(&paths, "storage", &service::args_without_install()),
+        Cmd::Storage(StorageCmd::Serve { listen, data, .. }) => storage::serve(&paths, &listen, data.as_deref()),
+        Cmd::Storage(StorageCmd::Uninstall) => service::uninstall("storage"),
+        Cmd::Storage(StorageCmd::Up) => storage::up(&paths),
+        Cmd::Storage(StorageCmd::Down) => storage::down(&paths),
+        Cmd::Storage(StorageCmd::Env) => storage::env(&paths),
         Cmd::Controller(ControllerCmd::Limit { name, max_sandboxes, remote }) => {
             remote_call(&paths, &remote, "POST", &format!("/tokens/{name}"), &serde_json::json!({"max_sandboxes": max_sandboxes}))
         }
@@ -954,10 +1091,30 @@ fn main() {
             &serde_json::json!({"name": name, "max_sandboxes": max_sandboxes, "admin": admin, "ns": ns, "role": role}),
         ),
         Cmd::Edge(EdgeCmd::Serve { install: true, .. }) => service::install(&paths, "edge", &service::args_without_install()),
-        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, remote, .. }) => {
-            fleet::edge_serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), &listen, public_listen.as_deref())
+        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, proxy_protocol, trusted_proxies, rate, burst, access_log, remote, .. }) => {
+            let rate = edge::limit::parse_rate(&rate)?;
+            let trusted_proxies = trusted_proxies.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<_>>()?;
+            let settings = edge::Settings { rate, burst, access_log, trusted_proxies };
+            let o = edge::Options { listen, public_listen, proxy_protocol, settings };
+            edge::serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), o)
         }
         Cmd::Edge(EdgeCmd::Uninstall) => service::uninstall("edge"),
+        Cmd::Edge(EdgeCmd::Ban { net, duration, reason, remote }) => {
+            let net = match net {
+                Some(n) => n,
+                None => {
+                    use std::io::Write;
+                    eprint!("IP or CIDR range to ban: ");
+                    std::io::stderr().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    line.trim().to_string()
+                }
+            };
+            remote_call(&paths, &remote, "POST", "/bans", &serde_json::json!({"net": net, "secs": duration, "reason": reason}))
+        }
+        Cmd::Edge(EdgeCmd::Unban { net, remote }) => remote_call(&paths, &remote, "DELETE", "/bans", &serde_json::json!({"net": net})),
+        Cmd::Edge(EdgeCmd::Bans { remote }) => remote_call(&paths, &remote, "GET", "/bans", &serde_json::Value::Null),
         Cmd::App { remote, ns, cmd } => {
             set_ns(ns);
             run_app(&paths, &remote, cmd)
@@ -994,8 +1151,8 @@ fn main() {
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib, project, workspace, allow, idle_ttl } => {
-            daemon::run(paths, daemon::Options { cpus, memory_mib, project, workspace, allow, idle_ttl })
+        Cmd::Daemon { cpus, memory_mib, project, workspace, allow, reach, idle_ttl } => {
+            daemon::run(paths, daemon::Options { cpus, memory_mib, project, workspace, allow, reach, idle_ttl })
         }
     });
     if let Err(e) = result {
@@ -1040,6 +1197,21 @@ fn run_ns(paths: &paths::Paths, remote: &Option<String>, c: NsCmd) -> anyhow::Re
 
 /// Calls the remote controller and prints the JSON answer.
 #[cfg(target_os = "macos")]
+/// `[http]` from rekcod.toml; null (keep the app's current settings) when there's none.
+#[cfg(target_os = "macos")]
+fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Result<serde_json::Value> {
+    let (rate, burst, max_body) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"));
+    if rate.is_none() && burst.is_none() && max_body.is_none() {
+        return Ok(serde_json::Value::Null);
+    }
+    if let Some(r) = rate {
+        edge::limit::parse_rate(r)?;
+    }
+    let burst = burst.map(|b| b.parse::<u32>().map_err(|_| anyhow::anyhow!("rekcod.toml http.burst: {b} isn't a number"))).transpose()?;
+    let max_body = max_body.map(|m| edge::limit::parse_size(m)).transpose()?;
+    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body}))
+}
+
 fn remote_call(paths: &paths::Paths, remote: &Option<String>, method: &str, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
     let path = if fleet::is_scoped(path) { r.scoped(path) } else { path.to_string() };
@@ -1206,6 +1378,9 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 "public": if public { Some(true) } else if private { Some(false) } else { t.get("app.public").map(|v| v == "true") },
                 "idle_stop_secs": idle_stop.or(dur("resources.idle_stop")?),
                 "recycle_secs": recycle.or(dur("resources.recycle")?),
+                // Absent keeps the app's setting.
+                "bucket": t.get("storage.bucket").map(|v| v == "true"),
+                "http": http_settings(&t)?,
             });
             remote_call(paths, remote, "POST", "/apps", &body)
         }
@@ -1242,7 +1417,53 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
             println!("{url}");
             Ok(())
         }
-        AppCmd::Destroy { name } => remote_call(paths, remote, "DELETE", &format!("/apps/{name}"), &serde_json::Value::Null),
+        AppCmd::Destroy { name, force } => {
+            let path = format!("/apps/{name}");
+            match remote_call(paths, remote, "DELETE", &path, &json!({"force": force})) {
+                Err(e) if !force && e.to_string().contains("destroy --force") && std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+                    use std::io::Write;
+                    eprint!("{e:#}\nDelete the bucket and everything in it? [y/N] ");
+                    std::io::stderr().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().read_line(&mut line)?;
+                    if !line.trim().eq_ignore_ascii_case("y") {
+                        anyhow::bail!("kept {name}");
+                    }
+                    remote_call(paths, remote, "DELETE", &path, &json!({"force": true}))
+                }
+                r => r,
+            }
+        }
+        AppCmd::Storage { name, cmd: None } => {
+            let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+            let mut v = fleet::call(&r.url, "GET", &r.scoped(format!("/apps/{name}/storage")), Some(&r.token), &serde_json::Value::Null)?;
+            v.as_object_mut().map(|o| o.remove("list"));
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
+        AppCmd::Storage { name, cmd: Some(AppStorageCmd::Ls) } => {
+            let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+            let v = fleet::call(&r.url, "GET", &r.scoped(format!("/apps/{name}/storage")), Some(&r.token), &serde_json::Value::Null)?;
+            for o in v["list"].as_array().into_iter().flatten() {
+                println!("{:>12}  {}  {}", o["size"], o["modified"].as_str().unwrap_or(""), o["key"].as_str().unwrap_or(""));
+            }
+            Ok(())
+        }
+        AppCmd::Storage { name, cmd: Some(AppStorageCmd::Url { key, expires }) } => {
+            let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+            let v = fleet::call(
+                &r.url,
+                "POST",
+                &r.scoped(format!("/apps/{name}/storage/url")),
+                Some(&r.token),
+                &json!({"key": key, "secs": expires}),
+            )?;
+            println!("{}", v["url"].as_str().unwrap_or(""));
+            Ok(())
+        }
+        AppCmd::Storage { name, cmd: Some(AppStorageCmd::Rotate) } => {
+            remote_call(paths, remote, "POST", &format!("/apps/{name}/storage/rotate"), &json!({}))
+        }
     }
 }
 
@@ -1263,6 +1484,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
                 secrets,
                 ttl_secs: ttl,
                 os,
+                reach: vec![],
             };
             let m = sandbox::create(paths, o)?;
             if json {

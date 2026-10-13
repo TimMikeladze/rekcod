@@ -130,6 +130,7 @@ pub fn entries(m: &Model) -> Vec<Entry> {
     }
     let vm = actions::vm_actions(m.running, m.socket_installed);
     out.extend(vm.into_iter().map(Entry::Action));
+    out.extend(actions::storage_actions(m.running, &m.containers).into_iter().map(Entry::Action));
     let hosts = actions::host_actions(&m.hosts);
     if !m.hosts.all.is_empty() {
         let current = m.hosts.all.iter().find(|h| h.current).map(|h| h.name.as_str());
@@ -247,6 +248,10 @@ pub fn entries(m: &Model) -> Vec<Entry> {
     if m.namespaces.all.len() > 1 {
         let items = actions::namespace_actions(&m.namespaces).into_iter().map(Entry::Action).collect();
         out.push(Entry::Submenu(format!("Namespace: {}", m.namespaces.current), items));
+    }
+    if let Some(bans) = &m.bans {
+        let items = actions::ban_actions(bans).into_iter().map(Entry::Action).collect();
+        out.push(Entry::Submenu(format!("Edge bans ({})", bans.len()), items));
     }
     out
 }
@@ -574,6 +579,7 @@ mod tests {
             jobs: vec![crate::actions::tests::sample_job()],
             namespaces: crate::actions::tests::sample_namespaces(),
             hosts: crate::actions::tests::sample_hosts(),
+            bans: Some(crate::actions::tests::sample_bans()),
         };
         fn kinds(e: &[Entry], out: &mut Vec<crate::actions::Kind>) {
             for e in e {
@@ -587,6 +593,8 @@ mod tests {
         let mut seen = Vec::new();
         kinds(&entries(&model), &mut seen);
         kinds(&entries(&Model::default()), &mut seen);
+        let storage = Model { running: true, containers: vec![crate::actions::tests::sample_storage()], ..Model::default() };
+        kinds(&entries(&storage), &mut seen);
         for k in crate::actions::Kind::ALL {
             assert!(seen.contains(&k), "menu bar lacks {k:?}");
         }

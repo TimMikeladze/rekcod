@@ -47,12 +47,17 @@ pub enum Kind {
     NsUse,
     HostUse,
     HostForward,
+    EdgeBan,
+    EdgeUnban,
+    StorageUp,
+    StorageEnv,
+    StorageDown,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 33] = [
+    pub const ALL: [Kind; 38] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -86,6 +91,11 @@ impl Kind {
         Kind::NsUse,
         Kind::HostUse,
         Kind::HostForward,
+        Kind::EdgeBan,
+        Kind::EdgeUnban,
+        Kind::StorageUp,
+        Kind::StorageEnv,
+        Kind::StorageDown,
     ];
 }
 
@@ -175,7 +185,7 @@ pub fn shell_quote(s: &str) -> String {
 
 // ---------------------------------------------------------------- model
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Container {
     pub id: String,
     pub name: String,
@@ -234,6 +244,9 @@ pub struct Model {
     pub namespaces: Namespaces,
     /// Remote docker hosts (`rekcod host ls`).
     pub hosts: Hosts,
+    /// The edge's banned addresses (`rekcod edge bans`); `None` unless the default remote
+    /// has an admin token.
+    pub bans: Option<Vec<String>>,
 }
 
 /// Docker contexts `rekcod-*`, and whether the local `rekcod` context is in use.
@@ -275,6 +288,13 @@ fn remote_namespaces(paths: &Paths) -> Namespaces {
         .map(|v| v.as_array().into_iter().flatten().filter_map(|n| n["name"].as_str().map(String::from)).collect())
         .unwrap_or_default();
     Namespaces { current: r.ns(), all }
+}
+
+/// `GET /bans` on the default remote; `None` without an admin token.
+fn remote_bans(paths: &Paths) -> Option<Vec<String>> {
+    let r = crate::fleet::remote(paths, None).ok()?;
+    let v = crate::fleet::call(&r.url, "GET", "/bans", Some(&r.token), &Value::Null).ok()?;
+    Some(v.as_array().into_iter().flatten().filter_map(|b| b["net"].as_str().map(String::from)).collect())
 }
 
 /// `GET /jobs` on the default remote, newest first; empty without one.
@@ -370,7 +390,8 @@ impl Model {
         let snapshots =
             crate::cli::api_get(paths, &format!("/volumes?filters={filter}")).ok().map(|b| parse_snapshots(&b)).unwrap_or_default();
         let projects = projects(&containers, &raw, snapshots);
-        Model { running, status, containers, ports, projects, sandbox, socket_installed, sandboxes, apps, jobs, namespaces, hosts }
+        let bans = remote_bans(paths);
+        Model { running, status, containers, ports, projects, sandbox, socket_installed, sandboxes, apps, jobs, namespaces, hosts, bans }
     }
 }
 
@@ -492,6 +513,21 @@ pub fn vm_actions(running: bool, socket_installed: bool) -> Vec<Action> {
         out.push(Action::rekcod(Kind::SocketInstall, "Use rekcod for /var/run/docker.sock", &["socket", "install"]).interactive());
     }
     out
+}
+
+/// Local S3 (`rekcod storage up`), while the VM runs; `rekcod-storage` is its container.
+pub fn storage_actions(running: bool, containers: &[Container]) -> Vec<Action> {
+    if !running {
+        return vec![];
+    }
+    if containers.iter().any(|c| c.name == "rekcod-storage" && c.state == "running") {
+        vec![
+            Action::rekcod(Kind::StorageEnv, "S3 storage: show env", &["storage", "env"]).interactive(),
+            Action::rekcod(Kind::StorageDown, "Stop S3 storage (data kept)", &["storage", "down"]),
+        ]
+    } else {
+        vec![Action::rekcod(Kind::StorageUp, "Start S3 storage (RustFS)", &["storage", "up"]).interactive()]
+    }
 }
 
 pub fn container_actions(c: &Container) -> Vec<Action> {
@@ -630,6 +666,13 @@ pub fn host_actions(h: &Hosts) -> Vec<Action> {
     out
 }
 
+/// Ban an address on every edge, or lift a ban.
+pub fn ban_actions(nets: &[String]) -> Vec<Action> {
+    let mut out = vec![Action::rekcod(Kind::EdgeBan, "Ban an IP or range", &["edge", "ban"]).interactive()];
+    out.extend(nets.iter().map(|n| Action::rekcod(Kind::EdgeUnban, format!("Unban {n}"), &["edge", "unban", n])));
+    out
+}
+
 pub fn age(created: u64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     match now.saturating_sub(created) {
@@ -643,6 +686,11 @@ pub fn age(created: u64) -> String {
 #[cfg(test)]
 pub mod tests {
     use super::*;
+
+    /// `rekcod storage up`'s container, running.
+    pub fn sample_storage() -> Container {
+        Container { id: "c".into(), name: "rekcod-storage".into(), state: "running".into(), ..Default::default() }
+    }
 
     pub fn sample() -> (Vec<Container>, Vec<Port>, Vec<Project>) {
         let containers = parse_containers(
@@ -684,6 +732,10 @@ pub mod tests {
         Hosts { all: vec![h("spare", true), h("mini", false)], local_current: false }
     }
 
+    pub fn sample_bans() -> Vec<String> {
+        vec!["203.0.113.0/24".into()]
+    }
+
     pub fn sample_sandbox() -> AgentSandbox {
         AgentSandbox {
             id: "abcdefgh".into(),
@@ -711,6 +763,8 @@ pub mod tests {
         let (containers, ports, projects) = sample();
         let mut all = vm_actions(true, false);
         all.extend(vm_actions(false, true));
+        all.extend(storage_actions(true, &[]));
+        all.extend(storage_actions(true, &[sample_storage()]));
         for c in &containers {
             all.extend(container_actions(c));
         }
@@ -729,6 +783,7 @@ pub mod tests {
         all.extend(job_actions(&sample_job()));
         all.extend(namespace_actions(&sample_namespaces()));
         all.extend(host_actions(&sample_hosts()));
+        all.extend(ban_actions(&sample_bans()));
         all
     }
 

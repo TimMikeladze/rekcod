@@ -78,6 +78,8 @@ pub fn op(paths: &Paths, name: &str, args: &Value) -> Result<Value> {
                 secrets: strs(&args["secrets"]),
                 ttl_secs: args["ttl_secs"].as_u64().unwrap_or(d.ttl_secs),
                 os: args["os"].as_str().map(String::from),
+                // Never from the API: it opens a hole to the Mac and LAN.
+                reach: vec![],
             };
             serde_json::to_value(sandbox::create(paths, o)?)?
         }

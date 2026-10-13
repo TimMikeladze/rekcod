@@ -109,6 +109,15 @@ if grep -q 'rekcod.sandbox=1' /proc/cmdline; then
     done
     log "sandbox network: allowlist"
   fi
+  # rekcod.reach=IP:PORT,...: exact TCP holes through the block above (an app instance's
+  # RustFS, docs/rustfs.md). Inserted first, so they win over the REJECTs and the allowlist.
+  reach=$(tr ' ' '\n' </proc/cmdline | sed -n 's/^rekcod\.reach=//p')
+  for hp in $(echo "$reach" | tr ',' ' '); do
+    for chain in OUTPUT DOCKER-USER; do
+      iptables -I "$chain" 1 -o eth0 -d "${hp%:*}" -p tcp --dport "${hp##*:}" -j ACCEPT
+    done
+    log "sandbox network: may reach $hp"
+  done
   iptables -A DOCKER-USER -j RETURN
   ip6tables -A OUTPUT -o eth0 -j REJECT
   ip6tables -A FORWARD -o eth0 -j REJECT

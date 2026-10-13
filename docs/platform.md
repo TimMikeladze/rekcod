@@ -9,8 +9,8 @@ whole platform: all four tracks, what each one needs, and the gate before each s
 | # | Track | Runs on | Who uses it | Gate before starting |
 |---|---|---|---|---|
 | 1 | Local agent sandboxes | the user's Mac | one developer and their agents | **built** 2026-10-12; [`agent-sandboxes.md`](agent-sandboxes.md) |
-| 2 | Self-hosted fleet | a team's own Mac minis | a team's engineers and agents | legal read of SLA §2I |
-| 3 | App hosting (PaaS) | the fleet from track 2 | internal apps and preview environments | track 2 in use |
+| 2 | Self-hosted fleet | a team's own Mac minis | a team's engineers and agents | **built** 2026-10-12; legal read of SLA §2I before running it |
+| 3 | App hosting (PaaS) | the fleet from track 2 | internal apps and preview environments | **built** 2026-10-12 |
 | 4 | macOS guests: CI and computer-use | dedicated Macs | iOS/macOS builds, agents driving macOS apps | track 2 in use, plus a demand check |
 
 Each track reuses the one before it. Sandboxes are the unit: a deployed app is a sandbox
@@ -399,3 +399,38 @@ uploads, cross-repo mounts) are where a hand-rolled one breaks. If the spike goe
 - Is one `rekcod edge` enough, or does ingress need two for failover? For internal use, one with a
   fast restart is my default.
 - Can Tart's image format and tooling be reused for track 4, given its FSL licence?
+
+## Tracks 2 and 3 as built
+
+`crates/rekcod/src/fleet.rs`. `scripts/e2e-fleet.sh` runs a controller, two nodes and an
+edge on one Mac against a real Postgres and passes all 27 checks:
+- placement, drain, quota, ownership, apply refused remotely, a silent node marked lost;
+- deploy from a repo without a Dockerfile, zero non-200s across a redeploy (400 requests),
+  a broken release refused while the old one serves, rollback, env and secrets, logs;
+- a signed PR webhook creating and deleting a preview.
+
+Where the code differs from the spec above:
+
+- **No mTLS, no internal CA.** Controller, nodes, edge and CLI speak plain HTTP with
+  bearer tokens: user tokens in `tokens`, a node secret per node from the join token. Run it
+  on a private network or VPN, or put TLS in front. `rustls` + `rcgen` is the upgrade path.
+- **No registry, no S3.** Each instance clones the release's commit and builds it in its
+  own sandbox's BuildKit. A release is a commit, so rollback rebuilds it (the build cache in
+  that sandbox is gone, so it's a full build). Golden disks are copied to nodes by hand
+  (`cp -cR ~/.rekcod/golden/default <node home>/golden/`).
+- **`rekcod edge` is a hand-written HTTP/1.1 proxy on `std`**, not pingora, with no TLS and
+  no ACME. It routes on `Host`, round-robins live instances, and refreshes the table from
+  `GET /routes` every 2 s. No `forward_auth`.
+- **Instances are reached through a relay** on the node: the instance's port is published on
+  the Mac's loopback by the sandbox daemon, and the node forwards `<node ip>:<port>` to it.
+- **Secrets are stored in Postgres in plain text** (a separate column, shown by key only).
+  Encrypting them with a controller key is still to do.
+- **`app status` replaces `status APP`**, since `rekcod status` is taken. Apps are under
+  `rekcod app`; the spec's `rekcod deploy` is `rekcod app deploy`.
+- **Logs aren't kept for 7 days** on the node; `app logs` is the last 200 lines of each live
+  instance. No Prometheus metrics endpoint yet.
+- **Remote sandboxes aren't in the menu bar**; apps on the default remote are.
+- **Previews inherit the base app's env** (not its secrets) and are deleted after 7 days by
+  the controller's watchdog. The PR comment needs `GITHUB_TOKEN` in the controller's
+  environment and uses `curl`.
+- **Controller is macOS-only for now**, like the rest of the binary.

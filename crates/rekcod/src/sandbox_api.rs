@@ -61,8 +61,13 @@ pub fn op(paths: &Paths, name: &str, args: &Value) -> Result<Value> {
     Ok(match name {
         "create" => {
             let d = CreateOptions::default();
+            // Fleet nodes: the workspace arrives as a git ref, not a Mac directory.
+            let dir = match args["git"]["url"].as_str() {
+                Some(url) => Some(crate::fleet::clone(paths, url, args["git"]["ref"].as_str().unwrap_or("HEAD"))?),
+                None => args["dir"].as_str().map(PathBuf::from),
+            };
             let o = CreateOptions {
-                dir: args["dir"].as_str().map(PathBuf::from),
+                dir,
                 name: args["name"].as_str().map(String::from),
                 mount: args["mount"].as_bool().unwrap_or(false),
                 image: args["image"].as_str().map(String::from),
@@ -114,21 +119,23 @@ pub fn op(paths: &Paths, name: &str, args: &Value) -> Result<Value> {
             sandbox::rm(paths, &[id_of(args)?], false)?;
             json!({"removed": true})
         }
+        "deploy_instance" => crate::fleet::deploy_instance(paths, args)?,
+        "logs" => json!({"logs": crate::fleet::instance_logs(paths, &id_of(args)?)?}),
         _ => bail!("unknown operation {name}"),
     })
 }
 
 // ------------------------------------------------------------------- HTTP
 
-struct Request {
-    method: String,
-    path: String,
-    query: Vec<(String, String)>,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
+pub(crate) struct Request {
+    pub method: String,
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
 }
 
-fn percent_decode(s: &str) -> String {
+pub(crate) fn percent_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -147,7 +154,7 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into()
 }
 
-fn read_request(r: &mut impl BufRead) -> Result<Request> {
+pub(crate) fn read_request(r: &mut impl BufRead) -> Result<Request> {
     let mut line = String::new();
     r.read_line(&mut line)?;
     let mut parts = line.split_whitespace();
@@ -180,7 +187,7 @@ fn read_request(r: &mut impl BufRead) -> Result<Request> {
     Ok(Request { method, path: path.to_string(), query, headers, body })
 }
 
-fn respond(w: &mut impl Write, code: u16, ctype: &str, body: &[u8]) -> Result<()> {
+pub(crate) fn respond(w: &mut impl Write, code: u16, ctype: &str, body: &[u8]) -> Result<()> {
     let reason = match code {
         200 => "OK",
         201 => "Created",
@@ -220,6 +227,8 @@ pub fn route(method: &str, path: &str, query: &[(String, String)], body: &Value)
         ("GET", ["sandboxes", _, "diff"]) => "diff",
         ("POST", ["sandboxes", _, "apply"]) => "apply",
         ("POST", ["sandboxes", _, "stop"]) => "stop",
+        ("GET", ["sandboxes", _, "logs"]) => "logs",
+        ("POST", ["instances"]) => "deploy_instance",
         _ => return None,
     };
     Some((op, args))
@@ -268,7 +277,7 @@ fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Resu
     Ok(())
 }
 
-fn handle(paths: &Paths, stream: impl Read + Write + Send, token: Option<&str>) -> Result<()> {
+pub(crate) fn handle(paths: &Paths, stream: impl Read + Write + Send, token: Option<&str>) -> Result<()> {
     let mut r = BufReader::new(stream);
     let req = read_request(&mut r)?;
     let mut w = r.into_inner();

@@ -259,6 +259,19 @@ impl std::fmt::Display for NoSandbox {
 }
 impl std::error::Error for NoSandbox {}
 
+/// MiB left for sandboxes before running VMs pass 75% of the Mac's memory.
+pub fn free_mib(paths: &Paths) -> u64 {
+    let host = crate::cli::sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
+    let main = crate::cli::status_value(paths)["memory_mib"].as_u64().unwrap_or(0);
+    let sandboxes: u64 = all(paths).iter().filter(|s| s.running()).map(|s| s.meta.memory_gib << 10).sum();
+    (host * 3 / 4).saturating_sub(main + sandboxes)
+}
+
+/// The sandbox's state directory.
+pub fn home(paths: &Paths, id: &str) -> Result<PathBuf> {
+    Ok(find(paths, id)?.paths.home)
+}
+
 /// Refuses a sandbox that would push running VMs past 75% of the Mac's memory.
 fn check_capacity(paths: &Paths, gib: u64) -> Result<()> {
     let host = crate::cli::sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;

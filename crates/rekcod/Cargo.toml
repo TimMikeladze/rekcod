@@ -22,4 +22,7 @@ objc2-virtualization = { version = "0.3", features = ["dispatch2"] }
 block2 = "0.6"
 dispatch2 = "0.3"
 notify = "8"
+postgres = "0.19"
+hmac = "0.12"
+sha2 = "0.10"
 objc2-app-kit = "0.3"

@@ -25,6 +25,8 @@ mod daemon;
 #[cfg(target_os = "macos")]
 mod fetch;
 #[cfg(target_os = "macos")]
+mod fleet;
+#[cfg(target_os = "macos")]
 mod menubar;
 #[cfg(target_os = "macos")]
 mod sandbox;
@@ -119,10 +121,34 @@ enum Cmd {
         cmd: Vec<String>,
     },
     /// Throwaway VMs for AI agents: a full dockerd that sees a copy of one project (docs/agent-sandboxes.md).
-    #[command(subcommand)]
-    Sandbox(SandboxCmd),
+    Sandbox {
+        /// Run on a fleet controller (`rekcod remote add`); no NAME means the default remote.
+        #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+        #[command(subcommand)]
+        cmd: SandboxCmd,
+    },
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp,
+    /// Fleet controllers this CLI talks to (docs/platform.md).
+    #[command(subcommand)]
+    Remote(RemoteCmd),
+    /// Run this Mac as a fleet node.
+    #[command(subcommand)]
+    Node(NodeCmd),
+    /// The fleet controller: sandbox placement, apps, tokens (state in Postgres).
+    #[command(subcommand)]
+    Controller(ControllerCmd),
+    /// HTTP ingress for apps: routes <app>.<domain> to live instances.
+    #[command(subcommand)]
+    Edge(EdgeCmd),
+    /// Apps hosted on the fleet: deploy, rollback, scale, env, logs.
+    App {
+        #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+        #[command(subcommand)]
+        cmd: AppCmd,
+    },
     /// Copy images and named volumes from another docker context (desktop-linux, orbstack, ...).
     Import {
         /// Source docker context.
@@ -225,6 +251,12 @@ enum SandboxCmd {
     /// Create a sandbox for DIR (default: this directory) and print its ID.
     Create {
         dir: Option<std::path::PathBuf>,
+        /// --remote: repository to clone (default: this directory's origin).
+        #[arg(long)]
+        git: Option<String>,
+        /// --remote: branch, tag or commit (default: this directory's HEAD).
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
         #[arg(long)]
         name: Option<String>,
         /// Share the live directory instead of a copy (no diff/apply).
@@ -336,6 +368,145 @@ enum SandboxCmd {
 }
 
 #[derive(Subcommand)]
+enum RemoteCmd {
+    /// Add a controller; the first one added is the default.
+    Add {
+        name: String,
+        url: String,
+        #[arg(long)]
+        token: String,
+    },
+    Ls,
+    Rm {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum NodeCmd {
+    /// Register with a controller and start serving (saves ~/.rekcod/node.json).
+    Join {
+        controller: String,
+        join_token: String,
+        /// Address the node API listens on.
+        #[arg(long, default_value = "127.0.0.1:7701")]
+        listen: String,
+        /// URL the controller should use, when --listen is 0.0.0.0.
+        #[arg(long)]
+        advertise: Option<String>,
+    },
+    /// Serve again after a restart (uses ~/.rekcod/node.json).
+    Serve,
+    /// Nodes known to the controller (admin token).
+    Ls {
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Stop placing new sandboxes on a node (admin token).
+    Drain {
+        id: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ControllerCmd {
+    /// Run the controller.
+    Serve {
+        /// Postgres URL.
+        #[arg(long)]
+        db: String,
+        #[arg(long, default_value = "127.0.0.1:7700")]
+        listen: String,
+        /// Apps are served at <app>.<domain>.
+        #[arg(long, default_value = "apps.localhost")]
+        domain: String,
+        /// How long old instances keep running after a deploy.
+        #[arg(long, default_value = "30s", value_parser = duration_secs)]
+        drain: u64,
+    },
+    /// Create a user token (admin token).
+    Token {
+        name: String,
+        #[arg(long, default_value_t = 10)]
+        max_sandboxes: i64,
+        #[arg(long)]
+        admin: bool,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum EdgeCmd {
+    /// Serve HTTP ingress (needs an admin-token remote).
+    Serve {
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        listen: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AppCmd {
+    /// Deploy this repository's pushed HEAD (settings from rekcod.toml, flags win).
+    Deploy {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        port: Option<i64>,
+        #[arg(long)]
+        instances: Option<i64>,
+        #[arg(long)]
+        git: Option<String>,
+        #[arg(long = "ref")]
+        git_ref: Option<String>,
+    },
+    Ls,
+    /// Releases, instances, env and URL.
+    Status {
+        name: String,
+    },
+    /// Go back to an earlier good release (default: the one before the live one).
+    Rollback {
+        name: String,
+        release: Option<i64>,
+    },
+    Scale {
+        name: String,
+        instances: i64,
+    },
+    #[command(subcommand)]
+    Env(AppVars),
+    #[command(subcommand)]
+    Secret(AppVars),
+    Logs {
+        name: String,
+    },
+    Open {
+        name: String,
+    },
+    Destroy {
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum AppVars {
+    /// KEY=VALUE...; redeploys the live release.
+    Set {
+        name: String,
+        vars: Vec<String>,
+    },
+    Unset {
+        name: String,
+        keys: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
 enum Golden {
     /// Build (or rebuild) a golden disk.
     Build {
@@ -392,8 +563,35 @@ fn main() {
             let opts = xrun::Options { image, publish, env, no_autoports, sandbox, offline, secrets, keep };
             xrun::run(&paths, &cmd, opts).map(|_| ())
         }
-        Cmd::Sandbox(c) => run_sandbox(&paths, c),
+        Cmd::Sandbox { remote: Some(r), cmd } => run_remote_sandbox(&paths, &r, cmd),
+        Cmd::Sandbox { remote: None, cmd } => run_sandbox(&paths, cmd),
         Cmd::Mcp => sandbox_api::mcp(paths),
+        Cmd::Remote(RemoteCmd::Add { name, url, token }) => fleet::remote_add(&paths, &name, &url, &token),
+        Cmd::Remote(RemoteCmd::Ls) => {
+            fleet::remote_list(&paths);
+            Ok(())
+        }
+        Cmd::Remote(RemoteCmd::Rm { name }) => fleet::remote_rm(&paths, &name),
+        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise }) => {
+            fleet::node_join(&paths, &controller, &join_token, &listen, advertise.as_deref())
+        }
+        Cmd::Node(NodeCmd::Serve) => fleet::node_serve(&paths),
+        Cmd::Node(NodeCmd::Ls { remote }) => remote_call(&paths, &remote, "GET", "/nodes", &serde_json::Value::Null),
+        Cmd::Node(NodeCmd::Drain { id, remote }) => {
+            remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/drain"), &serde_json::json!({}))
+        }
+        Cmd::Controller(ControllerCmd::Serve { db, listen, domain, drain }) => {
+            fleet::controller_serve(&paths, fleet::ControllerOptions { db, listen, domain, drain_secs: drain })
+        }
+        Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, remote }) => remote_call(
+            &paths,
+            &remote,
+            "POST",
+            "/tokens",
+            &serde_json::json!({"name": name, "max_sandboxes": max_sandboxes, "admin": admin}),
+        ),
+        Cmd::Edge(EdgeCmd::Serve { listen, remote }) => fleet::edge_serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), &listen),
+        Cmd::App { remote, cmd } => run_app(&paths, &remote, cmd),
         Cmd::Import { from, names, images_only, volumes_only, force } => {
             cli::import(&paths, &from, &names, !volumes_only, !images_only, force)
         }
@@ -417,10 +615,150 @@ fn main() {
     }
 }
 
+/// Calls the remote controller and prints the JSON answer.
+#[cfg(target_os = "macos")]
+fn remote_call(paths: &paths::Paths, remote: &Option<String>, method: &str, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
+    let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+    let v = fleet::call(&r.url, method, path, Some(&r.token), body)?;
+    match v.get("logs").and_then(|l| l.as_str()).or(v.get("patch").and_then(|p| p.as_str())) {
+        Some(text) => print!("{text}"),
+        None => println!("{}", serde_json::to_string_pretty(&v)?),
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn run_remote_sandbox(paths: &paths::Paths, remote: &str, c: SandboxCmd) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use serde_json::json;
+    let remote = Some(remote.to_string());
+    let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+    match c {
+        SandboxCmd::Create { dir, git, git_ref, name, image, cpus, memory, allow_hosts, offline, ttl, json: as_json, .. } => {
+            let (origin, head) = match (&git, &git_ref) {
+                (Some(g), Some(r)) => (g.clone(), r.clone()),
+                _ => {
+                    let d = dir.map_or_else(std::env::current_dir, Ok)?;
+                    let (o, h) = fleet::git_origin(&d)?;
+                    (git.unwrap_or(o), git_ref.unwrap_or(h))
+                }
+            };
+            let body = json!({"git": {"url": origin, "ref": head}, "name": name, "image": image, "cpus": cpus,
+                              "memory_gib": memory, "allow_hosts": allow_hosts, "offline": offline, "ttl_secs": ttl});
+            let v = fleet::call(&r.url, "POST", "/sandboxes", Some(&r.token), &body)?;
+            if as_json {
+                println!("{}", serde_json::to_string_pretty(&v)?)
+            } else {
+                println!("{}", v["id"].as_str().unwrap_or(""))
+            }
+            Ok(())
+        }
+        SandboxCmd::Exec { id, workdir, env, timeout, cmd } => {
+            let body = serde_json::to_vec(&json!({"cmd": cmd, "workdir": workdir, "env": env, "timeout_secs": timeout}))?;
+            let (code, reader) = fleet::send(&r.url, "POST", &format!("/sandboxes/{id}/exec"), Some(&r.token), &body)?;
+            let mut exit = 1;
+            for line in std::io::BufRead::lines(reader) {
+                let v: serde_json::Value = serde_json::from_str(&line?).unwrap_or_default();
+                if code >= 400 {
+                    anyhow::bail!("{}", v["error"].as_str().unwrap_or("request failed"));
+                }
+                if let Some(o) = v["stdout"].as_str() {
+                    print!("{o}");
+                } else if let Some(e) = v["stderr"].as_str() {
+                    eprint!("{e}");
+                } else if let Some(x) = v["exit"].as_i64() {
+                    exit = x as i32;
+                }
+            }
+            std::process::exit(exit)
+        }
+        SandboxCmd::Ls { .. } => remote_call(paths, &remote, "GET", "/sandboxes", &serde_json::Value::Null),
+        SandboxCmd::Diff { id, .. } => remote_call(paths, &remote, "GET", &format!("/sandboxes/{id}/diff"), &serde_json::Value::Null),
+        SandboxCmd::Fork { id, name, .. } => remote_call(paths, &remote, "POST", &format!("/sandboxes/{id}/fork"), &json!({"name": name})),
+        SandboxCmd::Stop { id } => remote_call(paths, &remote, "POST", &format!("/sandboxes/{id}/stop"), &json!({})),
+        SandboxCmd::Rm { ids, .. } => {
+            for id in ids {
+                fleet::call(&r.url, "DELETE", &format!("/sandboxes/{id}"), Some(&r.token), &serde_json::Value::Null)
+                    .with_context(|| id.clone())?;
+                println!("{id}");
+            }
+            Ok(())
+        }
+        _ => anyhow::bail!("this command isn't offered with --remote (create, exec, ls, diff, fork, stop and rm are)"),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::Result<()> {
+    use serde_json::json;
+    let vars = |v: &[String]| -> serde_json::Value {
+        json!(v.iter().filter_map(|kv| kv.split_once('=')).map(|(k, v)| (k.to_string(), json!(v))).collect::<serde_json::Map<_, _>>())
+    };
+    match c {
+        AppCmd::Deploy { name, port, instances, git, git_ref } => {
+            let dir = std::env::current_dir()?;
+            let t = fleet::parse_toml(&std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default());
+            let (origin, head) = match (&git, &git_ref) {
+                (Some(g), Some(r)) => (g.clone(), r.clone()),
+                _ => {
+                    let (o, h) = fleet::git_origin(&dir)?;
+                    (git.unwrap_or(o), git_ref.unwrap_or(h))
+                }
+            };
+            let dir_name = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+            let num = |k: &str| t.get(k).and_then(|v| v.parse::<i64>().ok());
+            let env: serde_json::Map<String, serde_json::Value> =
+                t.iter().filter_map(|(k, v)| k.strip_prefix("env.").map(|k| (k.to_string(), json!(v)))).collect();
+            let body = json!({
+                "name": name.or(t.get("app.name").cloned()).unwrap_or(dir_name),
+                "git": {"url": origin, "ref": head},
+                "port": port.or(num("app.port")),
+                "instances": instances.or(num("resources.instances")).unwrap_or(1),
+                "cpus": num("resources.cpus").unwrap_or(1),
+                "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()).unwrap_or(1),
+                "health": t.get("app.health").cloned(),
+                "start": t.get("app.start"),
+                "env": env,
+            });
+            remote_call(paths, remote, "POST", "/apps", &body)
+        }
+        AppCmd::Ls => remote_call(paths, remote, "GET", "/apps", &serde_json::Value::Null),
+        AppCmd::Status { name } => remote_call(paths, remote, "GET", &format!("/apps/{name}"), &serde_json::Value::Null),
+        AppCmd::Rollback { name, release } => {
+            remote_call(paths, remote, "POST", &format!("/apps/{name}/rollback"), &json!({"release": release}))
+        }
+        AppCmd::Scale { name, instances } => {
+            remote_call(paths, remote, "POST", &format!("/apps/{name}/scale"), &json!({"instances": instances}))
+        }
+        AppCmd::Env(AppVars::Set { name, vars: v }) => {
+            remote_call(paths, remote, "POST", &format!("/apps/{name}/env"), &json!({"set": vars(&v)}))
+        }
+        AppCmd::Env(AppVars::Unset { name, keys }) => {
+            remote_call(paths, remote, "POST", &format!("/apps/{name}/env"), &json!({"unset": keys}))
+        }
+        AppCmd::Secret(AppVars::Set { name, vars: v }) => {
+            remote_call(paths, remote, "POST", &format!("/apps/{name}/secrets"), &json!({"set": vars(&v)}))
+        }
+        AppCmd::Secret(AppVars::Unset { name, keys }) => {
+            remote_call(paths, remote, "POST", &format!("/apps/{name}/secrets"), &json!({"unset": keys}))
+        }
+        AppCmd::Logs { name } => remote_call(paths, remote, "GET", &format!("/apps/{name}/logs"), &serde_json::Value::Null),
+        AppCmd::Open { name } => {
+            let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+            let v = fleet::call(&r.url, "GET", &format!("/apps/{name}"), Some(&r.token), &serde_json::Value::Null)?;
+            let url = v["url"].as_str().unwrap_or_default().to_string();
+            std::process::Command::new("/usr/bin/open").arg(&url).status()?;
+            println!("{url}");
+            Ok(())
+        }
+        AppCmd::Destroy { name } => remote_call(paths, remote, "DELETE", &format!("/apps/{name}"), &serde_json::Value::Null),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
     match c {
-        SandboxCmd::Create { dir, name, mount, image, golden, cpus, memory, allow_hosts, offline, secrets, ttl, json } => {
+        SandboxCmd::Create { dir, name, mount, image, golden, cpus, memory, allow_hosts, offline, secrets, ttl, json, .. } => {
             let o = sandbox::CreateOptions {
                 dir,
                 name,

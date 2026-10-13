@@ -33,12 +33,16 @@ pub enum Kind {
     SandboxApply,
     SandboxStop,
     SandboxRemove,
+    AppOpen,
+    AppLogs,
+    AppRollback,
+    AppDestroy,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 19] = [
+    pub const ALL: [Kind; 23] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -58,6 +62,10 @@ impl Kind {
         Kind::SandboxApply,
         Kind::SandboxStop,
         Kind::SandboxRemove,
+        Kind::AppOpen,
+        Kind::AppLogs,
+        Kind::AppRollback,
+        Kind::AppDestroy,
     ];
 }
 
@@ -198,6 +206,30 @@ pub struct Model {
     pub socket_installed: bool,
     /// Agent sandboxes (`rekcod sandbox ls`).
     pub sandboxes: Vec<AgentSandbox>,
+    /// Apps on the default fleet remote (`rekcod app ls`), if one is configured.
+    pub apps: Vec<RemoteApp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RemoteApp {
+    pub name: String,
+    pub url: String,
+    pub live_release: Option<i64>,
+}
+
+/// `GET /apps` on the default remote; empty without one or when it doesn't answer.
+fn remote_apps(paths: &Paths) -> Vec<RemoteApp> {
+    let Ok(r) = crate::fleet::remote(paths, None) else { return vec![] };
+    let Ok(v) = crate::fleet::call(&r.url, "GET", "/apps", Some(&r.token), &Value::Null) else { return vec![] };
+    v.as_array()
+        .into_iter()
+        .flatten()
+        .map(|a| RemoteApp {
+            name: a["name"].as_str().unwrap_or("").into(),
+            url: a["url"].as_str().unwrap_or("").into(),
+            live_release: a["live_release"].as_i64(),
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -225,12 +257,13 @@ impl Model {
                 running: l.running,
             })
             .collect();
+        let apps = remote_apps(paths);
         let mut ports = ports_of(&status, false);
         if let Some(sb) = &sandbox {
             ports.extend(ports_of(sb, true));
         }
         if !running {
-            return Model { running, status, ports, sandbox, socket_installed, sandboxes, ..Default::default() };
+            return Model { running, status, ports, sandbox, socket_installed, sandboxes, apps, ..Default::default() };
         }
         let raw = crate::cli::api_get(paths, "/containers/json?all=1").unwrap_or_default();
         let containers = parse_containers(&raw);
@@ -238,7 +271,7 @@ impl Model {
         let snapshots =
             crate::cli::api_get(paths, &format!("/volumes?filters={filter}")).ok().map(|b| parse_snapshots(&b)).unwrap_or_default();
         let projects = projects(&containers, &raw, snapshots);
-        Model { running, status, containers, ports, projects, sandbox, socket_installed, sandboxes }
+        Model { running, status, containers, ports, projects, sandbox, socket_installed, sandboxes, apps }
     }
 }
 
@@ -425,6 +458,25 @@ pub fn sandbox_actions(s: &AgentSandbox) -> Vec<Action> {
     out
 }
 
+pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
+    let n = a.name.as_str();
+    vec![
+        Action {
+            kind: Kind::AppOpen,
+            label: format!("Open {}", a.url),
+            run: Run::Open(a.url.clone()),
+            dir: None,
+            interactive: false,
+            confirm: None,
+        },
+        Action::rekcod(Kind::AppLogs, "Logs", &["app", "logs", n]).interactive(),
+        Action::rekcod(Kind::AppRollback, "Roll back to the previous release", &["app", "rollback", n])
+            .confirm(format!("Roll {n} back to its previous good release?")),
+        Action::rekcod(Kind::AppDestroy, "Destroy", &["app", "destroy", n])
+            .confirm(format!("Destroy {n}? Its instances and release history are deleted.")),
+    ]
+}
+
 pub fn age(created: u64) -> String {
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     match now.saturating_sub(created) {
@@ -462,6 +514,10 @@ pub mod tests {
         (containers, ports, projects)
     }
 
+    pub fn sample_app() -> RemoteApp {
+        RemoteApp { name: "dash".into(), url: "http://dash.apps.test".into(), live_release: Some(3) }
+    }
+
     pub fn sample_sandbox() -> AgentSandbox {
         AgentSandbox { id: "abcdefgh".into(), name: Some("try1".into()), project: "/Users/me/app".into(), copy: true, running: true }
     }
@@ -495,6 +551,7 @@ pub mod tests {
             }
         }
         all.extend(sandbox_actions(&sample_sandbox()));
+        all.extend(app_actions(&sample_app()));
         all
     }
 
@@ -511,7 +568,14 @@ pub mod tests {
         for a in reachable_kinds() {
             let destructive = matches!(
                 a.kind,
-                Kind::VmStop | Kind::ContainerRemove | Kind::SnapRestore | Kind::SnapRemove | Kind::SandboxApply | Kind::SandboxRemove
+                Kind::VmStop
+                    | Kind::ContainerRemove
+                    | Kind::SnapRestore
+                    | Kind::SnapRemove
+                    | Kind::SandboxApply
+                    | Kind::SandboxRemove
+                    | Kind::AppRollback
+                    | Kind::AppDestroy
             );
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }

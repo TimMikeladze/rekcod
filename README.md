@@ -211,6 +211,50 @@ curl --unix-socket ~/.rekcod/run/sandbox.sock -X POST localhost/sandboxes/$id/ex
 Measured on an M5 Pro (`bench/sandbox.sh`): create to first exec 1.3 s p50, fork 1.2 s,
 `rm` 0.12 s, 16 created at once all ready in 3.2 s, about 300 MB idle each.
 
+### Fleet and app hosting
+
+The same sandboxes can run on a team's own Macs, and apps can be deployed onto them. One
+controller (state in Postgres) places sandboxes and app instances on nodes; `rekcod edge`
+routes `<app>.<domain>` to them. Design: [`docs/platform.md`](docs/platform.md). Read the
+licence section there first: Apple's macOS licence restricts running it as a service.
+
+```sh
+# the controller (any Mac), prints where its admin and join tokens are
+rekcod controller serve --db postgres://... --listen 0.0.0.0:7700 --domain apps.example.com
+# each Mac
+rekcod node join http://controller:7700 "$(cat join-token)" --listen 0.0.0.0:7701 --advertise http://mac2:7701
+# you
+rekcod remote add team http://controller:7700 --token ADMIN_TOKEN
+rekcod controller token alice --max-sandboxes 5          # a user token
+rekcod sandbox --remote create                           # clones this repo's origin at HEAD on a node
+rekcod sandbox --remote exec ID -- npm test
+rekcod edge serve --listen 0.0.0.0:80                    # HTTP; put TLS in front of it
+rekcod app deploy                                        # this repo's pushed HEAD + rekcod.toml
+rekcod app rollback dash
+rekcod app env set dash NODE_ENV=production              # redeploys the live release
+```
+
+A deploy starts new instances (on different nodes when it can), waits for the health check,
+switches the route, then stops the old ones after `--drain` (30 s). A failed health check
+leaves the old release serving and prints the new instances' last log lines. A repo without
+a Dockerfile gets one from its version files and `rekcod.toml`:
+
+```toml
+[app]
+port = 8000
+start = "python3 app.py"
+health = "/healthz"
+[resources]
+instances = 2
+memory = "1GiB"
+[env]
+GREETING = "hi"
+```
+
+Point a GitHub webhook (pull_request events, the secret in `controller/webhook-secret`) at
+`/webhooks/github` and each PR gets `<app>-pr-<n>`, deleted when it closes or after 7 days.
+`rekcod node` replaces `docker node` here; use `rekcod docker node` for swarm.
+
 ## File-sharing speed
 
 `bench/headroom.py`, 20.5k files (`#2` = warm repeat):
@@ -236,10 +280,15 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
 | `rekcod sandbox create\|exec\|shell\|cp\|fork\|diff\|apply\|ports\|log\|ls\|stop\|rm\|serve\|golden` | Agent sandboxes (above) |
 | `rekcod mcp` | MCP server on stdio for the sandbox commands |
+| `rekcod remote add\|ls\|rm` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`) |
+| `rekcod node join\|serve\|ls\|drain` | Run this Mac as a fleet node; list or drain nodes |
+| `rekcod controller serve\|token` | The fleet controller; create user tokens |
+| `rekcod edge serve` | HTTP ingress for apps |
+| `rekcod app deploy\|ls\|status\|rollback\|scale\|env\|secret\|logs\|open\|destroy` | Apps on the fleet |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
-| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete), agent sandboxes (shell, diff, apply, stop, delete). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
+| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete), agent sandboxes (shell, diff, apply, stop, delete), apps on the default remote (open, logs, roll back, destroy). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |
@@ -291,6 +340,7 @@ bench/postgres.sh rekcod desktop-linux       # pgbench on a named volume, per do
 python3 bench/tcp_rtt.py --context rekcod    # 64-byte round trip through a published port
 bench/sandbox.sh                             # agent sandbox create/fork/rm timings, 16 at once
 scripts/e2e-sandbox.sh                       # agent sandbox checks only; leaves the main VM alone
+REKCOD_E2E_DB=postgres://... scripts/e2e-fleet.sh   # controller, 2 nodes, edge, apps; WIPES that database
 rekcod x cargo test -p rekcod-agent          # the guest agent's Linux-only tests
 python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge
 tests/stress/overflow.sh                     # FSEvents burst; see the script for the forced-drop mode

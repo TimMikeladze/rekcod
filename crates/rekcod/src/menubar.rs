@@ -206,6 +206,17 @@ pub fn entries(m: &Model) -> Vec<Entry> {
             .collect();
         out.push(Entry::Submenu(format!("Agent sandboxes ({})", m.sandboxes.len()), items));
     }
+    if !m.apps.is_empty() {
+        let items = m
+            .apps
+            .iter()
+            .map(|a| {
+                let rel = a.live_release.map(|r| format!("release {r}")).unwrap_or_else(|| "not deployed".into());
+                Entry::Submenu(format!("{}  ({rel})", a.name), actions::app_actions(a).into_iter().map(Entry::Action).collect())
+            })
+            .collect();
+        out.push(Entry::Submenu(format!("Apps ({})", m.apps.len()), items));
+    }
     out
 }
 
@@ -525,6 +536,7 @@ mod tests {
             sandbox: None,
             socket_installed: false,
             sandboxes: vec![crate::actions::tests::sample_sandbox()],
+            apps: vec![crate::actions::tests::sample_app()],
         };
         fn kinds(e: &[Entry], out: &mut Vec<crate::actions::Kind>) {
             for e in e {

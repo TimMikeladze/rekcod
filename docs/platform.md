@@ -436,6 +436,9 @@ Where the code differs from the spec above:
   the controller's watchdog. The PR comment needs `GITHUB_TOKEN` in the controller's
   environment and uses `curl`.
 - **Controller is macOS-only for now**, like the rest of the binary.
+- **Services are per-user LaunchAgents** (`--install`, `crates/rekcod/src/service.rs`), not
+  LaunchDaemons, so they start at login and the Mac needs automatic login. KeepAlive restarts
+  them if they exit. `scripts/spare-setup.sh` sets up a one-machine fleet on the tailnet.
 
 ## Track 4 as built
 

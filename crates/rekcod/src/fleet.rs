@@ -327,7 +327,7 @@ struct NodeConfig {
     advertise: String,
 }
 
-pub fn node_join(paths: &Paths, controller: &str, join_token: &str, listen: &str, advertise: Option<&str>) -> Result<()> {
+pub fn node_join(paths: &Paths, controller: &str, join_token: &str, listen: &str, advertise: Option<&str>, install: bool) -> Result<()> {
     let addr: SocketAddr = listen.parse().context("--listen takes IP:PORT")?;
     let advertise = match advertise {
         Some(a) => a.trim_end_matches('/').to_string(),
@@ -345,6 +345,9 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, listen: &str
     };
     std::fs::write(paths.home.join("node.json"), serde_json::to_vec_pretty(&cfg)?)?;
     eprintln!("rekcod: joined {} as node {}", cfg.controller, cfg.id);
+    if install {
+        return crate::service::install(paths, "node", &["node".into(), "serve".into()]);
+    }
     node_serve(paths)
 }
 

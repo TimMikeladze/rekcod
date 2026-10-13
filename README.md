@@ -262,6 +262,13 @@ http://127.0.0.1:8081}]` and the controller started with `--domain example.com`.
 app answers `no app at ...` there, the same as one that doesn't exist. PR previews are
 private.
 
+On a spare Mac, `scripts/spare-setup.sh --db postgres://... --domain example.com` does
+the first three commands as LaunchAgents on its Tailscale address (`--install` on
+`controller serve`, `node join`/`node serve` and `edge serve`): they start at login and
+restart if they exit, so turn on automatic login. The database URL goes to
+`~/.rekcod/controller/db-url` (0600), not into the plist. `rekcod controller|node|edge
+uninstall` removes them.
+
 A deploy starts new instances (on different nodes when it can), waits for the health check,
 switches the route, then stops the old ones after `--drain` (30 s). A failed health check
 leaves the old release serving and prints the new instances' last log lines. A repo without
@@ -311,9 +318,9 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod macos fetch\|install\|setup\|authorize\|ls\|rm` | macOS base images for `sandbox create --os macos` |
 | `rekcod sandbox screenshot\|input` | Screen and mouse/keyboard of a macOS sandbox |
 | `rekcod remote add\|ls\|rm` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`) |
-| `rekcod node join\|serve\|ls\|drain` | Run this Mac as a fleet node; list or drain nodes |
-| `rekcod controller serve\|token` | The fleet controller; create user tokens |
-| `rekcod edge serve` | HTTP ingress for apps |
+| `rekcod node join\|serve\|ls\|drain\|uninstall` | Run this Mac as a fleet node; list or drain nodes |
+| `rekcod controller serve\|token\|uninstall` | The fleet controller; create user tokens |
+| `rekcod edge serve\|uninstall` | HTTP ingress for apps |
 | `rekcod app deploy\|ls\|status\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|destroy` | Apps on the fleet |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |

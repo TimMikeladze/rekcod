@@ -35,6 +35,8 @@ mod sandbox;
 #[cfg(target_os = "macos")]
 mod sandbox_api;
 #[cfg(target_os = "macos")]
+mod service;
+#[cfg(target_os = "macos")]
 mod snap;
 #[cfg(target_os = "macos")]
 mod syssock;
@@ -454,9 +456,18 @@ enum NodeCmd {
         /// URL the controller should use, when --listen is 0.0.0.0.
         #[arg(long)]
         advertise: Option<String>,
+        /// After joining, run `node serve` as a LaunchAgent instead of in this terminal.
+        #[arg(long)]
+        install: bool,
     },
     /// Serve again after a restart (uses ~/.rekcod/node.json).
-    Serve,
+    Serve {
+        /// Run as a LaunchAgent: now, at login, and again if it exits.
+        #[arg(long)]
+        install: bool,
+    },
+    /// Remove the node's LaunchAgent.
+    Uninstall,
     /// Nodes known to the controller (admin token).
     Ls {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
@@ -474,9 +485,12 @@ enum NodeCmd {
 enum ControllerCmd {
     /// Run the controller.
     Serve {
-        /// Postgres URL.
+        /// Postgres URL (default: ~/.rekcod/controller/db-url, written by --install).
         #[arg(long)]
-        db: String,
+        db: Option<String>,
+        /// Run as a LaunchAgent: now, at login, and again if it exits.
+        #[arg(long)]
+        install: bool,
         #[arg(long, default_value = "127.0.0.1:7700")]
         listen: String,
         /// Apps are served at <app>.<domain>.
@@ -486,6 +500,8 @@ enum ControllerCmd {
         #[arg(long, default_value = "30s", value_parser = duration_secs)]
         drain: u64,
     },
+    /// Remove the controller's LaunchAgent.
+    Uninstall,
     /// Create a user token (admin token).
     Token {
         name: String,
@@ -508,9 +524,14 @@ enum EdgeCmd {
         /// Routes only apps marked public; point cloudflared at it.
         #[arg(long)]
         public_listen: Option<String>,
+        /// Run as a LaunchAgent: now, at login, and again if it exits.
+        #[arg(long)]
+        install: bool,
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
+    /// Remove the edge's LaunchAgent.
+    Uninstall,
 }
 
 #[derive(Subcommand)]
@@ -657,16 +678,35 @@ fn main() {
             Ok(())
         }
         Cmd::Remote(RemoteCmd::Rm { name }) => fleet::remote_rm(&paths, &name),
-        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise }) => {
-            fleet::node_join(&paths, &controller, &join_token, &listen, advertise.as_deref())
+        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install }) => {
+            fleet::node_join(&paths, &controller, &join_token, &listen, advertise.as_deref(), install)
         }
-        Cmd::Node(NodeCmd::Serve) => fleet::node_serve(&paths),
+        Cmd::Node(NodeCmd::Serve { install: true }) => service::install(&paths, "node", &["node".into(), "serve".into()]),
+        Cmd::Node(NodeCmd::Serve { install: false }) => fleet::node_serve(&paths),
+        Cmd::Node(NodeCmd::Uninstall) => service::uninstall("node"),
+        Cmd::Controller(ControllerCmd::Uninstall) => service::uninstall("controller"),
         Cmd::Node(NodeCmd::Ls { remote }) => remote_call(&paths, &remote, "GET", "/nodes", &serde_json::Value::Null),
         Cmd::Node(NodeCmd::Drain { id, remote }) => {
             remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/drain"), &serde_json::json!({}))
         }
-        Cmd::Controller(ControllerCmd::Serve { db, listen, domain, drain }) => {
-            fleet::controller_serve(&paths, fleet::ControllerOptions { db, listen, domain, drain_secs: drain })
+        Cmd::Controller(ControllerCmd::Serve { db, install, listen, domain, drain }) => {
+            let file = paths.home.join("controller/db-url");
+            if install {
+                if let Some(db) = &db {
+                    std::fs::create_dir_all(paths.home.join("controller"))?;
+                    std::fs::write(&file, db)?;
+                    std::fs::set_permissions(&file, std::os::unix::fs::PermissionsExt::from_mode(0o600))?;
+                }
+                service::install(&paths, "controller", &service::args_without_install())
+            } else {
+                let db = match db {
+                    Some(d) => d,
+                    None => std::fs::read_to_string(&file)
+                        .map(|s| s.trim().to_string())
+                        .map_err(|_| anyhow::anyhow!("no --db and no {}", file.display()))?,
+                };
+                fleet::controller_serve(&paths, fleet::ControllerOptions { db, listen, domain, drain_secs: drain })
+            }
         }
         Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, remote }) => remote_call(
             &paths,
@@ -675,9 +715,11 @@ fn main() {
             "/tokens",
             &serde_json::json!({"name": name, "max_sandboxes": max_sandboxes, "admin": admin}),
         ),
-        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, remote }) => {
+        Cmd::Edge(EdgeCmd::Serve { install: true, .. }) => service::install(&paths, "edge", &service::args_without_install()),
+        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, remote, .. }) => {
             fleet::edge_serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), &listen, public_listen.as_deref())
         }
+        Cmd::Edge(EdgeCmd::Uninstall) => service::uninstall("edge"),
         Cmd::App { remote, cmd } => run_app(&paths, &remote, cmd),
         Cmd::Import { from, names, images_only, volumes_only, force } => {
             cli::import(&paths, &from, &names, !volumes_only, !images_only, force)

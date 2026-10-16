@@ -26,26 +26,38 @@ pub struct Ca {
     key: rcgen::KeyPair,
 }
 
-fn ca_params() -> Result<rcgen::CertificateParams> {
+fn ca_params(common_name: &str) -> Result<rcgen::CertificateParams> {
     let mut p = rcgen::CertificateParams::new(Vec::<String>::new())?;
     p.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    p.distinguished_name.push(rcgen::DnType::CommonName, "rekcod fleet CA");
+    p.distinguished_name.push(rcgen::DnType::CommonName, common_name);
     p.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign, rcgen::KeyUsagePurpose::CrlSign];
     p.not_before = rcgen::date_time_ymd(2025, 1, 1);
     p.not_after = rcgen::date_time_ymd(2045, 1, 1);
     Ok(p)
 }
 
-/// Loads `dir/ca.pem` and `dir/ca.key`, making them on first use.
+/// Loads `dir/ca.pem` and `dir/ca.key`, making them on first use. This CA signs only the
+/// controller's own certificate; it's what CLIs and edges trust.
 pub fn ensure_ca(dir: &Path) -> Result<Ca> {
-    let (pem_path, key_path) = (dir.join("ca.pem"), dir.join("ca.key"));
+    ensure_named(dir, "ca", "rekcod fleet CA")
+}
+
+/// `dir/node-ca.pem`: signs node certificates, and only the controller trusts it. A node
+/// (anyone with the join token, before approval) gets a certificate from this one, so it can
+/// never pass for the controller to a CLI or an edge.
+pub fn ensure_node_ca(dir: &Path) -> Result<Ca> {
+    ensure_named(dir, "node-ca", "rekcod node CA")
+}
+
+fn ensure_named(dir: &Path, name: &str, common_name: &str) -> Result<Ca> {
+    let (pem_path, key_path) = (dir.join(format!("{name}.pem")), dir.join(format!("{name}.key")));
     if let (Ok(pem), Ok(key)) = (std::fs::read_to_string(&pem_path), std::fs::read_to_string(&key_path)) {
-        let key = rcgen::KeyPair::from_pem(&key).context("controller/ca.key")?;
-        return Ok(Ca { pem, params: ca_params()?, key });
+        let key = rcgen::KeyPair::from_pem(&key).with_context(|| format!("controller/{name}.key"))?;
+        return Ok(Ca { pem, params: ca_params(common_name)?, key });
     }
     let key = rcgen::KeyPair::generate()?;
-    let params = ca_params()?;
-    let pem = ca_params()?.self_signed(&key)?.pem();
+    let params = ca_params(common_name)?;
+    let pem = ca_params(common_name)?.self_signed(&key)?.pem();
     crate::paths::write_private(&key_path, key.serialize_pem().as_bytes())?;
     std::fs::write(&pem_path, &pem)?;
     Ok(Ca { pem, params, key })

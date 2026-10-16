@@ -1265,9 +1265,13 @@ struct Controller {
     /// One lock per namespace, held from a quota check until what it allowed is recorded,
     /// so creates running at once can't all pass the same check.
     quotas: Mutex<HashMap<String, Arc<Mutex<()>>>>,
-    /// The fleet CA (https controllers): issues node certificates; `/ca.pem` serves it.
+    /// The fleet CA (https controllers): signs the controller's certificate; `/ca.pem` serves it.
     ca: Option<crate::tls::Ca>,
     ca_pem: Option<String>,
+    /// Signs node certificates; only this controller trusts it.
+    node_ca: Option<crate::tls::Ca>,
+    /// Names in the controller's own certificate, never issued to a node.
+    own_names: Vec<String>,
 }
 
 struct Caller {
@@ -1366,6 +1370,8 @@ impl Controller {
             quotas: Default::default(),
             ca: None,
             ca_pem: None,
+            node_ca: None,
+            own_names: vec![],
         }
     }
 
@@ -1479,11 +1485,12 @@ impl Controller {
     /// The node holding sandbox `id` in `ns`, if `who` may use it.
     fn sandbox_node(&self, ns: &str, id: &str, who: &Caller, need: Role) -> Result<(String, String, String)> {
         self.allow(who, ns, need).map_err(|_| anyhow!(sandbox::NoSandbox(id.into())))?;
-        let r = self
-            .db
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query_opt("select node, owner, state from sandboxes where id = ?1 and ns = ?2", &[&id, &ns])?;
+        // App instances run as sandboxes but are reached through apps, never directly: a
+        // viewer could otherwise read an instance's files, a member exec into it.
+        let r = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
+            "select node, owner, state from sandboxes where id = ?1 and ns = ?2 and id not in (select sandbox from instances)",
+            &[&id, &ns],
+        )?;
         let Some(r) = r else { bail!(sandbox::NoSandbox(id.into())) };
         let (node, owner, state): (String, String, String) = (r.get(0), r.get(1), r.get(2));
         if !can_touch(who, ns, &owner) {
@@ -1950,6 +1957,15 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
     match (req.method.as_str(), seg.as_slice()) {
         ("POST", ["nodes", "register"]) => {
             let r = (|| {
+                // Pending nodes cost a row each and anyone with the join token can add them.
+                let pending: i64 =
+                    c.db.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .query_one("select count(*) from nodes where state = 'pending'", &[])?
+                        .get(0);
+                if pending >= 20 {
+                    bail!("20 nodes are already waiting for approval; approve or remove some first");
+                }
                 let want = c.config("join_token")?.unwrap_or_default();
                 if want.is_empty() || !crate::sandbox_api::ct_eq(body["join_token"].as_str().unwrap_or("").as_bytes(), want.as_bytes()) {
                     bail!("bad join token");
@@ -1969,10 +1985,27 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                 }
                 let mut reply = json!({"id": id, "secret": sec, "state": state});
                 // An https node gets a certificate for the host it advertised.
-                if let (Some(ca), Some(rest)) = (&c.ca, url.strip_prefix("https://")) {
+                if let (Some(ca), Some(rest)) = (&c.node_ca, url.strip_prefix("https://")) {
                     let a = rest.trim_end_matches('/');
-                    let host = a.rsplit_once(':').map_or(a, |(h, _)| h).trim_matches(['[', ']']);
-                    let (cert, key) = ca.issue(&[host.to_string()])?;
+                    let host = a.rsplit_once(':').map_or(a, |(h, _)| h).trim_matches(['[', ']']).to_ascii_lowercase();
+                    // Not a name the controller answers to, nor another node's: the certificate
+                    // would let whoever registered first pass for it.
+                    if c.own_names.iter().any(|n| n.eq_ignore_ascii_case(&host))
+                        && !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1")
+                    {
+                        bail!("{host} is one of the controller's own names");
+                    }
+                    let taken =
+                        c.db.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .query("select url from nodes where id <> ?1", &[&id])?;
+                    if taken
+                        .iter()
+                        .any(|r| authority(&r.get::<String>(0)).is_ok_and(|a| a.eq_ignore_ascii_case(rest.trim_end_matches('/'))))
+                    {
+                        bail!("another node already registered {rest}");
+                    }
+                    let (cert, key) = ca.issue(std::slice::from_ref(&host))?;
                     reply["cert"] = json!(cert);
                     reply["key"] = json!(key);
                 } else if !url.starts_with("https://") {
@@ -4211,10 +4244,22 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
         check_plain_http(&o.listen, "the controller")?;
     } else {
         let ca = crate::tls::ensure_ca(&dir)?;
-        crate::tls::trust_by_default(&ca.pem)?;
+        let node_ca = crate::tls::ensure_node_ca(&dir)?;
+        // The controller talks to nodes, whose certificates come from the node CA.
+        crate::tls::trust_by_default(&node_ca.pem)?;
         ctl.ca_pem = Some(ca.pem.clone());
         ctl.ca = Some(ca);
+        ctl.node_ca = Some(node_ca);
     }
+    let listen_ip = o.listen.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']']).to_string()).unwrap_or_default();
+    let mut names: Vec<String> = vec!["localhost".into(), "127.0.0.1".into()];
+    if listen_ip.parse::<IpAddr>().is_ok_and(|ip| !ip.is_unspecified()) {
+        names.push(listen_ip);
+    }
+    names.extend(hostname());
+    names.extend(o.tls_names.iter().cloned());
+    names.dedup();
+    ctl.own_names = names.clone();
     ctl.alert_webhook = o.alert_webhook;
     ctl.db_path = db_path;
     ctl.backup_dir = o.backup_dir;
@@ -4226,14 +4271,6 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     c.seal_plain_secrets()?;
     let l = TcpListener::bind(&o.listen).with_context(|| format!("bind {}", o.listen))?;
     let tls = c.ca.as_ref().map(|ca| -> Result<_> {
-        let listen_ip = o.listen.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']']).to_string()).unwrap_or_default();
-        let mut names: Vec<String> = vec!["localhost".into(), "127.0.0.1".into()];
-        if listen_ip.parse::<IpAddr>().is_ok_and(|ip| !ip.is_unspecified()) {
-            names.push(listen_ip);
-        }
-        names.extend(hostname());
-        names.extend(o.tls_names.iter().cloned());
-        names.dedup();
         let (cert, key) = ca.issue(&names)?;
         let fp = ca.fingerprint()?;
         std::fs::write(dir.join("ca-fingerprint"), &fp)?;
@@ -4353,6 +4390,8 @@ mod tests {
         let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
         ctl.ca_pem = Some(ca.pem.clone());
         ctl.ca = Some(ca);
+        ctl.node_ca = Some(crate::tls::ensure_node_ca(&dir).unwrap());
+        ctl.own_names = vec!["127.0.0.1".into(), "ctl.example".into()];
         let c = Arc::new(ctl);
         add_token(&c, "admin-t", "admin", true, "member", false, None);
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -4386,6 +4425,15 @@ mod tests {
         )
         .unwrap();
         assert!(reg["cert"].as_str().unwrap().contains("BEGIN CERTIFICATE") && reg["key"].as_str().is_some());
+        // Node certificates come from the node CA, which remotes don't trust.
+        let ca_pem = std::fs::read_to_string(dir.join("ca.pem")).unwrap();
+        assert_ne!(crate::tls::fingerprint(reg["cert"].as_str().unwrap()).unwrap(), crate::tls::fingerprint(&ca_pem).unwrap());
+        let node_ca = std::fs::read_to_string(dir.join("node-ca.pem")).unwrap();
+        assert!(!node_ca.is_empty() && node_ca != ca_pem);
+        // Not the controller's name, and not a second node at the same address.
+        let reg2 = |u: &str| call(&url, "POST", "/nodes/register", None, &json!({"join_token": "jt", "url": u, "mem_total_mib": 1}));
+        assert!(reg2("https://ctl.example:7701").unwrap_err().to_string().contains("controller's own"));
+        assert!(reg2("https://127.0.0.1:17999").unwrap_err().to_string().contains("already registered"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4419,6 +4467,18 @@ mod tests {
         assert!(c.db.lock().unwrap().query_opt("select 1 from tokens where token = ?1", &[&t]).unwrap().is_none(), "stored hashed");
         call(&url, "DELETE", "/tokens/bob", Some("admin-t"), &json!({})).unwrap();
         assert!(get("/apps", &t).unwrap_err().to_string().contains("(401)"));
+        // App instances are sandboxes too, but never reachable as such.
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("insert into nodes (id, url, secret, last_seen) values ('n-1', 'http://127.0.0.1:1', 's', 0)", &[]).unwrap();
+            db.execute(
+                "insert into sandboxes (id, node, owner, state, created, ns) values ('inst1', 'n-1', 'alice', 'running', 0, 'default')",
+                &[],
+            )
+            .unwrap();
+            db.execute("insert into instances values ('web', 1, 'inst1', 'n-1', '127.0.0.1:1', 'live')", &[]).unwrap();
+        }
+        assert!(get("/sandboxes/inst1/files?path=/etc/hostname", "alice-t").unwrap_err().to_string().contains("no sandbox inst1"));
         // Big bodies without a token are refused before they're read: a 401, or the
         // connection closed under the client while it still writes.
         match send(&url, "POST", "/apps", None, &vec![b'x'; 8 << 20]) {

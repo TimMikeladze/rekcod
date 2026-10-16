@@ -111,6 +111,14 @@ control-plane hop (CLI, edge and nodes to the controller, the controller to node
 fd7a:115c:a1e0::/48, `*.ts.net`), and elsewhere only with `REKCOD_INSECURE=1`. App traffic
 between the edge and instance relays stays plain TCP; nodes belong on a tailnet.
 
+Two CAs: `ca.pem` signs only the controller's certificate and is what CLIs and edges pin;
+`node-ca.pem` signs node certificates and only the controller trusts it, so a node (which
+gets its certificate at registration, before approval) can't pass for the controller. A
+node can't register the controller's own names or an address another node holds, and at
+most 20 nodes wait for approval at once. App instance sandboxes are reachable only through
+their app, never through `/sandboxes/ID`. Edges report traffic and wake apps for every
+app, by design: an edge token is trusted for that.
+
 ## Status
 
 Built as described, except: WebSocket tunnels close after an hour idle but the edge's

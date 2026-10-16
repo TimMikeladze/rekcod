@@ -12,6 +12,29 @@ Test state: `cargo test --workspace` passes 87 (rekcod) + 5 (proto). The agent's
 typecheck and lint clean, `npm audit --omit=dev` reports 7 high (all via `shadcn` in
 `dependencies`). e2e only runs on a developer Mac.
 
+## Status after the 0.3.0 work
+
+What changed since this audit, item by item, is in `CHANGELOG.md` (Unreleased) and the
+commits after f994023. In short:
+
+- Section 1: all fixed (S7 also moves to the host, `docs/sandbox-network.md`).
+- Sections 2 and 3: all fixed, except the per-mount `strict` cache mode (not built) and
+  memory return to macOS (unchanged, a Virtualization.framework limit).
+- Sections 4 and 5: all fixed. App traffic between the edge and nodes stays plain TCP;
+  nodes belong on a tailnet.
+- Section 6: fixed, except the shared `--sandbox` VM and cache volumes across projects
+  (documented in `docs/sandbox.md`) and port forwards from sandboxes to the Mac's
+  localhost (they no longer shadow anything already listening).
+- Section 7: everything that doesn't need an account or a decision. Waiting on you:
+  a Developer ID (notarization is wired and turns on with the secrets in
+  `docs/releasing.md`), a self-hosted Mac runner for e2e (`REKCOD_E2E_RUNNER`), the v0.3.0
+  tag, publishing the Homebrew tap, and turning on GitHub private vulnerability reporting.
+- Section 8: fixed (log rotation and trimming, `rekcod doctor`, metrics, alerts,
+  `--backup-dir`, cleanup).
+- Section 9: request-level controller tests, the `Conn` spill test, `safefs` tests and
+  `scripts/e2e-lifecycle.sh` (VM crashes, damaged disks, repair) were added.
+- An external security review of the sandboxes is still not done.
+
 ## Where it stands
 
 The local Docker replacement is close for a single developer who knows to keep backups. Three

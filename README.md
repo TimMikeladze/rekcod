@@ -294,7 +294,8 @@ rekcod sandbox input $id type "hello"
 ```
 
 exec, diff, apply and fork work as for Linux sandboxes (over SSH; the workspace is copied
-into the guest's `~/ws`). The MCP server adds `sandbox_screenshot` and `sandbox_input` for
+into the guest's `~/ws` and back with tar). Their network is plain NAT with no filtering:
+the Mac and the LAN are reachable, so `--offline` and `--allow-host` are refused for them. The MCP server adds `sandbox_screenshot` and `sandbox_input` for
 computer-use agents. Details: [`docs/platform.md`](docs/platform.md#track-4-as-built).
 
 ### A spare Mac

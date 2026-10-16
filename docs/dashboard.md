@@ -53,8 +53,8 @@ gets a token instead:
 connections from any non-loopback peer, then loads Next's `server.js`. Pages can't be framed
 (`X-Frame-Options: DENY`, `frame-ancestors 'none'`).
 
-The daemon still splices `host.docker.internal:PORT` to the dashboard's port; the token is
-what stops a container there.
+The daemon also refuses `host.docker.internal:PORT` for the port in `run/dashboard.json`, so a container
+can't connect to the dashboard at all. Anything else on the Mac needs the token.
 
 Release tarballs don't include it unless built with `scripts/package.sh --with-dashboard`,
 which puts the standalone build in `share/rekcod/dashboard` (Node is still needed to run it).

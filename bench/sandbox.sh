@@ -31,6 +31,19 @@ for id in $(cat "$proj/forks"); do
 done | p50
 $B sandbox rm "$parent" >/dev/null
 
+# Through the daemon's network stack (docs/sandbox-network.md), from an allowed host. The
+# internet link is usually the limit; compare with curl on the Mac.
+printf 'download              '
+id=$($B sandbox create "$proj" --image python:3.13-slim 2>/dev/null)
+$B sandbox exec "$id" -- python3 -c "
+import time, urllib.request
+t, n = time.time(), 0
+r = urllib.request.urlopen('https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-standard-3.22.0-aarch64.iso')
+while b := r.read(1 << 20):
+    n += len(b)
+print(f'{n / (time.time() - t) / 1e6:.0f} MB/s ({n >> 20} MiB)')"
+$B sandbox rm "$id" >/dev/null
+
 printf '%s at once           ' "$CONC"
 t=$(now)
 for i in $(seq "$CONC"); do

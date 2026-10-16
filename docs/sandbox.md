@@ -23,7 +23,8 @@ It shouldn't be able to read the rest of your machine or reach anything else on 
 | Mac directories shared | `/Users`, `/Volumes`, `/private` | only the current directory, at its real path |
 | State | `~/.rekcod/vm` | `~/.rekcod/sandbox/vm` (own data disk, MAC address, sockets) |
 | `host.docker.internal` → Mac loopback | yes (vsock splice) | **no**: the daemon doesn't park reverse connections |
-| Mac / LAN addresses (vmnet gateway, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10) | reachable | **rejected** by iptables on `eth0`, in `OUTPUT` (host network) and `DOCKER-USER` (bridge), set up before dockerd starts. IPv6 out of `eth0` is rejected |
+| Network card | VZ NAT | a socket the rekcod daemon on the Mac serves; every connection is checked there (docs/sandbox-network.md) |
+| Mac / LAN addresses (the gateway, 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10, loopback, the Mac's own addresses) | reachable | **refused** by the daemon, which answers the SYN with a reset. iptables on `eth0` (`OUTPUT` and `DOCKER-USER`, set up before dockerd starts) reject the same ranges as a second layer. No IPv6 |
 | DNS | Mac resolvers over vsock | same (needed for the internet) |
 | Environment | `.env`, `-e` | only `-e` and `--secret NAME`; `.env` is **not** passed |
 | Lifetime | until `rekcod stop` | powered off when the command exits (`--keep` to leave it up) |
@@ -31,7 +32,8 @@ It shouldn't be able to read the rest of your machine or reach anything else on 
 Why a separate VM rather than a container in the main VM: the main VM mounts all of
 `/Users`, so a container escape there (a kernel bug, a misconfigured mount) reaches
 all of `$HOME`. In the sandbox VM, a full guest-root compromise still only sees the
-project directory.
+project directory, and can't reach the Mac or the LAN: flushing the guest's iptables
+changes nothing, because the network checks run in the daemon on the Mac.
 
 ## What it protects against
 
@@ -77,11 +79,16 @@ server on the Mac at `0.0.0.0:18099`:
 
 `scripts/e2e.sh` checks the directory isolation and the Mac's unreachability on every run.
 
+2026-10-16, after the network moved to the daemon (docs/sandbox-network.md): `rekcod x
+--sandbox --image alpine:3.22` gets `eth0` at 10.0.2.15, loads `https://example.com`, and
+the Mac's LAN address on port 22 is refused. The checks with the guest's firewall flushed
+ran in agent sandboxes (`scripts/e2e-sandbox.sh`), which use the same code path.
+
 ## Before calling it a security feature
 
 1. External review of the share setup (`daemon.rs` sandbox options, `boot.sh` project
    mount and firewall rules).
-2. An egress allowlist (`--allow-host`), enforced in the guest. Done for `rekcod sandbox`
-   (docs/agent-sandboxes.md), not yet for `rekcod x --sandbox`.
+2. An egress allowlist (`--allow-host`), enforced on the Mac. Done for `rekcod sandbox`
+   (docs/agent-sandboxes.md, docs/sandbox-network.md), not yet for `rekcod x --sandbox`.
 3. A per-run disposable data disk, so one sandboxed run can't plant images for the next.
    Done for `rekcod sandbox` (each one clones a golden disk and deletes it on `rm`).

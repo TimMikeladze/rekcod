@@ -94,6 +94,14 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
   Rust toolchain by `rust-toolchain.toml`.
 - The guest build checks a pinned sha256 for every download and pins the Alpine release and
   `linux-virt` version (`guest/versions.env`).
+- Sandbox VMs no longer use VZ NAT. Their network card is a socket the daemon serves with a
+  userspace TCP/IP stack (smoltcp), and the daemon checks every connection: Mac and LAN
+  refused, allowlisted sandboxes limited to addresses their allowed names resolved to, with
+  the TLS SNI or HTTP Host checked on 443 and 80. Guest root flushing iptables no longer
+  opens anything. `--offline` sandboxes get no network card. Needs the guest from this
+  release (`rekcod.net=` in `boot.sh`).
+- Sandbox DNS refuses queries with more than one question or a compression pointer in the
+  question, in the guest agent and in the daemon.
 
 ### Fixed
 

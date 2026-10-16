@@ -25,12 +25,25 @@ echo 8192 >/proc/sys/fs/inotify/max_user_instances
 echo 262144 >/proc/sys/vm/max_map_count
 echo 1 >/proc/sys/net/ipv4/ip_forward
 
-# Network (VZ NAT). udhcpc's default script writes the address, route and resolv.conf.
+# Network. Main VM: VZ NAT, and udhcpc's default script writes the address, route and
+# resolv.conf. Sandbox VMs get rekcod.net=IP/PREFIX,GW: eth0 is a socket the rekcod daemon
+# serves and filters (docs/sandbox-network.md), configured statically. Offline sandboxes
+# have no eth0.
 log "modules loaded"
 ip link set lo up
-ip link set eth0 up
-udhcpc -i eth0 -f -q -n -t 30 -T 1 -A 1 >/dev/null 2>&1 || log "DHCP failed"
-log "network up"
+net=$(tr ' ' '\n' </proc/cmdline | sed -n 's/^rekcod\.net=//p')
+if [ ! -e /sys/class/net/eth0 ]; then
+  log "no network card"
+elif [ -n "$net" ]; then
+  ip link set eth0 up
+  ip addr add "${net%,*}" dev eth0
+  ip route add default via "${net#*,}"
+  log "network up (static ${net%,*})"
+else
+  ip link set eth0 up
+  udhcpc -i eth0 -f -q -n -t 30 -T 1 -A 1 >/dev/null 2>&1 || log "DHCP failed"
+  log "network up"
+fi
 
 # Data disk: holds all docker state. It's only ever formatted when it's blank: the Mac
 # just created it (rekcod.fresh=1) or its first 4 MiB are zeros. A disk with data that
@@ -130,8 +143,9 @@ if [ -n "$ip4" ]; then
   echo "nameserver $ip4" >/etc/resolv.conf
 fi
 
-# Sandbox: internet only. Nothing on the Mac (vmnet gateway, the Mac's LAN
-# addresses) or the local network; DNS still works (it goes over vsock).
+# Sandbox: internet only. Nothing on the Mac (the gateway, the Mac's LAN addresses) or
+# the local network; DNS still works (it goes over vsock). The daemon on the Mac enforces
+# the same rules on every packet; these are a second layer that guest root can flush.
 # DOCKER-USER exists before dockerd starts, and dockerd keeps it first.
 if grep -q 'rekcod.sandbox=1' /proc/cmdline; then
   iptables -N DOCKER-USER 2>/dev/null

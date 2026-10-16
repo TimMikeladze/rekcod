@@ -9,10 +9,12 @@
 //! - pushes the Mac clock to the guest every 30 s
 //! - `~/.rekcod/run/control.sock`: relays `rekcod compact` (and research
 //!   commands) to the guest agent
+//! - sandbox VMs: serves their network card and checks every connection (`netstack.rs`),
+//!   and refuses DNS for names off the allowlist
 //! - SIGTERM: ask the guest to power off, force it after a timeout
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,9 +34,10 @@ use tokio::task::JoinHandle;
 use crate::dns;
 use crate::http;
 use crate::memory;
+use crate::netstack;
 use crate::paths::Paths;
 use crate::ports::{self, Binding};
-use crate::vm::{State, Vm, VmConfig};
+use crate::vm::{Net, State, Vm, VmConfig};
 use crate::watch::{self, Watch};
 
 // Stock-kernel guests: virtio-rng must load from the initramfs, or boot stalls ~5s
@@ -69,13 +72,14 @@ pub struct Options {
 
 /// `IP:PORT,...` checked, so nothing else lands on the kernel command line (boot.sh reads it).
 pub fn reach_arg(s: &str) -> Result<String> {
-    let all: Vec<String> = s
-        .split(',')
-        .map(|a| {
-            a.trim().parse::<std::net::SocketAddrV4>().map(|a| a.to_string()).map_err(|_| anyhow::anyhow!("--reach {a}: not IPv4:PORT"))
-        })
-        .collect::<Result<_>>()?;
-    Ok(all.join(","))
+    Ok(reach_addrs(s)?.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","))
+}
+
+fn reach_addrs(s: &str) -> Result<Vec<SocketAddrV4>> {
+    s.split(',')
+        .filter(|a| !a.trim().is_empty())
+        .map(|a| a.trim().parse::<SocketAddrV4>().map_err(|_| anyhow::anyhow!("--reach {a}: not IPv4:PORT")))
+        .collect()
 }
 
 /// Standard base64, for passing a path on the kernel command line.
@@ -132,7 +136,29 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             .map(|d| (d.to_string(), std::path::Path::new("/").join(d)))
             .collect(),
     };
-    let cfg = VmConfig {
+    // Sandbox VMs: the network card is a socket this daemon serves, and every connection is
+    // checked here (docs/sandbox-network.md). The guest's own firewall stays as a second layer.
+    let allow: Option<Vec<String>> = opts
+        .allow
+        .as_deref()
+        .map(|a| a.split(',').map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect())
+        .filter(|a: &Vec<String>| !a.iter().any(|h| h == "*"));
+    let reach = reach_addrs(opts.reach.as_deref().unwrap_or(""))?;
+    let resolved = Arc::new(netstack::Resolved::default());
+    let mut host_net = None;
+    let net = match &opts.project {
+        None => Net::Nat,
+        // Offline: an empty allowlist and nothing to reach.
+        Some(_) if allow.as_ref().is_some_and(|a| a.is_empty()) && reach.is_empty() => Net::None,
+        Some(_) => {
+            let (vm_end, ours) = netstack::socketpair().context("create the sandbox network socket")?;
+            cmdline.push(' ');
+            cmdline.push_str(netstack::CMDLINE);
+            host_net = Some(ours);
+            Net::Socket(vm_end)
+        }
+    };
+    let mut cfg = VmConfig {
         cpus: opts.cpus,
         memory_mib: opts.memory_mib,
         kernel: guest.join("Image"),
@@ -143,8 +169,22 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         mac_address: std::fs::read_to_string(paths.mac_address())?.trim().to_string(),
         console_log: paths.console_log(),
         shares,
+        net,
     };
     let vm = Vm::create(&cfg)?;
+    // The VM holds its own copy of its end.
+    cfg.net = Net::None;
+    let dns_filter = match (&opts.project, &allow) {
+        (Some(_), Some(a)) => Some(Arc::new(DnsFilter { allow: a.clone(), resolved: resolved.clone() })),
+        _ => None,
+    };
+    let _net = match host_net {
+        Some(fd) => {
+            let policy = Arc::new(netstack::Policy::new(allow, reach, resolved));
+            Some(netstack::start(fd, policy, Arc::new(|line| log!("{line}"))).context("start the sandbox network")?)
+        }
+        None => None,
+    };
     log!("kernel command line: {}", cfg.cmdline);
     vm.start().await?;
     log!("VM started ({} CPUs, {} MiB, rosetta={})", cfg.cpus, cfg.memory_mib, vm.rosetta);
@@ -215,7 +255,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     if fs_cache {
         tokio::spawn(warm_recent(vm.clone(), paths.warm_paths()));
     }
-    tokio::spawn(dns_bridge(vm.clone()));
+    tokio::spawn(dns_bridge(vm.clone(), dns_filter));
     tokio::spawn(port_forwarder(vm.clone(), status.clone()));
 
     let mut term = signal(SignalKind::terminate())?;
@@ -545,17 +585,42 @@ async fn clock_sync(vm: Vm) {
     }
 }
 
+/// A sandbox with an allowlist: names off it are answered REFUSED, and the A records
+/// answered for the rest are the addresses its network stack lets it connect to.
+struct DnsFilter {
+    allow: Vec<String>,
+    resolved: Arc<netstack::Resolved>,
+}
+
+impl DnsFilter {
+    async fn answer(&self, query: &[u8]) -> Option<Vec<u8>> {
+        match dns::query_name(query) {
+            Some(name) if rekcod_proto::host_allowed(&self.allow, &name) => {
+                let answer = resolve(query).await?;
+                for (ip, ttl) in dns::answer_a(&answer) {
+                    self.resolved.record(ip, ttl);
+                }
+                Some(answer)
+            }
+            name => {
+                log!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain question)"));
+                dns::refused(query)
+            }
+        }
+    }
+}
+
 /// Answers the guest's DNS queries with the Mac's current resolvers.
-async fn dns_bridge(vm: Vm) {
+async fn dns_bridge(vm: Vm, filter: Option<Arc<DnsFilter>>) {
     loop {
-        if let Err(e) = dns_session(&vm).await {
+        if let Err(e) = dns_session(&vm, &filter).await {
             log!("dns bridge: {e:#}");
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn dns_session(vm: &Vm) -> Result<()> {
+async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(vm.connect(DNS_PORT).await?);
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // Queries resolving at once; more wait, so a flood can't spawn tasks without limit.
@@ -574,10 +639,15 @@ async fn dns_session(vm: &Vm) -> Result<()> {
             let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
+            let filter = filter.clone();
             let permit = in_flight.clone().acquire_owned().await?;
             tokio::spawn(async move {
                 let _permit = permit;
-                if let Some(frame) = resolve(&query).await.as_deref().and_then(frame) {
+                let answer = match &filter {
+                    Some(f) => f.answer(&query).await,
+                    None => resolve(&query).await,
+                };
+                if let Some(frame) = answer.as_deref().and_then(frame) {
                     let _ = tx.send(frame);
                 }
             });

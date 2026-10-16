@@ -24,6 +24,7 @@ How a feature behaves today and how to drive it.
 - [rustfs.md](rustfs.md): app buckets, stored images and backups on RustFS.
 - [fleet-hardening.md](fleet-hardening.md): fleet TLS, tokens, node approval, the reconcile loop.
 - [sandbox-network.md](sandbox-network.md): sandbox egress filtered on the Mac.
+- [security-review.md](security-review.md): scope and setup for an external security review.
 
 ## Building and releasing
 

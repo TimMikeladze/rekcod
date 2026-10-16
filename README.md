@@ -722,7 +722,7 @@ Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md)
 - Mac→container change latency is about 14 ms p50 (`bench/inotify_rtt.py`; OrbStack measured 12 ms).
 - The VM's directories (`~/.rekcod/vm`, `sb`, `golden`, macOS images) are excluded from Time Machine; back up what's in your volumes with `rekcod snap save --push` or your own dumps.
 - Memory isn't returned to macOS. `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop, even under memory pressure (docs/phase2.md, docs/phase5.md).
-- `--sandbox` and `rekcod sandbox` haven't had an external security review (docs/sandbox.md).
+- `--sandbox` and `rekcod sandbox` haven't had an external security review (docs/sandbox.md); [`docs/security-review.md`](docs/security-review.md) is the scope for one.
 - A sandbox fork copies the disk, not memory: processes restart in the child (Virtualization.framework can't restore a VM with a virtio-fs share).
 - No brew formula. Releases are ad-hoc signed, not notarized.
 

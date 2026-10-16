@@ -20,7 +20,7 @@ export const metadata: Metadata = {
 // Folds the sidebar and sets the table density before first paint, so neither jumps on load.
 const sidebar = `try{var d=document.documentElement.dataset;localStorage.getItem("rekcod.sidebar.collapsed")==="1"&&(d.sidebar="collapsed");localStorage.getItem("rekcod.density")==="compact"&&(d.density="compact")}catch(e){}`
 
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
     <html lang="en" className={`${geistSans.variable} ${geistMono.variable} antialiased`} suppressHydrationWarning>
       <head>

@@ -897,6 +897,17 @@ pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: bool) -> Result<Vec
     if check {
         return Ok(ch);
     }
+    // Refused entries are found before anything is written, so an apply is all or nothing
+    // as far as policy goes (an I/O error halfway can still leave it partial).
+    for c in ch.iter().filter(|c| c.kind != 'D') {
+        let from = src.join(&c.path);
+        if std::fs::symlink_metadata(&from)?.file_type().is_symlink() {
+            let target = std::fs::read_link(&from)?;
+            if !crate::safefs::link_stays_inside(Path::new(&c.path), &target) {
+                bail!("refusing symlink {} -> {}: it points outside the project; nothing was applied", c.path, target.display());
+            }
+        }
+    }
     let dir = crate::safefs::Dir::open(&s.meta.project)?;
     for c in &ch {
         let rel = Path::new(&c.path);

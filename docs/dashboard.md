@@ -26,8 +26,10 @@ npm run dev                  # http://localhost:4500, or the next free port
 npm run bundle -- --install  # standalone build, copied to ~/.rekcod/dashboard
 ```
 
-Release tarballs don't include it unless built with `scripts/package.sh --with-dashboard`,
-which puts the standalone build in `share/rekcod/dashboard` (Node is still needed to run it).
+Releases after 0.2.1 are packaged with `scripts/package.sh --with-dashboard`, which puts the
+standalone build in `share/rekcod/dashboard`; `scripts/install.sh` copies it to
+`/usr/local/share/rekcod/dashboard`. Node is still needed to run it. 0.2.x tarballs don't
+have it.
 
 - `REKCOD_BIN` picks the binary. Without it: `rekcod` on `PATH`, then `../target/release/rekcod`,
   then `../target/debug/rekcod`. `rekcod dashboard` passes its own path.

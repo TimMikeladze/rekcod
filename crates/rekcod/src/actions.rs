@@ -66,12 +66,16 @@ pub enum Kind {
     BackupNow,
     RemoteUse,
     DashboardOpen,
+    VmRepair,
+    VmForceStop,
+    VmAutostartOn,
+    VmAutostartOff,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 52] = [
+    pub const ALL: [Kind; 56] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -124,6 +128,10 @@ impl Kind {
         Kind::BackupNow,
         Kind::RemoteUse,
         Kind::DashboardOpen,
+        Kind::VmRepair,
+        Kind::VmForceStop,
+        Kind::VmAutostartOn,
+        Kind::VmAutostartOff,
     ];
 }
 
@@ -315,7 +323,10 @@ pub struct Snapshot {
     pub project: String,
     pub name: String,
     pub created: u64,
+    /// The project volumes it holds, sorted.
     pub volumes: Vec<String>,
+    /// The snapshot volumes holding them, in the same order.
+    pub volume_names: Vec<String>,
 }
 
 /// Everything the menu bar shows, loaded in one go.
@@ -331,6 +342,8 @@ pub struct Model {
     pub sandbox: Option<Value>,
     /// `/var/run/docker.sock` goes through rekcod (`rekcod socket install` done).
     pub socket_installed: bool,
+    /// The VM starts at login (`rekcod start --install`).
+    pub autostart: bool,
     /// Agent sandboxes (`rekcod sandbox ls`).
     pub sandboxes: Vec<AgentSandbox>,
     /// Apps on the default fleet remote (`rekcod app ls`), if one is configured.
@@ -573,6 +586,7 @@ impl Model {
             ports,
             sandbox,
             socket_installed,
+            autostart: crate::cli::autostart_installed(),
             sandboxes,
             apps: rd.apps,
             jobs: rd.jobs,
@@ -751,27 +765,19 @@ pub fn parse_containers(json: &[u8]) -> Vec<Container> {
     out
 }
 
-/// Snapshots from `GET /volumes` (labels written by `rekcod snap save`).
+/// Snapshots from `GET /volumes` (labels written by `rekcod snap save`); see `snap::parse`.
 pub fn parse_snapshots(json: &[u8]) -> Vec<Snapshot> {
-    let v: Value = serde_json::from_slice(json).unwrap_or_default();
-    let mut out: Vec<Snapshot> = Vec::new();
-    for vol in v["Volumes"].as_array().into_iter().flatten() {
-        let l = &vol["Labels"];
-        let (Some(project), Some(name), Some(source)) =
-            (l["dev.rekcod.snap.project"].as_str(), l["dev.rekcod.snap.name"].as_str(), l["dev.rekcod.snap.volume"].as_str())
-        else {
-            continue;
-        };
-        let created = l["dev.rekcod.snap.created"].as_str().and_then(|c| c.parse().ok()).unwrap_or(0);
-        match out.iter_mut().find(|s| s.project == project && s.name == name) {
-            Some(s) => {
-                s.created = s.created.max(created);
-                s.volumes.push(source.to_string());
-                s.volumes.sort();
-            }
-            None => out.push(Snapshot { project: project.into(), name: name.into(), created, volumes: vec![source.into()] }),
-        }
-    }
+    let mut out: Vec<Snapshot> = crate::snap::parse(json)
+        .into_iter()
+        .filter(|s| !s.volumes.is_empty())
+        .map(|s| Snapshot {
+            project: s.project,
+            name: s.name,
+            created: s.created,
+            volumes: s.volumes.keys().cloned().collect(),
+            volume_names: s.volumes.values().cloned().collect(),
+        })
+        .collect();
     out.sort_by(|a, b| (&a.project, std::cmp::Reverse(a.created)).cmp(&(&b.project, std::cmp::Reverse(b.created))));
     out
 }
@@ -814,17 +820,32 @@ fn git_branch(dir: &std::path::Path) -> Option<String> {
 
 // -------------------------------------------------------------- actions
 
-pub fn vm_actions(running: bool, socket_installed: bool) -> Vec<Action> {
+pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool) -> Vec<Action> {
     let mut out = if !running {
-        vec![Action::rekcod(Kind::VmStart, "Start rekcod", &["start"])]
+        vec![
+            Action::rekcod(Kind::VmStart, "Start rekcod", &["start"]),
+            Action::rekcod(Kind::VmRepair, "Repair the data disk and start", &["start", "--repair"])
+                .confirm(
+                    "Run e2fsck -fy on the VM's data disk? Use this when rekcod won't start because of disk errors; it can take minutes."
+                        .into(),
+                )
+                .interactive(),
+        ]
     } else {
         vec![
             Action::rekcod(Kind::VmStop, "Stop rekcod", &["stop"])
                 .confirm("Stop rekcod? Running containers stop (and `--rm` ones are deleted).".into()),
+            Action::rekcod(Kind::VmForceStop, "Force stop rekcod", &["stop", "--force"])
+                .confirm("Power the VM off now? Containers don't get to shut down, like pulling the plug.".into()),
             Action::rekcod(Kind::Compact, "Compact data disk", &["compact"]),
             Action::rekcod(Kind::Shell, "Root shell in the VM", &["shell"]).interactive(),
         ]
     };
+    out.push(if autostart {
+        Action::rekcod(Kind::VmAutostartOff, "Don't start rekcod at login", &["start", "--uninstall"])
+    } else {
+        Action::rekcod(Kind::VmAutostartOn, "Start rekcod at login", &["start", "--install"])
+    });
     if !socket_installed {
         // sudo asks for a password, so it runs in Terminal.
         out.push(Action::rekcod(Kind::SocketInstall, "Use rekcod for /var/run/docker.sock", &["socket", "install"]).interactive());
@@ -1234,8 +1255,8 @@ pub mod tests {
     /// Every action kind comes out of the lists the menu bar renders.
     pub fn reachable_kinds() -> Vec<Action> {
         let (containers, ports, projects) = sample();
-        let mut all = vm_actions(true, false);
-        all.extend(vm_actions(false, true));
+        let mut all = vm_actions(true, false, false);
+        all.extend(vm_actions(false, true, true));
         all.extend(storage_actions(true, &[]));
         all.extend(storage_actions(true, &[sample_storage()]));
         for c in &containers {
@@ -1308,6 +1329,8 @@ pub mod tests {
                     | Kind::VolumePrune
                     | Kind::BuildCachePrune
                     | Kind::NodeDrain
+                    | Kind::VmForceStop
+                    | Kind::VmRepair
             ) || (a.kind == Kind::EdgeBan && !a.interactive);
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }

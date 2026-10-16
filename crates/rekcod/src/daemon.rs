@@ -63,6 +63,8 @@ pub struct Options {
     pub reach: Option<String>,
     /// Power off after this many seconds without an exec (`run/last-used`).
     pub idle_ttl: Option<u64>,
+    /// `e2fsck -fy` the data disk at boot (`rekcod start --repair`).
+    pub repair: bool,
 }
 
 /// `IP:PORT,...` checked, so nothing else lands on the kernel command line (boot.sh reads it).
@@ -99,8 +101,18 @@ pub fn run(paths: Paths, opts: Options) -> Result<()> {
 
 async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let t0 = Instant::now();
+    // Held until we exit: a second daemon on the same disk fails here.
+    let _pid_lock = paths.hold_pid_file()?;
+    let _ = std::fs::remove_file(paths.last_exit());
+    raise_fd_limit();
     let guest = paths.guest_dir()?;
     let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
+    if paths.data_fresh().exists() {
+        cmdline.push_str(" rekcod.fresh=1");
+    }
+    if opts.repair {
+        cmdline.push_str(" rekcod.fsck=yes");
+    }
     let shares: Vec<(String, PathBuf)> = match &opts.project {
         Some(dir) => {
             let dir = dir.to_str().context("project path is not UTF-8")?;
@@ -133,7 +145,6 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     };
     let vm = Vm::create(&cfg)?;
     vm.start().await?;
-    std::fs::write(paths.pid_file(), std::process::id().to_string())?;
     log!("VM started ({} CPUs, {} MiB, rosetta={})", cfg.cpus, cfg.memory_mib, vm.rosetta);
 
     // Docker socket first so `rekcod start` can poll it while the guest boots.
@@ -154,9 +165,15 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         Some(dir) => vec![dir.clone()],
         None => watch::GLOBAL_ROOTS.iter().map(PathBuf::from).collect(),
     };
+    // Batches the guest didn't take, as directory trees; resent with the next batch and by
+    // `retry_notify`. Dropping them would leave containers reading stale files until the
+    // (day-long) cache TTL ran out.
+    let failed: Arc<std::sync::Mutex<BTreeSet<String>>> = Arc::default();
+    tokio::spawn(retry_notify(vm.clone(), notify_conn.clone(), failed.clone()));
     let watch = Watch::start(fs_cache, roots, move |changed: Vec<String>| {
         let vm = notify_vm.clone();
         let conn = notify_conn.clone();
+        let failed = failed.clone();
         async move {
             if std::env::var_os("REKCOD_DEBUG").is_some() {
                 log!("file events: {changed:?}");
@@ -164,8 +181,11 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             for tree in changed.iter().filter(|l| l.ends_with('/')) {
                 log!("file events: invalidating everything under {tree}");
             }
-            if let Err(e) = notify_guest(&vm, &conn, &changed).await {
-                log!("file events: {e:#}");
+            let mut batch: Vec<String> = std::mem::take(&mut *failed.lock().unwrap()).into_iter().collect();
+            batch.extend(changed);
+            if let Err(e) = notify_guest(&vm, &conn, &batch).await {
+                log!("file events: {e:#}; will resend {} path(s) as directories", batch.len());
+                failed.lock().unwrap().extend(as_trees(&batch));
             }
         }
     })?;
@@ -208,6 +228,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
                 log!("force stop");
                 let _ = vm.force_stop().await;
                 cleanup(&paths);
+                clean_exit(&paths);
                 return Ok(());
             }
             _ = tick.tick() => {
@@ -222,14 +243,42 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
                 if matches!(s, State::Stopped | State::Error) {
                     log!("guest stopped on its own ({s:?})");
                     cleanup(&paths);
-                    return Ok(());
+                    // Not clean: the login agent (`start --install`) boots it again.
+                    bail!("guest stopped on its own ({s:?})");
                 }
             }
         }
     }
     shutdown(&vm).await;
     cleanup(&paths);
+    clean_exit(&paths);
     Ok(())
+}
+
+/// Tells `rekcod start --foreground` (the login agent) that this stop was on purpose.
+fn clean_exit(paths: &Paths) {
+    let _ = std::fs::write(paths.last_exit(), b"clean");
+}
+
+/// launchd starts agents with a soft limit of 256 descriptors; every forwarded connection
+/// and docker client takes two.
+fn raise_fd_limit() {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return;
+    }
+    let per_proc = crate::cli::sysctl_u64("kern.maxfilesperproc").unwrap_or(10240) as libc::rlim_t;
+    let want = lim.rlim_max.min(per_proc);
+    if want > lim.rlim_cur {
+        lim.rlim_cur = want;
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+    }
+}
+
+/// After a failed accept (EMFILE, ENFILE), wait before the next one instead of spinning.
+async fn accept_failed(what: &str, e: std::io::Error) {
+    log!("{what}: accept: {e}");
+    tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
 fn cleanup(paths: &Paths) {
@@ -244,7 +293,8 @@ async fn shutdown(vm: &Vm) {
     if let Err(e) = &asked {
         log!("graceful shutdown request failed: {e:#}");
     }
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // The guest waits up to 18 s for dockerd (which gives containers 10 s), then unmounts.
+    let deadline = Instant::now() + Duration::from_secs(30);
     while asked.is_ok() && Instant::now() < deadline {
         if matches!(vm.state(), State::Stopped | State::Error) {
             log!("guest powered off");
@@ -291,7 +341,13 @@ async fn control_within(vm: &Vm, cmd: Control, timeout: Duration) -> Result<Stri
 /// Only commands that are safe to expose to the CLI are relayed.
 async fn control_server(vm: Vm, listener: UnixListener) {
     loop {
-        let Ok((conn, _)) = listener.accept().await else { continue };
+        let conn = match listener.accept().await {
+            Ok((c, _)) => c,
+            Err(e) => {
+                accept_failed("control", e).await;
+                continue;
+            }
+        };
         let vm = vm.clone();
         tokio::spawn(async move {
             let mut conn = BufReader::new(conn);
@@ -315,6 +371,10 @@ pub fn send_control(paths: &Paths, cmd: &Control) -> Result<String> {
     use std::io::{BufRead, Write};
     let mut conn =
         std::os::unix::net::UnixStream::connect(paths.control_socket()).context("connect to the rekcod daemon (is rekcod running?)")?;
+    // `rekcod status` and the menu bar must not hang on a wedged agent; trim really is slow.
+    let wait = if matches!(cmd, Control::Trim | Control::BenchMeta(_)) { 600 } else { 5 };
+    conn.set_read_timeout(Some(Duration::from_secs(wait)))?;
+    conn.set_write_timeout(Some(Duration::from_secs(5)))?;
     conn.write_all(cmd.encode().as_bytes())?;
     let mut reply = String::new();
     std::io::BufReader::new(conn).read_line(&mut reply)?;
@@ -370,6 +430,51 @@ async fn warm_recent(vm: Vm, file: PathBuf) {
     }
     if !dirs.is_empty() {
         log!("warming {} recently used bind source(s)", dirs.len());
+    }
+}
+
+/// Paths to re-send after a failed batch: each file's directory as a tree (`dir/`), so the
+/// guest drops everything cached under it. Capped by collapsing to fewer, higher dirs.
+fn as_trees(paths: &[String]) -> BTreeSet<String> {
+    let mut out: BTreeSet<String> = paths
+        .iter()
+        .map(|p| {
+            if p.ends_with('/') {
+                p.clone()
+            } else {
+                format!("{}/", std::path::Path::new(p).parent().map_or("/".into(), |d| d.display().to_string()).trim_end_matches('/'))
+            }
+        })
+        .collect();
+    while out.len() > 256 {
+        out = out
+            .iter()
+            .map(|t| {
+                format!(
+                    "{}/",
+                    std::path::Path::new(t.trim_end_matches('/'))
+                        .parent()
+                        .map_or("".into(), |d| d.display().to_string())
+                        .trim_end_matches('/')
+                )
+            })
+            .collect();
+    }
+    out
+}
+
+/// Re-sends batches that failed (agent restarting, VM busy) every 2 s until they go through.
+async fn retry_notify(vm: Vm, conn: Arc<NotifyConn>, failed: Arc<std::sync::Mutex<BTreeSet<String>>>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let batch: Vec<String> = std::mem::take(&mut *failed.lock().unwrap()).into_iter().collect();
+        if batch.is_empty() {
+            continue;
+        }
+        match notify_guest(&vm, &conn, &batch).await {
+            Ok(()) => log!("file events: resent {} directory invalidation(s)", batch.len()),
+            Err(_) => failed.lock().unwrap().extend(batch),
+        }
     }
 }
 
@@ -499,7 +604,13 @@ async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
 
 async fn docker_proxy(vm: Vm, listener: UnixListener) {
     loop {
-        let Ok((client, _)) = listener.accept().await else { continue };
+        let client = match listener.accept().await {
+            Ok((c, _)) => c,
+            Err(e) => {
+                accept_failed("docker socket", e).await;
+                continue;
+            }
+        };
         let vm = vm.clone();
         tokio::spawn(async move {
             match vm.connect(DOCKER_PORT).await {
@@ -713,6 +824,8 @@ fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
     let mut changed = false;
     {
         let mut active = status.forwards.lock().unwrap();
+        // Ports our listeners hold now, including ones closed below (abort is asynchronous).
+        let ours: BTreeSet<u16> = active.iter().filter(|(_, f)| f.task.is_some()).map(|(b, _)| b.port).collect();
         active.retain(|binding, fwd| {
             let keep = want.get(binding) == Some(&fwd.container) && (fwd.task.is_some() || !retry_failed);
             if !keep {
@@ -729,7 +842,7 @@ fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
                 continue;
             }
             changed = true;
-            let fwd = match listen(binding) {
+            let fwd = match listen(binding, !ours.contains(&binding.port)) {
                 Ok(listener) => {
                     log!("port {}:{}/{:?} -> {container}", binding.addr, binding.port, binding.proto);
                     let task = match listener {
@@ -757,7 +870,9 @@ enum Listener {
     Udp(UdpSocket),
 }
 
-fn listen(b: Binding) -> std::io::Result<Listener> {
+/// `probe`: refuse if something already answers on the port. Off when one of our own
+/// listeners has (or just had) the port, since it would answer the probe itself.
+fn listen(b: Binding, probe: bool) -> std::io::Result<Listener> {
     use socket2::{Domain, Socket, Type};
     let addr = SocketAddr::new(b.addr, b.port);
     let kind = if b.proto == Proto::Udp { Type::DGRAM } else { Type::STREAM };
@@ -770,6 +885,18 @@ fn listen(b: Binding) -> std::io::Result<Listener> {
     if b.proto == Proto::Udp {
         socket.bind(&addr.into())?;
         return Ok(Listener::Udp(UdpSocket::from_std(socket.into())?));
+    }
+    // SO_REUSEADDR (needed to rebind right after a container restarts, past TIME_WAIT) also
+    // lets macOS bind 127.0.0.1:P while another app holds *:P, and loopback traffic would
+    // then come to us. So first check whether anything answers there.
+    let probe_first = probe;
+    let probe = if addr.ip().is_unspecified() {
+        SocketAddr::new(if addr.is_ipv6() { std::net::Ipv6Addr::LOCALHOST.into() } else { std::net::Ipv4Addr::LOCALHOST.into() }, b.port)
+    } else {
+        addr
+    };
+    if probe_first && std::net::TcpStream::connect_timeout(&probe, Duration::from_millis(100)).is_ok() {
+        return Err(std::io::Error::from(std::io::ErrorKind::AddrInUse));
     }
     socket.set_reuse_address(true)?;
     socket.bind(&addr.into())?;
@@ -855,7 +982,13 @@ async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut
 
 async fn accept_loop(vm: Vm, listener: TcpListener, port: u16) {
     loop {
-        let Ok((mut tcp, _)) = listener.accept().await else { continue };
+        let mut tcp = match listener.accept().await {
+            Ok((c, _)) => c,
+            Err(e) => {
+                accept_failed(&format!("port {port}"), e).await;
+                continue;
+            }
+        };
         let vm = vm.clone();
         tokio::spawn(async move {
             let _ = tcp.set_nodelay(true);
@@ -979,4 +1112,18 @@ fn meta_reply(req: &str) -> String {
         return out;
     }
     "-\n".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failed_file_events_come_back_as_directories() {
+        let t = as_trees(&["/Users/me/app/src/a.rs".into(), "/Users/me/app/src/b.rs".into(), "/Users/me/lib/".into()]);
+        assert_eq!(t.into_iter().collect::<Vec<_>>(), ["/Users/me/app/src/", "/Users/me/lib/"]);
+        let many: Vec<String> = (0..1000).map(|i| format!("/Users/me/p{i}/f")).collect();
+        let t = as_trees(&many);
+        assert!(t.len() <= 256 && t.contains("/Users/me/"), "{t:?}");
+    }
 }

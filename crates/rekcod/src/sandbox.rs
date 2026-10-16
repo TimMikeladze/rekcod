@@ -233,6 +233,7 @@ impl Sandbox {
             allow,
             reach: m.reach.clone(),
             idle_ttl: (m.ttl_secs > 0).then_some(m.ttl_secs),
+            repair: false,
         };
         crate::cli::boot(&self.paths, &opts)?;
         // A restarted or forked VM: the workspace container comes back by its restart policy,

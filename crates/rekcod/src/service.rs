@@ -22,8 +22,9 @@ fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
 
-/// A KeepAlive agent running `exe args...`, logging to `log`.
-pub fn plist(name: &str, exe: &Path, args: &[String], log: &Path, rekcod_home: Option<&Path>) -> String {
+/// A KeepAlive agent running `exe args...`, logging to `log`. `crash_only`: launchd
+/// restarts it only after a non-zero exit, so a deliberate stop sticks.
+pub fn plist_with(name: &str, exe: &Path, args: &[String], log: &Path, rekcod_home: Option<&Path>, crash_only: bool) -> String {
     let argv: String = std::iter::once(exe.display().to_string())
         .chain(args.iter().cloned())
         .map(|a| format!("    <string>{}</string>\n", xml_escape(&a)))
@@ -37,6 +38,7 @@ pub fn plist(name: &str, exe: &Path, args: &[String], log: &Path, rekcod_home: O
         })
         .unwrap_or_default();
     let log = xml_escape(&log.display().to_string());
+    let keep_alive = if crash_only { "<dict><key>SuccessfulExit</key><false/></dict>" } else { "<true/>" };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -47,7 +49,7 @@ pub fn plist(name: &str, exe: &Path, args: &[String], log: &Path, rekcod_home: O
   <array>
 {argv}  </array>
 {env}  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
+  <key>KeepAlive</key>{keep_alive}
   <key>ThrottleInterval</key><integer>5</integer>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
@@ -78,13 +80,26 @@ fn launchctl(args: &[&str]) -> Result<std::process::Output> {
 /// Writes the agent and loads it now. `REKCOD_NO_LAUNCHCTL` writes it into the rekcod home
 /// instead and loads nothing (dry run).
 pub fn install(paths: &Paths, name: &str, args: &[String]) -> Result<()> {
+    install_with(paths, name, args, false)
+}
+
+pub fn installed(name: &str) -> bool {
+    plist_path(name).is_ok_and(|p| p.exists())
+}
+
+/// Starts the agent's job now if it isn't running (no-op otherwise).
+pub fn kickstart(name: &str) {
+    let _ = launchctl(&["kickstart", &format!("{}/{}", domain(), label(name))]);
+}
+
+pub fn install_with(paths: &Paths, name: &str, args: &[String], crash_only: bool) -> Result<()> {
     let exe = std::env::current_exe()?.canonicalize()?;
     let dry = std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some();
     let path = if dry { paths.home.join(format!("{}.plist", label(name))) } else { plist_path(name)? };
     std::fs::create_dir_all(path.parent().context("plist dir")?)?;
     let log = paths.home.join("logs").join(format!("{name}.log"));
     let home = (!paths.is_default_home()).then_some(paths.home.as_path());
-    std::fs::write(&path, plist(name, &exe, args, &log, home))?;
+    std::fs::write(&path, plist_with(name, &exe, args, &log, home, crash_only))?;
     if dry {
         println!("wrote {} (dry run: not loaded)", path.display());
         return Ok(());
@@ -95,7 +110,8 @@ pub fn install(paths: &Paths, name: &str, args: &[String]) -> Result<()> {
     if !out.status.success() {
         bail!("launchctl bootstrap: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
-    println!("{name} installed: runs now and at login, restarts if it exits; log {}", log.display());
+    let restarts = if crash_only { "restarts if it crashes" } else { "restarts if it exits" };
+    println!("{name} installed: runs now and at login, {restarts}; log {}", log.display());
     Ok(())
 }
 
@@ -122,12 +138,13 @@ mod tests {
 
     #[test]
     fn plist_keeps_alive_and_logs() {
-        let p = plist(
+        let p = plist_with(
             "edge",
             Path::new("/opt/r&d/rekcod"),
             &["edge".into(), "serve".into()],
             Path::new("/h/logs/edge.log"),
             Some(Path::new("/h")),
+            false,
         );
         assert!(p.contains("<string>/opt/r&amp;d/rekcod</string>\n    <string>edge</string>\n    <string>serve</string>"), "{p}");
         assert!(p.contains("<key>KeepAlive</key><true/>") && p.contains("<string>dev.rekcod.edge</string>"));
@@ -138,5 +155,7 @@ mod tests {
         let ok = Command::new("plutil").arg("-lint").arg(&f).output().map(|o| o.status.success()).unwrap_or(true);
         std::fs::remove_file(&f).unwrap();
         assert!(ok, "plutil rejected:\n{p}");
+        let vm = plist_with("vm", Path::new("/r"), &["start".into()], Path::new("/l"), None, true);
+        assert!(vm.contains("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"), "{vm}");
     }
 }

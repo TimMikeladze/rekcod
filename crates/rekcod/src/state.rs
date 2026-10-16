@@ -91,7 +91,7 @@ pub fn model_json(m: &Model) -> Value {
                 .snapshots
                 .iter()
                 .map(|s| {
-                    let sizes: Option<u64> = s.volumes.iter().map(|v| vol_size(&crate::snap::snapshot_volume(&p.name, &s.name, v))).sum();
+                    let sizes: Option<u64> = s.volume_names.iter().map(|v| vol_size(v)).sum();
                     json!({"name": s.name, "created": s.created, "volumes": s.volumes, "size": sizes,
                            "current": p.branch.as_deref() == Some(s.name.as_str()),
                            "actions": actions_json(&actions::snapshot_actions(s))})
@@ -166,7 +166,8 @@ pub fn model_json(m: &Model) -> Value {
         "status": status,
         "sandbox_vm": m.sandbox,
         "socket_installed": m.socket_installed,
-        "vm_actions": actions_json(&actions::vm_actions(m.running, m.socket_installed)),
+        "autostart": m.autostart,
+        "vm_actions": actions_json(&actions::vm_actions(m.running, m.socket_installed, m.autostart)),
         "storage_actions": actions_json(&actions::storage_actions(m.running, &m.containers)),
         "containers": containers,
         "ports": ports,
@@ -338,7 +339,7 @@ mod tests {
         };
         collect(&model_json(&full));
         collect(&model_json(&Model { socket_installed: false, ..Default::default() }));
-        collect(&model_json(&Model { running: true, containers: vec![sample_storage()], ..Default::default() }));
+        collect(&model_json(&Model { running: true, autostart: true, containers: vec![sample_storage()], ..Default::default() }));
         for kind in actions::Kind::ALL {
             assert!(seen.contains(&format!("{kind:?}")), "{kind:?} is missing from `rekcod state`");
         }

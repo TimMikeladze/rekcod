@@ -13,6 +13,27 @@ pub fn with_umask<T>(mask: libc::mode_t, f: impl FnOnce() -> T) -> T {
     r
 }
 
+/// An exclusive `flock` on `path` (created if missing), held until the file is dropped.
+pub fn lock(path: &std::path::Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path)?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("lock {}", path.display()));
+    }
+    Ok(f)
+}
+
+/// Whether some process holds an `flock` on `path`.
+pub fn locked(path: &std::path::Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let Ok(f) = std::fs::File::open(path) else { return false };
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } == 0 {
+        unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_UN) };
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
+}
+
 /// Writes a file only this user can read, created 0600 rather than chmodded after.
 pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -68,6 +89,39 @@ impl Paths {
     }
     pub fn pid_file(&self) -> PathBuf {
         self.home.join("run/daemon.pid")
+    }
+
+    /// Locks the pid file for this process's lifetime (keep the returned file) and writes
+    /// our pid into it. `running_pid` only trusts a locked pid file, so one left behind by
+    /// a crash, whose pid the OS may since have given to another process, never counts.
+    /// Fails if another process holds it.
+    pub fn hold_pid_file(&self) -> Result<std::fs::File> {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        let mut f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(self.pid_file())?;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            bail!("another rekcod daemon is running for {}", self.home.display());
+        }
+        f.set_len(0)?;
+        write!(f, "{}", std::process::id())?;
+        Ok(f)
+    }
+    /// Held while a CLI checks for, spawns and waits on the daemon, so two commands run at
+    /// once (the menu bar and a terminal, say) never boot two VMs on one disk.
+    pub fn boot_lock(&self) -> PathBuf {
+        self.home.join("run/boot.lock")
+    }
+    /// Written when `data.img` is created; tells the guest a blank disk may be formatted.
+    pub fn data_fresh(&self) -> PathBuf {
+        self.home.join("vm/data.fresh")
+    }
+    /// `clean` after the daemon stopped on purpose; anything else means it crashed.
+    pub fn last_exit(&self) -> PathBuf {
+        self.home.join("run/last-exit")
+    }
+    /// `rekcod start` settings (cpus, memory, disk) that later boots reuse.
+    pub fn config(&self) -> PathBuf {
+        self.home.join("config.json")
     }
     pub fn status_file(&self) -> PathBuf {
         self.home.join("run/status.json")

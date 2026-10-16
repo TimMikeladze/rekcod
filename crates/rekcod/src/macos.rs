@@ -595,8 +595,8 @@ pub fn run(home: PathBuf, idle_ttl: u64) -> Result<()> {
     let g = read_config(&home)?;
     let vm = crate::vm::Vm::from_config(configuration(&home, &g)?);
     tokio::runtime::Builder::new_current_thread().enable_all().build()?.block_on(async {
+        let _pid_lock = paths.hold_pid_file()?;
         vm.start().await?;
-        std::fs::write(paths.pid_file(), std::process::id().to_string())?;
         eprintln!("rekcod: macOS guest started ({} CPUs, {} GiB, {})", g.cpus, g.memory_gib, g.mac);
         let mut term = signal(SignalKind::terminate())?;
         let mut kill = signal(SignalKind::user_defined1())?;

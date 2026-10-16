@@ -29,9 +29,48 @@ pub(crate) fn api_get(paths: &Paths, path: &str) -> Result<Vec<u8>> {
     })
 }
 
+/// The daemon's pid while one runs. The daemon holds its pid file locked
+/// ([`Paths::hold_pid_file`]); a file nobody holds is left over from a crash.
 pub(crate) fn running_pid(paths: &Paths) -> Option<i32> {
     let pid: i32 = std::fs::read_to_string(paths.pid_file()).ok()?.trim().parse().ok()?;
-    (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
+    if crate::paths::locked(&paths.pid_file()) {
+        return Some(pid);
+    }
+    // Daemons from before the lock still run after an upgrade: trust the pid only if it's
+    // alive and is a rekcod binary.
+    (unsafe { libc::kill(pid, 0) } == 0 && pid_is_rekcod(pid)).then_some(pid)
+}
+
+fn pid_is_rekcod(pid: i32) -> bool {
+    let mut buf = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let n = unsafe { libc::proc_pidpath(pid, buf.as_mut_ptr().cast(), buf.len() as u32) };
+    n > 0 && std::str::from_utf8(&buf[..n as usize]).is_ok_and(|p| p.ends_with("/rekcod"))
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Copy, PartialEq, Debug)]
+pub struct Saved {
+    pub cpus: Option<usize>,
+    pub memory_gib: Option<u64>,
+    pub disk_gib: Option<u64>,
+}
+
+/// `rekcod start --cpus/--memory/--disk`, kept so the menu bar, passthrough commands and
+/// the login agent boot the same VM.
+pub(crate) fn saved(paths: &Paths) -> Saved {
+    std::fs::read(paths.config()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+fn save_settings(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64) -> Result<()> {
+    let old = saved(paths);
+    let new = Saved {
+        cpus: cpus.or(old.cpus),
+        memory_gib: memory_gib.or(old.memory_gib),
+        disk_gib: Some(disk_gib.max(old.disk_gib.unwrap_or(0))),
+    };
+    if new != old {
+        std::fs::write(paths.config(), serde_json::to_vec_pretty(&new)?)?;
+    }
+    Ok(())
 }
 
 /// (total, free) GiB on the volume holding `dir`.
@@ -86,6 +125,10 @@ fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
         std::fs::write(paths.guest_version(), &version)?;
     }
     // Sparse; the guest grows the filesystem to match at boot.
+    if !paths.data_disk().exists() {
+        // Only a disk we just made may be formatted (boot.sh); removed once dockerd answers.
+        std::fs::write(paths.data_fresh(), b"")?;
+    }
     let f = OpenOptions::new().create(true).truncate(false).write(true).open(paths.data_disk())?;
     if f.metadata()?.len() < disk_gib << 30 {
         f.set_len(disk_gib << 30)?;
@@ -118,6 +161,8 @@ pub struct BootOptions {
     pub reach: Vec<String>,
     /// Agent sandbox: power off after this many idle seconds.
     pub idle_ttl: Option<u64>,
+    /// `e2fsck -fy` the data disk and reinstall the root disk before booting.
+    pub repair: bool,
 }
 
 impl Default for BootOptions {
@@ -132,6 +177,7 @@ impl Default for BootOptions {
             allow: None,
             reach: vec![],
             idle_ttl: None,
+            repair: false,
         }
     }
 }
@@ -141,15 +187,30 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
     if let Some(pid) = running_pid(paths) {
         return Ok(Some(pid));
     }
+    let _lock = crate::paths::lock(&paths.boot_lock())?;
+    // Another command may have booted it while we waited for the lock.
+    if let Some(pid) = running_pid(paths) {
+        return Ok(Some(pid));
+    }
     {
         if let Some(dir) = &opts.guest_dir {
             // SAFETY: single-threaded CLI, before spawning anything.
             unsafe { std::env::set_var("REKCOD_GUEST_DIR", dir) };
         }
-        prepare_vm(paths, opts.disk_gib)?;
-        let cpus = opts.cpus.unwrap_or_else(default_cpus).clamp(1, vm::max_cpus());
+        // The main VM boots with what `rekcod start` was last given; sandboxes say their own.
+        let saved = if opts.project.is_none() { saved(paths) } else { Saved::default() };
+        if opts.repair {
+            // A fresh copy of the release's root disk; it holds nothing of yours.
+            let _ = std::fs::remove_file(paths.root_disk());
+        }
+        prepare_vm(paths, opts.disk_gib.max(saved.disk_gib.unwrap_or(0)))?;
+        let cpus = opts.cpus.or(saved.cpus).unwrap_or_else(default_cpus).clamp(1, vm::max_cpus());
         let host_mib = sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
-        let memory_mib = opts.memory_gib.map(|g| g << 10).unwrap_or((host_mib / 2).min(8 << 10));
+        let memory_mib = opts.memory_gib.or(saved.memory_gib).map(|g| g << 10).unwrap_or((host_mib / 2).min(8 << 10));
+        if let Some(free) = free_disk_gib(&paths.home).filter(|f| *f < 5) {
+            eprintln!("rekcod: warning: only {free} GiB free on the Mac's disk; the VM's disk fails when it runs out");
+        }
+        let console_start = std::fs::metadata(paths.console_log()).map(|m| m.len()).unwrap_or(0);
 
         let log = OpenOptions::new().create(true).append(true).open(paths.daemon_log())?;
         let mut cmd = Command::new(std::env::current_exe()?);
@@ -173,6 +234,9 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         if let Some(ttl) = opts.idle_ttl {
             cmd.args(["--idle-ttl", &ttl.to_string()]);
         }
+        if opts.repair {
+            cmd.arg("--repair");
+        }
         // Detach from the terminal so closing it doesn't kill the VM.
         unsafe {
             cmd.pre_exec(|| {
@@ -182,10 +246,21 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         }
         let mut child = cmd.spawn().context("spawn rekcod daemon")?;
 
-        let deadline = Instant::now() + Duration::from_secs(120);
+        let deadline = Instant::now() + Duration::from_secs(if opts.repair { 1800 } else { 120 });
+        let mut checked = Instant::now();
         loop {
             if api_get(paths, "/_ping").is_ok_and(|b| b == b"OK") {
+                let _ = std::fs::remove_file(paths.data_fresh());
                 break;
+            }
+            if checked.elapsed() > Duration::from_millis(500) {
+                checked = Instant::now();
+                if let Some(err) = data_disk_error(paths, console_start) {
+                    bail!(
+                        "the VM's data disk can't be used: {err}\nNothing was formatted. `rekcod stop`, then `rekcod start --repair` runs e2fsck -fy on it.\nsee {}",
+                        paths.console_log().display()
+                    );
+                }
             }
             if let Some(status) = child.try_wait()? {
                 bail!(
@@ -203,6 +278,16 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         }
     }
     Ok(None)
+}
+
+/// The guest's "data disk error" line from this boot's part of the console log.
+fn data_disk_error(paths: &Paths, from: u64) -> Option<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut f = std::fs::File::open(paths.console_log()).ok()?;
+    f.seek(SeekFrom::Start(from)).ok()?;
+    let mut text = String::new();
+    f.take(1 << 20).read_to_string(&mut text).ok()?;
+    text.lines().find_map(|l| l.split_once("data disk error: ").map(|(_, e)| e.trim().to_string()))
 }
 
 /// SIGTERM the daemon and wait for the VM to power off; false if it wasn't running.
@@ -228,9 +313,21 @@ pub(crate) fn signal_daemon(paths: &Paths, sig: libc::c_int) -> Result<bool> {
     Ok(true)
 }
 
-pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, no_switch: bool) -> Result<()> {
+pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, no_switch: bool, repair: bool) -> Result<()> {
     let t0 = Instant::now();
-    let opts = BootOptions { cpus, memory_gib, disk_gib, ..Default::default() };
+    if repair && let Some(pid) = running_pid(paths) {
+        bail!("rekcod is running (pid {pid}); `rekcod stop` first, then `rekcod start --repair`");
+    }
+    save_settings(paths, cpus, memory_gib, disk_gib)?;
+    if autostart_installed() && !repair {
+        // Let the login agent own the VM, so a crash brings it back. Whoever boots first
+        // wins the boot lock; the agent supervises either way.
+        crate::service::kickstart(AUTOSTART);
+    }
+    let opts = BootOptions { cpus, memory_gib, disk_gib, repair, ..Default::default() };
+    if repair {
+        println!("checking the data disk with e2fsck -fy and reinstalling the root disk; this can take a while");
+    }
     if let Some(pid) = boot(paths, &opts)? {
         println!("rekcod is already running (pid {pid})");
     }
@@ -296,8 +393,41 @@ fn default_socket_on_start(paths: &Paths, no_switch: bool) -> Result<()> {
     Ok(())
 }
 
-pub fn stop(paths: &Paths, no_switch: bool) -> Result<()> {
-    if stop_daemon(paths)? {
+/// The login agent that `rekcod start --install` writes (`dev.rekcod.vm`).
+pub const AUTOSTART: &str = "vm";
+
+pub fn autostart_install(paths: &Paths) -> Result<()> {
+    let args: Vec<String> = ["start", "--no-switch", "--foreground"].map(String::from).into();
+    crate::service::install_with(paths, AUTOSTART, &args, true)
+}
+
+pub fn autostart_installed() -> bool {
+    crate::service::installed(AUTOSTART)
+}
+
+/// `rekcod start --foreground`, the login agent's process: waits while the VM runs. Exits 0
+/// when it stopped on purpose (so launchd leaves it stopped) and 1 when it crashed (so
+/// launchd boots it again). A boot that fails also exits 0: retrying a broken disk every
+/// few seconds helps nobody.
+pub fn supervise(paths: &Paths, started: Result<()>) -> Result<()> {
+    if let Err(e) = started {
+        eprintln!("rekcod: boot failed, not retrying: {e:#}");
+        return Ok(());
+    }
+    while running_pid(paths).is_some() {
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let how = std::fs::read_to_string(paths.last_exit()).unwrap_or_default();
+    if how.trim() == "clean" {
+        return Ok(());
+    }
+    eprintln!("rekcod: the VM stopped without `rekcod stop`; launchd will boot it again");
+    std::process::exit(1);
+}
+
+pub fn stop(paths: &Paths, no_switch: bool, force: bool) -> Result<()> {
+    let stopped = if force { signal_daemon(paths, libc::SIGUSR1)? } else { stop_daemon(paths)? };
+    if stopped {
         println!("rekcod stopped");
     } else {
         println!("rekcod is not running");

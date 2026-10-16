@@ -235,7 +235,7 @@ function NavLink({ item, on, count, alerts }: { item: NavItem; on: boolean; coun
 function ActionItems({ actions, subject }: { actions: Action[]; subject: string }) {
   const { trigger } = useAction()
   return actions.map((a) => (
-    <DropdownMenuItem key={a.kind + a.label} onClick={() => trigger(a, subject)} variant={a.kind === "VmStop" ? "destructive" : "default"}>
+    <DropdownMenuItem key={a.kind + a.label} onClick={() => trigger(a, subject)} variant={a.kind === "VmStop" || a.kind === "VmForceStop" ? "destructive" : "default"}>
       {a.label}
     </DropdownMenuItem>
   ))
@@ -273,11 +273,11 @@ function VmSwitcher({ state }: { state: S }) {
         </DropdownMenuGroup>
         <DropdownMenuItem render={<Link href="/vm" />}>VM details</DropdownMenuItem>
         <DropdownMenuSeparator />
-        <ActionItems actions={vm.filter((a) => a.kind !== "VmStop")} subject="rekcod" />
+        <ActionItems actions={vm.filter((a) => a.kind !== "VmStop" && a.kind !== "VmForceStop")} subject="rekcod" />
         {state.storage_actions.length > 0 && <DropdownMenuSeparator />}
         <ActionItems actions={state.storage_actions} subject="S3 storage" />
         {vm.some((a) => a.kind === "VmStop") && <DropdownMenuSeparator />}
-        <ActionItems actions={vm.filter((a) => a.kind === "VmStop")} subject="rekcod" />
+        <ActionItems actions={vm.filter((a) => a.kind === "VmStop" || a.kind === "VmForceStop")} subject="rekcod" />
       </DropdownMenuContent>
     </DropdownMenu>
   )

@@ -10,6 +10,7 @@ export const DESTRUCTIVE = new Set([
   "AppDestroy",
   "JobCancel",
   "VmStop",
+  "VmForceStop",
   "ProjectDown",
   "ImageRemove",
   "VolumeRemove",

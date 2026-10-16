@@ -32,15 +32,47 @@ ip link set eth0 up
 udhcpc -i eth0 -f -q -n -t 30 -T 1 -A 1 >/dev/null 2>&1 || log "DHCP failed"
 log "network up"
 
-# Data disk: formatted on first boot, holds all docker state.
-if ! blkid /dev/vdb 2>/dev/null | grep -q 'TYPE="ext4"'; then
-  log "formatting data disk"
-  mkfs.ext4 -q -L rekcod-data -m 0 -E lazy_itable_init=1,lazy_journal_init=1 /dev/vdb
+# Data disk: holds all docker state. It's only ever formatted when it's blank: the Mac
+# just created it (rekcod.fresh=1) or its first 4 MiB are zeros. A disk with data that
+# isn't recognisable as ext4 is never formatted; dockerd doesn't start and the host
+# reports the error instead (`rekcod start --repair`).
+data_fail() {
+  log "data disk error: $*"
+  echo "$*" >/run/rekcod-data-failed
+}
+is_ext4() { blkid /dev/vdb 2>/dev/null | grep -q 'TYPE="ext4"'; }
+blank() { [ "$(head -c 4194304 /dev/vdb | tr -d '\000' | head -c 1 | wc -c)" -eq 0 ]; }
+if ! is_ext4; then
+  if grep -q 'rekcod\.fresh=1' /proc/cmdline || blank; then
+    log "formatting data disk"
+    mkfs.ext4 -q -L rekcod-data -m 0 -E lazy_itable_init=1,lazy_journal_init=1 /dev/vdb
+  else
+    # A damaged primary superblock: e2fsck can rebuild it from the first backup.
+    log "data disk has no readable ext4 superblock; trying the backup"
+    e2fsck -p -b 32768 -B 4096 /dev/vdb >/dev/console 2>&1
+  fi
 fi
-mount -o noatime /dev/vdb /var/lib/docker || log "data disk mount failed"
-# The Mac side may have grown data.img (`rekcod start --disk`); ext4 grows online.
-resize2fs /dev/vdb >/dev/null 2>&1 || log "data disk resize failed"
-log "data disk mounted"
+if ! is_ext4; then
+  data_fail "/dev/vdb holds data but isn't a readable ext4 filesystem; not formatting it"
+else
+  # -p repairs what's safe to repair; 4 and up means it needs a person (or --repair, -y).
+  if grep -q 'rekcod\.fsck=yes' /proc/cmdline; then
+    log "checking data disk (repair)"
+    e2fsck -fy /dev/vdb >/dev/console 2>&1
+  else
+    e2fsck -p /dev/vdb >/dev/console 2>&1
+  fi
+  rc=$?
+  if [ $rc -ge 4 ]; then
+    data_fail "e2fsck found errors it can't fix safely (exit $rc); run \`rekcod start --repair\`"
+  elif mount -o noatime /dev/vdb /var/lib/docker; then
+    # The Mac side may have grown data.img (`rekcod start --disk`); ext4 grows online.
+    resize2fs /dev/vdb >/dev/null 2>&1 || log "data disk resize failed"
+    log "data disk mounted"
+  else
+    data_fail "mounting /dev/vdb failed"
+  fi
+fi
 
 # Mac directories at the same paths as on the Mac, so bind mounts need no translation.
 # "rekcod" = patched virtiofs with host-driven invalidation (docs/phase2.md);
@@ -131,7 +163,8 @@ elif [ -n "$gw" ]; then
 fi
 
 # Build cache would otherwise grow until the data disk is full.
-gc='"builder": {"gc": {"enabled": true, "defaultMaxUsedSpace": "20GB"}}'
+# shutdown-timeout: containers get 10 s after SIGTERM, inside shutdown.sh's 18 s wait.
+gc='"shutdown-timeout": 10, "builder": {"gc": {"enabled": true, "defaultMaxUsedSpace": "20GB"}}'
 if [ -n "$gw" ]; then
   echo "{\"host-gateway-ips\": [\"$gw\"], $gc}" >/etc/docker/daemon.json
 else

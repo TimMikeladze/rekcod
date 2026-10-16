@@ -93,12 +93,28 @@ enum Cmd {
         /// Do not change the active docker context.
         #[arg(long)]
         no_switch: bool,
+        /// Check the data disk with `e2fsck -fy` and reinstall the root disk, then boot.
+        /// For when the VM won't start because its disk has errors.
+        #[arg(long)]
+        repair: bool,
+        /// Start now and at every login, and boot again if the VM stops without `rekcod stop`.
+        #[arg(long, conflicts_with_all = ["uninstall", "repair"])]
+        install: bool,
+        /// Stop starting at login (the VM keeps running).
+        #[arg(long, conflicts_with_all = ["install", "repair"])]
+        uninstall: bool,
+        /// Stay in the foreground until the VM stops; exit 0 for `rekcod stop`, 1 for a crash.
+        #[arg(long, hide = true)]
+        foreground: bool,
     },
     /// Power off the VM and restore the previous docker context.
     Stop {
         /// Do not change the active docker context.
         #[arg(long)]
         no_switch: bool,
+        /// Power off immediately, without letting dockerd stop containers. For a hung VM.
+        #[arg(long)]
+        force: bool,
     },
     /// Show VM state, versions, forwarded ports, disk and file-cache stats.
     Status {
@@ -274,6 +290,8 @@ enum Cmd {
         reach: Option<String>,
         #[arg(long)]
         idle_ttl: Option<u64>,
+        #[arg(long)]
+        repair: bool,
     },
 }
 
@@ -1112,8 +1130,13 @@ fn main() {
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
     let result = paths::Paths::new().and_then(|paths| match command {
-        Cmd::Start { cpus, memory, disk, no_switch } => cli::start(&paths, cpus, memory, disk, no_switch),
-        Cmd::Stop { no_switch } => cli::stop(&paths, no_switch),
+        Cmd::Start { install: true, .. } => cli::autostart_install(&paths),
+        Cmd::Start { uninstall: true, .. } => service::uninstall(cli::AUTOSTART),
+        Cmd::Start { cpus, memory, disk, no_switch, repair, foreground, .. } => {
+            let r = cli::start(&paths, cpus, memory, disk, no_switch, repair);
+            if foreground { cli::supervise(&paths, r) } else { r }
+        }
+        Cmd::Stop { no_switch, force } => cli::stop(&paths, no_switch, force),
         Cmd::Status { json } => cli::status(&paths, json),
         Cmd::Snap(Snap::Save { name, project, push }) => snap::save(&paths, project.as_deref(), name.as_deref(), push),
         Cmd::Snap(Snap::Restore { name, project, pull }) => snap::restore(&paths, project.as_deref(), name.as_deref(), pull),
@@ -1254,8 +1277,8 @@ fn main() {
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib, project, workspace, allow, reach, idle_ttl } => {
-            daemon::run(paths, daemon::Options { cpus, memory_mib, project, workspace, allow, reach, idle_ttl })
+        Cmd::Daemon { cpus, memory_mib, project, workspace, allow, reach, idle_ttl, repair } => {
+            daemon::run(paths, daemon::Options { cpus, memory_mib, project, workspace, allow, reach, idle_ttl, repair })
         }
     });
     if let Err(e) = result {

@@ -333,8 +333,18 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
     }
 }
 
-/// Bytes a connection may buffer for a slow reader before it is dropped.
+/// Bytes a connection keeps in memory for a slow reader; past this it spills to a file.
 const CONN_BUFFER_MAX: usize = 64 << 20;
+/// Bytes it may spill before the reader gets an error instead.
+const CONN_SPILL_MAX: u64 = 16 << 30;
+
+enum Chunk {
+    Data(Vec<u8>),
+    /// This many more bytes were appended to the spill file.
+    Spilled(usize),
+    /// The spill file is full: the reader gets ConnectionReset, never a short clean EOF.
+    Overflow,
+}
 
 /// A vsock connection that is read eagerly.
 ///
@@ -344,43 +354,87 @@ const CONN_BUFFER_MAX: usize = 64 << 20;
 /// log stream, so `copy_bidirectional` stops reading the guest side), the
 /// write blocks, a vCPU blocks behind it, IPIs to that vCPU go unanswered, and
 /// the whole guest freezes (docs/phase2b-4.md, "VM freeze"). So a task always
-/// reads into memory; a reader that falls more than [`CONN_BUFFER_MAX`] behind
-/// loses the connection instead of the VM.
+/// reads. A reader that falls [`CONN_BUFFER_MAX`] behind gets the rest from an
+/// unlinked temp file; one that falls [`CONN_SPILL_MAX`] further behind gets an
+/// error. Either way it never sees a clean EOF on a stream that was cut short.
 pub struct Conn {
-    rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    rx: tokio::sync::mpsc::UnboundedReceiver<Chunk>,
     pending: Vec<u8>,
     pos: usize,
     buffered: Arc<std::sync::atomic::AtomicUsize>,
+    /// The spill file, its read offset, and bytes in it not yet read.
+    spill: Option<(Arc<std::fs::File>, u64, u64)>,
+    spill_file: Arc<std::sync::OnceLock<Arc<std::fs::File>>>,
     write: tokio::io::WriteHalf<UnixStream>,
     pump: tokio::task::JoinHandle<()>,
 }
 
+fn open_spill_file() -> std::io::Result<std::fs::File> {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("rekcod-conn-{}-{n}", std::process::id()));
+    let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+    std::fs::remove_file(&path)?;
+    Ok(f)
+}
+
 impl Conn {
     fn new(stream: UnixStream) -> Conn {
+        use std::io::Write as _;
         use std::sync::atomic::Ordering;
         use tokio::io::AsyncReadExt;
         let (mut read, write) = tokio::io::split(stream);
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let buffered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let counter = buffered.clone();
+        let spill_file: Arc<std::sync::OnceLock<Arc<std::fs::File>>> = Arc::default();
+        let (counter, shared) = (buffered.clone(), spill_file.clone());
         let pump = tokio::spawn(async move {
             let mut buf = vec![0u8; 256 * 1024];
+            let mut spilled: u64 = 0;
+            let mut file: Option<Arc<std::fs::File>> = None;
+            let discard = |mut read: tokio::io::ReadHalf<UnixStream>, mut buf: Vec<u8>| async move {
+                while matches!(read.read(&mut buf).await, Ok(n) if n > 0) {}
+            };
             loop {
-                match read.read(&mut buf).await {
+                let n = match read.read(&mut buf).await {
                     Ok(0) | Err(_) => return, // dropping tx = EOF for the reader
-                    Ok(n) => {
-                        // Reader stalled or gone: end its stream (EOF) but keep
-                        // reading and discarding, so the guest never blocks.
-                        if counter.fetch_add(n, Ordering::Relaxed) + n > CONN_BUFFER_MAX || tx.send(buf[..n].to_vec()).is_err() {
-                            drop(tx);
-                            while matches!(read.read(&mut buf).await, Ok(n) if n > 0) {}
-                            return;
+                    Ok(n) => n,
+                };
+                // Once spilling, everything after goes to the file too, so order holds.
+                if file.is_none() && counter.load(Ordering::Relaxed) + n <= CONN_BUFFER_MAX {
+                    counter.fetch_add(n, Ordering::Relaxed);
+                    if tx.send(Chunk::Data(buf[..n].to_vec())).is_err() {
+                        return discard(read, buf).await; // reader gone
+                    }
+                    continue;
+                }
+                if file.is_none() {
+                    match open_spill_file() {
+                        Ok(f) => {
+                            let f = Arc::new(f);
+                            let _ = shared.set(f.clone());
+                            file = Some(f);
+                        }
+                        Err(e) => {
+                            eprintln!("rekcod: vsock reader stalled and spilling failed ({e}); dropping the connection");
+                            let _ = tx.send(Chunk::Overflow);
+                            return discard(read, buf).await;
                         }
                     }
                 }
+                let f = file.as_ref().expect("spill file");
+                if spilled + n as u64 > CONN_SPILL_MAX || (&**f).write_all(&buf[..n]).is_err() {
+                    eprintln!("rekcod: vsock reader fell {} GiB behind; dropping the connection", CONN_SPILL_MAX >> 30);
+                    let _ = tx.send(Chunk::Overflow);
+                    return discard(read, buf).await;
+                }
+                spilled += n as u64;
+                if tx.send(Chunk::Spilled(n)).is_err() {
+                    return discard(read, buf).await;
+                }
             }
         });
-        Conn { rx, pending: Vec::new(), pos: 0, buffered, write, pump }
+        Conn { rx, pending: Vec::new(), pos: 0, buffered, spill: None, spill_file, write, pump }
     }
 }
 
@@ -396,23 +450,52 @@ impl tokio::io::AsyncRead for Conn {
         cx: &mut std::task::Context<'_>,
         out: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
+        use std::os::unix::fs::FileExt;
         use std::task::Poll;
         let this = &mut *self;
-        if this.pos >= this.pending.len() {
+        loop {
+            if this.pos < this.pending.len() {
+                let n = out.remaining().min(this.pending.len() - this.pos);
+                out.put_slice(&this.pending[this.pos..this.pos + n]);
+                this.pos += n;
+                return Poll::Ready(Ok(()));
+            }
+            if let Some((f, off, left)) = this.spill.as_mut().filter(|s| s.2 > 0) {
+                let mut tmp = vec![0u8; (*left).min(out.remaining() as u64).min(1 << 20) as usize];
+                let n = f.read_at(&mut tmp, *off)?;
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "spill file truncated")));
+                }
+                *off += n as u64;
+                *left -= n as u64;
+                out.put_slice(&tmp[..n]);
+                return Poll::Ready(Ok(()));
+            }
             match this.rx.poll_recv(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(None) => return Poll::Ready(Ok(())), // EOF
-                Poll::Ready(Some(chunk)) => {
+                Poll::Ready(Some(Chunk::Data(chunk))) => {
                     this.buffered.fetch_sub(chunk.len(), std::sync::atomic::Ordering::Relaxed);
                     this.pending = chunk;
                     this.pos = 0;
                 }
+                Poll::Ready(Some(Chunk::Spilled(n))) => {
+                    if this.spill.is_none() {
+                        let f = this.spill_file.get().cloned().expect("spill file set before Spilled");
+                        this.spill = Some((f, 0, 0));
+                    }
+                    if let Some(s) = this.spill.as_mut() {
+                        s.2 += n as u64;
+                    }
+                }
+                Poll::Ready(Some(Chunk::Overflow)) => {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::ConnectionReset,
+                        "rekcod: reader fell too far behind the VM and the stream was cut",
+                    )));
+                }
             }
         }
-        let n = out.remaining().min(this.pending.len() - this.pos);
-        out.put_slice(&this.pending[this.pos..this.pos + n]);
-        this.pos += n;
-        Poll::Ready(Ok(()))
     }
 }
 
@@ -429,5 +512,41 @@ impl tokio::io::AsyncWrite for Conn {
     }
     fn poll_shutdown(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.write).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn a_stalled_reader_gets_every_byte_in_order() {
+        let (guest, host) = UnixStream::pair().unwrap();
+        let mut conn = Conn::new(host);
+        // More than the memory cap, written while nobody reads: the rest spills to a file.
+        let total = CONN_BUFFER_MAX + (8 << 20);
+        let writer = tokio::spawn(async move {
+            let mut guest = guest;
+            let mut i: u32 = 0;
+            let mut sent = 0;
+            while sent < total {
+                let chunk: Vec<u8> = (0..65536)
+                    .map(|_| {
+                        i = i.wrapping_add(1);
+                        (i % 251) as u8
+                    })
+                    .collect();
+                guest.write_all(&chunk).await.unwrap();
+                sent += chunk.len();
+            }
+        });
+        writer.await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(conn.spill_file.get().is_some(), "should have spilled");
+        let mut got = Vec::with_capacity(total);
+        conn.read_to_end(&mut got).await.unwrap();
+        assert_eq!(got.len(), total);
+        assert!(got.iter().enumerate().all(|(k, b)| *b as usize == (k + 1) % 251));
     }
 }

@@ -60,6 +60,43 @@ pub struct Ivars {
     running_actions: Arc<AtomicUsize>,
     /// The VM is booting or shutting down (daemon alive, docker not answering).
     transitioning: Arc<AtomicBool>,
+    models: Arc<Models>,
+}
+
+/// The menu's model, loaded on a background thread. `Model::load` asks docker and the
+/// fleet controller; on the main thread a slow controller would freeze the menu bar.
+#[derive(Default)]
+pub struct Models {
+    latest: std::sync::Mutex<Option<(std::time::Instant, Arc<Model>)>>,
+    loaded: std::sync::Condvar,
+    poke: std::sync::Mutex<bool>,
+    poked: std::sync::Condvar,
+}
+
+impl Models {
+    /// Reloads every 15 s, and right away when `fresh` asks.
+    fn run(self: Arc<Self>, paths: Paths) {
+        std::thread::spawn(move || {
+            loop {
+                let m = Arc::new(Model::load(&paths));
+                *self.latest.lock().unwrap() = Some((std::time::Instant::now(), m));
+                self.loaded.notify_all();
+                let poked = self.poke.lock().unwrap();
+                let (mut poked, _) = self.poked.wait_timeout_while(poked, std::time::Duration::from_secs(15), |p| !*p).unwrap();
+                *poked = false;
+            }
+        });
+    }
+
+    /// A model loaded after this call if one arrives within `wait`, else the newest there is.
+    fn fresh(&self, wait: std::time::Duration) -> Option<Arc<Model>> {
+        let asked = std::time::Instant::now();
+        *self.poke.lock().unwrap() = true;
+        self.poked.notify_all();
+        let latest = self.latest.lock().unwrap();
+        let (latest, _) = self.loaded.wait_timeout_while(latest, wait, |l| l.as_ref().is_none_or(|(t, _)| *t < asked)).unwrap();
+        latest.as_ref().map(|(_, m)| m.clone())
+    }
 }
 
 define_class!(
@@ -128,7 +165,7 @@ pub fn entries(m: &Model) -> Vec<Entry> {
     } else {
         out.push(Entry::Label("rekcod is stopped".into()));
     }
-    let vm = actions::vm_actions(m.running, m.socket_installed);
+    let vm = actions::vm_actions(m.running, m.socket_installed, m.autostart);
     out.extend(vm.into_iter().map(Entry::Action));
     out.extend(actions::storage_actions(m.running, &m.containers).into_iter().map(Entry::Action));
     let hosts = actions::host_actions(&m.hosts);
@@ -314,6 +351,7 @@ impl Target {
             frame: Cell::new(None),
             running_actions: Arc::default(),
             transitioning: Arc::default(),
+            models: Arc::default(),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -359,7 +397,12 @@ impl Target {
 
     /// Rebuilds the menu's items from a fresh model (called as it opens).
     fn fill(&self, menu: &NSMenu) {
-        let model = Model::load(&self.ivars().paths);
+        let paths = &self.ivars().paths;
+        let model = self
+            .ivars()
+            .models
+            .fresh(std::time::Duration::from_millis(1500))
+            .unwrap_or_else(|| Arc::new(Model { running: crate::cli::running_pid(paths).is_some(), ..Default::default() }));
         menu.removeAllItems();
         self.ivars().actions.borrow_mut().clear();
         self.add(menu, &entries(&model));
@@ -505,6 +548,7 @@ pub fn run(paths: Paths) -> Result<()> {
             }
         });
     }
+    target.ivars().models.clone().run(target.ivars().paths.clone());
     let _ = target.ivars().item.set(item);
     target.update_title();
     let _timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_target_selector_userInfo_repeats(2.0, &target, sel!(tick:), None, true) };
@@ -618,6 +662,7 @@ mod tests {
             projects,
             sandbox: None,
             socket_installed: false,
+            autostart: false,
             sandboxes: vec![crate::actions::tests::sample_sandbox()],
             apps: vec![
                 crate::actions::tests::sample_app(),
@@ -650,7 +695,8 @@ mod tests {
         let mut seen = Vec::new();
         kinds(&entries(&model), &mut seen);
         kinds(&entries(&Model::default()), &mut seen);
-        let storage = Model { running: true, containers: vec![crate::actions::tests::sample_storage()], ..Model::default() };
+        let storage =
+            Model { running: true, autostart: true, containers: vec![crate::actions::tests::sample_storage()], ..Model::default() };
         kinds(&entries(&storage), &mut seen);
         for k in crate::actions::Kind::ALL {
             assert!(seen.contains(&k), "menu bar lacks {k:?}");

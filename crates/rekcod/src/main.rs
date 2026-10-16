@@ -1205,6 +1205,13 @@ fn main() {
     }
     let args = Args::parse();
     let command = args.command;
+    // A signal mask is inherited across exec: a daemon spawned by a fleet node (which blocks
+    // SIGTERM to handle it on one thread) would otherwise never see `rekcod stop`.
+    unsafe {
+        let mut none: libc::sigset_t = std::mem::zeroed();
+        libc::sigemptyset(&mut none);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
+    }
     if !matches!(command, Cmd::Daemon { .. }) {
         // Behave like other CLIs when piped into `head` (the daemon keeps Rust's SIGPIPE-ignore).
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };

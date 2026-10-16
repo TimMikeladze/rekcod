@@ -269,6 +269,10 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         unsafe {
             cmd.pre_exec(|| {
                 libc::setsid();
+                // Not the parent's blocked signals (a fleet node blocks SIGTERM).
+                let mut none: libc::sigset_t = std::mem::zeroed();
+                libc::sigemptyset(&mut none);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
                 Ok(())
             });
         }

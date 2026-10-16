@@ -9,6 +9,43 @@ its own and downloads it on first start.
 
 ## [Unreleased]
 
+Version 0.3.0 in `Cargo.toml`; not tagged yet.
+
+### Upgrading from 0.2
+
+- **Fleet controllers serve TLS.** Start the new controller, then re-add remotes with
+  `rekcod remote add NAME https://HOST:7700 --token T --ca-fingerprint $(rekcod controller ca)`
+  and re-join nodes with `--ca-fingerprint`. `controller serve --http` keeps plain HTTP on
+  loopback and tailnet addresses. Controllers, nodes and CLIs must be on the same minor
+  version; older ones get an error naming both versions.
+- **New nodes need `rekcod node approve ID`** unless the controller runs with
+  `--auto-approve` (`spare setup` passes it). Existing nodes stay ready.
+- **Tokens are hashed** on the controller's first start. They keep working; the plaintext
+  is no longer in fleet.db, so keep `controller/admin-token`.
+- **Edges should use an edge token** (`controller token edge --edge`) instead of an admin
+  one. Admin tokens still work.
+- **`rekcod mcp` and `rekcod sandbox serve` only create sandboxes for the directory they
+  started in** (`--root` adds others) and refuse `allow_hosts`, `secrets` and `mount` unless
+  started with `--allow-host`, `--secret` and `--allow-mount`.
+- Sandboxes from before this keep working; `apply` falls back to the old mtime conflict
+  check for them.
+
+### Security
+
+- Git URLs and refs that git would read as options (`--upload-pack=...`) are refused; only
+  https, ssh and http transports (local repos with `REKCOD_ALLOW_LOCAL_GIT=1`).
+- The node API's sandbox id can't be replaced by a query parameter; remote sandbox creates
+  forward only user fields; golden disk and macOS image names are validated.
+- `sandbox apply` never writes through a symlink, refuses symlinks out of the project and
+  applies a frozen copy (`--reviewed` for what `diff` showed).
+- The dashboard needs a per-launch token, and containers can't reach its port through
+  `host.docker.internal`.
+- Workspace containers drop `NET_RAW`; a live `.git` is mounted read-only into sandboxes.
+- Fleet: TLS with a pinned CA, hashed and revocable tokens with expiry, edge tokens, node
+  approval and join-token rotation, presigned URLs instead of RustFS root keys on nodes,
+  viewers can't read env values, webhook replay protection, fork PRs need a label, request
+  size and connection limits, constant-time token checks.
+
 ### Added
 
 - `rekcod snap save|restore|ls|rm`: compose volume snapshots, named after the git branch by
@@ -37,9 +74,21 @@ its own and downloads it on first start.
 - `scripts/install.sh`: checksum-verified install from a release.
 - Releases carry CycloneDX SBOMs and a build provenance attestation.
 
+- `rekcod start --repair` (e2fsck the data disk, fresh root disk), `start --install` (boot at
+  login and again after a crash), `stop --force`. Start settings are saved and reused.
+- `rekcod upgrade`, `rekcod uninstall`, `rekcod doctor`.
+- Fleet: a reconcile loop that takes back instances that answer again and replaces missing
+  ones, `node approve|rm`, `controller ca|revoke|rotate-join`, `--alert-webhook`,
+  `--backup-dir`, `GET /metrics`, kept logs of removed instances, graceful SIGTERM.
+- `scripts/e2e-lifecycle.sh`: VM crash, damaged-disk and repair checks on a VM of its own.
+
 ### Changed
 
 - `start --no-switch` with a non-default `REKCOD_HOME` leaves the shared docker context alone.
+- Snapshots are written as a new generation before the old one goes; restore saves the
+  current volumes as `pre-restore` first.
+- DNS uses per-domain resolvers from `scutil --dns` (VPN split DNS, Tailscale).
+- `daemon.log` and `console.log` start fresh each boot, keeping the previous as `.1`.
 - Releases bundle the dashboard and run fmt, clippy, all tests, `cargo deny` and the
   dashboard checks before publishing. Workflow actions are pinned by commit SHA, and the
   Rust toolchain by `rust-toolchain.toml`.
@@ -48,6 +97,18 @@ its own and downloads it on first start.
 
 ### Fixed
 
+- A data disk that isn't readable ext4 is never formatted (it was, on any blkid miss); its
+  backup superblock is tried and the error reported.
+- A reader that falls behind a vsock stream no longer gets a short stream with a clean EOF.
+- A stale pid file no longer counts as a running VM, and `stop` no longer signals whatever
+  process reused the pid. Two commands starting the VM at once boot one VM.
+- Mac ports another process serves on `*:PORT` aren't shadowed by a `127.0.0.1:PORT`
+  forward.
+- File-change batches the guest didn't take are resent instead of dropped.
+- The menu bar no longer freezes on a slow controller.
+- Fleet: lost nodes' instances come back, nodes boot their instances after a reboot,
+  concurrent deploys of one app are serialized, a restart cleans up half-done deploys, jobs
+  a node lost are reported, `--listen 0.0.0.0 --advertise ...` produces reachable endpoints.
 - `rekcod x --sandbox` exits as soon as the command does.
 - `scripts/e2e.sh` removes only its own `rekcod x` container and refuses its final
   `rekcod stop` while containers it didn't start are running.

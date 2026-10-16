@@ -6,6 +6,8 @@ Start with the [README](../README.md): install, what works, commands, build and 
 
 How a feature behaves today and how to drive it.
 
+- [troubleshooting.md](troubleshooting.md): what to do when something's wrong; start with `rekcod doctor`.
+- [install-upgrade.md](install-upgrade.md): `rekcod upgrade`, `uninstall`, `doctor`, logs.
 - [cli-passthrough.md](cli-passthrough.md): `rekcod <docker command>` without a docker CLI.
 - [default-socket.md](default-socket.md): routing `/var/run/docker.sock` to rekcod.
 - [sandbox.md](sandbox.md): `rekcod x --sandbox` and its threat model.
@@ -18,6 +20,8 @@ How a feature behaves today and how to drive it.
 - [namespaces.md](namespaces.md): multi-tenancy in a fleet.
 - [edge-http.md](edge-http.md): the edge proxy, rate limits, bans, per-app HTTP settings.
 - [rustfs.md](rustfs.md): app buckets, stored images and backups on RustFS.
+- [fleet-hardening.md](fleet-hardening.md): fleet TLS, tokens, node approval, the reconcile loop.
+- [sandbox-network.md](sandbox-network.md): sandbox egress filtered on the Mac.
 
 ## Building and releasing
 
@@ -33,6 +37,7 @@ How a feature behaves today and how to drive it.
 Specs and phase write-ups, kept for the reasoning and the numbers. Where one disagrees with
 the code or a doc above, the code and the doc above win.
 
+- [production-readiness.md](production-readiness.md): the audit the 0.3.0 work went through.
 - [plan.md](plan.md): the original strategy, phases and gates.
 - [mvp.md](mvp.md): phase 1, switching in one command.
 - [phase2.md](phase2.md): bind-mount caching and the memory finding.

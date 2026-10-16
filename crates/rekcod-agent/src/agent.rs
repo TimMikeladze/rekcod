@@ -485,6 +485,17 @@ async fn trim_periodically() {
         tokio::time::sleep(Duration::from_secs(3600)).await;
         let reply = tokio::task::spawn_blocking(trim).await.unwrap_or_default();
         eprintln!("rekcod-agent: hourly trim: {reply}");
+        for log in ["/var/lib/docker/dockerd.log", "/var/log/dnsmasq.log"] {
+            trim_log(log);
+        }
+    }
+}
+
+/// Past 20 MB, keeps a copy as `.1` and truncates: services write with `>>` (O_APPEND),
+/// so they carry on at the new end. run.sh rotates too, but only when a service restarts.
+fn trim_log(path: &str) {
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > 20 << 20) && std::fs::copy(path, format!("{path}.1")).is_ok() {
+        let _ = std::fs::OpenOptions::new().write(true).open(path).and_then(|f| f.set_len(0));
     }
 }
 

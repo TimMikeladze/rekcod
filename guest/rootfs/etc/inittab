@@ -1,6 +1,6 @@
 # rekcod guest init (busybox). boot.sh prepares everything, then services respawn.
 ::sysinit:/etc/rekcod/boot.sh
 ::respawn:/etc/rekcod/run.sh /dev/console /usr/local/bin/rekcod-agent
-::respawn:/etc/rekcod/run.sh /var/log/dockerd.log /usr/local/bin/dockerd --config-file /etc/docker/daemon.json
+::respawn:/etc/rekcod/run.sh /var/lib/docker/dockerd.log /usr/local/bin/dockerd --config-file /etc/docker/daemon.json
 ::respawn:/etc/rekcod/run.sh /var/log/dnsmasq.log /usr/sbin/dnsmasq -k --conf-file=/etc/dnsmasq.conf
 ::shutdown:/etc/rekcod/shutdown.sh

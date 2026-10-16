@@ -1156,6 +1156,10 @@ const MIGRATIONS: &[&str] = &[
      alter table tokens add column edge integer not null default 0;",
     // GitHub deliveries seen, so a replayed webhook does nothing.
     "create table if not exists deliveries (id text primary key, ts integer not null);",
+    // The last lines of instances that are gone (redeployed, recycled, lost), so their
+    // logs outlive them.
+    "create table if not exists instance_logs (app text not null, release integer not null, sandbox text primary key,
+       node text not null, ended integer not null, logs text not null);",
 ];
 
 pub struct Db(rusqlite::Connection);
@@ -2749,8 +2753,25 @@ fn load_app_key(c: &Controller, key: &str) -> Result<Option<App>> {
     }))
 }
 
+/// Instances whose last logs are kept per app, newest first.
+const KEEP_INSTANCE_LOGS: i64 = 20;
+
 fn delete_instance(c: &Controller, node: &str, sandbox_id: &str) {
     if let Ok((url, sec, _)) = c.node(node) {
+        // Its last lines first: after the DELETE they're gone with the VM.
+        if let Ok(v) = call_within(&url, "GET", &format!("/sandboxes/{sandbox_id}/logs"), Some(&sec), &Value::Null, QUICK) {
+            let logs = v["logs"].as_str().unwrap_or("").to_string();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = db.execute(
+                "insert or replace into instance_logs select app, release, sandbox, node, ?2, ?3 from instances where sandbox = ?1",
+                &[&sandbox_id, &now(), &logs],
+            );
+            let _ = db.execute(
+                "delete from instance_logs where sandbox in (select sandbox from instance_logs l where l.app = (select app from instances where sandbox = ?1)
+                   order by ended desc limit -1 offset ?2)",
+                &[&sandbox_id, &KEEP_INSTANCE_LOGS],
+            );
+        }
         let _ = call_within(&url, "DELETE", &format!("/sandboxes/{sandbox_id}"), Some(&sec), &Value::Null, QUICK);
     }
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3416,6 +3437,14 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         }
         ("GET", ["apps", name, "instances", sb, "logs"]) => {
             let app = load(name, Role::Viewer)?;
+            // A gone instance: what was kept when it was deleted.
+            let kept =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .query_opt("select logs, ended from instance_logs where app = ?1 and sandbox = ?2", &[&app.name, sb])?;
+            if let Some(r) = kept {
+                return Ok(json!({"logs": r.get::<String>(0), "ended": r.get::<i64>(1)}));
+            }
             let node: String =
                 c.db.lock()
                     .unwrap()

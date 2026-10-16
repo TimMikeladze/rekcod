@@ -1289,7 +1289,7 @@ dependencies = [
 
 [[package]]
 name = "rekcod"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -1323,7 +1323,7 @@ dependencies = [
 
 [[package]]
 name = "rekcod-agent"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "libc",
@@ -1334,7 +1334,7 @@ dependencies = [
 
 [[package]]
 name = "rekcod-proto"
-version = "0.2.1"
+version = "0.3.0"
 
 [[package]]
 name = "ring"

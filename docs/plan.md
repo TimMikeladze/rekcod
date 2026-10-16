@@ -122,7 +122,7 @@ Reimplementing the Engine API, Compose or BuildKit. 16K-page kernels. Lazy pulls
 1. The guest FUSE patch has to be carried across kernel upgrades. Keep it small and behind a mount option.
 2. Rosetta for Linux VMs after macOS 27 is unannounced. If it goes away, the VZ vs libkrun trade flips; revisit phase 4.
 3. Parity surface (networking, VPN, the menu bar app) has to be close to OrbStack before any differentiator matters.
-4. FSEvents gives bounded staleness, not coherence. Some tool will notice. Provide a per-mount `strict` mode that falls back to short TTLs.
+4. FSEvents gives bounded staleness, not coherence. Some tool will notice. Provide a per-mount `strict` mode that falls back to short TTLs. (Not built: the cache is on for every bind mount. Dropped FSEvents batches are resent as directory invalidations, which covers the overflow case; a per-mount switch would need a mount option in the guest patch.)
 5. `--sandbox` is a security claim: a share-scoping bug becomes a credential leak. Write a threat model and get an external review before marketing it as security.
 
 ## Phase 0 results (M5 Pro, 48 GB, macOS 27.0.1, OrbStack 2.2.3, engine 29.4.0)

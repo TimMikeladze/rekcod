@@ -89,12 +89,26 @@ xattr -d com.apple.quarantine /usr/local/bin/rekcod 2>/dev/null   # not notarize
 The binary pins the guest it was released with (`~/.rekcod/guest/<version>/`) and
 checks its sha256 before unpacking. `REKCOD_RELEASE_URL` points the download elsewhere.
 
+### Upgrading, removing, when something's wrong
+
+```sh
+rekcod upgrade             # latest release over this binary, checksum-verified; --check only looks
+rekcod stop && rekcod start   # the VM keeps running the old version until it restarts
+rekcod doctor              # checks the VM, versions, disk, sockets, context, VM internet; --bundle tars the logs
+rekcod uninstall           # stops it, removes login agents, socket route, docker context and ~/.rekcod
+rekcod uninstall --keep-data   # the same, keeping ~/.rekcod
+```
+
+`upgrade` refuses on a Homebrew install (`brew upgrade rekcod`; the formula is in
+`packaging/homebrew`). `uninstall` asks first and leaves the binary for you to delete.
+Details: [`docs/install-upgrade.md`](docs/install-upgrade.md).
+
 ## What works
 
 Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS 27:
 
 - Upstream dockerd 29.9.0 with its embedded BuildKit. `docker build`, compose `build:` and `buildx bake` all work.
-- Published TCP and UDP ports on the Mac's `localhost`, mirrored from docker events. If a Mac port is already taken, rekcod reports it in `rekcod status` and leaves the other process alone. Mac TCP connections go straight to the container's address, skipping docker-proxy (about 85 µs round trip vs 125 µs through it), so iptables rules in the guest's `DOCKER-USER` chain don't apply to them.
+- Published TCP and UDP ports on the Mac's `localhost`, mirrored from docker events. If a Mac port is already taken (even by a process on `*:PORT` while the container asks for `127.0.0.1:PORT`), rekcod reports it in `rekcod status` and leaves the other process alone. Mac TCP connections go straight to the container's address, skipping docker-proxy (about 85 µs round trip vs 125 µs through it), so iptables rules in the guest's `DOCKER-USER` chain don't apply to them.
 - Bind mounts from `/Users`, `/Volumes`, `/private`, `/tmp` and `/var/folders` at the same paths, cached in the
   guest and invalidated from FSEvents. Warm work is 3–9× faster than OrbStack's bind
   mounts and faster than native macOS (table below). Mac-side edits, atomic saves, creates,
@@ -340,21 +354,40 @@ routes `<app>.<domain>` to them. Design: [`docs/platform.md`](docs/platform.md).
 licence section there first: Apple's macOS licence restricts running it as a service.
 
 ```sh
-# the controller (any Mac), prints where its admin and join tokens are
-rekcod controller serve --listen 0.0.0.0:7700 --domain apps.example.com
-# each Mac
-rekcod node join http://controller:7700 "$(cat join-token)" --listen 0.0.0.0:7701 --advertise http://mac2:7701
+# the controller (any Mac); prints its CA fingerprint and where the admin and join tokens are
+rekcod controller serve --listen 0.0.0.0:7700 --domain apps.example.com --tls-name controller
+# each Mac, then approve it
+rekcod node join https://controller:7700 "$(cat join-token)" --ca-fingerprint sha256:... \
+  --listen 0.0.0.0:7701 --advertise https://mac2:7701
+rekcod node approve n-abc123 --remote team
 # you
-rekcod remote add team http://controller:7700 --token ADMIN_TOKEN
-rekcod controller token alice --max-sandboxes 5          # a user token
+rekcod remote add team https://controller:7700 --token ADMIN_TOKEN --ca-fingerprint sha256:...
+rekcod controller token alice --max-sandboxes 5          # a user token (--expires 30d, `controller revoke alice`)
 rekcod sandbox --remote create                           # clones this repo's origin at HEAD on a node
 rekcod sandbox --remote exec ID -- npm test
-rekcod edge serve --listen 100.x.y.z:8080 --public-listen 127.0.0.1:8081   # all apps / public apps only
+rekcod controller token edge-1 --edge                    # what an edge needs and nothing more
+rekcod edge serve --remote edge --listen 100.x.y.z:8080 --public-listen 127.0.0.1:8081   # all apps / public apps only
 rekcod app deploy                                        # this repo's pushed HEAD + rekcod.toml
 rekcod app rollback dash
 rekcod app env set dash NODE_ENV=production              # redeploys the live release
 rekcod app public dash                                   # also serve it on --public-listen
 ```
+
+The controller makes its own CA on first start (`controller/ca.pem`) and serves TLS with a
+certificate for its listen address, host name, `localhost` and each `--tls-name`. Remotes
+and nodes fetch the CA once and keep it only if it matches `--ca-fingerprint`; after that
+every control-plane connection (CLI, edges and nodes to the controller, the controller to
+nodes) is verified TLS. Nodes get their certificate from the controller when they join.
+`rekcod controller ca` prints the fingerprint again. `controller serve --http` serves plain
+HTTP, and only on loopback or tailnet addresses (100.64.0.0/10, `*.ts.net`) unless
+`REKCOD_INSECURE=1`. App traffic between the edge and nodes is plain HTTP, so keep nodes on
+a tailnet or LAN you trust.
+
+New nodes wait as `pending` until `rekcod node approve ID` (`controller serve --auto-approve`
+skips that, as `spare setup` does). `node rm ID` forgets one and its instances move.
+`controller rotate-join` replaces the join token. Tokens are stored hashed. An `--edge`
+token reads routes and bans, reports traffic and wakes sleeping apps; a token made with
+`--ns` has no access to `default`.
 
 Apps are private until you make them public (`app public NAME`, `app deploy --public`, or
 `public = true` under `[app]` in `rekcod.toml`). `--listen` routes every app; bind it to
@@ -398,9 +431,20 @@ closed after 90 s without a request, and `--access-log` prints a line per reques
 `--install` on `controller serve`, `node join`/`node serve`, `edge serve` and `storage serve`
 runs each as a LaunchAgent; `rekcod controller|node|edge|storage uninstall` removes it.
 [A spare Mac](#a-spare-mac) sets up all four with one command. With storage the controller
-backs `fleet.db` up every hour (below). Without it, copy `fleet.db` (and its `-wal` file)
-while it's stopped. Either way keep a copy of `controller/secret-key` somewhere else: app
-secrets in `fleet.db` are sealed with it, and they can't be read without it.
+backs `fleet.db` up every hour (below); `--backup-dir DIR` also keeps those copies on another
+disk or a synced folder. Without either, copy `fleet.db` (and its `-wal` file) while it's
+stopped. Either way keep a copy of `controller/secret-key` somewhere else: app secrets in
+`fleet.db` are sealed with it, and they can't be read without it. A controller that finds
+sealed secrets but no key refuses to start rather than make a new one.
+
+The controller keeps the fleet converging on what it should run. Every 10 s it health-checks
+instances: one that fails three checks leaves the routes, one on a node that comes back
+returns once it answers, and an app short of healthy instances for a minute is redeployed
+at its live commit (from stored images, so no rebuild). Nodes boot their instance VMs when
+they start, and report their sandboxes in every heartbeat. A restart marks deploys that
+were in flight failed. `--alert-webhook URL` posts `{"text": ...}` when a node is lost or a
+deploy or backup fails (Slack and Discord take that), and `GET /metrics` (admin or edge
+token) is Prometheus text. Stored release images are kept for the newest 10 commits per app.
 
 ### Namespaces
 
@@ -555,10 +599,10 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod mcp [--root DIR] [--allow-host H] [--secret NAME] [--allow-mount]` | MCP server on stdio for the sandbox commands; the flags fix what callers may ask for |
 | `rekcod macos fetch\|install\|setup\|authorize\|ls\|rm` | macOS base images for `sandbox create --os macos` |
 | `rekcod sandbox screenshot\|input` | Screen and mouse/keyboard of a macOS sandbox |
-| `rekcod remote add\|ls\|rm\|use` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`); `use` sets the default |
+| `rekcod remote add NAME URL --token T [--ca-fingerprint FP]\|ls\|rm\|use` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`); `use` sets the default |
 | `rekcod ns create\|ls\|quota\|member\|use\|rm` | Namespaces on the fleet (`--ns` on `sandbox`, `app` and `job`) |
-| `rekcod node join\|serve\|ls\|drain\|undrain\|pool\|uninstall` | Run this Mac as a fleet node; list, drain, undrain or dedicate nodes |
-| `rekcod controller serve\|token\|limit\|backup\|backups\|restore\|uninstall` | The fleet controller; create user tokens, change their caps, back up `fleet.db` |
+| `rekcod node join\|serve\|ls\|approve\|rm\|drain\|undrain\|pool\|uninstall` | Run this Mac as a fleet node; list, approve, remove, drain, undrain or dedicate nodes |
+| `rekcod controller serve\|ca\|token\|revoke\|rotate-join\|limit\|backup\|backups\|restore\|uninstall` | The fleet controller; its CA fingerprint, user and edge tokens, their caps, the join token, backups of `fleet.db` |
 | `rekcod storage serve\|uninstall\|up\|down\|env` | RustFS: the fleet's S3 bucket, or one in the local VM |
 | `rekcod edge serve\|ban\|unban\|bans\|uninstall` | HTTP ingress for apps; ban IPs and ranges on every edge |
 | `rekcod app deploy\|ls\|status\|release\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet; `release NAME N` prints one release with its deploy log, `logs --instance ID` one instance's logs |
@@ -571,6 +615,9 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, local S3 storage (start, env, stop), containers (start, stop, restart, logs, remove), ports (click to open), compose projects (restart, stop, down), snapshots (save, restore, delete), images and volumes (remove, prune), agent sandboxes (shell, diff, apply, stop, delete), apps on the default remote (open, logs, roll back, wake, restart instances, destroy), jobs (output, run again, cancel), nodes (drain, undrain), remotes (switch, back up the controller), edge bans. `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
 | `rekcod state` | Everything the menu bar and dashboard show, with each item's actions (`argv`, `confirm`), as one JSON document; `--local` skips the fleet controller |
 | `rekcod dashboard [--install\|--uninstall]` | Start the web dashboard (or find the running one) and open it; `--install` runs it at login (LaunchAgent `dev.rekcod.dashboard`) |
+| `rekcod upgrade [--check]` | Install the latest release over this binary |
+| `rekcod doctor [--bundle]` | Check what usually goes wrong, with a fix for each; `--bundle` writes a diagnostics tarball |
+| `rekcod uninstall [--keep-data] [--yes]` | Remove everything rekcod set up |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |

@@ -53,7 +53,7 @@ pids+=($!)
 for _ in $(seq 240); do curl -s -o /dev/null -m 1 http://127.0.0.1:17710/ && break; sleep 0.5; done
 check "storage serve answers" curl -s -o /dev/null -m 2 http://127.0.0.1:17710/
 check "root keys written 0600" sh -c 'test "$(stat -f %Lp "$0")" = 600' "$C/storage/credentials.json"
-"$R" controller serve --listen 127.0.0.1:17720 --domain apps.test --drain 1s --storage http://127.0.0.1:17710 >"$C/controller.log" 2>&1 &
+"$R" controller serve --http --auto-approve --listen 127.0.0.1:17720 --domain apps.test --drain 1s --storage http://127.0.0.1:17710 >"$C/controller.log" 2>&1 &
 pids+=($!) ctl=$!
 for _ in $(seq 50); do curl -s -o /dev/null -m 1 http://127.0.0.1:17720/ && break; sleep 0.2; done
 REKCOD_HOME=$N "$R" node join http://127.0.0.1:17720 "$(cat "$C/controller/join-token")" --listen 127.0.0.1:17721 >"$N/node.log" 2>&1 &
@@ -105,7 +105,7 @@ check "controller backup" cr controller backup
 check "controller backups lists it" sh -c '"$0" controller backups --remote admin | grep -q "fleet-"' "$R"
 kill "$ctl"; wait "$ctl" 2>/dev/null
 check "controller restore" "$R" controller restore
-"$R" controller serve --listen 127.0.0.1:17720 --domain apps.test --drain 1s >>"$C/controller.log" 2>&1 &
+"$R" controller serve --http --auto-approve --listen 127.0.0.1:17720 --domain apps.test --drain 1s >>"$C/controller.log" 2>&1 &
 pids+=($!)
 sleep 2
 check "restored controller has the app and remembers storage" sh -c '"$0" app ls --remote admin | grep -q "\"other\"" && grep -c "storage on" "$1" | grep -q 2' "$R" "$C/controller.log"

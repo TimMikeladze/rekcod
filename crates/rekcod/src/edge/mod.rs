@@ -263,6 +263,7 @@ fn minute_now() -> i64 {
 /// `rekcod edge serve`. `listen` routes every app (for the tailnet); `public_listen` only
 /// apps marked public (point cloudflared or another tunnel at it).
 pub fn serve(paths: &Paths, remote_name: Option<&str>, o: Options) -> Result<()> {
+    crate::lifecycle::trim_log_hourly(paths.home.join("logs/edge.log"));
     let edge = Edge::new(Some(fleet::remote(paths, remote_name)?), o.settings).with_cache(paths.home.join("edge-routes.json"));
     let e = edge.clone();
     std::thread::spawn(move || {

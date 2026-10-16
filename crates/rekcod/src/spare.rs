@@ -104,6 +104,9 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
         std::thread::sleep(Duration::from_millis(500));
     }
     let storage = format!("http://{ip}:7710");
+    // The tailnet DNS name goes into the controller's certificate, so remotes can use it.
+    let name = Command::new(&ts).args(["status", "--json"]).output().ok().and_then(|o| dns_name(&String::from_utf8_lossy(&o.stdout)));
+    let host = if addr.is_some() { ip.clone() } else { name.clone().unwrap_or(ip.clone()) };
     run(
         &exe,
         &[
@@ -116,6 +119,8 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
             "--storage",
             &storage,
             "--auto-approve",
+            "--tls-name",
+            &host,
             "--install",
         ],
     )?;
@@ -129,14 +134,22 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
     let admin = std::fs::read_to_string(&admin_file)
         .map(|s| s.trim().to_string())
         .map_err(|_| anyhow::anyhow!("controller didn't start; see {}", paths.home.join("logs/controller.log").display()))?;
-    let url = format!("http://{ip}:7700");
+    let fp_file = ctl.join("ca-fingerprint");
+    for _ in 0..60 {
+        if fp_file.exists() || std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let fp = std::fs::read_to_string(&fp_file).map(|f| f.trim().to_string()).unwrap_or_else(|_| "sha256:dry-run".into());
+    let url = format!("https://{ip}:7700");
     if paths.home.join("node.json").exists() {
         run(&exe, &["node", "serve", "--install"])?;
     } else {
         let join = std::fs::read_to_string(ctl.join("join-token")).context("no join token")?;
-        run(&exe, &["node", "join", &url, join.trim(), "--listen", &format!("{ip}:7701"), "--install"])?;
+        run(&exe, &["node", "join", &url, join.trim(), "--listen", &format!("{ip}:7701"), "--ca-fingerprint", &fp, "--install"])?;
     }
-    run(&exe, &["remote", "add", "local", &url, "--token", &admin])?;
+    run(&exe, &["remote", "add", "local", &url, "--token", &admin, "--ca-fingerprint", &fp])?;
     // The edge gets a token that can only read routes and bans: taking over whatever runs
     // the edge shouldn't mean owning the fleet.
     let edge_token = if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
@@ -145,7 +158,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
         let v = crate::fleet::call(&url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
         v["token"].as_str().context("no edge token")?.to_string()
     };
-    run(&exe, &["remote", "add", "edge", &url, "--token", &edge_token])?;
+    run(&exe, &["remote", "add", "edge", &url, "--token", &edge_token, "--ca-fingerprint", &fp])?;
     run(&exe, &["edge", "serve", "--remote", "edge", "--listen", &format!("{ip}:8080"), "--public-listen", "127.0.0.1:8081", "--install"])?;
 
     if auto_login_user().is_none() {
@@ -153,8 +166,6 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
             "rekcod: automatic login is off, so after a reboot nothing runs until someone logs in (System Settings › Users & Groups)"
         );
     }
-    let name = Command::new(&ts).args(["status", "--json"]).output().ok().and_then(|o| dns_name(&String::from_utf8_lossy(&o.stdout)));
-    let host = if addr.is_some() { ip.clone() } else { name.unwrap_or(ip.clone()) };
     eprintln!(
         "\nrekcod: this Mac is a fleet on {ip}: controller :7700, node :7701, RustFS :7710, edge :8080 (all apps), 127.0.0.1:8081 (public apps)\n\
          Public traffic, once {domain}'s DNS is on Cloudflare:\n\
@@ -164,7 +175,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
          Logs: {}/logs/{{controller,node,edge,storage}}.log   Undo: rekcod spare uninstall\n",
         paths.home.display()
     );
-    println!("remote http://{host}:7700 {admin}");
+    println!("remote https://{host}:7700 {admin} {fp}");
     Ok(())
 }
 
@@ -176,10 +187,12 @@ pub fn uninstall() -> Result<()> {
 }
 
 /// The `remote URL TOKEN` line `spare setup` ends with.
-pub fn parse_remote(line: &str) -> Option<(String, String)> {
+/// `remote URL TOKEN [CA-FINGERPRINT]`, the last line `spare setup` prints.
+pub fn parse_remote(line: &str) -> Option<(String, String, Option<String>)> {
     let mut it = line.trim().strip_prefix("remote ")?.split_whitespace();
     let (url, token) = (it.next()?, it.next()?);
-    url.starts_with("http").then(|| (url.to_string(), token.to_string()))
+    let fp = it.next().filter(|f| f.starts_with("sha256:")).map(String::from);
+    url.starts_with("http").then(|| (url.to_string(), token.to_string(), fp))
 }
 
 const FIND: &str = "command -v rekcod || { [ -x ~/.rekcod/bin/rekcod ] && echo ~/.rekcod/bin/rekcod; }";
@@ -187,11 +200,24 @@ const FIND: &str = "command -v rekcod || { [ -x ~/.rekcod/bin/rekcod ] && echo ~
 /// The spare's rekcod, copying this one over when it has none.
 pub fn ensure_binary(dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String]) -> Result<String> {
     let o = ssh().args(["/bin/zsh", "-lc", FIND]).stdin(Stdio::null()).output()?;
-    if let Some(p) = String::from_utf8_lossy(&o.stdout).lines().map(str::trim).find(|l| l.starts_with('/')) {
-        return Ok(p.to_string());
-    }
+    let found = String::from_utf8_lossy(&o.stdout).lines().map(str::trim).find(|l| l.starts_with('/')).map(String::from);
     let exe = std::env::current_exe()?.canonicalize()?;
-    eprintln!("rekcod: no rekcod on {dest}; copying {} to ~/.rekcod/bin/rekcod", exe.display());
+    if let Some(p) = &found {
+        // Same version: use it. Another version would speak another fleet API; ours goes
+        // into ~/.rekcod/bin, which FIND prefers next time only if nothing is on PATH.
+        let v = ssh().args([p.as_str(), "--version"]).stdin(Stdio::null()).output()?;
+        let theirs = String::from_utf8_lossy(&v.stdout).split_whitespace().nth(1).unwrap_or("").to_string();
+        if theirs == env!("CARGO_PKG_VERSION") {
+            return Ok(p.clone());
+        }
+        eprintln!(
+            "rekcod: {dest} has rekcod {theirs} at {p}; copying {} ({}) to ~/.rekcod/bin/rekcod",
+            exe.display(),
+            env!("CARGO_PKG_VERSION")
+        );
+    } else {
+        eprintln!("rekcod: no rekcod on {dest}; copying {} to ~/.rekcod/bin/rekcod", exe.display());
+    }
     let ok = ssh().args(["mkdir", "-p", ".rekcod/bin"]).stdin(Stdio::null()).status()?.success();
     let (port, host) = match scp_dest {
         [p, port, host] if p == "-p" => (Some(port.clone()), host.clone()),
@@ -219,7 +245,7 @@ fn shell_safe(s: &str) -> bool {
 /// Bytes go through before their newline so sudo's `Password:` prompt shows up.
 // Unbuffered on purpose: a buffered reader would wait for more than the prompt.
 #[allow(clippy::unbuffered_bytes)]
-fn pass_through(src: impl Read, mut out: impl Write) -> Result<Option<(String, String)>> {
+fn pass_through(src: impl Read, mut out: impl Write) -> Result<Option<(String, String, Option<String>)>> {
     const PREFIX: &[u8] = b"remote http";
     let (mut line, mut held, mut remote) = (Vec::new(), true, None);
     for b in src.bytes() {
@@ -251,7 +277,14 @@ fn pass_through(src: impl Read, mut out: impl Write) -> Result<Option<(String, S
 
 /// Runs `spare setup` over SSH, streaming its output, and returns the remote it printed.
 /// `ssh` should have `-t` when this terminal is one, so sudo can prompt.
-pub fn remote_setup(dest: &str, mut ssh: Command, bin: &str, domain: &str, addr: Option<&str>, no_power: bool) -> Result<(String, String)> {
+pub fn remote_setup(
+    dest: &str,
+    mut ssh: Command,
+    bin: &str,
+    domain: &str,
+    addr: Option<&str>,
+    no_power: bool,
+) -> Result<(String, String, Option<String>)> {
     if !shell_safe(domain) || addr.is_some_and(|a| !shell_safe(a)) || bin.contains('\'') {
         bail!("--domain and --addr take letters, digits and - . : only");
     }
@@ -278,9 +311,13 @@ mod tests {
     fn remote_line() {
         assert_eq!(
             parse_remote("remote http://spare.tail1.ts.net:7700 abc\r"),
-            Some(("http://spare.tail1.ts.net:7700".into(), "abc".into()))
+            Some(("http://spare.tail1.ts.net:7700".into(), "abc".into(), None))
         );
         assert_eq!(parse_remote("remote add local"), None);
+        assert_eq!(
+            parse_remote("remote https://s:7700 tok sha256:ab"),
+            Some(("https://s:7700".into(), "tok".into(), Some("sha256:ab".into())))
+        );
         assert_eq!(parse_remote("rekcod: remote x"), None);
     }
 
@@ -294,7 +331,7 @@ mod tests {
         sh.arg("-c");
         let r = remote_setup("spare", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), true);
         std::fs::remove_file(&bin).unwrap();
-        assert_eq!(r.unwrap(), ("http://spare:7700".into(), "tok".into()));
+        assert_eq!(r.unwrap(), ("http://spare:7700".into(), "tok".into(), None));
     }
 
     #[test]
@@ -302,7 +339,7 @@ mod tests {
         let mut out = Vec::new();
         let r = pass_through(&b"Password:ok\r\nremote http://s:7700 t\r\nreminder\n"[..], &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "Password:ok\r\nreminder\n");
-        assert_eq!(r, Some(("http://s:7700".into(), "t".into())));
+        assert_eq!(r, Some(("http://s:7700".into(), "t".into(), None)));
         assert!(remote_setup("s", Command::new("true"), "/x", "a.com'; rm -rf ~", None, true).is_err());
     }
 

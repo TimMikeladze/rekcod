@@ -505,6 +505,7 @@ fn in_terminal(command: &str) {
 }
 
 pub fn run(paths: Paths) -> Result<()> {
+    crate::lifecycle::trim_log_hourly(paths.home.join("logs/menubar.log"));
     let mtm = MainThreadMarker::new().context("menubar must run on the main thread")?;
     let app = NSApplication::sharedApplication(mtm);
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);

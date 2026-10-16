@@ -412,9 +412,14 @@ edge on one Mac, with the controller's SQLite file in its own home, and passes a
 
 Where the code differs from the spec above:
 
-- **No mTLS, no internal CA.** Controller, nodes, edge and CLI speak plain HTTP with
-  bearer tokens: user tokens in `tokens`, a node secret per node from the join token. Run it
-  on a private network or VPN, or put TLS in front. `rustls` + `rcgen` is the upgrade path.
+- **TLS with an internal CA, but bearer tokens rather than client certificates.** The
+  controller makes `controller/ca.pem` on first start (`rcgen`) and serves `rustls` with a
+  fresh certificate per start. CLIs, edges and nodes pin the CA by fingerprint
+  (`--ca-fingerprint`, checked when the CA is first fetched from `/ca.pem`). Nodes get a
+  certificate for their advertised host when they register and serve TLS with it.
+  Authentication is still a bearer token (hashed in `tokens`) or a per-node secret.
+  `--http` keeps plain HTTP for loopback and tailnet addresses. App traffic from the edge
+  to instance relays is plain TCP.
 - **No registry.** With `--storage`, a release's image is a `docker save | zstd` tarball
   in RustFS that rollbacks and later instances load ([`rustfs.md`](rustfs.md)); without it
   each instance clones the commit and builds it. Golden disks are copied to nodes by hand

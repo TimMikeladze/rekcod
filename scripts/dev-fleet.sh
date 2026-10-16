@@ -58,7 +58,7 @@ v1=$(commit v1)
 url="$repo/app.git"
 cr() { REKCOD_HOME=$C "$R" "$@"; }
 
-REKCOD_HOME=$C "$R" controller serve --listen 127.0.0.1:$CP --domain apps.test --drain 2s >"$C/controller.log" 2>&1 &
+REKCOD_HOME=$C "$R" controller serve --http --auto-approve --listen 127.0.0.1:$CP --domain apps.test --drain 2s >"$C/controller.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 50); do [[ -f $C/controller/admin-token ]] && break; sleep 0.2; done
 join=$(cat "$C/controller/join-token") admin=$(cat "$C/controller/admin-token")

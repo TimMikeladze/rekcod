@@ -85,6 +85,7 @@ pub fn ensure_binary(paths: &Paths) -> Result<PathBuf> {
 
 /// Runs RustFS in the foreground (it replaces this process) on `listen`, data in `data`.
 pub fn serve(paths: &Paths, listen: &str, data: Option<&Path>) -> Result<()> {
+    crate::lifecycle::trim_log_hourly(paths.home.join("logs/storage.log"));
     let addr: SocketAddr = listen.parse().context("--listen takes IP:PORT")?;
     if addr.ip().is_unspecified() {
         bail!("--listen {listen}: give the address clients use (the Tailscale IP), not 0.0.0.0");

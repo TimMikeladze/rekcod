@@ -105,6 +105,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let _pid_lock = paths.hold_pid_file()?;
     let _ = std::fs::remove_file(paths.last_exit());
     raise_fd_limit();
+    crate::lifecycle::trim_log_hourly(paths.daemon_log());
     let guest = paths.guest_dir()?;
     let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
     if paths.data_fresh().exists() {

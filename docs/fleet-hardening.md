@@ -105,8 +105,14 @@ actual state toward it. A `reconcile` pass runs every 10 s and on startup:
 
 ## Transport
 
-See the TLS section of `docs/platform.md` once it's built. In short: the controller makes a
-CA on first start, nodes and remotes pin it by fingerprint, and every control-plane hop
-(CLI, edge and nodes to the controller, the controller to nodes) is TLS. Plain `http://`
-still works on loopback and tailnet addresses (100.64.0.0/10, fd7a:115c:a1e0::/48), and
-elsewhere only with `--insecure`.
+The controller makes a CA on first start, nodes and remotes pin it by fingerprint, and every
+control-plane hop (CLI, edge and nodes to the controller, the controller to nodes) is TLS
+(`tls.rs`). Plain `http://` still works on loopback and tailnet addresses (100.64.0.0/10,
+fd7a:115c:a1e0::/48, `*.ts.net`), and elsewhere only with `REKCOD_INSECURE=1`. App traffic
+between the edge and instance relays stays plain TCP; nodes belong on a tailnet.
+
+## Status
+
+Built as described, except: WebSocket tunnels close after an hour idle but the edge's
+trusted-proxy default is still loopback whatever `--public-listen` is. `scripts/e2e-fleet.sh`
+runs the fleet over https with node approval and an edge token.

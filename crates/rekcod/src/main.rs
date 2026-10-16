@@ -33,6 +33,8 @@ mod fleet;
 #[cfg(target_os = "macos")]
 mod host;
 #[cfg(target_os = "macos")]
+mod lifecycle;
+#[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
 mod menubar;
@@ -56,6 +58,8 @@ mod state;
 mod storage;
 #[cfg(target_os = "macos")]
 mod syssock;
+#[cfg(target_os = "macos")]
+mod tls;
 #[cfg(target_os = "macos")]
 mod vm;
 #[cfg(target_os = "macos")]
@@ -169,6 +173,28 @@ enum Cmd {
     },
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp(ApiPolicyArgs),
+    /// Install the latest release over this binary (the VM keeps running the old one until restarted).
+    Upgrade {
+        /// Only say whether a newer release exists; exit 1 if one does.
+        #[arg(long)]
+        check: bool,
+    },
+    /// Stop rekcod and remove everything it set up: login agents, the socket route, the
+    /// docker context, and ~/.rekcod.
+    Uninstall {
+        /// Keep ~/.rekcod (VM disks, volumes, snapshots).
+        #[arg(long)]
+        keep_data: bool,
+        /// Don't ask first.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Check what usually goes wrong and say how to fix it.
+    Doctor {
+        /// Also write ~/.rekcod/doctor-<time>.tar.gz with status and logs (no tokens or keys).
+        #[arg(long)]
+        bundle: bool,
+    },
     /// macOS guests: base images for `rekcod sandbox create --os macos`.
     #[command(subcommand)]
     Macos(MacosCmd),
@@ -580,6 +606,9 @@ enum RemoteCmd {
         /// Namespace this remote's commands use (default: default).
         #[arg(long)]
         ns: Option<String>,
+        /// For https URLs: the controller's CA fingerprint (`sha256:...`, printed when it starts).
+        #[arg(long)]
+        ca_fingerprint: Option<String>,
     },
     Ls,
     Rm {
@@ -606,6 +635,9 @@ enum NodeCmd {
         /// After joining, run `node serve` as a LaunchAgent instead of in this terminal.
         #[arg(long)]
         install: bool,
+        /// For an https controller: its CA fingerprint (`sha256:...`, printed when it starts).
+        #[arg(long)]
+        ca_fingerprint: Option<String>,
     },
     /// Serve again after a restart (uses ~/.rekcod/node.json).
     Serve {
@@ -744,6 +776,14 @@ enum ControllerCmd {
         /// Also keep the hourly fleet.db backups here (another disk, a synced folder).
         #[arg(long)]
         backup_dir: Option<std::path::PathBuf>,
+        /// Serve plain HTTP instead of TLS; only on loopback or tailnet addresses (or with
+        /// REKCOD_INSECURE=1).
+        #[arg(long)]
+        http: bool,
+        /// Another name clients reach the controller by, for its certificate (repeatable;
+        /// a tailnet DNS name, say). Its listen IP, host name and localhost are always in it.
+        #[arg(long = "tls-name")]
+        tls_names: Vec<String>,
     },
     /// Remove the controller's LaunchAgent.
     Uninstall,
@@ -803,6 +843,8 @@ enum ControllerCmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
+    /// This controller's CA fingerprint, for `remote add` and `node join` (run on the controller).
+    Ca,
     /// Make a new join token; the old one stops working (admin token).
     RotateJoin {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
@@ -1191,6 +1233,9 @@ fn main() {
         Cmd::Sandbox { remote: None, ns: Some(_), .. } => Err(anyhow::anyhow!("--ns is for fleet sandboxes; add --remote")),
         Cmd::Sandbox { remote: None, cmd, .. } => run_sandbox(&paths, cmd),
         Cmd::Mcp(policy) => sandbox_api::mcp(paths, policy.policy()?),
+        Cmd::Upgrade { check } => lifecycle::upgrade(check),
+        Cmd::Uninstall { keep_data, yes } => lifecycle::uninstall(&paths, keep_data, yes),
+        Cmd::Doctor { bundle } => lifecycle::doctor(&paths, bundle),
         Cmd::Macos(MacosCmd::Fetch) => macos::fetch(&paths),
         Cmd::Macos(MacosCmd::Install { name, disk, cpus, memory }) => macos::install(&paths, &name, disk, cpus, memory),
         Cmd::Macos(MacosCmd::Setup { name }) => macos::setup(&paths, &name),
@@ -1198,15 +1243,17 @@ fn main() {
         Cmd::Macos(MacosCmd::Ls) => macos::list(&paths),
         Cmd::Macos(MacosCmd::Rm { name }) => macos::remove(&paths, &name),
         Cmd::Macos(MacosCmd::Run { home, idle_ttl }) => macos::run(home, idle_ttl),
-        Cmd::Remote(RemoteCmd::Add { name, url, token, ns }) => fleet::remote_add(&paths, &name, &url, &token, ns.as_deref()),
+        Cmd::Remote(RemoteCmd::Add { name, url, token, ns, ca_fingerprint }) => {
+            fleet::remote_add(&paths, &name, &url, &token, ns.as_deref(), ca_fingerprint.as_deref())
+        }
         Cmd::Remote(RemoteCmd::Ls) => {
             fleet::remote_list(&paths);
             Ok(())
         }
         Cmd::Remote(RemoteCmd::Rm { name }) => fleet::remote_rm(&paths, &name),
         Cmd::Remote(RemoteCmd::Use { name }) => fleet::remote_use(&paths, &name),
-        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install }) => {
-            fleet::node_join(&paths, &controller, &join_token, &listen, advertise.as_deref(), install)
+        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install, ca_fingerprint }) => {
+            fleet::node_join(&paths, &controller, &join_token, &listen, advertise.as_deref(), install, ca_fingerprint.as_deref())
         }
         Cmd::Node(NodeCmd::Serve { install: true }) => service::install(&paths, "node", &["node".into(), "serve".into()]),
         Cmd::Node(NodeCmd::Serve { install: false }) => fleet::node_serve(&paths),
@@ -1239,6 +1286,8 @@ fn main() {
             auto_approve,
             alert_webhook,
             backup_dir,
+            http,
+            tls_names,
             ..
         }) => fleet::controller_serve(
             &paths,
@@ -1252,6 +1301,8 @@ fn main() {
                 auto_approve,
                 alert_webhook,
                 backup_dir,
+                http,
+                tls_names,
             },
         ),
         Cmd::Controller(ControllerCmd::Backup { remote }) => remote_call(&paths, &remote, "POST", "/backups", &serde_json::json!({})),
@@ -1278,6 +1329,12 @@ fn main() {
         ),
         Cmd::Controller(ControllerCmd::Revoke { name, remote }) => {
             remote_call(&paths, &remote, "DELETE", &format!("/tokens/{name}"), &serde_json::json!({}))
+        }
+        Cmd::Controller(ControllerCmd::Ca) => {
+            let pem = std::fs::read_to_string(paths.home.join("controller/ca.pem"))
+                .map_err(|_| anyhow::anyhow!("no CA here; it's made when `rekcod controller serve` first starts"))?;
+            println!("{}", tls::fingerprint(&pem)?);
+            Ok(())
         }
         Cmd::Controller(ControllerCmd::RotateJoin { remote }) => {
             remote_call(&paths, &remote, "POST", "/join-token", &serde_json::json!({}))

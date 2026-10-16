@@ -38,9 +38,12 @@ fn random_bytes<const N: usize>() -> Result<[u8; N]> {
 
 // ------------------------------------------------------------- HTTP client
 
-/// `http://host:port` → `host:port`.
-fn authority(base: &str) -> Result<String> {
-    let rest = base.strip_prefix("http://").ok_or_else(|| anyhow!("{base}: only http:// URLs are supported"))?;
+/// `http(s)://host:port` → `host:port`.
+pub fn authority(base: &str) -> Result<String> {
+    let rest = base
+        .strip_prefix("https://")
+        .or_else(|| base.strip_prefix("http://"))
+        .ok_or_else(|| anyhow!("{base}: the URL needs https:// (or http:// on loopback or a tailnet)"))?;
     Ok(rest.trim_end_matches('/').to_string())
 }
 
@@ -59,7 +62,7 @@ pub fn percent_encode(s: &str) -> String {
 pub const SLOW: Duration = Duration::from_secs(900);
 pub const QUICK: Duration = Duration::from_secs(30);
 
-pub fn send(base: &str, method: &str, path: &str, token: Option<&str>, body: &[u8]) -> Result<(u16, BufReader<TcpStream>)> {
+pub fn send(base: &str, method: &str, path: &str, token: Option<&str>, body: &[u8]) -> Result<(u16, BufReader<crate::tls::Stream>)> {
     send_within(base, method, path, token, body, Some(SLOW))
 }
 
@@ -71,13 +74,15 @@ pub fn send_within(
     token: Option<&str>,
     body: &[u8],
     timeout: Option<Duration>,
-) -> Result<(u16, BufReader<TcpStream>)> {
+) -> Result<(u16, BufReader<crate::tls::Stream>)> {
     let addr = authority(base)?;
     let sock = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("can't resolve {addr}"))?;
-    let mut s = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).with_context(|| format!("connect {base}"))?;
-    s.set_read_timeout(timeout)?;
-    s.set_write_timeout(Some(QUICK))?;
+    let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).with_context(|| format!("connect {base}"))?;
+    tcp.set_read_timeout(timeout)?;
+    tcp.set_write_timeout(Some(QUICK))?;
+    let mut s = crate::tls::connect(base, &addr, tcp)?;
     let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
+    let auth = format!("{auth}X-Rekcod-Version: {}\r\n", env!("CARGO_PKG_VERSION"));
     write!(
         s,
         "{method} {path} HTTP/1.1\r\nHost: {addr}\r\n{auth}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -129,6 +134,9 @@ pub struct Remote {
     /// Namespace for app, sandbox and job commands; `REKCOD_NS` (and `--ns`) win.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ns: Option<String>,
+    /// The controller's CA (PEM), for https URLs; checked against a fingerprint when added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca: Option<String>,
 }
 
 impl Remote {
@@ -153,7 +161,13 @@ fn remotes_file(paths: &Paths) -> PathBuf {
 }
 
 pub fn remotes(paths: &Paths) -> Remotes {
-    std::fs::read(remotes_file(paths)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let r: Remotes = std::fs::read(remotes_file(paths)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    for rem in r.remotes.values() {
+        if let (Some(ca), Ok(a)) = (&rem.ca, authority(&rem.url)) {
+            let _ = crate::tls::trust(&a, ca);
+        }
+    }
+    r
 }
 
 pub fn remote(paths: &Paths, name: Option<&str>) -> Result<Remote> {
@@ -162,10 +176,21 @@ pub fn remote(paths: &Paths, name: Option<&str>) -> Result<Remote> {
     r.remotes.get(&name).cloned().ok_or_else(|| anyhow!("no remote {name}"))
 }
 
-pub fn remote_add(paths: &Paths, name: &str, url: &str, token: &str, ns: Option<&str>) -> Result<()> {
-    authority(url)?;
+pub fn remote_add(paths: &Paths, name: &str, url: &str, token: &str, ns: Option<&str>, ca_fingerprint: Option<&str>) -> Result<()> {
+    let url = url.trim_end_matches('/');
+    let a = authority(url)?;
+    let ca = match (url.starts_with("https://"), ca_fingerprint) {
+        (true, Some(fp)) => Some(crate::tls::fetch_ca(url, fp)?),
+        (true, None) => {
+            bail!("an https remote needs --ca-fingerprint (the controller prints it at start, and `rekcod controller ca` shows it)")
+        }
+        (false, _) => {
+            check_plain_http(&a, "this remote")?;
+            None
+        }
+    };
     let mut r = remotes(paths);
-    r.remotes.insert(name.into(), Remote { url: url.trim_end_matches('/').into(), token: token.into(), ns: ns.map(String::from) });
+    r.remotes.insert(name.into(), Remote { url: url.into(), token: token.into(), ns: ns.map(String::from), ca });
     if r.default.is_none() {
         r.default = Some(name.into());
     }
@@ -219,6 +244,45 @@ pub fn remote_list(paths: &Paths) {
         let star = if r.default.as_deref() == Some(name) { "*" } else { " " };
         println!("{star} {name:<12} {}  ns={}", rem.url, rem.ns.as_deref().unwrap_or("default"));
     }
+}
+
+/// This Mac's host name, and its `.local` Bonjour name.
+fn hostname() -> Vec<String> {
+    let mut buf = [0u8; 256];
+    if unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len()) } != 0 {
+        return vec![];
+    }
+    let n = buf.iter().position(|b| *b == 0).unwrap_or(0);
+    let h = String::from_utf8_lossy(&buf[..n]).to_string();
+    if h.is_empty() || !h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.') {
+        return vec![];
+    }
+    let base = h.trim_end_matches(".local").to_string();
+    vec![base.clone(), format!("{base}.local")]
+}
+
+/// Plain `http://` is for loopback and tailnet addresses (Tailscale encrypts those); anything
+/// else needs https, or `REKCOD_INSECURE=1` for a network you trust.
+pub fn check_plain_http(authority: &str, what: &str) -> Result<()> {
+    if std::env::var_os("REKCOD_INSECURE").is_some() {
+        return Ok(());
+    }
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h).trim_matches(['[', ']']);
+    let ok = |ip: IpAddr| match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    };
+    let tailnet_name = host.ends_with(".ts.net") || host == "localhost";
+    let ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
+        Ok(ip) => vec![ip],
+        Err(_) => (host, 0).to_socket_addrs().map(|a| a.map(|s| s.ip()).collect()).unwrap_or_default(),
+    };
+    if tailnet_name || (!ips.is_empty() && ips.iter().all(|ip| ok(*ip))) {
+        return Ok(());
+    }
+    bail!(
+        "{what} at http://{authority} would send tokens in clear text; use https, a loopback or tailnet address, or set REKCOD_INSECURE=1"
+    )
 }
 
 /// The git remote URL and HEAD commit of `dir`, for remote creates and deploys.
@@ -816,24 +880,57 @@ struct NodeConfig {
     secret: String,
     listen: String,
     advertise: String,
+    /// The controller's CA (https controllers), and the certificate it issued this node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ca: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cert: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    key: Option<String>,
 }
 
-pub fn node_join(paths: &Paths, controller: &str, join_token: &str, listen: &str, advertise: Option<&str>, install: bool) -> Result<()> {
+pub fn node_join(
+    paths: &Paths,
+    controller: &str,
+    join_token: &str,
+    listen: &str,
+    advertise: Option<&str>,
+    install: bool,
+    ca_fingerprint: Option<&str>,
+) -> Result<()> {
+    let controller = controller.trim_end_matches('/');
     let addr: SocketAddr = listen.parse().context("--listen takes IP:PORT")?;
+    // An https controller issues this node a certificate, so the node serves https too.
+    let scheme = if controller.starts_with("https://") { "https" } else { "http" };
     let advertise = match advertise {
         Some(a) => a.trim_end_matches('/').to_string(),
-        None if addr.ip().is_unspecified() => bail!("--listen {listen} needs --advertise http://<this Mac's address>:{}", addr.port()),
-        None => format!("http://{addr}"),
+        None if addr.ip().is_unspecified() => bail!("--listen {listen} needs --advertise {scheme}://<this Mac's address>:{}", addr.port()),
+        None => format!("{scheme}://{addr}"),
+    };
+    let ca = if scheme == "https" {
+        let fp = ca_fingerprint.ok_or_else(|| anyhow!("joining an https controller needs --ca-fingerprint (it prints it at start)"))?;
+        let ca = crate::tls::fetch_ca(controller, fp)?;
+        crate::tls::trust(&authority(controller)?, &ca)?;
+        Some(ca)
+    } else {
+        check_plain_http(&authority(controller)?, "the controller")?;
+        None
     };
     let host = crate::cli::sysctl_u64("hw.memsize").unwrap_or(0) >> 20;
     let r = call(controller, "POST", "/nodes/register", None, &json!({"join_token": join_token, "url": advertise, "mem_total_mib": host}))?;
     let cfg = NodeConfig {
-        controller: controller.trim_end_matches('/').into(),
+        controller: controller.into(),
         id: r["id"].as_str().context("no node id")?.into(),
         secret: r["secret"].as_str().context("no node secret")?.into(),
         listen: listen.into(),
         advertise,
+        ca,
+        cert: r["cert"].as_str().map(String::from),
+        key: r["key"].as_str().map(String::from),
     };
+    if r["state"] == "pending" {
+        eprintln!("rekcod: waiting for an admin: `rekcod node approve {}`", cfg.id);
+    }
     crate::paths::write_private(&paths.home.join("node.json"), &serde_json::to_vec_pretty(&cfg)?)?;
     eprintln!("rekcod: joined {} as node {}", cfg.controller, cfg.id);
     if install {
@@ -846,6 +943,16 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     let cfg: NodeConfig = serde_json::from_slice(&std::fs::read(paths.home.join("node.json")).context("not joined; `rekcod node join`")?)?;
     let addr: SocketAddr = cfg.listen.parse()?;
     graceful_exit(None);
+    if let Some(ca) = &cfg.ca {
+        crate::tls::trust_by_default(ca)?;
+    }
+    let tls = match (&cfg.cert, &cfg.key) {
+        (Some(c), Some(k)) => Some(crate::tls::server_config(c, k)?),
+        _ => {
+            check_plain_http(&cfg.listen, "this node's API")?;
+            None
+        }
+    };
     let ip = if addr.ip().is_unspecified() { IpAddr::from([0, 0, 0, 0]) } else { addr.ip() };
     let _ = NODE_IP.set(ip);
     let host = authority(&cfg.advertise).ok().and_then(|a| a.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']']).to_string()));
@@ -917,6 +1024,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             std::thread::sleep(Duration::from_secs(5));
         }
     });
+    crate::lifecycle::trim_log_hourly(paths.home.join("logs/node.log"));
     let gc_paths = paths.clone();
     std::thread::spawn(move || {
         loop {
@@ -927,9 +1035,12 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     let l = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
     eprintln!("rekcod: node {} serving sandboxes on {} ({})", cfg.id, cfg.listen, cfg.advertise);
     for s in l.incoming().flatten() {
-        let (p, t) = (paths.clone(), cfg.secret.clone());
+        let (p, t, tls) = (paths.clone(), cfg.secret.clone(), tls.clone());
         let _ = s.set_read_timeout(Some(crate::sandbox_api::READ_TIMEOUT));
-        crate::sandbox_api::spawn_limited(move || crate::sandbox_api::handle(&p, &crate::sandbox_api::Policy::node(), s, Some(&t)));
+        crate::sandbox_api::spawn_limited(move || -> Result<()> {
+            let stream = crate::tls::accept(tls.as_ref(), s)?;
+            crate::sandbox_api::handle(&p, &crate::sandbox_api::Policy::node(), stream, Some(&t))
+        });
     }
     Ok(())
 }
@@ -1150,6 +1261,9 @@ struct Controller {
     /// One lock per namespace, held from a quota check until what it allowed is recorded,
     /// so creates running at once can't all pass the same check.
     quotas: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    /// The fleet CA (https controllers): issues node certificates; `/ca.pem` serves it.
+    ca: Option<crate::tls::Ca>,
+    ca_pem: Option<String>,
 }
 
 struct Caller {
@@ -1246,6 +1360,8 @@ impl Controller {
             db_path: PathBuf::new(),
             backup_dir: None,
             quotas: Default::default(),
+            ca: None,
+            ca_pem: None,
         }
     }
 
@@ -1760,7 +1876,8 @@ fn proxy(node_url: &str, secret: &str, req: &crate::sandbox_api::Request, path: 
     let q: Vec<String> = req.query.iter().map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v))).collect();
     let path = if q.is_empty() { path.to_string() } else { format!("{path}?{}", q.join("&")) };
     let addr = authority(node_url)?;
-    let mut s = TcpStream::connect(&addr).with_context(|| format!("connect node {node_url}"))?;
+    let tcp = TcpStream::connect(&addr).with_context(|| format!("connect node {node_url}"))?;
+    let mut s = crate::tls::connect(node_url, &addr, tcp)?;
     write!(
         s,
         "{} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: Bearer {secret}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -1782,13 +1899,24 @@ fn json_reply(w: &mut impl Write, r: Result<Value>) -> Result<()> {
     }
 }
 
-fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
-    let peer = stream.peer_addr().ok().map(|a| a.ip());
+fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + Write) -> Result<()> {
     let mut r = BufReader::new(stream);
     let mut req = crate::sandbox_api::read_head(&mut r)?;
     // Requests that need a user token are checked before their body is read, so nobody
     // without one can make the controller buffer a large body. Registration, heartbeats
     // and webhooks prove themselves in the body; theirs is capped lower.
+    if req.method == "GET" && req.path == "/ca.pem" {
+        let pem = c.ca_pem.clone().unwrap_or_default();
+        return respond(r.get_mut(), if pem.is_empty() { 404 } else { 200 }, "application/x-pem-file", pem.as_bytes());
+    }
+    // A CLI or node from another release would speak another API: say so plainly.
+    if let Some(v) = req.header("x-rekcod-version").map(String::from)
+        && !crate::lifecycle::compatible(&v, env!("CARGO_PKG_VERSION"))
+    {
+        let msg =
+            format!("this controller runs rekcod {}, you have {v}; upgrade the older one (`rekcod upgrade`)", env!("CARGO_PKG_VERSION"));
+        return respond(r.get_mut(), 400, "application/json", json!({"error": msg}).to_string().as_bytes());
+    }
     let open = matches!(
         req.path.trim_matches('/').split('/').collect::<Vec<_>>().as_slice(),
         ["nodes", "register"] | ["nodes", _, "heartbeat"] | ["webhooks", "github"]
@@ -1835,7 +1963,18 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 if state == "pending" {
                     eprintln!("rekcod: node {id} ({url}) registered; `rekcod node approve {id}` to use it");
                 }
-                Ok(json!({"id": id, "secret": sec, "state": state}))
+                let mut reply = json!({"id": id, "secret": sec, "state": state});
+                // An https node gets a certificate for the host it advertised.
+                if let (Some(ca), Some(rest)) = (&c.ca, url.strip_prefix("https://")) {
+                    let a = rest.trim_end_matches('/');
+                    let host = a.rsplit_once(':').map_or(a, |(h, _)| h).trim_matches(['[', ']']);
+                    let (cert, key) = ca.issue(&[host.to_string()])?;
+                    reply["cert"] = json!(cert);
+                    reply["key"] = json!(key);
+                } else if !url.starts_with("https://") {
+                    check_plain_http(&authority(url)?, "the node")?;
+                }
+                Ok(reply)
             })();
             return json_reply(&mut w, r);
         }
@@ -3966,6 +4105,10 @@ pub struct ControllerOptions {
     pub auto_approve: bool,
     pub alert_webhook: Option<String>,
     pub backup_dir: Option<PathBuf>,
+    /// Plain HTTP instead of TLS (loopback and tailnet addresses only).
+    pub http: bool,
+    /// Extra names for the controller's certificate (a tailnet DNS name, say).
+    pub tls_names: Vec<String>,
     /// SQLite file (default `~/.rekcod/controller/fleet.db`).
     pub db: Option<PathBuf>,
     pub listen: String,
@@ -4035,6 +4178,14 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     let key = secret_key(&dir.join("secret-key"), sealed)?;
     let mut ctl = Controller::new(db, o.domain, o.drain_secs, key);
     ctl.auto_approve = o.auto_approve;
+    if o.http {
+        check_plain_http(&o.listen, "the controller")?;
+    } else {
+        let ca = crate::tls::ensure_ca(&dir)?;
+        crate::tls::trust_by_default(&ca.pem)?;
+        ctl.ca_pem = Some(ca.pem.clone());
+        ctl.ca = Some(ca);
+    }
     ctl.alert_webhook = o.alert_webhook;
     ctl.db_path = db_path;
     ctl.backup_dir = o.backup_dir;
@@ -4045,7 +4196,31 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     graceful_exit(Some(c.clone()));
     c.seal_plain_secrets()?;
     let l = TcpListener::bind(&o.listen).with_context(|| format!("bind {}", o.listen))?;
-    eprintln!("rekcod: controller on http://{} (tokens in {})", o.listen, dir.display());
+    let tls = c.ca.as_ref().map(|ca| -> Result<_> {
+        let listen_ip = o.listen.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']']).to_string()).unwrap_or_default();
+        let mut names: Vec<String> = vec!["localhost".into(), "127.0.0.1".into()];
+        if listen_ip.parse::<IpAddr>().is_ok_and(|ip| !ip.is_unspecified()) {
+            names.push(listen_ip);
+        }
+        names.extend(hostname());
+        names.extend(o.tls_names.iter().cloned());
+        names.dedup();
+        let (cert, key) = ca.issue(&names)?;
+        let fp = ca.fingerprint()?;
+        std::fs::write(dir.join("ca-fingerprint"), &fp)?;
+        eprintln!("rekcod: controller on https://{} for {}; CA {fp}", o.listen, names.join(", "));
+        eprintln!(
+            "rekcod: rekcod remote add NAME https://<one of those>:{} --token \"$(cat {})\" --ca-fingerprint {fp}",
+            o.listen.rsplit_once(':').map_or("7700", |(_, p)| p),
+            dir.join("admin-token").display()
+        );
+        crate::tls::server_config(&cert, &key)
+    });
+    let tls = tls.transpose()?;
+    if tls.is_none() {
+        eprintln!("rekcod: controller on http://{} (tokens in {})", o.listen, dir.display());
+    }
+    crate::lifecycle::trim_log_hourly(paths.home.join("logs/controller.log"));
     if let Err(e) = sweep(&c) {
         eprintln!("rekcod: startup sweep: {e:#}");
     }
@@ -4055,9 +4230,11 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
             break;
         }
         let _ = s.set_read_timeout(Some(crate::sandbox_api::READ_TIMEOUT));
-        let c = c.clone();
+        let (c, tls) = (c.clone(), tls.clone());
         crate::sandbox_api::spawn_limited(move || {
-            if let Err(e) = controller_handle(&c, s) {
+            let peer = s.peer_addr().ok().map(|a| a.ip());
+            let r = crate::tls::accept(tls.as_ref(), s).and_then(|stream| controller_handle(&c, peer, stream));
+            if let Err(e) = r {
                 eprintln!("rekcod: controller: {e:#}");
             }
         });
@@ -4119,7 +4296,7 @@ mod tests {
         std::thread::spawn(move || {
             for s in l.incoming().flatten() {
                 let c = cc.clone();
-                std::thread::spawn(move || controller_handle(&c, s));
+                std::thread::spawn(move || controller_handle(&c, s.peer_addr().ok().map(|a| a.ip()), s));
             }
         });
         (url, c)
@@ -4133,6 +4310,54 @@ mod tests {
                 &[&hash_token(t), &name, &admin, &expires, &default_role, &edge],
             )
             .unwrap();
+    }
+
+    #[test]
+    fn https_controller_end_to_end() {
+        let dir = std::env::temp_dir().join(format!("rekcod-ctl-tls-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = crate::tls::ensure_ca(&dir).unwrap();
+        let (cert, key) = ca.issue(&["127.0.0.1".into()]).unwrap();
+        let tls = crate::tls::server_config(&cert, &key).unwrap();
+        let fp = ca.fingerprint().unwrap();
+        let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        ctl.ca_pem = Some(ca.pem.clone());
+        ctl.ca = Some(ca);
+        let c = Arc::new(ctl);
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let cc = c.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let (c, tls) = (cc.clone(), tls.clone());
+                std::thread::spawn(move || {
+                    let peer = s.peer_addr().ok().map(|a| a.ip());
+                    crate::tls::accept(Some(&tls), s).and_then(|st| controller_handle(&c, peer, st))
+                });
+            }
+        });
+        let url = format!("https://{addr}");
+        let home = Paths { home: dir.clone() };
+        assert!(remote_add(&home, "x", &url, "admin-t", None, None).is_err(), "https needs a fingerprint");
+        assert!(remote_add(&home, "x", &url, "admin-t", None, Some("sha256:00")).is_err(), "wrong fingerprint");
+        remote_add(&home, "x", &url, "admin-t", None, Some(&fp)).unwrap();
+        let r = remote(&home, Some("x")).unwrap();
+        assert!(r.ca.is_some());
+        assert!(call(&r.url, "GET", "/apps", Some(&r.token), &Value::Null).is_ok());
+        // A node registering over https gets a certificate for the host it advertised.
+        c.db.lock().unwrap().execute("insert or replace into config values ('join_token', 'jt')", &[]).unwrap();
+        let reg = call(
+            &url,
+            "POST",
+            "/nodes/register",
+            None,
+            &json!({"join_token": "jt", "url": "https://127.0.0.1:17999", "mem_total_mib": 1024}),
+        )
+        .unwrap();
+        assert!(reg["cert"].as_str().unwrap().contains("BEGIN CERTIFICATE") && reg["key"].as_str().is_some());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -4271,8 +4496,18 @@ mod tests {
     #[test]
     fn urls() {
         assert_eq!(authority("http://10.0.0.2:7701/").unwrap(), "10.0.0.2:7701");
-        assert!(authority("https://x").is_err());
+        assert_eq!(authority("https://x:7700").unwrap(), "x:7700");
+        assert!(authority("ftp://x").is_err());
         assert_eq!(percent_encode("/a b"), "%2Fa%20b");
+        // Plain HTTP only where it can't be read in transit.
+        for ok in ["127.0.0.1:7700", "[::1]:7700", "100.101.102.103:7700", "spare.tail1.ts.net:7700", "localhost:1"] {
+            assert!(check_plain_http(ok, "x").is_ok(), "{ok}");
+        }
+        if std::env::var_os("REKCOD_INSECURE").is_none() {
+            for bad in ["10.0.0.5:7700", "192.168.1.9:7700", "203.0.113.1:7700", "100.200.0.1:7700"] {
+                assert!(check_plain_http(bad, "x").is_err(), "{bad}");
+            }
+        }
     }
 
     #[test]

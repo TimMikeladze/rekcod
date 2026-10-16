@@ -57,26 +57,28 @@ url="$repo/app.git"
 echo "fleet"
 REKCOD_HOME=$C "$R" controller serve --listen 127.0.0.1:17700 --domain apps.test --drain 2s >"$C/controller.log" 2>&1 &
 pids+=($!)
-for _ in $(seq 50); do [[ -f $C/controller/admin-token ]] && break; sleep 0.2; done
-join=$(cat "$C/controller/join-token") admin=$(cat "$C/controller/admin-token")
-REKCOD_HOME=$N1 "$R" node join http://127.0.0.1:17700 "$join" --listen 127.0.0.1:17701 >"$N1/node.log" 2>&1 &
+for _ in $(seq 50); do [[ -f $C/controller/ca-fingerprint ]] && break; sleep 0.2; done
+join=$(cat "$C/controller/join-token") admin=$(cat "$C/controller/admin-token") fp=$(cat "$C/controller/ca-fingerprint")
+check "plain http to the https controller fails" sh -c '! curl -sf -m 3 http://127.0.0.1:17700/apps'
+check "the CA's fingerprint is checked" sh -c '! REKCOD_HOME="$1" "$0" remote add bad https://127.0.0.1:17700 --token x --ca-fingerprint sha256:00' "$R" "$C"
+REKCOD_HOME=$N1 "$R" node join https://127.0.0.1:17700 "$join" --listen 127.0.0.1:17701 --ca-fingerprint "$fp" >"$N1/node.log" 2>&1 &
 pids+=($!)
-REKCOD_HOME=$N2 "$R" node join http://127.0.0.1:17700 "$join" --listen 127.0.0.1:17702 >"$N2/node.log" 2>&1 &
+REKCOD_HOME=$N2 "$R" node join https://127.0.0.1:17700 "$join" --listen 127.0.0.1:17702 --ca-fingerprint "$fp" >"$N2/node.log" 2>&1 &
 pids+=($!) node2=$!
 sleep 2
 cr() { REKCOD_HOME=$C "$R" "$@"; }
-cr remote add admin http://127.0.0.1:17700 --token "$admin"
+cr remote add admin https://127.0.0.1:17700 --token "$admin" --ca-fingerprint "$fp"
 alice=$(cr controller token alice --max-sandboxes 2 --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
 bob=$(cr controller token bob --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
-cr remote add alice http://127.0.0.1:17700 --token "$alice"
-cr remote add bob http://127.0.0.1:17700 --token "$bob"
+cr remote add alice https://127.0.0.1:17700 --token "$alice" --ca-fingerprint "$fp"
+cr remote add bob https://127.0.0.1:17700 --token "$bob" --ca-fingerprint "$fp"
 check "new nodes wait for approval" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"pending\"")" = 2' "$R"
 check "a pending node gets nothing" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.22' "$R" "$url"
 for n in $(cr node ls --remote admin | sed -n 's/.*"id": "\(n-[a-z0-9]*\)".*/\1/p'); do cr node approve "$n" --remote admin >/dev/null; done
 check "two nodes ready" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"ready\"")" = 2' "$R"
 check "a user token can't read routes" sh -c '! "$0" edge bans --remote alice' "$R"
 edge=$(cr controller token edge --edge --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
-cr remote add edge http://127.0.0.1:17700 --token "$edge"
+cr remote add edge https://127.0.0.1:17700 --token "$edge" --ca-fingerprint "$fp"
 check "an edge token can't list nodes" sh -c '! "$0" node ls --remote edge' "$R"
 
 s1=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.22 2>"$C/err")
@@ -128,8 +130,8 @@ check "logs" sh -c '"$0" app logs --remote admin hello | grep -q GET' "$R"
 body=$(printf '{"action":"opened","number":7,"repository":{"clone_url":"%s","html_url":"x"},"pull_request":{"head":{"sha":"%s","repo":{"clone_url":"%s"}}}}' "$url" "$v2" "$url")
 ws=$(cat "$C/controller/webhook-secret")
 sig="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$ws" | awk '{print $NF}')"
-hook() { curl -s -m 120 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: $2" -d "$1" http://127.0.0.1:17700/webhooks/github; }
-check "webhook with a bad signature is refused" sh -c '! curl -sf -m 5 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: sha256=00" -d "{}" http://127.0.0.1:17700/webhooks/github'
+hook() { curl -s -m 120 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: $2" -d "$1" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github; }
+check "webhook with a bad signature is refused" sh -c '! curl -sf -m 5 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: sha256=00" -d "{}" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github'
 hook "$body" "$sig" >>"$C/hook.log"; echo >>"$C/hook.log"
 sleep 2.5
 check "PR preview deployed (inherits env)" sh -c 'test "$(curl -s -m 3 -H "Host: hello-pr-7.apps.test" http://127.0.0.1:18088/)" = "v2 hi"'
@@ -193,7 +195,7 @@ check "ns create (4 CPUs, 4 GiB)" cr ns create team --max-cpus 4 --max-memory 4 
 check "member add" cr ns member add team alice --remote admin
 check "viewer add" cr ns member add team bob --role viewer --remote admin
 carol=$(cr controller token carol --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
-cr remote add carol http://127.0.0.1:17700 --token "$carol"
+cr remote add carol https://127.0.0.1:17700 --token "$carol" --ca-fingerprint "$fp"
 check "members see it in ns ls" sh -c '"$0" ns ls --remote bob | grep -q "\"name\": \"team\""' "$R"
 check "others don't" sh -c '! "$0" ns ls --remote carol | grep -q "\"team\""' "$R"
 s3=$(cr sandbox create --remote alice --ns team --git "$url" --ref main --image alpine:3.22 --cpus 1 --memory 1 2>"$C/err")

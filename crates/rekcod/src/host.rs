@@ -114,8 +114,8 @@ pub fn add_fleet(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet)
     check(name, dest)?;
     let bin = crate::spare::ensure_binary(dest, || ssh(dest), &ssh_dest(dest))?;
     let tty: &[&str] = if std::io::IsTerminal::is_terminal(&std::io::stdin()) { &["-t"] } else { &[] };
-    let (url, token) = crate::spare::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.no_power)?;
-    crate::fleet::remote_add(paths, name, &url, &token, None)?;
+    let (url, token, fp) = crate::spare::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.no_power)?;
+    crate::fleet::remote_add(paths, name, &url, &token, None, fp.as_deref())?;
     println!("remote {name}: {url}  (rekcod app deploy --remote {name})");
     if !f.docker {
         return Ok(());

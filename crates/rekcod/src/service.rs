@@ -92,8 +92,28 @@ pub fn kickstart(name: &str) {
     let _ = launchctl(&["kickstart", &format!("{}/{}", domain(), label(name))]);
 }
 
-pub fn install_with(paths: &Paths, name: &str, args: &[String], crash_only: bool) -> Result<()> {
+/// The path to put in a LaunchAgent: the one this binary was run by when that's a symlink
+/// into a Homebrew Cellar (`/opt/homebrew/bin/rekcod`), whose target changes with every
+/// `brew upgrade`; otherwise the binary's own path.
+fn stable_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe()?.canonicalize()?;
+    let argv0 = std::env::args().next().unwrap_or_default();
+    let invoked = if argv0.contains('/') {
+        Some(PathBuf::from(&argv0))
+    } else {
+        std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(&argv0)).find(|c| c.exists()))
+    };
+    if let Some(link) = invoked.filter(|l| l.is_absolute() && std::fs::symlink_metadata(l).is_ok_and(|m| m.file_type().is_symlink()))
+        && link.canonicalize().is_ok_and(|t| t == exe)
+        && exe.components().any(|c| c.as_os_str() == "Cellar")
+    {
+        return Ok(link);
+    }
+    Ok(exe)
+}
+
+pub fn install_with(paths: &Paths, name: &str, args: &[String], crash_only: bool) -> Result<()> {
+    let exe = stable_exe()?;
     let dry = std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some();
     let path = if dry { paths.home.join(format!("{}.plist", label(name))) } else { plist_path(name)? };
     std::fs::create_dir_all(path.parent().context("plist dir")?)?;

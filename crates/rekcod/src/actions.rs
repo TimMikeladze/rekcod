@@ -70,12 +70,15 @@ pub enum Kind {
     VmForceStop,
     VmAutostartOn,
     VmAutostartOff,
+    Doctor,
+    Upgrade,
+    Uninstall,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 56] = [
+    pub const ALL: [Kind; 59] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -132,6 +135,9 @@ impl Kind {
         Kind::VmForceStop,
         Kind::VmAutostartOn,
         Kind::VmAutostartOff,
+        Kind::Doctor,
+        Kind::Upgrade,
+        Kind::Uninstall,
     ];
 }
 
@@ -851,6 +857,13 @@ pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool) -> Vec
         out.push(Action::rekcod(Kind::SocketInstall, "Use rekcod for /var/run/docker.sock", &["socket", "install"]).interactive());
     }
     out.push(Action::rekcod(Kind::DashboardOpen, "Open the dashboard", &["dashboard"]));
+    out.push(Action::rekcod(Kind::Doctor, "Check for problems", &["doctor"]).interactive());
+    out.push(Action::rekcod(Kind::Upgrade, "Check for updates", &["upgrade"]).interactive());
+    out.push(
+        Action::rekcod(Kind::Uninstall, "Uninstall rekcod", &["uninstall", "--yes"])
+            .confirm("Uninstall rekcod? This stops it, removes its login agents and docker context, and deletes ~/.rekcod with every VM disk, volume and snapshot.".into())
+            .interactive(),
+    );
     out
 }
 
@@ -1331,6 +1344,7 @@ pub mod tests {
                     | Kind::NodeDrain
                     | Kind::VmForceStop
                     | Kind::VmRepair
+                    | Kind::Uninstall
             ) || (a.kind == Kind::EdgeBan && !a.interactive);
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }

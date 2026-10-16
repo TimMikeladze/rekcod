@@ -112,9 +112,14 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
         "create" => {
             let d = CreateOptions::default();
             policy.check(args)?;
-            // Fleet nodes: the workspace arrives as a git ref, not a Mac directory.
+            // Fleet nodes: the workspace arrives as a git ref, not a Mac directory. Only there:
+            // for `serve`/`mcp --root` a git URL would skip the root and have the Mac fetch
+            // from any host before any sandbox exists.
             let dir = match args["git"]["url"].as_str() {
-                Some(url) => Some(crate::fleet::clone(paths, url, args["git"]["ref"].as_str().unwrap_or("HEAD"))?),
+                Some(url) if policy.roots.is_empty() => {
+                    Some(crate::fleet::clone(paths, url, args["git"]["ref"].as_str().unwrap_or("HEAD"))?)
+                }
+                Some(_) => bail!("git sources are only for fleet nodes; pass dir"),
                 None => Some(policy.project(args["dir"].as_str())?),
             };
             let o = CreateOptions {
@@ -735,6 +740,8 @@ mod tests {
         assert!(p.check(&json!({"allow_hosts": ["*"]})).is_err());
         assert!(p.check(&json!({"secrets": ["AWS_SECRET_ACCESS_KEY"]})).is_err());
         assert!(Policy::node().project(Some("/Users")).is_err());
+        let refused = op(&Paths { home: std::env::temp_dir() }, &p, "create", &json!({"git": {"url": "https://127.0.0.1:1/x.git"}}));
+        assert!(refused.unwrap_err().to_string().contains("only for fleet nodes"));
         assert!(exec_opts(&json!({"env": ["AWS_SECRET_ACCESS_KEY"]})).is_err());
         assert!(exec_opts(&json!({"env": ["A=1"]})).is_ok());
         std::fs::remove_dir_all(root).unwrap();

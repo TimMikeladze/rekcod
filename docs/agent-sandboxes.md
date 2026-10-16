@@ -217,7 +217,9 @@ rekcod mcp --secret NPM_TOKEN                # a variable callers may pass in wi
 rekcod mcp --allow-mount                     # lets callers ask for a live read-write share
 ```
 
-A request outside those gets a 400 that names the flag. `exec` takes `env` only as
+A request outside those gets a 400 that names the flag. `git` sources (`{"git": {"url",
+"ref"}}`) are only for fleet nodes; `serve` and `mcp` refuse them, since the Mac would fetch
+from the URL before any sandbox exists. `exec` takes `env` only as
 `KEY=VALUE`; a bare `KEY` would make docker copy the value from the server's own
 environment. The token is checked before the body is read. Request lines and headers are
 capped at 16 KiB and 100 headers, bodies at 64 MiB, a peer gets 30 s to send its request,

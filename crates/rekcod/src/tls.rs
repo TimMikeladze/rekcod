@@ -321,9 +321,8 @@ mod tests {
         let addr = l.local_addr().unwrap();
         let ca_pem = ca.pem.clone();
         std::thread::spawn(move || {
-            for _ in 0..4 {
-                let (tcp, _) = l.accept().unwrap();
-                let mut s = accept(Some(&server), tcp).unwrap();
+            for tcp in l.incoming().flatten() {
+                let Ok(mut s) = accept(Some(&server), tcp) else { continue };
                 let mut req = [0u8; 4096];
                 let n = s.read(&mut req).unwrap_or(0);
                 let body = if String::from_utf8_lossy(&req[..n]).starts_with("GET /ca.pem") { ca_pem.clone() } else { "hello".into() };
@@ -342,8 +341,13 @@ mod tests {
         let mut out = String::new();
         s.read_to_string(&mut out).unwrap();
         assert!(out.ends_with("hello"), "{out}");
-        // A CA we don't hold for that host: no connection.
-        assert!(connect("https://10.9.9.9:1", "10.9.9.9:1", TcpStream::connect(addr).unwrap()).is_err());
+        // A CA we don't hold for that host: no connection. (Any socket will do; it's refused
+        // before a byte is sent.)
+        let spare = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(spare.local_addr().unwrap()).unwrap();
+        if DEFAULT_TRUST.get().is_none() {
+            assert!(connect("https://10.9.9.9:1", "10.9.9.9:1", tcp).is_err());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

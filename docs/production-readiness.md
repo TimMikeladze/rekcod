@@ -33,7 +33,13 @@ commits after f994023. In short:
   `--backup-dir`, cleanup).
 - Section 9: request-level controller tests, the `Conn` spill test, `safefs` tests and
   `scripts/e2e-lifecycle.sh` (VM crashes, damaged disks, repair) were added.
-- An external security review of the sandboxes is still not done.
+- An external security review of the sandboxes is still not done; `docs/security-review.md`
+  is the brief. An internal adversarial pass (three reviewers, real VMs, guest root with the
+  guest firewall flushed) confirmed the sandbox, apply, API and dashboard claims and found
+  four things, all fixed: node certificates came from the CA clients pin for the controller,
+  app instance sandboxes were reachable as sandboxes, the main VM's `--network user` could
+  reach the Mac's loopback, and `serve`/`mcp` accepted git sources that skipped `--root`.
+  A role-matrix test now covers every fleet write route against every caller kind.
 - Verified on this Mac with isolated homes: `scripts/e2e-lifecycle.sh` 21/21, `scripts/e2e-sandbox.sh` 26/26, `scripts/e2e-fleet.sh` 79/79, `cargo test --workspace` 121 + 5, agent tests 7 in a Linux container. `scripts/e2e.sh` was not run: it drives your main VM.
 
 ## Where it stands

@@ -170,3 +170,7 @@ bridge directly. The daemon's question check has unit tests only.
   shows only its public name, which is refused unless it's on the list.
 - `rekcod x --sandbox` gets the same network stack but still has no allowlist (open
   internet, Mac and LAN refused).
+
+A VM may have 4096 TCP connections and 1024 UDP flows open through the daemon at once; past
+that, new ones are refused (a reset for TCP) and logged, so guest root can't run the Mac out
+of descriptors.

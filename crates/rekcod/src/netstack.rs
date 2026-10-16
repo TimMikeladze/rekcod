@@ -33,6 +33,9 @@ pub const GUEST: Ipv4Addr = Ipv4Addr::new(10, 0, 2, 15);
 pub const CMDLINE: &str = "rekcod.net=10.0.2.15/24,10.0.2.2";
 const GATEWAY_MAC: [u8; 6] = [0x02, 0x72, 0x6b, 0x00, 0x02, 0x02];
 const MTU: usize = 1500;
+/// TCP connections and UDP flows a VM may have open at once.
+const MAX_CONNS: usize = 4096;
+const MAX_FLOWS: usize = 1024;
 /// Per direction, per connection. smoltcp scales the window to fit.
 const TCP_BUFFER: usize = 256 << 10;
 const CHUNK: usize = 64 << 10;
@@ -675,6 +678,12 @@ impl Stack {
             }
             return;
         }
+        // Each connection is a host socket and task: guest root opening them without limit
+        // would run the Mac out of descriptors. Over the cap, the guest gets a reset.
+        if self.conns.len() >= MAX_CONNS {
+            self.deny(format!("refused tcp {dst} ({MAX_CONNS} connections open)"));
+            return self.inject(frame);
+        }
         let kind = match self.policy.check(true, dst) {
             Verdict::Refuse(why) => {
                 self.deny(format!("refused tcp {dst} ({why})"));
@@ -717,6 +726,12 @@ impl Stack {
             },
         };
         self.flows.remove(&key);
+        if self.flows.len() >= MAX_FLOWS {
+            self.flows.retain(|_, tx| !tx.is_closed());
+            if self.flows.len() >= MAX_FLOWS {
+                return self.deny(format!("refused udp {dst} ({MAX_FLOWS} flows open)"));
+            }
+        }
         if let Verdict::Refuse(why) = self.policy.check(false, dst) {
             return self.deny(format!("refused udp {dst} ({why})"));
         }

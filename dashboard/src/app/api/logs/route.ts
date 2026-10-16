@@ -1,7 +1,7 @@
 import { FIXTURE, spawnRekcod } from "@/lib/rekcod"
 import { fakeLogLine, fakeLogs } from "@/lib/server/fixtures"
 import { bad, guarded } from "@/lib/server/readonly"
-import { fakeStream, textStream } from "@/lib/server/stream"
+import { cappedStream, fakeStream } from "@/lib/server/stream"
 import { logsArgv } from "@/lib/server/validate"
 
 // Container logs with the sheet's options: `follow`, `timestamps`, `since` (1m, 10m, 1h, 6h,
@@ -15,5 +15,5 @@ export async function GET(req: Request) {
     const ts = a.argv.includes("--timestamps")
     return fakeStream(req, fakeLogs(ts), a.argv.includes("--follow") ? () => fakeLogLine(0, ts) : undefined)
   }
-  return textStream(req, spawnRekcod(a.argv))
+  return cappedStream(req, () => spawnRekcod(a.argv))
 }

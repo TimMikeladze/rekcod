@@ -1,6 +1,6 @@
 import { refuse } from "@/lib/guard"
 import { FIXTURE, offered, spawnStream, STREAMED } from "@/lib/rekcod"
-import { textStream } from "@/lib/server/stream"
+import { cappedStream } from "@/lib/server/stream"
 
 // Streams a log-like action's output (`logs -f`, `app logs`, ...) as plain text until the
 // client disconnects.
@@ -16,5 +16,5 @@ export async function GET(req: Request) {
   const a = await offered(argv)
   if (!a || !STREAMED.has(a.kind)) return new Response("not a streamed action rekcod offers right now", { status: 400 })
   if (FIXTURE) return new Response(`dry run: rekcod ${a.argv!.join(" ")}\n`)
-  return textStream(req, spawnStream(a))
+  return cappedStream(req, () => spawnStream(a))
 }

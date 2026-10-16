@@ -12,19 +12,49 @@ rekcod dashboard            # starts the bundled build (or finds the running one
 rekcod dashboard --install  # the same at login (LaunchAgent dev.rekcod.dashboard)
 ```
 
-`rekcod dashboard` runs `server.js` from the first of `$REKCOD_DASHBOARD_DIR`,
+`rekcod dashboard` runs `start.cjs` from the first of `$REKCOD_DASHBOARD_DIR`,
 `~/.rekcod/dashboard`, `<bin>/../share/rekcod/dashboard` and this checkout's
-`dashboard/.next/standalone`, on the first free port from 4500. It needs Node (`node` on
-`PATH`, Homebrew's, or `$REKCOD_NODE`). A second call prints and opens the running one's URL
-(`~/.rekcod/run/dashboard.json`). Logs go to `~/.rekcod/logs/dashboard.log`.
+`dashboard/.next/standalone` that has one, on the first free port from 4500. A build without
+`start.cjs` predates the token, so it's skipped; rebuild with `npm run bundle -- --install`.
+It needs Node (`node` on `PATH`, Homebrew's, or `$REKCOD_NODE`). A second call prints and
+opens the running one's sign-in URL. Logs go to `~/.rekcod/logs/dashboard.log`.
 
 From a checkout:
 
 ```sh
 cd dashboard && npm ci
-npm run dev                  # http://localhost:4500, or the next free port
+npm run dev                  # prints http://localhost:4500/auth?token=..., or the next free port
 npm run bundle -- --install  # standalone build, copied to ~/.rekcod/dashboard
 ```
+
+## Signing in
+
+Every container can reach the Mac's 127.0.0.1 through `host.docker.internal`, and any
+process can set `Host: localhost`, so listening on loopback keeps nothing out. Each launch
+gets a token instead:
+
+- `rekcod dashboard` makes 32 random bytes (hex), passes them to the server as
+  `REKCOD_DASHBOARD_TOKEN` and writes `{"pid", "port", "token"}` to
+  `~/.rekcod/run/dashboard.json`, created 0600. It opens
+  `http://localhost:PORT/auth?token=TOKEN`, and so does a second call, from that file.
+- `npm run dev` and `npm start` make their own token (or take `REKCOD_DASHBOARD_TOKEN`) and
+  print the link. They don't write the file.
+- `/auth` compares the token in constant time, sets `rekcod-dashboard-PORT` (HttpOnly,
+  SameSite=Strict, Path=/, until the browser quits) and redirects to `/`. The port is in the
+  name because cookies ignore ports, and two dashboards would overwrite each other's.
+- `src/proxy.ts` checks the cookie on every request except build assets and icons. Without it
+  a page answers 401 with "Open this with `rekcod dashboard`", an API route answers 401.
+  A server started without a token (or one under 32 characters) answers 401 to everything.
+- Restarting the server (or the LaunchAgent at login) makes a new token, so open pages get
+  401 until you run `rekcod dashboard` again. Under the LaunchAgent the token stays out of
+  `dashboard.log`.
+
+`start.cjs` sets the listen address to 127.0.0.1 whatever `HOSTNAME` says and drops
+connections from any non-loopback peer, then loads Next's `server.js`. Pages can't be framed
+(`X-Frame-Options: DENY`, `frame-ancestors 'none'`).
+
+The daemon still splices `host.docker.internal:PORT` to the dashboard's port; the token is
+what stops a container there.
 
 Release tarballs don't include it unless built with `scripts/package.sh --with-dashboard`,
 which puts the standalone build in `share/rekcod/dashboard` (Node is still needed to run it).
@@ -104,8 +134,13 @@ action lists and never changes anything except by running `rekcod <argv>`.
   "disk"); rows open their detail page. What you picked recently comes first (an empty query
   lists it, then the pages), and an action that confirms shows its warning under it. Running
   one goes through the same confirm and allow-list path as the buttons.
-- The API refuses requests whose `Host` isn't localhost (DNS rebinding), cross-origin
-  requests, and POSTs without an `x-rekcod: 1` header.
+- Each API route (`lib/guard.ts`) checks again, in order: `Host` is localhost (DNS
+  rebinding, 403), the sign-in cookie (401), `Sec-Fetch-Site` is `same-origin` or `none`
+  (403; a page on another localhost port is "same-site" and gets the SameSite=Strict
+  cookie), `Origin`, when sent, is this host (403; `null` included), and POSTs carry
+  `x-rekcod: 1` (403).
+- At most 16 log streams (`/api/stream`, `/api/logs`, `/api/instance-logs`) run at once, each
+  its own `rekcod` process; the 17th gets 429 until one closes.
 
 Read-only views that need more than `rekcod state` use fixed routes. Each runs one known
 command and only for a name or id in the current state; none takes argv from the page:
@@ -194,8 +229,10 @@ columns and every row action is in the row's menu.
 
 ```sh
 npm test           # vitest: allow-list, issues, notifications, palette (pages, recents), stats parsing, state merge,
-                   # route validation, share, sorting, log levels and search, bulk kinds, activity filters, 5xx rate
-npm run test:e2e   # Playwright against the fixture bundle: every list and detail page, axe (no
+                   # route validation, share, sorting, log levels and search, bulk kinds, activity filters, 5xx rate,
+                   # the token and cookie, guard.ts (Host, Origin, Sec-Fetch-Site, x-rekcod), the stream cap
+npm run test:e2e   # Playwright against the fixture bundle, run through start.cjs and signed in through /auth
+                   # (auth.setup.ts); 401 without the cookie and for a wrong token (auth.spec.ts); every list and detail page, axe (no
                    # serious violations, no hydration errors), /?tab= redirect, Cmd+B rail, 404, filter, confirm/cancel, dry-run toast, /stream,
                    # keyboard rows, Cmd+K, 390 px, the phone drawer (dashboard.spec.ts); sorting, bulk select and its
                    # confirm, container tabs, log search, shortcuts, palette, empty states, toast View, row flash,
@@ -207,6 +244,8 @@ Both run in CI (`dashboard` job) and in `.githooks/pre-commit` when a staged fil
 
 ## Limitations
 
+- The token keeps out other machines and containers, not other processes running as you:
+  they can read `dashboard.json` or the server's environment.
 - Jobs come from the controller's last 50; the menu bar shows 10.
 - One remote at a time: the default one, like the menu bar. `remote use` and `ns use` switch it.
 - Deploys, scaling, env changes and `node pool` take arguments, so they're CLI-only; their

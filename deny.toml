@@ -1,0 +1,42 @@
+# cargo-deny (https://embarkstudios.github.io/cargo-deny/). CI runs `cargo deny check`.
+
+[graph]
+# The host runs on macOS, the agent on aarch64 musl. Nothing else ships.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-musl"]
+all-features = true
+
+[advisories]
+# RustSec advisories fail the check, and so do yanked crates.
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Licenses that can ship inside an Apache-2.0 binary.
+allow = [
+  "Apache-2.0",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.9
+exceptions = [
+  # FSEvents watcher. CC0 is a public-domain dedication, so it adds no conditions.
+  { crate = "notify", allow = ["CC0-1.0"] },
+]
+
+[bans]
+# Two versions of a crate cost build time and binary size, not correctness.
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace path dependencies have no version. The crates are `publish = false`, so
+# cargo-deny lets that through.
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

@@ -1,0 +1,24 @@
+name: guest image
+description: Builds rekcod-agent and the guest image (out/guest) on an arm64 Linux runner.
+runs:
+  using: composite
+  steps:
+    # The compiled guest kernel, reused until guest/kernel, guest/fuse, guest/build.sh or the
+    # pinned versions change (guest/build.sh keys its cache on the same inputs).
+    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ runner.temp }}/kernel-cache
+        key: guest-kernel-${{ hashFiles('guest/build.sh', 'guest/versions.env', 'guest/kernel/**', 'guest/fuse/**') }}
+    - name: agent
+      shell: bash
+      run: |
+        cargo build --locked --release -p rekcod-agent --target aarch64-unknown-linux-musl
+        mkdir -p out/agent && cp target/aarch64-unknown-linux-musl/release/rekcod-agent out/agent/
+    - name: guest image
+      shell: bash
+      run: |
+        sudo REKCOD_KERNEL_CACHE="$RUNNER_TEMP/kernel-cache" guest/build.sh out/agent/rekcod-agent out/guest
+        sudo chown -R "$(id -u):$(id -g)" out/guest "$RUNNER_TEMP/kernel-cache"
+        ls -l out/guest
+        size=$(stat -c %s out/guest/root.img)
+        test "$size" -lt $((400 * 1024 * 1024)) || { echo "root.img too big: $size"; exit 1; }

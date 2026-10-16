@@ -3,6 +3,7 @@ name = "rekcod"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "Docker on macOS, switched in one command"
 
 [dependencies]

@@ -4,9 +4,14 @@
 #
 #   scripts/e2e.sh                       # core checks
 #   E2E_IMPORT_FROM=orbstack scripts/e2e.sh   # also test import from that context
+#   E2E_ALLOW_STOP=1 scripts/e2e.sh      # run the final `rekcod stop` even with your containers up
+#
+# The last step stops the VM, which deletes running `--rm` containers. It refuses when
+# containers this run didn't create are running, unless E2E_ALLOW_STOP=1.
+# REKCOD (default target/release/rekcod) and REKCOD_HOME pass through.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-R="$PWD/target/release/rekcod"
+R=${REKCOD:-$PWD/target/release/rekcod}
 failures=0
 ok() { printf '  ok    %s\n' "$1"; }
 bad() { printf '  FAIL  %s\n' "$1"; failures=$((failures + 1)); }
@@ -17,10 +22,26 @@ prev=$(docker context show)
 # Start from another context so the switch and the restore are both tested.
 if [[ $prev == rekcod ]]; then docker context use default >/dev/null; switched_back=1; prev=default; fi
 work=$(mktemp -d "$HOME/.rekcod-e2e.XXXX")
+work=$(cd "$work" && pwd -P)
 trap 'docker compose -p rekcod-e2e -f "$work/compose.yaml" down -v >/dev/null 2>&1; rm -rf "$work"' EXIT
+# Long-running containers this run starts carry this label; `foreign` below skips them.
+run_label="dev.rekcod.e2e=$(basename "$work")"
+xp="$work/x"
+# Running containers this run didn't create: not labeled by it, not one of its compose
+# projects (rekcod-e2e*), not a `rekcod x` container for its project dir.
+foreign() {
+  docker ps --format '{{.Names}}|{{.Label "dev.rekcod.e2e"}}|{{.Label "com.docker.compose.project"}}|{{.Label "dev.rekcod.x"}}' 2>/dev/null |
+    awk -F'|' -v run="${run_label#*=}" -v xp="$xp" '$2 != run && $3 !~ /^rekcod-e2e/ && $4 != xp { print $1 }'
+}
+# Polls "$@" up to $1 times, $2 seconds apart.
+until_ok() { local n=$1 gap=$2 i; shift 2; for ((i = 0; i < n; i++)); do "$@" >/dev/null 2>&1 && return 0; sleep "$gap"; done; return 1; }
 
 echo "start"
 "$R" start || { echo "rekcod start failed"; exit 1; }
+others=$(foreign)
+if [[ -n $others && ${E2E_ALLOW_STOP:-} != 1 ]]; then
+  echo "note: containers not started by this run are up ($(echo "$others" | tr '\n' ' ')); the final \`rekcod stop\` will refuse to run"
+fi
 check "context switched to rekcod" test "$(docker context show)" = rekcod
 
 echo "engine"
@@ -31,12 +52,12 @@ check "host.docker.internal resolves" docker run --rm alpine:3.22 getent hosts h
 check "external DNS" docker run --rm alpine:3.22 nslookup example.com
 
 echo "switcher gaps"
-docker run -d --rm --name rekcod-e2e-udp -p 18053:5353/udp alpine:3.22 sh -c 'nc -lu -p 5353 -e cat' >/dev/null
-sleep 1.5
-check "published UDP port echoes" sh -c 'test "$(echo ping | nc -u -w2 127.0.0.1 18053)" = ping'
+docker run -d --rm --name rekcod-e2e-udp -l "$run_label" -p 18053:5353/udp alpine:3.22 sh -c 'nc -lu -p 5353 -e cat' >/dev/null
+# Retried until the listener and the port mirror are up.
+check "published UDP port echoes" until_ok 10 0.3 sh -c 'test "$(echo ping | nc -u -w1 127.0.0.1 18053)" = ping'
 docker rm -f rekcod-e2e-udp >/dev/null 2>&1
 python3 -m http.server 18077 --bind 127.0.0.1 --directory tests/e2e/stack/www >/dev/null 2>&1 & srv=$!
-sleep 0.5
+until_ok 50 0.1 curl -sf -o /dev/null http://127.0.0.1:18077/
 check "host.docker.internal reaches Mac 127.0.0.1" sh -c 'docker run --rm alpine:3.22 wget -qO- http://host.docker.internal:18077/ | grep -q "rekcod e2e"'
 kill $srv 2>/dev/null
 tmpf=$(mktemp /tmp/rekcod-e2e.XXXX); echo mac-tmp >"$tmpf"
@@ -47,7 +68,7 @@ check "rekcod compact" "$R" compact
 echo "docker passthrough (docs/cli-passthrough.md)"
 check "rekcod run keeps docker's exit code" sh -c '"$0" run --rm alpine:3.22 sh -c "exit 7"; test $? = 7' "$R"
 check "rekcod compose version" "$R" compose version
-"$R" run -d --name rekcod-e2e-pt alpine:3.22 sleep 60 >/dev/null
+"$R" run -d --name rekcod-e2e-pt -l "$run_label" alpine:3.22 sleep 60 >/dev/null
 check "rekcod stop <container> is docker's" sh -c '"$0" stop -t 1 rekcod-e2e-pt && "$0" status | grep -q "rekcod running"' "$R"
 docker container rm -f rekcod-e2e-pt >/dev/null 2>&1
 
@@ -60,15 +81,16 @@ check "built image served on localhost:18081" sh -c 'curl -sf localhost:18081 | 
 echo "<h1>edited</h1>" >"$work/www/index.html"
 # Mac-side changes reach the guest's caches via FSEvents (~25 ms): poll briefly.
 check "Mac-side edit visible in container" sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do curl -sf localhost:18080 | grep -q edited && exit 0; sleep 0.1; done; exit 1'
-docker run -d --name rekcod-e2e-watch -v "$work/www:/w" alpine:3.22 inotifyd - /w >/dev/null
-sleep 1
-echo "<h1>hot reload</h1>" >"$work/www/index.html"
-check "Mac-side edit fires inotify in container" sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do docker logs rekcod-e2e-watch 2>&1 | grep -q index.html && exit 0; sleep 0.2; done; exit 1'
+docker run -d --name rekcod-e2e-watch -l "$run_label" -v "$work/www:/w" alpine:3.22 inotifyd - /w >/dev/null
+until_ok 50 0.1 docker exec rekcod-e2e-watch pidof inotifyd
+# Edits again each round: an edit landing before inotifyd has added its watch isn't lost.
+check "Mac-side edit fires inotify in container" sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do echo "<h1>hot reload $i</h1>" >"$0/www/index.html"; sleep 0.2; docker logs rekcod-e2e-watch 2>&1 | grep -q index.html && exit 0; done; exit 1' "$work"
 printf 'atomic' >"$work/www/.tmp-save" && mv "$work/www/.tmp-save" "$work/www/index.html"
 check "atomic (rename) save readable in container" sh -c "for i in 1 2 3 4 5 6 7 8 9 10; do docker exec rekcod-e2e-watch cat /w/index.html 2>/dev/null | grep -q atomic && exit 0; sleep 0.2; done; exit 1"
 echo doomed >"$work/www/doomed.txt"
 docker exec rekcod-e2e-watch cat /w/doomed.txt >/dev/null 2>&1
 rm "$work/www/doomed.txt"
+# Nothing to poll for: this waits to see that the file doesn't come back.
 sleep 1
 check "Mac-side delete stays deleted" test ! -e "$work/www/doomed.txt"
 docker rm -f rekcod-e2e-watch >/dev/null 2>&1
@@ -79,7 +101,7 @@ check "port released after down" sh -c '! curl -sf --max-time 2 localhost:18080'
 
 echo "coherence (Mac-side changes vs cached guest view)"
 coh="$work/coh"; mkdir -p "$coh"
-docker run -d --name rekcod-e2e-coh -v "$coh:/c" alpine:3.22 sleep 600 >/dev/null
+docker run -d --name rekcod-e2e-coh -l "$run_label" -v "$coh:/c" alpine:3.22 sleep 600 >/dev/null
 # Poll the container's view for up to 2s; caches are warmed by the previous step.
 see() { local i; for i in $(seq 1 20); do docker exec rekcod-e2e-coh sh -c "$1" >/dev/null 2>&1 && return 0; sleep 0.1; done; return 1; }
 echo one >"$coh/a"; see 'test "$(cat /c/a)" = one'; docker exec rekcod-e2e-coh sh -c 'ls /c; stat /c/new' >/dev/null 2>&1
@@ -121,11 +143,12 @@ printf 'services:\n  a:\n    image: alpine:3.22\n    command: sleep 600\n    ini
 check "snap save, change, restore" sh -c "cd '$sp' && '$R' snap save -p rekcod-e2e-snap s1 && docker compose -p rekcod-e2e-snap exec -T a sh -c 'echo v2 > /d/f' && '$R' snap restore -p rekcod-e2e-snap s1 && test \"\$(docker compose -p rekcod-e2e-snap exec -T a cat /d/f)\" = v1"
 check "snap ls --json" sh -c "cd '$sp' && '$R' snap ls -p rekcod-e2e-snap --json | grep -q '\"name\": \"s1\"'"
 (cd "$sp" && "$R" snap rm -p rekcod-e2e-snap s1 >/dev/null 2>&1; docker compose -p rekcod-e2e-snap down -v -t 1 >/dev/null 2>&1)
-xp="$work/x"; mkdir -p "$xp"
+mkdir -p "$xp"
 check "rekcod x keeps the exit code" sh -c "cd '$xp' && '$R' x --image alpine:3.22 sh -c 'exit 3'; test \$? = 3"
 (cd "$xp" && "$R" x --image python:3.13-slim python3 -m http.server 18093 --bind 127.0.0.1 >/dev/null 2>&1 &)
 check "rekcod x forwards a 127.0.0.1 listener to the Mac" sh -c 'for i in $(seq 1 60); do curl -sf -o /dev/null localhost:18093 && exit 0; sleep 1; done; exit 1'
-docker rm -f $(docker ps -q --filter label=dev.rekcod.x) >/dev/null 2>&1
+# Only this run's `rekcod x` container: the label holds its project dir.
+docker ps -q --filter "label=dev.rekcod.x=$xp" | xargs docker rm -f >/dev/null 2>&1
 echo inside >"$xp/f.txt"
 check "x --sandbox sees the project, not the rest of \$HOME" sh -c "cd '$xp' && test \"\$('$R' x --sandbox --image alpine:3.22 sh -c 'cat f.txt; ls -A /Users/*/ | wc -l' | tr '\n' ' ')\" = 'inside 1 '"
 check "x --sandbox can't reach the Mac" sh -c "cd '$xp' && '$R' x --sandbox --image alpine:3.22 sh -c '! wget -qO- -T 3 http://host.docker.internal:22/'"
@@ -144,9 +167,19 @@ if [[ -n "${E2E_IMPORT_FROM:-}" ]]; then
   docker volume rm -f rekcod-e2e-vol >/dev/null 2>&1
 fi
 
-REKCOD="$R" "$(dirname "$0")/e2e-sandbox.sh" || failures=$((failures + 1))
+REKCOD="$R" scripts/e2e-sandbox.sh || failures=$((failures + 1))
 
 echo "stop"
+others=$(foreign)
+if [[ -n $others && ${E2E_ALLOW_STOP:-} != 1 ]]; then
+  echo "refusing to run \`rekcod stop\`: these containers weren't started by this run, and stopping"
+  echo "the VM deletes any that were started with --rm:"
+  echo "$others" | sed 's/^/  /'
+  echo "Stop them yourself, or rerun with E2E_ALLOW_STOP=1. Checks so far: $failures failed."
+  # The VM stays up, so leave the context where the user had it.
+  if [[ -n ${switched_back:-} ]]; then docker context use rekcod >/dev/null; else docker context use "$prev" >/dev/null; fi
+  exit 1
+fi
 "$R" stop >/dev/null
 check "context restored to $prev" test "$(docker context show)" = "$prev"
 [[ -n ${switched_back:-} ]] && docker context use rekcod >/dev/null

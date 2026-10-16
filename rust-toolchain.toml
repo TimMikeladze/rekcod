@@ -1,0 +1,7 @@
+# CI, the release build and local builds all use this toolchain. Bump it in its own commit
+# so a new clippy lint or rustfmt change doesn't hide in a feature diff.
+[toolchain]
+channel = "1.99.0"
+targets = ["aarch64-unknown-linux-musl"]
+components = ["clippy", "rustfmt"]
+profile = "minimal"

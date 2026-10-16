@@ -3,75 +3,100 @@ on:
   push:
     branches: [main]
   pull_request:
+  # release.yml runs this whole workflow before it publishes anything.
+  workflow_call:
+    inputs:
+      upload-guest:
+        description: Upload out/guest as the `guest` artifact for the caller.
+        type: boolean
+        default: false
+
+permissions: {}
 
 # A newer push makes the older run's result moot.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ${{ github.workflow }}-ci-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
   host:
     runs-on: macos-15
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          targets: aarch64-unknown-linux-musl
-          components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2
+          persist-credentials: false
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
-      - run: cargo test --workspace
-      - run: cargo clippy -p rekcod -p rekcod-proto -- -D warnings
-      - run: cargo clippy -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings
-      - run: cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --locked -p rekcod -p rekcod-proto -- -D warnings
+      - run: cargo clippy --locked -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings
+      - run: cargo build --locked --release -p rekcod-agent --target aarch64-unknown-linux-musl
+
+  # Advisories, licenses, duplicate crates and sources (deny.toml).
+  deny:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check
 
   # The web dashboard against fixtures/state.json: no VM, no rekcod binary needed.
   dashboard:
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     defaults:
       run:
         working-directory: dashboard
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
       - run: npm ci
+      # Only what ships in the standalone bundle; dev tooling is out of scope.
+      - run: npm audit --omit=dev --audit-level=high
       - run: npm test
       - run: npm run typecheck
       - run: npm run lint
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: playwright-report
           path: dashboard/playwright-report
 
   guest:
     runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v4
-      # The compiled guest kernel, reused until guest/kernel, guest/fuse or
-      # guest/build.sh changes (guest/build.sh keys its cache the same way).
-      - uses: actions/cache@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: ${{ runner.temp }}/kernel-cache
-          key: guest-kernel-${{ hashFiles('guest/build.sh', 'guest/kernel/**', 'guest/fuse/**') }}
-      - uses: dtolnay/rust-toolchain@stable
+          persist-credentials: false
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The agent's cfg(target_os = "linux") tests, which the macOS job compiles out.
+      - run: cargo test --locked -p rekcod-agent --target aarch64-unknown-linux-musl
+      - uses: ./.github/actions/guest
+      - if: inputs.upload-guest
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          targets: aarch64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
-      - name: agent
-        run: |
-          cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
-          mkdir -p out/agent && cp target/aarch64-unknown-linux-musl/release/rekcod-agent out/agent/
-      - name: guest image
-        run: |
-          sudo REKCOD_KERNEL_CACHE="$RUNNER_TEMP/kernel-cache" guest/build.sh out/agent/rekcod-agent out/guest
-          sudo chown -R "$(id -u):$(id -g)" out/guest "$RUNNER_TEMP/kernel-cache"
-          ls -l out/guest
-          size=$(stat -c %s out/guest/root.img)
-          test "$size" -lt $((400 * 1024 * 1024)) || { echo "root.img too big: $size"; exit 1; }
+          name: guest
+          path: out/guest
+          retention-days: 7

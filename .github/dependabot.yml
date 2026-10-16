@@ -1,0 +1,28 @@
+version: 2
+updates:
+  # Workspace crates (Cargo.lock). Minor and patch bumps arrive as one PR a week.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /dashboard
+    schedule:
+      interval: weekly
+    groups:
+      dashboard-minor:
+        update-types: [minor, patch]
+
+  # Workflows and the composite actions in .github/actions. Dependabot updates the pinned
+  # SHA and its `# vX.Y.Z` comment together.
+  - package-ecosystem: github-actions
+    directories: [/, /.github/actions/*]
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

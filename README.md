@@ -65,10 +65,25 @@ container (only `--sandbox` gets its own VM). The reasoning behind these is in
 From the latest GitHub release:
 
 ```sh
-curl -fsSL https://github.com/TimMikeladze/rekcod/releases/latest/download/rekcod-darwin-arm64.tar.gz | tar -xz
-sudo mv bin/rekcod /usr/local/bin/
-xattr -d com.apple.quarantine /usr/local/bin/rekcod 2>/dev/null   # not notarized yet
+curl -fsSL https://raw.githubusercontent.com/TimMikeladze/rekcod/main/scripts/install.sh | bash
 rekcod start      # first run downloads and verifies the guest image (~100 MB)
+```
+
+[`scripts/install.sh`](scripts/install.sh) downloads `rekcod-darwin-arm64.tar.gz` and
+`SHA256SUMS`, checks the tarball's sha256 and installs nothing on a mismatch. Then it puts
+`rekcod` in `/usr/local/bin` and, when the release has it, the dashboard in
+`/usr/local/share/rekcod/dashboard`, asking for sudo only if `/usr/local` isn't writable.
+`REKCOD_VERSION=0.2.1` installs that release, `PREFIX` installs elsewhere.
+
+By hand, the same steps:
+
+```sh
+base=https://github.com/TimMikeladze/rekcod/releases/latest/download
+curl -fsSLO "$base/rekcod-darwin-arm64.tar.gz" -O "$base/SHA256SUMS"
+shasum -a 256 -c SHA256SUMS --ignore-missing     # must print "rekcod-darwin-arm64.tar.gz: OK"
+tar -xzf rekcod-darwin-arm64.tar.gz
+sudo mkdir -p /usr/local/bin && sudo mv bin/rekcod /usr/local/bin/
+xattr -d com.apple.quarantine /usr/local/bin/rekcod 2>/dev/null   # not notarized yet
 ```
 
 The binary pins the guest it was released with (`~/.rekcod/guest/<version>/`) and
@@ -561,7 +576,8 @@ If `DOCKER_HOST` is already set, it overrides contexts, and `rekcod start` warns
 Needs Rust and Xcode command-line tools (`codesign`). No Docker engine: `guest/build.sh`
 builds the guest image in chroots inside the running rekcod VM (`rekcod start` first;
 a fresh install boots the released guest). The first build compiles the guest kernel;
-later builds reuse it until `guest/kernel`, `guest/fuse` or `guest/build.sh` change.
+later builds reuse it until `guest/kernel`, `guest/fuse`, `guest/build.sh` or the pins in
+`guest/versions.env` change.
 See `docs/guest-build.md`.
 
 ```sh
@@ -572,9 +588,12 @@ scripts/package.sh                                 # release tarballs + SHA256SU
 ```
 
 Releases: push a `vX.Y.Z` tag matching `Cargo.toml`. `.github/workflows/release.yml`
-builds the guest on arm64 Linux and the host on macOS, then publishes the release.
-CI (`ci.yml`) runs unit tests, clippy and a guest build. The e2e suite needs a Mac
-that can run VMs, so it runs locally.
+runs all of CI first, then packages the host with the dashboard on macOS, attaches SBOMs
+and a provenance attestation, and publishes the release ([`docs/releasing.md`](docs/releasing.md)).
+CI (`ci.yml`) runs rustfmt, clippy, the host tests on macOS, the agent's Linux-only tests on
+arm64 Linux, `cargo deny`, the dashboard's `npm audit`, unit, type, lint and Playwright
+checks, and a guest build. The e2e suite needs a Mac that can run VMs, so it runs locally;
+`e2e.yml` runs it on a self-hosted Mac once one is registered.
 
 `target/release/rekcod` finds `out/guest` on its own. Elsewhere, set `REKCOD_GUEST_DIR` or copy
 `out/guest` to `~/.rekcod/guest`.
@@ -586,8 +605,10 @@ that can run VMs, so it runs locally.
 ```sh
 cargo test --workspace                       # unit tests
 cargo fmt --all --check                      # formatting (rustfmt.toml; CI enforces it)
+cargo deny check                             # advisories, licenses, sources (deny.toml; CI runs it)
 (cd dashboard && npm test && npm run typecheck && npm run lint)  # dashboard
-scripts/e2e.sh                               # real CLI + compose against rekcod
+scripts/e2e.sh                               # real CLI + compose against rekcod; ends with `rekcod stop`,
+                                             # refused while containers it didn't start run (E2E_ALLOW_STOP=1)
 E2E_IMPORT_FROM=orbstack scripts/e2e.sh      # also exercises import
 python3 bench/headroom.py --context rekcod   # file-sharing benchmark (compare --context orbstack)
 python3 bench/inotify_rtt.py --context rekcod  # Mac edit -> container inotify latency

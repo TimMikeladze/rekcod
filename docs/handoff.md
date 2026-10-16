@@ -8,8 +8,8 @@ You're continuing **rekcod**: Docker on macOS (Apple Silicon) that runs the real
 `dockerd` in a Virtualization.framework VM. Users switch to it in one command (`rekcod start`
 selects a `rekcod` docker context, `rekcod import --from <context>` copies images and volumes)
 and back in one (`rekcod stop`). The goal is that Docker Desktop and OrbStack users switch over
-without changing anything. Repo: github.com/TimMikeladze/rekcod (private),
-branch `main`.
+without changing anything. Repo: github.com/TimMikeladze/rekcod (public, Apache-2.0),
+branch `main`. Index of the docs: `docs/README.md`.
 
 ## Read first
 
@@ -19,12 +19,13 @@ branch `main`.
 - `docs/phase2.md`: the bind-mount caching design, measured results, the bugs found, and the memory finding.
 - `guest/fuse/README.md`: how to edit the kernel patch.
 
-## State (2026-10-11)
+## State (2026-10-11, facts updated 2026-10-16)
 
 - Phase 1 is done. It has switch-over, import, ports, DNS via the Mac and Rosetta, and boots in 1.3 s.
 - Phase 2 bind mounts are done. Patched `fuse`/`virtiofs` modules give long TTLs, lazy open, and FSEvents-driven `rekcod_notify` invalidation with stat comparison. Warm work is 3–9× faster than OrbStack; cold first-touch is 2–6× slower.
 - Memory reclaim (balloon) is opt-in with `REKCOD_BALLOON=1`. On macOS 27 the guest inflates the balloon but the host footprint doesn't drop.
-- Tests: 18 unit tests (`cargo test --workspace`), clippy clean, and `scripts/e2e.sh` passes 28/28, run 5× in a row.
+- Tests: 92 unit tests run on macOS (`cargo test --workspace`) plus the agent's 6 Linux-only tests (CI's arm64 Linux job, or `rekcod x cargo test -p rekcod-agent`), clippy clean, and `scripts/e2e.sh` has 47 checks (3 of them only with `E2E_IMPORT_FROM`).
+- CI is done: `.github/workflows/ci.yml` on every push and PR, `release.yml` on `v*` tags gated on all of CI (docs/releasing.md).
 - Machine: M5 Pro, macOS 27.0.1.
   - Docker Desktop is installed but broken (`Docker Desktop is unable to start`).
   - OrbStack is installed and is the comparison baseline (`--context orbstack`).
@@ -32,9 +33,9 @@ branch `main`.
 
 ## Ground rules (don't relitigate)
 
-1. Never reimplement the Docker API, Compose or BuildKit. Parity comes from upstream dockerd (pinned in `guest/build.sh`).
+1. Never reimplement the Docker API, Compose or BuildKit. Parity comes from upstream dockerd (pinned in `guest/versions.env`).
 2. Virtualization.framework, not libkrun/HVF, because only VZ gets Rosetta (Docker VMM lacks it).
-3. Host↔guest traffic is vsock only: ports 2375 docker, 2376 port forward, 2377 control, 2378 DNS (`crates/rekcod-proto`). No TCP API and no reliance on vmnet routing.
+3. Host↔guest traffic is vsock only: ports 2375 docker, 2376 port forward, 2377 control, 2378 DNS, 2379 reverse (parked connections for `host.docker.internal` to the Mac), 2380 metadata-server prototype (`crates/rekcod-proto`). No TCP API and no reliance on vmnet routing.
 4. File-sharing semantics are bounded staleness (about 25 ms), not coherence. Guest writes are coherent. Never write to Mac files to signal the guest.
 5. 4K-page guest kernel, because 16K breaks jemalloc in prebuilt images.
 6. Never kill whatever holds a Mac port. Report it in `rekcod status` instead.
@@ -73,7 +74,7 @@ branch `main`.
 ```sh
 cargo test --workspace && cargo clippy -p rekcod -p rekcod-proto
 scripts/build.sh                                    # needs `rekcod start` for the guest image
-E2E_IMPORT_FROM=orbstack scripts/e2e.sh             # 28 checks; run it 3x for anything touching fuse
+E2E_IMPORT_FROM=orbstack scripts/e2e.sh             # 47 checks; run it 3x for anything touching fuse
 python3 bench/headroom.py --context rekcod          # compare: --context orbstack
 ```
 
@@ -86,18 +87,17 @@ Also found and fixed a pre-existing whole-VM freeze: VZ blocks a vCPU when a vso
 connection isn't drained (`phase2b-4.md`, "VM freeze"). **Never let a vsock
 connection go unread**; always use `vm::Conn`.
 
-### Phase 3: ship it (nobody can install it yet)
+### Phase 3: ship it
 
-1. Prebuilt artifacts (rekcod binary, `out/guest/*`, checksums) on GitHub Releases.
-   - Shrink `root.img` first: it's 584 MB, so drop unused kernel modules and consider squashfs or erofs plus a writable overlay.
-2. Auto-fetch the guest: `rekcod start` downloads and verifies the guest on first run into `~/.rekcod/guest`.
-3. Developer ID signing and notarization, keeping the virtualization entitlement.
+1. Done: prebuilt artifacts (rekcod binary, guest tarball, `SHA256SUMS`) on GitHub Releases, `root.img` shrunk, and `scripts/install.sh`.
+2. Done: `rekcod start` downloads and verifies the pinned guest on first run into `~/.rekcod/guest`.
+3. Developer ID signing and notarization: wired into `release.yml` but off until the Apple secrets exist (docs/releasing.md).
    - Blocked on the user: needs their Apple Developer account and certs. Ask.
-4. Brew tap (`TimMikeladze/tap/rekcod`) with a `rekcod upgrade` flow.
-5. CI (GitHub Actions): unit tests and clippy on macOS arm64; the guest image built on an arm64 Linux runner.
-   - Hosted macOS runners can't nest VMs, so e2e needs a self-hosted Mac. Ask before setting one up.
+4. Open: brew tap (`TimMikeladze/tap/rekcod`) with a `rekcod upgrade` flow.
+5. Done: CI (GitHub Actions) on macOS and arm64 Linux, releases gated on it.
+   - Hosted macOS runners can't nest VMs, so e2e needs a self-hosted Mac. `e2e.yml` is ready and skipped until `REKCOD_E2E_RUNNER=true`. Ask before setting one up.
 
-### Phase 4: done except the menu bar item
+### Phase 4: done (the menu bar item shipped in phase 5)
 
 UDP ports, `host.docker.internal` → Mac loopback, Mac `/tmp`, DNS over TCP, `rekcod compact`
 plus hourly trim, and bind-mount warming are shipped and checked in `scripts/e2e.sh`.
@@ -120,6 +120,6 @@ the menu bar item, warm-at-boot, and ~14 ms change latency. Memory return is sti
 
 A custom vsock file server is slower per request than Apple's virtio-fs (63 vs 46 µs). libkrun would lose Rosetta.
 
-Phase 3 progress: see `docs/phase3.md` (guest shrink, releases, auto-fetch, CI done; signing/notarization and brew open).
+Phase 3 progress: see `docs/phase3.md` (guest shrink, releases, auto-fetch, CI done; notarization wired but dormant; brew open).
 
-**Start with:** Developer ID signing + notarization (needs the user's Apple account).
+**Start with:** turning on notarization (needs the user's Apple account; the secrets are listed in docs/releasing.md).

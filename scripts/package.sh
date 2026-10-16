@@ -8,6 +8,10 @@
 #
 # --with-dashboard also puts the web dashboard's standalone build in share/rekcod/dashboard,
 # where `rekcod dashboard` finds it. Off by default: it needs Node on the user's Mac.
+#
+# CODESIGN_IDENTITY signs the released binary with that identity, hardened runtime and a
+# secure timestamp (release.yml sets it to the Developer ID when the secrets exist,
+# docs/releasing.md). Default "-": ad-hoc.
 set -euo pipefail
 with_dashboard=0
 [[ ${1:-} == --with-dashboard ]] && with_dashboard=1
@@ -25,13 +29,18 @@ sha=$(shasum -a 256 "$rel/$guest_tar" | cut -d' ' -f1)
 
 # Signing rewrites the file, and macOS kills a process whose binary changes underneath it (a
 # VM daemon started from target/release), so only copies are signed.
+#   signed_into <dest> [identity]
 signed_into() {
+  local id=${2:--} opts=()
+  # Notarization requires the hardened runtime and a timestamp; ad-hoc signing can't have one.
+  [[ $id == - ]] || opts=(--options runtime --timestamp)
   cp target/release/rekcod "$1.tmp"
-  codesign --force --sign - --entitlements rekcod.entitlements "$1.tmp"
+  # ${opts[@]+...}: bash 3.2 (macOS /bin/bash) treats an empty array as unset under set -u.
+  codesign --force --sign "$id" ${opts[@]+"${opts[@]}"} --entitlements rekcod.entitlements "$1.tmp"
   mv -f "$1.tmp" "$1"
 }
-REKCOD_GUEST_VERSION=$gv REKCOD_GUEST_SHA256=$sha cargo build --release -p rekcod
-signed_into "$rel/stage/bin/rekcod"
+REKCOD_GUEST_VERSION=$gv REKCOD_GUEST_SHA256=$sha cargo build --locked --release -p rekcod
+signed_into "$rel/stage/bin/rekcod" "${CODESIGN_IDENTITY:--}"
 parts=(bin)
 if [[ $with_dashboard == 1 ]]; then
   (cd dashboard && npm ci && npm run bundle)
@@ -46,5 +55,5 @@ rm -rf "$rel/stage"
 cp "$rel/$host_tar" "$rel/rekcod-darwin-arm64.tar.gz"
 (cd "$rel" && shasum -a 256 "$host_tar" rekcod-darwin-arm64.tar.gz "$guest_tar" > SHA256SUMS)
 # Leave target/release/rekcod as a dev build again (no embedded guest).
-cargo build --release -p rekcod >/dev/null 2>&1 && signed_into target/release/rekcod
+cargo build --locked --release -p rekcod >/dev/null 2>&1 && signed_into target/release/rekcod
 ls -l "$rel"

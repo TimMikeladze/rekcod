@@ -3,6 +3,7 @@ name = "rekcod-agent"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 description = "rekcod guest agent: vsock bridges for the docker API, published ports and control"
 
 [target.'cfg(target_os = "linux")'.dependencies]

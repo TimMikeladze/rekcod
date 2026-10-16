@@ -1,0 +1,16 @@
+name: rust toolchain
+description: Installs the toolchain, targets and components that rust-toolchain.toml pins.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        # Hosted images ship rustup; a bare self-hosted runner may not.
+        if ! command -v rustup >/dev/null; then
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$PATH"
+        fi
+        # No arguments: installs what rust-toolchain.toml names (rustup 1.28+).
+        rustup toolchain install
+        rustc --version

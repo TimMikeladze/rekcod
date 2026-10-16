@@ -56,8 +56,10 @@ connections from any non-loopback peer, then loads Next's `server.js`. Pages can
 The daemon also refuses `host.docker.internal:PORT` for the port in `run/dashboard.json`, so a container
 can't connect to the dashboard at all. Anything else on the Mac needs the token.
 
-Release tarballs don't include it unless built with `scripts/package.sh --with-dashboard`,
-which puts the standalone build in `share/rekcod/dashboard` (Node is still needed to run it).
+Releases after 0.2.1 are packaged with `scripts/package.sh --with-dashboard`, which puts the
+standalone build in `share/rekcod/dashboard`; `scripts/install.sh` copies it to
+`/usr/local/share/rekcod/dashboard`. Node is still needed to run it. 0.2.x tarballs don't
+have it.
 
 - `REKCOD_BIN` picks the binary. Without it: `rekcod` on `PATH`, then `../target/release/rekcod`,
   then `../target/debug/rekcod`. `rekcod dashboard` passes its own path.

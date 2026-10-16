@@ -1,0 +1,80 @@
+name: e2e
+# The VM suites need a Mac that can run VMs, which hosted runners can't. Every job is
+# skipped until the repository variable REKCOD_E2E_RUNNER is "true", so nothing queues
+# while no self-hosted runner is registered. Setup: docs/releasing.md.
+#
+# On a v* tag, release.yml calls this workflow and won't publish if it fails. Run it by
+# hand from the Actions tab (workflow_dispatch) on any branch.
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      guest-artifact:
+        description: Use this artifact from the calling run as out/guest instead of building one.
+        type: string
+        default: ""
+
+permissions: {}
+
+jobs:
+  guest:
+    if: vars.REKCOD_E2E_RUNNER == 'true' && inputs.guest-artifact == ''
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: ./.github/actions/guest
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: guest-e2e
+          path: out/guest
+          retention-days: 3
+
+  e2e:
+    needs: guest
+    # Runs after a built guest, or with the caller's when the guest job was skipped for that.
+    if: >-
+      !cancelled() && vars.REKCOD_E2E_RUNNER == 'true' &&
+      (needs.guest.result == 'success' || (needs.guest.result == 'skipped' && inputs.guest-artifact != ''))
+    runs-on: [self-hosted, macOS, ARM64, rekcod-e2e]
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    # One VM suite at a time on the runner.
+    concurrency:
+      group: rekcod-e2e
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ inputs.guest-artifact || 'guest-e2e' }}
+          path: out/guest
+      # A dev build finds out/guest next to it, so no release download is involved.
+      - run: scripts/build.sh --host-only
+      # Its own REKCOD_HOME, never the runner user's ~/.rekcod. Short, because the docker
+      # socket path has to fit in sun_path (104 bytes).
+      - name: isolated rekcod home
+        run: |
+          echo "REKCOD_HOME=$HOME/.rke2e" >> "$GITHUB_ENV"
+          rm -rf "$HOME/.rke2e"
+      # Also runs scripts/e2e-sandbox.sh before its final `rekcod stop`.
+      - run: scripts/e2e.sh
+      # Controller, nodes and edge in their own homes; leaves the main VM alone.
+      - if: success() || failure()
+        run: scripts/e2e-fleet.sh
+      - name: stop the e2e VM
+        if: always()
+        run: |
+          # Without the isolated home this would stop the runner user's own VM.
+          [ -n "${REKCOD_HOME:-}" ] || exit 0
+          target/release/rekcod stop || true
+          rm -rf "$REKCOD_HOME"

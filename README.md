@@ -228,8 +228,9 @@ shells open Terminal, and everything run is kept on an Activity page. Details:
 
 `rekcod x --sandbox <command>` runs in a second, throwaway VM whose only Mac
 directory is the current one. The rest of `$HOME` (`~/.ssh`, cloud credentials, other
-repos) doesn't exist there, and nothing on the Mac or the local network is reachable;
-the internet is. Variables get in only with `--secret NAME`; `--offline` cuts the network.
+repos) doesn't exist there, and nothing on the Mac or the local network is reachable
+(checked by the rekcod daemon on the Mac, not only inside the VM); the internet is.
+Variables get in only with `--secret NAME`; `--offline` cuts the network.
 Use it for `npm install` of something you don't trust, or for an AI agent's commands.
 Threat model and limits: [`docs/sandbox.md`](docs/sandbox.md).
 
@@ -257,8 +258,12 @@ rekcod sandbox rm $id
 
 The internet is limited to an allowlist of package and image registries and GitHub
 (`--allow-host` adds names, `--allow-host '*'` opens it, `--offline` cuts it).
-Names off the list don't resolve, and connections to addresses no allowed name resolved to
-are rejected; `rekcod sandbox log ID --net` shows what was blocked. A sandbox powers off
+Names off the list don't resolve, connections to addresses no allowed name resolved to
+are refused, and HTTPS to an allowed address must name an allowed host in its SNI (shared
+CDN addresses serve other sites too). The rekcod daemon on the Mac makes those checks: the
+sandbox's network card is a socket it serves, so root inside the sandbox flushing its own
+iptables changes nothing ([`docs/sandbox-network.md`](docs/sandbox-network.md)).
+`rekcod sandbox log ID --net` shows what was blocked. A sandbox powers off
 after 30 minutes without an exec (`--ttl`) and boots again on the next one.
 
 For agents: `rekcod mcp` is an MCP server on stdio with tools for create, exec,

@@ -162,7 +162,9 @@ works when the guest is stopped. It skips VM-local paths (`node_modules`, `.venv
 The existing sandbox rules stay: Mac and LAN ranges, link-local and IPv6 out of `eth0` are
 rejected in `OUTPUT` and `DOCKER-USER`, and there's no `host.docker.internal`.
 
-New: an egress allowlist enforced in the guest.
+New: an egress allowlist enforced in the guest. (As built, it's enforced by the daemon on
+the Mac, with the guest rules as a second layer; see As built and
+docs/sandbox-network.md.)
 
 - A DNS stub in `rekcod-agent` (`hickory-proto`) answers for allowed names only and adds
   each resolved address to an nftables set. It replaces `dnsmasq` in sandboxes (see
@@ -373,12 +375,15 @@ Where the code differs from the spec above:
   about 15 s, too long to hide inside a `create`. Run `rekcod sandbox golden build` once.
 - **Root image is a per-sandbox APFS clone**, not a read-only mount with a tmpfs overlay.
   The existing `prepare_vm` already clones it, and a clone costs no space.
-- **Egress uses the agent's existing DNS stub and per-address iptables rules**, not
-  hickory or nftables sets. The stub answers REFUSED for names off the list and logs
-  `rekcod-egress: denied NAME` to the console; for allowed names it inserts
-  `-d IP -j ACCEPT` into `REKCOD-ALLOW` before handing back the answer. Direct connections
-  aren't logged, only lookups. Allowlist matching (`rekcod_proto::host_allowed`) is shared
-  between host and guest.
+- **Egress is enforced by the daemon on the Mac** (docs/sandbox-network.md), not by
+  nftables in the guest. The sandbox's network card is a socket the daemon serves with a
+  userspace TCP/IP stack: it answers DNS only for allowed names, lets TCP and UDP out only
+  to addresses those answers returned (plus a TLS SNI or HTTP Host check on 443 and 80),
+  and refuses the Mac and LAN. Refusals go to the sandbox's `daemon.log`. The guest keeps
+  its old rules as a second layer: the agent's DNS stub answers REFUSED for names off the
+  list and logs `rekcod-egress: denied NAME` to the console, and for allowed names inserts
+  `-d IP -j ACCEPT` into `REKCOD-ALLOW`. Allowlist matching (`rekcod_proto::host_allowed`)
+  is shared between host and guest.
 - **Fork pauses the workspace container**, not the VM, and syncs first. dockerd keeps
   running, so the clone is crash-consistent. There's no `fsfreeze` control message.
 - **Fork keeps the parent's secrets.** They're in the workspace container's config on the

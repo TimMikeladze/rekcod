@@ -10,6 +10,8 @@ How a feature behaves today and how to drive it.
 - [default-socket.md](default-socket.md): routing `/var/run/docker.sock` to rekcod.
 - [sandbox.md](sandbox.md): `rekcod x --sandbox` and its threat model.
 - [agent-sandboxes.md](agent-sandboxes.md): `rekcod sandbox`, the HTTP API and MCP.
+- [sandbox-network.md](sandbox-network.md): sandbox egress checked by the daemon on the Mac
+  (userspace TCP/IP stack, allowlist, SNI check).
 - [frontends.md](frontends.md): the CLI, menu bar and dashboard share one action list.
 - [dashboard.md](dashboard.md): the web dashboard and `rekcod dashboard`.
 - [remote-docker.md](remote-docker.md): another Mac's rekcod as your docker engine.

@@ -34,7 +34,21 @@ check "egress: allowed registry" "$R" sandbox exec e2e-sb1 -- wget -q -T 10 -O /
 check "egress: other names refused" sh -c '! "$0" sandbox exec e2e-sb1 -- wget -q -T 5 -O /dev/null https://example.com' "$R"
 check "egress: direct IPs rejected" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 3 1.1.1.1 443' "$R"
 check "egress: denial logged" sh -c '"$0" sandbox log e2e-sb1 --net | grep -q example.com' "$R"
-check "Mac unreachable" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 2 192.168.64.1 22' "$R"
+check "Mac unreachable" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 2 10.0.2.2 22' "$R"
+# The network checks again, after guest root flushed the guest's own firewall: the rekcod
+# daemon on the Mac decides every connection (docs/sandbox-network.md).
+lan=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || echo 192.168.64.1)
+id=$("$R" sandbox ls --json | python3 -I -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if s.get("name")=="e2e-sb1"][0])')
+DOCKER_HOST="unix://${REKCOD_HOME:-$HOME/.rekcod}/sb/$id/run/docker.sock" docker run --rm --privileged --pid=host alpine:3.22 \
+  nsenter -t 1 -m -u -n -i sh -c 'iptables -F; iptables -P OUTPUT ACCEPT; iptables -P FORWARD ACCEPT' >/dev/null 2>&1
+check "guest root flushed iptables" sh -c '! DOCKER_HOST="unix://$1/sb/$2/run/docker.sock" docker run --rm --privileged --pid=host alpine:3.22 nsenter -t 1 -n iptables -S OUTPUT | grep -q REJECT' _ "${REKCOD_HOME:-$HOME/.rekcod}" "$id"
+check "flushed: allowed registry" "$R" sandbox exec e2e-sb1 -- wget -q -T 10 -O /dev/null https://dl-cdn.alpinelinux.org/alpine/
+check "flushed: direct IPs refused" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 3 1.1.1.1 443' "$R"
+check "flushed: Mac LAN address refused" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 3 "$1" 22' "$R" "$lan"
+check "flushed: 10.0.0.0/8 refused" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 3 10.0.0.1 80' "$R"
+ip=$("$R" sandbox exec e2e-sb1 -- sh -c "nslookup dl-cdn.alpinelinux.org 2>/dev/null | awk '/^Address: /{print \$2; exit}'")
+check "flushed: allowed address, other SNI refused" sh -c '! "$0" sandbox exec e2e-sb1 -- wget -q -T 5 -O /dev/null --no-check-certificate "https://$1/"' "$R" "$ip"
+check "flushed: refusals logged on the Mac" sh -c '"$0" sandbox log e2e-sb1 --net | grep -q "refused tcp 1.1.1.1:443"' "$R"
 "$R" sandbox exec e2e-sb1 -- sh -c 'echo parent > forked.txt' >/dev/null 2>&1
 check "fork copies the workspace" sh -c '"$0" sandbox fork e2e-sb1 --name e2e-sb2 && test "$("$0" sandbox exec e2e-sb2 -- cat forked.txt)" = parent' "$R"
 "$R" sandbox exec e2e-sb2 -- touch child-only >/dev/null 2>&1

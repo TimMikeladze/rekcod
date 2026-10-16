@@ -25,6 +25,9 @@ confidence-threshold = 0.9
 exceptions = [
   # FSEvents watcher. CC0 is a public-domain dedication, so it adds no conditions.
   { crate = "notify", allow = ["CC0-1.0"] },
+  # Sandbox network stack. 0BSD is permission without conditions, not even attribution.
+  { crate = "smoltcp", allow = ["0BSD"] },
+  { crate = "managed", allow = ["0BSD"] },
 ]
 
 [bans]

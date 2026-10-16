@@ -4,7 +4,7 @@
 //! `VZVirtualMachine` is dispatched there. Async callers get results back
 //! over oneshot channels, so the rest of the daemon is plain tokio.
 
-use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -16,9 +16,9 @@ use objc2::rc::Retained;
 use objc2_foundation::{NSArray, NSDictionary, NSError, NSFileHandle, NSString, NSURL};
 use objc2_virtualization::{
     VZDirectorySharingDeviceConfiguration, VZDiskImageCachingMode, VZDiskImageStorageDeviceAttachment, VZDiskImageSynchronizationMode,
-    VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader, VZLinuxRosettaAvailability,
-    VZLinuxRosettaDirectoryShare, VZMACAddress, VZMultipleDirectoryShare, VZNATNetworkDeviceAttachment, VZSharedDirectory,
-    VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
+    VZFileHandleNetworkDeviceAttachment, VZFileHandleSerialPortAttachment, VZGenericPlatformConfiguration, VZLinuxBootLoader,
+    VZLinuxRosettaAvailability, VZLinuxRosettaDirectoryShare, VZMACAddress, VZMultipleDirectoryShare, VZNATNetworkDeviceAttachment,
+    VZSharedDirectory, VZStorageDeviceConfiguration, VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioEntropyDeviceConfiguration, VZVirtioFileSystemDeviceConfiguration, VZVirtioNetworkDeviceConfiguration,
     VZVirtioSocketConnection, VZVirtioSocketDevice, VZVirtioSocketDeviceConfiguration, VZVirtioTraditionalMemoryBalloonDevice,
     VZVirtioTraditionalMemoryBalloonDeviceConfiguration, VZVirtualMachine, VZVirtualMachineConfiguration, VZVirtualMachineState,
@@ -39,6 +39,16 @@ pub struct VmConfig {
     pub console_log: PathBuf,
     /// Name in the guest's `mac` virtio-fs share -> host directory.
     pub shares: Vec<(String, PathBuf)>,
+    pub net: Net,
+}
+
+pub enum Net {
+    /// Virtualization.framework's NAT (the main VM).
+    Nat,
+    /// One end of a datagram socketpair; the daemon serves the other (`netstack.rs`).
+    Socket(OwnedFd),
+    /// No network card (offline sandboxes).
+    None,
 }
 
 /// Wrapper for Objective-C objects we only touch on the VM queue.
@@ -268,12 +278,26 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
         // vda = root, vdb = data (order matters to the guest's boot script).
         c.setStorageDevices(&NSArray::from_retained_slice(&[disk(&cfg.root_disk)?, disk(&cfg.data_disk)?]));
 
-        let net = VZVirtioNetworkDeviceConfiguration::new();
-        net.setAttachment(Some(&Retained::into_super(VZNATNetworkDeviceAttachment::new())));
-        let mac = VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(&cfg.mac_address))
-            .with_context(|| format!("bad MAC address {}", cfg.mac_address))?;
-        net.setMACAddress(&mac);
-        c.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(net)]));
+        let attachment = match &cfg.net {
+            Net::Nat => Some(Retained::into_super(VZNATNetworkDeviceAttachment::new())),
+            Net::Socket(fd) => {
+                let fd = fd.try_clone().context("dup the network socket")?;
+                let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), fd.into_raw_fd(), true);
+                Some(Retained::into_super(VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
+                    VZFileHandleNetworkDeviceAttachment::alloc(),
+                    &handle,
+                )))
+            }
+            Net::None => None,
+        };
+        if let Some(attachment) = attachment {
+            let net = VZVirtioNetworkDeviceConfiguration::new();
+            net.setAttachment(Some(&attachment));
+            let mac = VZMACAddress::initWithString(VZMACAddress::alloc(), &NSString::from_str(&cfg.mac_address))
+                .with_context(|| format!("bad MAC address {}", cfg.mac_address))?;
+            net.setMACAddress(&mac);
+            c.setNetworkDevices(&NSArray::from_retained_slice(&[Retained::into_super(net)]));
+        }
 
         // One virtio-fs device exposing the Mac directories by name.
         let names: Vec<Retained<NSString>> = cfg.shares.iter().map(|(n, _)| NSString::from_str(n)).collect();

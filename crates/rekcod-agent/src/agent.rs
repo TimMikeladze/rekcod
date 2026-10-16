@@ -596,18 +596,27 @@ fn skip_name(p: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
-/// The first question's name, dotted.
+/// The question's name, dotted. None unless the query has exactly one question and its
+/// name has no compression pointer: the whole packet goes upstream, so the name checked
+/// has to be the only one in it. The daemon applies the same rule (`dns::query_name`).
 fn query_name(p: &[u8]) -> Option<String> {
+    if p.get(4..6)? != [0, 1] {
+        return None;
+    }
     let mut i = 12;
     let mut labels = Vec::new();
     loop {
         let len = *p.get(i)? as usize;
-        if len == 0 || len & 0xc0 != 0 {
+        if len == 0 {
             break;
+        }
+        if len & 0xc0 != 0 {
+            return None;
         }
         labels.push(String::from_utf8_lossy(p.get(i + 1..i + 1 + len)?).into_owned());
         i += 1 + len;
     }
+    p.get(i + 1..i + 5)?; // type and class
     Some(labels.join("."))
 }
 
@@ -661,9 +670,9 @@ impl Dns {
             return false;
         }
         if let Some(eg) = &self.egress {
-            let name = query_name(query).unwrap_or_default();
-            if !rekcod_proto::host_allowed(&eg.allow, &name) {
-                eprintln!("rekcod-egress: denied {name}");
+            let name = query_name(query);
+            if !name.as_deref().is_some_and(|n| rekcod_proto::host_allowed(&eg.allow, n)) {
+                eprintln!("rekcod-egress: denied {}", name.as_deref().unwrap_or("(not one plain question)"));
                 let answer = refused(query);
                 match client {
                     Client::Tcp(tx) => {
@@ -816,6 +825,24 @@ mod tests {
         assert_eq!(answer_ipv4s(&p), vec![std::net::Ipv4Addr::new(93, 184, 216, 34)]);
         let r = refused(&p[..24]);
         assert_eq!((r[3] & 0x0f, &r[6..12]), (5, &[0u8; 6][..]));
+    }
+
+    #[test]
+    fn query_name_needs_one_plain_question() {
+        let q = [&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x03npm\x03org\x00\x00\x01\x00\x01"].concat();
+        assert_eq!(query_name(&q).as_deref(), Some("npm.org"));
+        // A second question would go upstream unchecked.
+        let mut two = q.clone();
+        two[5] = 2;
+        two.extend_from_slice(b"\x04evil\x03com\x00\x00\x01\x00\x01");
+        assert_eq!(query_name(&two), None);
+        let mut none = q.clone();
+        none[5] = 0;
+        assert_eq!(query_name(&none), None);
+        // "npm" then a pointer: the checked prefix isn't the name the resolver sees.
+        let ptr = [&q[..12], b"\x03npm\xc0\x0c\x00\x01\x00\x01"].concat();
+        assert_eq!(query_name(&ptr), None);
+        assert_eq!(query_name(&q[..q.len() - 2]), None);
     }
 
     #[test]

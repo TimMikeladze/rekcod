@@ -81,8 +81,13 @@ pub fn pick(resolvers: &[Resolver], name: &str) -> Vec<SocketAddr> {
     }
 }
 
-/// The question name of a DNS query, or None if it doesn't parse.
+/// The question name of a DNS query, or None unless it has exactly one question whose name
+/// has no compression pointer. Sandboxes refuse anything else, so the name checked is the
+/// only one the upstream resolver sees.
 pub fn query_name(q: &[u8]) -> Option<String> {
+    if q.get(4..6)? != [0, 1] {
+        return None;
+    }
     let mut i = 12;
     let mut labels = Vec::new();
     loop {
@@ -96,7 +101,58 @@ pub fn query_name(q: &[u8]) -> Option<String> {
         labels.push(std::str::from_utf8(q.get(i + 1..i + 1 + len)?).ok()?.to_string());
         i += 1 + len;
     }
+    q.get(i + 1..i + 5)?; // type and class
     Some(labels.join("."))
+}
+
+/// End of a (possibly compressed) name starting at `i`.
+fn skip_name(p: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        let len = *p.get(i)? as usize;
+        if len & 0xc0 == 0xc0 {
+            return Some(i + 2);
+        }
+        i += 1 + len;
+        if len == 0 {
+            return Some(i);
+        }
+    }
+}
+
+/// A records in an answer's answer section, with their TTLs.
+pub fn answer_a(p: &[u8]) -> Vec<(std::net::Ipv4Addr, u32)> {
+    let mut out = Vec::new();
+    let (Some(qd), Some(an)) = (p.get(4..6), p.get(6..8)) else { return out };
+    let (qd, an) = (u16::from_be_bytes([qd[0], qd[1]]), u16::from_be_bytes([an[0], an[1]]));
+    let mut i = 12;
+    for _ in 0..qd {
+        let Some(e) = skip_name(p, i) else { return out };
+        i = e + 4;
+    }
+    for _ in 0..an {
+        let Some(e) = skip_name(p, i) else { return out };
+        let Some(h) = p.get(e..e + 10) else { return out };
+        let (rtype, rdlen) = (u16::from_be_bytes([h[0], h[1]]), u16::from_be_bytes([h[8], h[9]]) as usize);
+        let ttl = u32::from_be_bytes([h[4], h[5], h[6], h[7]]);
+        if rtype == 1
+            && rdlen == 4
+            && let Some(a) = p.get(e + 10..e + 14)
+        {
+            out.push((std::net::Ipv4Addr::new(a[0], a[1], a[2], a[3]), ttl));
+        }
+        i = e + 10 + rdlen;
+    }
+    out
+}
+
+/// `query` turned into an answer with RCODE REFUSED and no records.
+pub fn refused(query: &[u8]) -> Option<Vec<u8>> {
+    query.get(..12)?;
+    let mut out = query.to_vec();
+    out[2] |= 0x80; // QR
+    out[3] = (out[3] & 0xf0) | 5;
+    out[6..12].fill(0);
+    Some(out)
 }
 
 pub fn if_index(name: &str) -> u32 {
@@ -121,8 +177,39 @@ mod tests {
         assert_eq!(s("box.tail1234.ts.net"), ["100.100.100.100:53"]);
         assert_eq!(s("git.corp.example."), ["[fe80::1%20]:53"]);
         assert_eq!(s("example.com"), ["192.168.1.1:53"]);
-        let q = [&[0u8; 12][..], b"\x03git\x04corp\x07example\x00\x00\x01\x00\x01"].concat();
+        let q = [&[0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x03git\x04corp\x07example\x00\x00\x01\x00\x01"].concat();
         assert_eq!(query_name(&q).as_deref(), Some("git.corp.example"));
+    }
+
+    #[test]
+    fn sandbox_queries_need_one_plain_question() {
+        let q = [&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x03npm\x03org\x00\x00\x01\x00\x01"].concat();
+        assert_eq!(query_name(&q).as_deref(), Some("npm.org"));
+        // Two questions: the second could name anything.
+        let mut two = q.clone();
+        two[5] = 2;
+        two.extend_from_slice(b"\x04evil\x03com\x00\x00\x01\x00\x01");
+        assert_eq!(query_name(&two), None);
+        let mut none = q.clone();
+        none[5] = 0;
+        assert_eq!(query_name(&none), None);
+        // "npm" then a pointer to whatever offset 12 spells.
+        let ptr = [&q[..12], b"\x03npm\xc0\x0c\x00\x01\x00\x01"].concat();
+        assert_eq!(query_name(&ptr), None);
+        assert_eq!(query_name(&q[..q.len() - 2]), None, "type/class cut off");
+        let r = refused(&q).unwrap();
+        assert_eq!((r[2] & 0x80, r[3] & 0x0f, &r[4..12]), (0x80, 5, &[0, 1, 0, 0, 0, 0, 0, 0][..]));
+    }
+
+    #[test]
+    fn answer_a_reads_addresses_and_ttls() {
+        // x.b.io: a CNAME, then an A record with TTL 300 (compressed names).
+        let mut p = vec![0x12, 0x34, 0x81, 0x80, 0, 1, 0, 2, 0, 0, 0, 0];
+        p.extend([1, b'x', 1, b'b', 2, b'i', b'o', 0, 0, 1, 0, 1]);
+        p.extend([0xc0, 12, 0, 5, 0, 1, 0, 0, 0, 60, 0, 2, 0xc0, 14]);
+        p.extend([0xc0, 14, 0, 1, 0, 1, 0, 0, 1, 44, 0, 4, 93, 184, 216, 34]);
+        assert_eq!(answer_a(&p), vec![(std::net::Ipv4Addr::new(93, 184, 216, 34), 300)]);
+        assert_eq!(answer_a(&p[..40]), vec![]);
     }
 
     #[test]

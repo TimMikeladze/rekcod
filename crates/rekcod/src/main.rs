@@ -39,6 +39,8 @@ mod macos;
 #[cfg(target_os = "macos")]
 mod menubar;
 #[cfg(target_os = "macos")]
+mod netstack;
+#[cfg(target_os = "macos")]
 mod s3;
 #[cfg(target_os = "macos")]
 mod safefs;

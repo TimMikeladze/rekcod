@@ -950,10 +950,13 @@ pub fn ports(paths: &Paths, id: &str, json: bool) -> Result<()> {
 pub fn log(paths: &Paths, id: &str, follow: bool, json: bool, net: bool) -> Result<()> {
     let s = find(paths, id)?;
     if net {
-        // Denials the guest agent printed to the console.
-        let text = std::fs::read_to_string(s.paths.console_log()).unwrap_or_default();
-        for l in text.lines().filter(|l| l.contains("rekcod-egress:")) {
-            println!("{l}");
+        // Lookups the guest agent refused (console), then lookups and connections the
+        // daemon refused (docs/sandbox-network.md).
+        for log in [s.paths.console_log(), s.paths.daemon_log()] {
+            let text = std::fs::read_to_string(log).unwrap_or_default();
+            for l in text.lines().filter(|l| l.contains("rekcod-egress:")) {
+                println!("{l}");
+            }
         }
         return Ok(());
     }

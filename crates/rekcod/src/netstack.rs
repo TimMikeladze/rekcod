@@ -134,6 +134,14 @@ impl Policy {
 
     pub fn check(&self, tcp: bool, dst: SocketAddrV4) -> Verdict {
         if self.everything {
+            // What NAT reaches, which never includes the Mac's loopback: services there
+            // (the dashboard, anything bound to 127.0.0.1) are reachable only through
+            // host.docker.internal, which refuses the dashboard's port. A container with
+            // NET_RAW could otherwise address 127.0.0.1 straight out of eth0.
+            let ip = *dst.ip();
+            if ip.is_loopback() || ip.is_unspecified() {
+                return Verdict::Refuse("the Mac's loopback (use host.docker.internal)");
+            }
             return Verdict::Allow;
         }
         if tcp && self.reach.contains(&dst) {
@@ -1188,6 +1196,11 @@ mod tests {
         let p = Policy::everything();
         for dst in ["1.1.1.1:443", "192.168.1.10:445", "10.0.0.5:5432", "8.8.8.8:53"] {
             assert!(matches!(p.check(true, dst.parse().unwrap()), Verdict::Allow), "{dst}");
+        }
+        // Never the Mac's loopback, which NAT doesn't reach either (the dashboard lives there).
+        for dst in ["127.0.0.1:4500", "127.1.2.3:22", "0.0.0.0:80"] {
+            assert!(matches!(p.check(true, dst.parse().unwrap()), Verdict::Refuse(_)), "{dst}");
+            assert!(matches!(p.check(false, dst.parse().unwrap()), Verdict::Refuse(_)), "{dst}");
         }
         // Sandboxes keep refusing the LAN.
         let s = Policy::new(None, vec![], Arc::default());

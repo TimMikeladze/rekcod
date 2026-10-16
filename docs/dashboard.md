@@ -54,7 +54,9 @@ connections from any non-loopback peer, then loads Next's `server.js`. Pages can
 (`X-Frame-Options: DENY`, `frame-ancestors 'none'`).
 
 The daemon also refuses `host.docker.internal:PORT` for the port in `run/dashboard.json`, so a container
-can't connect to the dashboard at all. Anything else on the Mac needs the token.
+can't connect to the dashboard at all. On `--network user` (the default behind a
+full-tunnel VPN) the daemon also refuses any connection a container addresses to the Mac's
+loopback directly. Anything else on the Mac needs the token.
 
 Releases after 0.2.1 are packaged with `scripts/package.sh --with-dashboard`, which puts the
 standalone build in `share/rekcod/dashboard`; `scripts/install.sh` copies it to

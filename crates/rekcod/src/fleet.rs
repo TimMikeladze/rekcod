@@ -4487,6 +4487,89 @@ mod tests {
         }
     }
 
+    /// Every route against every kind of caller. Only the authorization outcome is
+    /// checked: a request that gets past it may still fail later (no node to call, say).
+    #[test]
+    fn role_matrix() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        add_token(&c, "owner-t", "olive", false, "member", false, None);
+        add_token(&c, "member-t", "mia", false, "member", false, None);
+        add_token(&c, "viewer-t", "vic", false, "member", false, None);
+        add_token(&c, "outsider-t", "otto", false, "member", false, None);
+        add_token(&c, "nsonly-t", "nina", false, "none", false, None);
+        add_token(&c, "edge-t", "edge", false, "none", true, None);
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("insert into namespaces (name, created, salt) values ('team', 0, x'01')", &[]).unwrap();
+            db.execute("insert into members values ('team', 'olive', 'owner'), ('team', 'mia', 'member'), ('team', 'vic', 'viewer'), ('team', 'nina', 'viewer')", &[]).unwrap();
+            db.execute("insert into apps (name, owner, git_url, git_ref, port, created, ns) values ('web--team', 'mia', 'https://x/y', 'main', 8000, 0, 'team')", &[]).unwrap();
+            db.execute(
+                "insert into jobs (id, owner, node, spec, state, created, ns) values ('j-abc', 'mia', 'n-1', '{}', 'done', 0, 'team')",
+                &[],
+            )
+            .unwrap();
+            db.execute(
+                "insert into jobs (id, owner, node, spec, state, created, ns) values ('j-def', 'mia', 'n-1', '{}', 'done', 0, 'default')",
+                &[],
+            )
+            .unwrap();
+        }
+        // (method, path, body, callers allowed past authorization)
+        let routes: &[(&str, &str, Value, &[&str])] = &[
+            ("GET", "/ns/team/apps", json!(null), &["admin", "owner", "member", "viewer", "nsonly"]),
+            ("GET", "/ns/team/apps/web", json!(null), &["admin", "owner", "member", "viewer", "nsonly"]),
+            ("GET", "/ns/team/apps/web/logs", json!(null), &["admin", "owner", "member", "viewer", "nsonly"]),
+            ("POST", "/ns/team/apps/web/env", json!({"set": {"A": "1"}}), &["admin", "owner", "member"]),
+            ("POST", "/ns/team/apps/web/scale", json!({"instances": 2}), &["admin", "owner", "member"]),
+            ("POST", "/ns/team/apps/web/visibility", json!({"public": true}), &["admin", "owner", "member"]),
+            ("POST", "/ns/team/apps/web/storage/url", json!({"key": "a"}), &["admin", "owner", "member"]),
+            ("DELETE", "/ns/team/apps/web", json!({}), &["admin", "owner", "member"]),
+            ("GET", "/ns/team/jobs", json!(null), &["admin", "owner", "member", "viewer", "nsonly"]),
+            ("GET", "/ns/team/jobs/j-abc", json!(null), &["admin", "owner", "member", "viewer", "nsonly"]),
+            ("POST", "/ns/team/jobs/j-abc/cancel", json!({}), &["admin", "owner", "member"]),
+            ("POST", "/namespaces/team/members", json!({"who": "otto", "role": "viewer"}), &["admin", "owner"]),
+            ("POST", "/namespaces/team/quota", json!({"max_cpus": 4}), &["admin"]),
+            ("GET", "/nodes", json!(null), &["admin"]),
+            ("POST", "/nodes/n-x/drain", json!({}), &["admin"]),
+            ("POST", "/join-token", json!({}), &["admin"]),
+            ("POST", "/tokens", json!({"name": "z"}), &["admin"]),
+            ("GET", "/routes", json!(null), &["admin", "edge"]),
+            ("POST", "/bans", json!({"net": "203.0.113.9"}), &["admin", "edge"]),
+            ("DELETE", "/bans", json!({"net": "203.0.113.9"}), &["admin"]),
+            ("GET", "/backups", json!(null), &["admin"]),
+            // In default each person only sees their own.
+            ("GET", "/apps/blog", json!(null), &["admin", "member"]),
+            ("POST", "/apps/blog/env", json!({"set": {"A": "1"}}), &["admin", "member"]),
+            ("GET", "/jobs/j-def", json!(null), &["admin", "member"]),
+        ];
+        let denied = |e: &str| {
+            ["role", "no namespace", "admin token required", "admin or edge", "(401)", "(403)", "no app ", "no job "]
+                .iter()
+                .any(|m| e.contains(m))
+        };
+        for (method, path, body, allowed) in routes {
+            for who in ["admin", "owner", "member", "viewer", "outsider", "nsonly", "edge"] {
+                // Put back what a destructive route removed for the caller before.
+                c.db.lock()
+                    .unwrap()
+                    .execute(
+                        "insert or ignore into apps (name, owner, git_url, git_ref, port, created, ns) values
+                           ('web--team', 'mia', 'https://x/y', 'main', 8000, 0, 'team'), ('blog', 'mia', 'https://x/y', 'main', 8000, 0, 'default')",
+                        &[],
+                    )
+                    .unwrap();
+                let r = call(&url, method, path, Some(&format!("{who}-t")), body);
+                assert!(!r.as_ref().is_err_and(|e| e.to_string().contains("no such endpoint")), "test bug: {method} {path}");
+                let got_in = match &r {
+                    Ok(_) => true,
+                    Err(e) => !denied(&e.to_string()),
+                };
+                assert_eq!(got_in, allowed.contains(&who), "{who} {method} {path}: {r:?}");
+            }
+        }
+    }
+
     #[test]
     fn plaintext_tokens_are_hashed_on_upgrade() {
         let f = std::env::temp_dir().join(format!("rekcod-tok-{}.db", std::process::id()));

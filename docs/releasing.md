@@ -4,6 +4,31 @@ How a tag becomes a GitHub release, what's signed and attested, and the two piec
 stay off until someone turns them on: Developer ID notarization and the self-hosted e2e
 runner.
 
+## Before 0.3.0 ships (state on 2026-10-16)
+
+`main` is at 0.3.0 and pushed; CI is green. These were left for the owner on purpose and
+each one is a single step:
+
+1. **Tag the release:** `git tag v0.3.0 && git push origin v0.3.0`. release.yml runs the
+   tests, builds the guest and the bundled dashboard, and publishes the GitHub release.
+   Until then `releases/latest` (what `scripts/install.sh` and `rekcod upgrade` fetch) is
+   0.2.1.
+2. **Notarize:** add the five secrets in "Developer ID signing and notarization" below. The
+   next tag is then signed with the Developer ID and notarized; without them it's ad-hoc
+   signed and users strip the quarantine attribute (the README says how).
+3. **e2e on tags:** register a Mac as described in "Self-hosted e2e runner" and set
+   `REKCOD_E2E_RUNNER=true`. Until then run `scripts/e2e.sh`, `scripts/e2e-sandbox.sh`,
+   `scripts/e2e-fleet.sh` and `scripts/e2e-lifecycle.sh` by hand before tagging.
+4. **Homebrew:** `gh repo create TimMikeladze/homebrew-tap --public`, copy
+   `packaging/homebrew/rekcod.rb` to `Formula/rekcod.rb` there with `version` and `sha256`
+   from the release's `SHA256SUMS`. The tap has to be public for `brew install` without a
+   token.
+5. **Vulnerability reports:** turn on private vulnerability reporting
+   (`gh api -X PUT repos/TimMikeladze/rekcod/private-vulnerability-reporting`), which
+   `SECURITY.md` points to.
+6. **Outside security review:** hand `docs/security-review.md` to a reviewer. An internal
+   adversarial pass has been done (`docs/production-readiness.md`, "Status").
+
 ## Cutting a release
 
 1. Bump `version` in `Cargo.toml` (the workspace version) and run `cargo check` so

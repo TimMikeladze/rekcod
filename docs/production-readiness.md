@@ -39,8 +39,10 @@ commits after f994023. In short:
   four things, all fixed: node certificates came from the CA clients pin for the controller,
   app instance sandboxes were reachable as sandboxes, the main VM's `--network user` could
   reach the Mac's loopback, and `serve`/`mcp` accepted git sources that skipped `--root`.
-  A role-matrix test now covers every fleet write route against every caller kind.
-- Verified on this Mac with isolated homes: `scripts/e2e-lifecycle.sh` 21/21, `scripts/e2e-sandbox.sh` 26/26, `scripts/e2e-fleet.sh` 79/79, `cargo test --workspace` 121 + 5, agent tests 7 in a Linux container. `scripts/e2e.sh` was not run: it drives your main VM.
+  A role-matrix test now covers every fleet write route against every caller kind, and
+  `scripts/e2e-fleet.sh` checks cross-tenant access live over https against real
+  instances (87 checks).
+- Verified on this Mac with isolated homes: `scripts/e2e-lifecycle.sh` 21/21, `scripts/e2e-sandbox.sh` 26/26, `scripts/e2e-fleet.sh` 87/87, `cargo test --workspace` 121 + 5, agent tests 7 in a Linux container. `scripts/e2e.sh` 70 checks on the main VM after it moved to 0.3.0.
 
 ## Where it stands
 

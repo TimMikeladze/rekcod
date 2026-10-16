@@ -102,6 +102,19 @@ get() { curl -s -m 3 -H "Host: $1.apps.test" http://127.0.0.1:18088/; }
 check "deploy (generated Dockerfile)" cr app deploy --remote admin --git "$url" --ref main --name hello --instances 2
 sleep 2.5
 check "edge serves the app" sh -c 'test "$(curl -s -m 3 -H "Host: hello.apps.test" http://127.0.0.1:18088/)" = "v1 "'
+# Live authorization checks against the https controller, with real instances behind it.
+ca="$C/controller/ca.pem"
+api() { curl -s -m 10 --cacert "$ca" -H "Authorization: Bearer $1" "${@:3}" "https://127.0.0.1:17700$2"; }
+inst=$(api "$admin" /apps/hello | python3 -c 'import json,sys; print(json.load(sys.stdin)["instances"][0]["sandbox"])')
+check "an app instance isn't reachable as a sandbox" sh -c 'curl -s -m 10 --cacert "$0" -H "Authorization: Bearer $1" "https://127.0.0.1:17700/sandboxes/$2/files?path=/etc/hostname" | grep -q "no sandbox"' "$ca" "$admin" "$inst"
+check "the query string can't name another sandbox" sh -c 'curl -s -m 10 --cacert "$0" -H "Authorization: Bearer $1" -X POST -d "{\"cmd\":[\"true\"]}" "https://127.0.0.1:17700/sandboxes/nope/exec?id=$2" | grep -q "no sandbox"' "$ca" "$alice" "$inst"
+check "an edge token can't deploy" sh -c 'curl -s -m 10 --cacert "$0" -H "Authorization: Bearer $1" -X POST -d "{}" https://127.0.0.1:17700/apps/hello/deploy | grep -q "edge tokens only"' "$ca" "$edge"
+check "a user token can't change another user's app" sh -c 'curl -s -m 10 --cacert "$0" -H "Authorization: Bearer $1" -X POST -d "{\"set\":{\"A\":\"1\"}}" https://127.0.0.1:17700/apps/hello/env | grep -q "no app"' "$ca" "$bob"
+check "git options are refused on deploy" sh -c 'curl -s -m 10 --cacert "$0" -H "Authorization: Bearer $1" -X POST -d "{\"name\":\"x\",\"git\":{\"url\":\"https://github.com/a/b\",\"ref\":\"--upload-pack=touch /tmp/rekcod-pwned\"}}" https://127.0.0.1:17700/apps | grep -q "bad git ref" && test ! -e /tmp/rekcod-pwned' "$ca" "$alice"
+check "a node can't register the controller's name" sh -c 'curl -s -m 10 --cacert "$0" -X POST -d "{\"join_token\":\"$1\",\"url\":\"https://$(hostname -s):17999\"}" https://127.0.0.1:17700/nodes/register | grep -q "controller.s own"' "$ca" "$join"
+# curl exits 60 when the certificate doesn't verify (not a connection error).
+check "a client pinned to the fleet CA refuses a node certificate" sh -c 'curl -s -m 5 --cacert "$0" https://127.0.0.1:17701/sandboxes >/dev/null; test $? -eq 60' "$ca"
+check "the node CA does verify it" sh -c 'curl -s -m 5 --cacert "$0" https://127.0.0.1:17701/sandboxes >/dev/null; test $? -ne 60' "$C/controller/node-ca.pem"
 check "new apps aren't on the public listener" sh -c 'curl -s -m 3 -H "Host: hello.apps.test" http://127.0.0.1:18089/ | grep -q "no app"'
 check "app public" cr app public --remote admin hello
 sleep 2.5

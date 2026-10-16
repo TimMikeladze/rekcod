@@ -60,6 +60,8 @@ check "the error names --repair" sh -c "'$R' status >/dev/null; grep -aq 'not fo
 "$R" stop --no-switch --force >/dev/null 2>&1
 check "start --repair brings it back" start --repair
 check "dockerd answers after the repair" $D info
+# 200 MiB of junk took docker's own metadata with it; the image comes back for what follows.
+docker save alpine:3.22 | $D load >/dev/null
 
 echo "ports"
 port=18555
@@ -68,7 +70,7 @@ listener=$!
 sleep 1
 $D run -d --name shadow -p 127.0.0.1:$port:80 alpine:3.22 sleep 300 >/dev/null
 sleep 2
-check "a port the Mac already serves isn't taken" sh -c "'$R' status --json | grep -A3 '\"port\": $port' | grep -q error"
+check "a port the Mac already serves isn't taken" sh -c "'$R' status --json | python3 -c 'import json,sys; sys.exit(0 if any(p.get(\"port\") == $port and p.get(\"error\") for p in json.load(sys.stdin)[\"ports\"]) else 1)'"
 $D rm -f shadow >/dev/null
 
 echo "login agent"

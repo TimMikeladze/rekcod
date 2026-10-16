@@ -115,7 +115,7 @@ impl Edge {
     /// Reports activity, then pulls routes and bans from the controller. Blocking.
     fn refresh(&self) {
         let Some(r) = &self.remote else { return };
-        let hosts: Vec<String> = self.seen.lock().unwrap().drain().collect();
+        let hosts: Vec<String> = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain().collect();
         let (traffic, clients) = self.stats.take(minute_now());
         if !(hosts.is_empty() && traffic.is_empty() && clients.is_empty())
             && let Err(e) =
@@ -128,7 +128,7 @@ impl Edge {
                 let m: HashMap<String, Route> = serde_json::from_value(v).unwrap_or_default();
                 let live: HashSet<String> = m.values().flat_map(|r| r.endpoints.iter().cloned()).collect();
                 self.pool.retain(&live);
-                *self.table.write().unwrap() = m;
+                *self.table.write().unwrap_or_else(std::sync::PoisonError::into_inner) = m;
             }
             Err(e) => eprintln!("rekcod: edge: routes: {e:#}"),
         }
@@ -152,7 +152,7 @@ impl Edge {
             Ok(v) => {
                 let eps: Vec<String> =
                     v["endpoints"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
-                if let Some(r) = self.table.write().unwrap().get_mut(host) {
+                if let Some(r) = self.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(host) {
                     r.endpoints = eps.clone();
                 }
                 eps
@@ -369,7 +369,7 @@ async fn handle(edge: Arc<Edge>, req: Request<Incoming>, peer: IpAddr, opts: Lis
         forward(&edge, req, &host, client, peer, opts).await
     };
     let ms = t.elapsed().as_millis().min(u32::MAX as u128) as u32;
-    let known = edge.table.read().unwrap().contains_key(&host);
+    let known = edge.table.read().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(&host);
     edge.stats.request(minute_now(), known.then_some(host.as_str()), (!edge.trusts(client)).then_some(client), resp.status().as_u16(), ms);
     if let Some((method, path)) = log {
         eprintln!("{client} {method} {host}{path} {} {ms}ms", resp.status().as_u16());
@@ -390,7 +390,8 @@ fn over_limit(e: &hyper::Error) -> bool {
 }
 
 async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: IpAddr, peer: IpAddr, opts: Listener) -> Response<Body> {
-    let route = edge.table.read().unwrap().get(host).filter(|r| r.public || !opts.public_only).cloned();
+    let route =
+        edge.table.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).filter(|r| r.public || !opts.public_only).cloned();
     let Some(route) = route else {
         return text(StatusCode::NOT_FOUND, format!("no app at {host}\n"));
     };
@@ -401,7 +402,7 @@ async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: Ip
         r.headers_mut().insert(header::RETRY_AFTER, wait.as_secs().max(1).into());
         return r;
     }
-    edge.seen.lock().unwrap().insert(host.to_string());
+    edge.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(host.to_string());
     let max_body = route.http.max_body.unwrap_or(DEFAULT_MAX_BODY);
     let declared = req.headers().get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
     if declared.is_some_and(|n| n > max_body) {
@@ -575,7 +576,10 @@ mod tests {
     async fn routes_every_request_on_a_kept_alive_connection() {
         let (a, b) = (instance("a").await, instance("b").await);
         let edge = Edge::new(None, fast());
-        edge.table.write().unwrap().extend([("a.test".to_string(), route(&[&a], true)), ("b.test".to_string(), route(&[&b], false))]);
+        edge.table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([("a.test".to_string(), route(&[&a], true)), ("b.test".to_string(), route(&[&b], false))]);
         let private = edge_on(&edge, Listener::default()).await;
         let mut s = dial(&private).await;
         assert_eq!(app(&get(&mut s, "a.test", "").await.1), "a");
@@ -594,13 +598,13 @@ mod tests {
         let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
         let live = instance("live").await;
         let edge = Edge::new(None, fast());
-        edge.table.write().unwrap().insert("a.test".into(), route(&[&dead, &live], false));
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&dead, &live], false));
         let addr = edge_on(&edge, Listener::default()).await;
         for _ in 0..4 {
             let (code, body) = get(&mut dial(&addr).await, "a.test", "").await;
             assert_eq!((code, app(&body)), (200, "live"));
         }
-        edge.table.write().unwrap().insert("a.test".into(), route(&[&dead], false));
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&dead], false));
         assert_eq!(get(&mut dial(&addr).await, "a.test", "").await.0, 503);
     }
 
@@ -608,7 +612,7 @@ mod tests {
     async fn rate_limits_then_bans() {
         let a = instance("a").await;
         let edge = Edge::new(None, Settings { rate: Duration::from_secs(60), burst: 2, ..direct() });
-        edge.table.write().unwrap().insert("a.test".into(), route(&[&a], false));
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
         let addr = edge_on(&edge, Listener::default()).await;
         let mut s = dial(&addr).await;
         assert_eq!(get(&mut s, "a.test", "").await.0, 200);
@@ -618,7 +622,10 @@ mod tests {
         // A per-app rate applies on top of the edge's.
         let edge = Edge::new(None, direct());
         let http = HttpSettings { rate: Some("1/m".into()), burst: Some(1), max_body: None };
-        edge.table.write().unwrap().insert("a.test".into(), Route { http, ..route(&[&a], false) });
+        edge.table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("a.test".into(), Route { http, ..route(&[&a], false) });
         let addr = edge_on(&edge, Listener::default()).await;
         let mut s = dial(&addr).await;
         assert_eq!(get(&mut s, "a.test", "").await.0, 200);
@@ -638,14 +645,14 @@ mod tests {
         let a = instance("a").await;
         let spoof = "X-Forwarded-For: 203.0.113.9\r\n";
         let edge = Edge::new(None, direct());
-        edge.table.write().unwrap().insert("a.test".into(), route(&[&a], true));
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], true));
         let addr = edge_on(&edge, Listener::default()).await;
         assert_eq!(get(&mut dial(&addr).await, "a.test", spoof).await.1, "a|127.0.0.1");
 
         // Loopback is trusted by default, as cloudflared on the same Mac.
         let edge = Edge::new(None, fast());
         let http = HttpSettings { rate: Some("1/m".into()), burst: Some(1), max_body: None };
-        edge.table.write().unwrap().insert("a.test".into(), Route { http, ..route(&[&a], true) });
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), Route { http, ..route(&[&a], true) });
         let tunnel = edge_on(&edge, Listener { public_only: true, ..Default::default() }).await;
         let mut s = dial(&tunnel).await;
         assert_eq!(get(&mut s, "a.test", spoof).await.1, "a|203.0.113.9, 127.0.0.1");
@@ -666,7 +673,10 @@ mod tests {
         let a = instance("a").await;
         let edge = Edge::new(None, fast());
         let http = HttpSettings { max_body: Some(8), ..Default::default() };
-        edge.table.write().unwrap().insert("a.test".into(), Route { http, ..route(&[&a], false) });
+        edge.table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("a.test".into(), Route { http, ..route(&[&a], false) });
         let addr = edge_on(&edge, Listener::default()).await;
         let mut s = dial(&addr).await;
         assert_eq!(get(&mut s, "a.test", "").await.0, 200);
@@ -686,7 +696,7 @@ mod tests {
     async fn websocket_upgrade_pipes_bytes() {
         let a = instance("a").await;
         let edge = Edge::new(None, fast());
-        edge.table.write().unwrap().insert("a.test".into(), route(&[&a], false));
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
         let addr = edge_on(&edge, Listener::default()).await;
         let mut s = dial(&addr).await;
         s.get_mut().write_all(b"GET /ws HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n").await.unwrap();

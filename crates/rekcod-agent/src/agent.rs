@@ -49,6 +49,13 @@ pub fn run() -> Result<()> {
     })
 }
 
+/// One failed accept (EMFILE, say) mustn't end the agent: that would drop every session,
+/// forward and the DNS channel at once. Log it and wait a moment instead.
+async fn accept_failed(port: u32, e: std::io::Error) {
+    eprintln!("rekcod-agent: accept on port {port}: {e}");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
 async fn serve<F, Fut>(port: u32, handler: F) -> Result<()>
 where
     F: Fn(VsockStream) -> Fut,
@@ -57,7 +64,13 @@ where
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port)).with_context(|| format!("bind vsock port {port}"))?;
     eprintln!("rekcod-agent: listening on vsock port {port}");
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                accept_failed(port, e).await;
+                continue;
+            }
+        };
         let task = handler(stream);
         tokio::spawn(async move {
             if let Err(e) = task.await {
@@ -147,7 +160,13 @@ type Parked = Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<VsockStream>>>;
 async fn reverse_listener(parked: Parked) -> Result<()> {
     let listener = TcpListener::bind(("0.0.0.0", REVERSE_LISTEN_PORT)).await.context("bind reverse listener")?;
     loop {
-        let (tcp, _) = listener.accept().await?;
+        let (tcp, _) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                accept_failed(0, e).await;
+                continue;
+            }
+        };
         let parked = parked.clone();
         tokio::spawn(async move {
             if let Err(e) = reverse(tcp, parked).await {
@@ -685,7 +704,13 @@ async fn dns_stub(dns: Arc<Dns>) -> Result<()> {
 async fn dns_tcp_stub(dns: Arc<Dns>) -> Result<()> {
     let listener = TcpListener::bind(DNS_STUB_ADDR).await.context("bind DNS TCP stub")?;
     loop {
-        let (mut tcp, _) = listener.accept().await?;
+        let (mut tcp, _) = match listener.accept().await {
+            Ok(c) => c,
+            Err(e) => {
+                accept_failed(0, e).await;
+                continue;
+            }
+        };
         let dns = dns.clone();
         tokio::spawn(async move {
             while let Ok(query) = read_frame(&mut tcp).await {

@@ -35,7 +35,7 @@ impl Stats {
     }
 
     fn is_down(&self) -> bool {
-        self.down_until.lock().unwrap().is_some_and(|t| t > Instant::now())
+        self.down_until.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_some_and(|t| t > Instant::now())
     }
 }
 
@@ -67,7 +67,7 @@ impl Lease {
         let new = if rtt > old { rtt } else { (old * 7 + rtt * 3) / 10 };
         self.stats.ewma.store(new, Ordering::Relaxed);
         if let Some(s) = self.sender.take().filter(|s| reuse && !s.is_closed()) {
-            let mut idle = self.stats.idle.lock().unwrap();
+            let mut idle = self.stats.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if idle.len() < IDLE_MAX {
                 idle.push(s);
             }
@@ -83,12 +83,12 @@ impl Drop for Lease {
 
 impl Pool {
     fn stats(&self, ep: &str) -> Arc<Stats> {
-        self.stats.lock().unwrap().entry(ep.to_string()).or_default().clone()
+        self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(ep.to_string()).or_default().clone()
     }
 
     /// Forgets instances no route mentions any more.
     pub fn retain(&self, live: &std::collections::HashSet<String>) {
-        self.stats.lock().unwrap().retain(|ep, _| live.contains(ep));
+        self.stats.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|ep, _| live.contains(ep));
     }
 
     fn rand(&self) -> u64 {
@@ -128,7 +128,7 @@ impl Pool {
     pub async fn lease(&self, eps: &[String]) -> Option<Lease> {
         for (ep, stats) in self.order(eps) {
             let pooled = {
-                let mut idle = stats.idle.lock().unwrap();
+                let mut idle = stats.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 idle.retain(|s| !s.is_closed());
                 idle.iter().position(|s| s.is_ready()).map(|i| idle.swap_remove(i))
             };
@@ -138,11 +138,11 @@ impl Pool {
             };
             match sender {
                 Some(sender) => {
-                    *stats.down_until.lock().unwrap() = None;
+                    *stats.down_until.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                     stats.in_flight.fetch_add(1, Ordering::Relaxed);
                     return Some(Lease { endpoint: ep, sender: Some(sender), stats, start: Instant::now() });
                 }
-                None => *stats.down_until.lock().unwrap() = Some(Instant::now() + DOWN_FOR),
+                None => *stats.down_until.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now() + DOWN_FOR),
             }
         }
         None
@@ -169,7 +169,7 @@ mod tests {
         let eps: Vec<String> = vec!["a:1".into(), "b:1".into()];
         p.stats("a:1").in_flight.store(50, Ordering::Relaxed);
         assert!((0..20).all(|_| p.order(&eps)[0].0 == "b:1"));
-        *p.stats("b:1").down_until.lock().unwrap() = Some(Instant::now() + DOWN_FOR);
+        *p.stats("b:1").down_until.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now() + DOWN_FOR);
         let o = p.order(&eps);
         assert_eq!(o.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(), ["a:1", "b:1"]);
     }

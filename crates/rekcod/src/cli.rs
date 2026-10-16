@@ -136,7 +136,22 @@ fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
     if !paths.mac_address().exists() {
         std::fs::write(paths.mac_address(), random_mac()?)?;
     }
+    exclude_from_backups(&paths.home.join("vm"));
     Ok(())
+}
+
+/// Time Machine would copy a live ext4 image (inconsistent, and up to the disk's size).
+/// `tmutil addexclusion` sets a sticky attribute, so it's done once per directory.
+pub(crate) fn exclude_from_backups(dir: &std::path::Path) {
+    let marker = dir.join(".rekcod-tm-excluded");
+    // An excluded directory takes its whole subtree with it (sb/, golden/).
+    if !dir.is_dir() || dir.ancestors().take(4).any(|d| d.join(".rekcod-tm-excluded").exists()) {
+        return;
+    }
+    let ok = Command::new("/usr/bin/tmutil").arg("addexclusion").arg(dir).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    if ok.is_ok_and(|s| s.success()) {
+        let _ = std::fs::write(marker, b"");
+    }
 }
 
 fn tail(path: &std::path::Path, lines: usize) -> String {
@@ -330,6 +345,15 @@ pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_g
     }
     if let Some(pid) = boot(paths, &opts)? {
         println!("rekcod is already running (pid {pid})");
+        let running: serde_json::Value =
+            std::fs::read(paths.status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+        let theirs = running["version"].as_str().unwrap_or("0.2.1 or older");
+        if theirs != env!("CARGO_PKG_VERSION") {
+            println!(
+                "note: the running VM was started by rekcod {theirs}; this is {}. `rekcod stop && rekcod start` switches to it",
+                env!("CARGO_PKG_VERSION")
+            );
+        }
     }
     let version = api_get(paths, "/version")
         .ok()

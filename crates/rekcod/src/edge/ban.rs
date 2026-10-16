@@ -31,18 +31,18 @@ pub struct Bans {
 
 impl Bans {
     pub fn set_remote(&self, nets: Vec<IpNet>) {
-        *self.remote.write().unwrap() = nets;
+        *self.remote.write().unwrap_or_else(std::sync::PoisonError::into_inner) = nets;
     }
 
     pub fn ban_for(&self, ip: IpAddr, d: Duration) {
-        self.local.lock().unwrap().push((IpNet::from(ip), Instant::now() + d));
+        self.local.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((IpNet::from(ip), Instant::now() + d));
     }
 
     pub fn is_banned(&self, ip: IpAddr) -> bool {
-        if self.remote.read().unwrap().iter().any(|n| n.contains(&ip)) {
+        if self.remote.read().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|n| n.contains(&ip)) {
             return true;
         }
-        let mut local = self.local.lock().unwrap();
+        let mut local = self.local.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         local.retain(|(_, until)| *until > Instant::now());
         local.iter().any(|(n, _)| n.contains(&ip))
     }

@@ -19,6 +19,12 @@ mod proxyport;
 
 #[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
+    // Busybox init starts us with 1024 descriptors; every forwarded connection takes two.
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } == 0 && lim.rlim_cur < lim.rlim_max {
+        lim.rlim_cur = lim.rlim_max;
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+    }
     agent::run()
 }
 

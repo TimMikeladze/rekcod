@@ -181,11 +181,12 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             for tree in changed.iter().filter(|l| l.ends_with('/')) {
                 log!("file events: invalidating everything under {tree}");
             }
-            let mut batch: Vec<String> = std::mem::take(&mut *failed.lock().unwrap()).into_iter().collect();
+            let mut batch: Vec<String> =
+                std::mem::take(&mut *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).into_iter().collect();
             batch.extend(changed);
             if let Err(e) = notify_guest(&vm, &conn, &batch).await {
                 log!("file events: {e:#}; will resend {} path(s) as directories", batch.len());
-                failed.lock().unwrap().extend(as_trees(&batch));
+                failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(as_trees(&batch));
             }
         }
     })?;
@@ -239,7 +240,11 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
                     log!("idle for {ttl}s, stopping");
                     break;
                 }
-                let s = vm.state();
+                // vm.state() waits on the VM's dispatch queue, which a stuck VM can hold.
+                let probe = vm.clone();
+                let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(move || probe.state())).await else {
+                    continue;
+                };
                 if matches!(s, State::Stopped | State::Error) {
                     log!("guest stopped on its own ({s:?})");
                     cleanup(&paths);
@@ -408,7 +413,7 @@ async fn memory_manager(vm: Vm, max: u64, status: Arc<Status>) {
                 log!("balloon: guest may use {} MiB (was {} MiB, {} MiB free)", next >> 20, target >> 20, free >> 20);
             }
             target = next;
-            *status.balloon.lock().unwrap() = target >> 20;
+            *status.balloon.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = target >> 20;
             status.write();
         }
     }
@@ -467,13 +472,14 @@ fn as_trees(paths: &[String]) -> BTreeSet<String> {
 async fn retry_notify(vm: Vm, conn: Arc<NotifyConn>, failed: Arc<std::sync::Mutex<BTreeSet<String>>>) {
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let batch: Vec<String> = std::mem::take(&mut *failed.lock().unwrap()).into_iter().collect();
+        let batch: Vec<String> =
+            std::mem::take(&mut *failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner)).into_iter().collect();
         if batch.is_empty() {
             continue;
         }
         match notify_guest(&vm, &conn, &batch).await {
             Ok(()) => log!("file events: resent {} directory invalidation(s)", batch.len()),
-            Err(_) => failed.lock().unwrap().extend(batch),
+            Err(_) => failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).extend(batch),
         }
     }
 }
@@ -523,7 +529,17 @@ async fn clock_sync(vm: Vm) {
             Err(e) => log!("clock sync failed: {e:#}"),
             _ => {}
         }
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        // Every 30 s, or as soon as the Mac wakes: Instant stops while it sleeps and wall
+        // time doesn't, so a gap between them means the guest's clock is now behind (TLS,
+        // JWTs and S3 signatures fail until it catches up).
+        let (mono, wall) = (Instant::now(), SystemTime::now());
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let slept = wall.elapsed().unwrap_or_default().saturating_sub(mono.elapsed());
+            if slept > Duration::from_secs(5) || mono.elapsed() >= Duration::from_secs(30) {
+                break;
+            }
+        }
     }
 }
 
@@ -540,6 +556,8 @@ async fn dns_bridge(vm: Vm) {
 async fn dns_session(vm: &Vm) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(vm.connect(DNS_PORT).await?);
     let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Queries resolving at once; more wait, so a flood can't spawn tasks without limit.
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(256));
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if wr.write_all(&frame).await.is_err() {
@@ -554,7 +572,9 @@ async fn dns_session(vm: &Vm) -> Result<()> {
             let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
+            let permit = in_flight.clone().acquire_owned().await?;
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Some(frame) = resolve(&query).await.as_deref().and_then(frame) {
                     let _ = tx.send(frame);
                 }
@@ -568,9 +588,30 @@ async fn dns_session(vm: &Vm) -> Result<()> {
     result
 }
 
+/// The Mac's resolvers from `scutil --dns`, re-read at most every 5 s.
+fn resolvers() -> Arc<Vec<dns::Resolver>> {
+    static CACHE: std::sync::Mutex<Option<(Instant, Arc<Vec<dns::Resolver>>)>> = std::sync::Mutex::new(None);
+    let mut c = CACHE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((at, r)) = c.as_ref()
+        && at.elapsed() < Duration::from_secs(5)
+    {
+        return r.clone();
+    }
+    let text =
+        std::process::Command::new("/usr/sbin/scutil").arg("--dns").output().map(|o| String::from_utf8_lossy(&o.stdout).into_owned());
+    let r = Arc::new(text.map(|t| dns::parse_scutil(&t)).unwrap_or_default());
+    *c = Some((Instant::now(), r.clone()));
+    r
+}
+
 async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
-    let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-    for server in dns::nameservers(&resolv, dns::if_index) {
+    let resolvers = tokio::task::spawn_blocking(resolvers).await.unwrap_or_default();
+    let mut servers = dns::query_name(query).map(|n| dns::pick(&resolvers, &n)).unwrap_or_default();
+    if servers.is_empty() {
+        let resolv = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
+        servers = dns::nameservers(&resolv, dns::if_index);
+    }
+    for server in servers {
         let local: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
         let Ok(sock) = UdpSocket::bind(local).await else { continue };
         if sock.send_to(query, server).await.is_err() {
@@ -638,6 +679,9 @@ struct PortStatus {
 #[derive(Serialize)]
 struct StatusFile<'a> {
     pid: u32,
+    /// The daemon's own version; after an upgrade it can differ from the CLI's.
+    version: &'static str,
+    guest_version: &'a str,
     started_at: u64,
     cpus: usize,
     memory_mib: u64,
@@ -712,13 +756,16 @@ impl Status {
                 error: f.error.clone(),
             })
             .collect();
+        let guest_version = std::fs::read_to_string(self.paths.guest_version()).unwrap_or_default();
         let file = StatusFile {
             pid: std::process::id(),
+            version: env!("CARGO_PKG_VERSION"),
+            guest_version: guest_version.trim(),
             started_at: self.started_at,
             cpus: self.cpus,
             memory_mib: self.memory_mib,
             fs_cache: self.fs_cache,
-            balloon_mib: *self.balloon.lock().unwrap(),
+            balloon_mib: *self.balloon.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             project: self.project.as_deref(),
             ports: &ports,
         };
@@ -760,11 +807,15 @@ async fn watch_events(vm: &Vm, status: &Arc<Status>) -> Result<()> {
 async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     // all=1: created containers too, so a bind source is warmed before `start`.
     let body = http::get(vm.connect(DOCKER_PORT).await?, "/containers/json?all=1").await?;
-    *status.published.lock().unwrap() = ports::desired(&body)?;
-    *status.autoport.lock().unwrap() = ports::autoport_containers(&body)?;
+    *status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ports::desired(&body)?;
+    *status.autoport.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ports::autoport_containers(&body)?;
     let binds = watch::bind_sources(&body)?;
     if status.fs_cache {
-        let new: Vec<PathBuf> = binds.difference(&status.binds.lock().unwrap()).filter(|p| p.is_dir()).cloned().collect();
+        let new: Vec<PathBuf> = binds
+            .difference(&status.binds.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
+            .filter(|p| p.is_dir())
+            .cloned()
+            .collect();
         for path in &new {
             if let Some(p) = path.to_str() {
                 let _ = control(vm, Control::Warm(p.to_string())).await;
@@ -777,7 +828,7 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
             let _ = std::fs::write(file, text);
         }
     }
-    *status.binds.lock().unwrap() = binds.clone();
+    *status.binds.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = binds.clone();
     for err in status.watch.set_roots(binds) {
         log!("{err}");
     }
@@ -791,7 +842,7 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
 async fn autoports(vm: Vm, status: Arc<Status>) {
     loop {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let containers = status.autoport.lock().unwrap().clone();
+        let containers = status.autoport.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
         let mut want = BTreeMap::new();
         for (id, name) in &containers {
             let Ok(reply) = control(&vm, Control::Listeners(id.clone())).await else { continue };
@@ -802,10 +853,11 @@ async fn autoports(vm: Vm, status: Arc<Status>) {
                 }
             }
         }
-        let published: BTreeSet<u16> = status.published.lock().unwrap().keys().map(|b| b.port).collect();
+        let published: BTreeSet<u16> =
+            status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).keys().map(|b| b.port).collect();
         want.retain(|b, _| !published.contains(&b.port));
         let changed = {
-            let mut listening = status.listening.lock().unwrap();
+            let mut listening = status.listening.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let changed = *listening != want;
             *listening = want;
             changed
@@ -819,11 +871,11 @@ async fn autoports(vm: Vm, status: Arc<Status>) {
 /// Opens and closes Mac listeners to match published + auto-detected ports.
 /// `retry_failed`: try again on ports that couldn't be bound before.
 fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
-    let mut want = status.listening.lock().unwrap().clone();
-    want.extend(status.published.lock().unwrap().clone());
+    let mut want = status.listening.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    want.extend(status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
     let mut changed = false;
     {
-        let mut active = status.forwards.lock().unwrap();
+        let mut active = status.forwards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Ports our listeners hold now, including ones closed below (abort is asynchronous).
         let ours: BTreeSet<u16> = active.iter().filter(|(_, f)| f.task.is_some()).map(|(b, _)| b.port).collect();
         active.retain(|binding, fwd| {
@@ -907,7 +959,7 @@ fn listen(b: Binding, probe: bool) -> std::io::Result<Listener> {
 /// A UDP flow (one Mac client address) closes after this long without traffic.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
-type UdpFlows = Arc<Mutex<HashMap<SocketAddr, mpsc::UnboundedSender<Vec<u8>>>>>;
+type UdpFlows = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
 
 /// Published UDP port: one vsock stream per Mac client address, carrying
 /// framed datagrams both ways (the agent relays them to docker-proxy).
@@ -918,29 +970,37 @@ async fn udp_loop(vm: Vm, sock: UdpSocket, port: u16) {
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
         let packet = buf[..n].to_vec();
-        let existing = flows.lock().unwrap().get(&from).cloned();
+        let existing = flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&from).cloned();
         let packet = match existing {
-            Some(tx) => match tx.send(packet) {
-                Ok(()) => continue,
-                Err(e) => e.0,
+            // Full: the guest isn't keeping up, so drop the datagram, as a network would.
+            Some(tx) => match tx.try_send(packet) {
+                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
+                Err(mpsc::error::TrySendError::Closed(p)) => p,
             },
             None => packet,
         };
-        let (tx, rx) = mpsc::unbounded_channel();
-        let _ = tx.send(packet);
-        flows.lock().unwrap().insert(from, tx);
+        if flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() >= UDP_FLOWS_MAX {
+            continue;
+        }
+        let (tx, rx) = mpsc::channel(UDP_QUEUE);
+        let _ = tx.try_send(packet);
+        flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(from, tx);
         tokio::spawn(udp_flow(vm.clone(), sock.clone(), from, port, rx, flows.clone()));
     }
 }
 
-async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut rx: mpsc::UnboundedReceiver<Vec<u8>>, flows: UdpFlows) {
+/// Datagrams queued per UDP flow, and flows per forwarded port.
+const UDP_QUEUE: usize = 256;
+const UDP_FLOWS_MAX: usize = 1024;
+
+async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut rx: mpsc::Receiver<Vec<u8>>, flows: UdpFlows) {
     let last = Mutex::new(Instant::now());
     let result = async {
         let (mut rd, mut wr) = tokio::io::split(vm.connect(FORWARD_PORT).await?);
         wr.write_all(forward_header(Proto::Udp, port).as_bytes()).await?;
         let up = async {
             while let Some(p) = rx.recv().await {
-                *last.lock().unwrap() = Instant::now();
+                *last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                 if let Some(f) = frame(&p) {
                     wr.write_all(&f).await?;
                 }
@@ -953,7 +1013,7 @@ async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut
                 rd.read_exact(&mut len).await?;
                 let mut p = vec![0u8; u16::from_be_bytes(len) as usize];
                 rd.read_exact(&mut p).await?;
-                *last.lock().unwrap() = Instant::now();
+                *last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
                 sock.send_to(&p, from).await?;
             }
             #[allow(unreachable_code)]
@@ -962,7 +1022,7 @@ async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut
         let idle = async {
             loop {
                 tokio::time::sleep(Duration::from_secs(5)).await;
-                if last.lock().unwrap().elapsed() > UDP_IDLE {
+                if last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).elapsed() > UDP_IDLE {
                     return anyhow::Ok(());
                 }
             }
@@ -974,7 +1034,7 @@ async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut
         }
     }
     .await;
-    flows.lock().unwrap().remove(&from);
+    flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&from);
     if let Err(e) = result {
         log!("forward udp :{port} for {from}: {e:#}");
     }

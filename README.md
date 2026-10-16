@@ -103,11 +103,11 @@ Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS
   tree is pre-warmed in the background from the moment its container is created, and the
   most recently used ones are warmed again right after `rekcod start`.
 - `linux/amd64` images through Rosetta.
-- `host.docker.internal` (including Mac services bound only to `127.0.0.1`) and `gateway.docker.internal`. Container DNS goes through the Mac's own resolvers (UDP and TCP), so VPN and link-local DNS work.
+- `host.docker.internal` (including Mac services bound only to `127.0.0.1`) and `gateway.docker.internal`. Container DNS goes through the Mac's own resolvers (UDP and TCP), including per-domain ones from `scutil --dns` (`/etc/resolver/*`, VPN split DNS, Tailscale MagicDNS), so VPN and link-local DNS work.
 - `docker run -i`/`attach`/`exec` with stdin half-close, healthcheck-gated `depends_on`, and idempotent `compose up`.
 - `rekcod import`: images (`save | load`) and named volumes (data, labels; copied with `docker cp` and checked by file count and bytes), so compose reuses them. Volumes in use at the source are skipped unless you pass `--force`.
 - Idle VM memory is about 160 MiB RSS.
-- Database-style workloads run at native-Mac durability: guest `fsync` maps to macOS `fsync` (survives VM or app crashes, like any Mac app), not a full media flush on every commit. pgbench (8 clients, scale 20): about 15k TPS, versus 1k with Virtualization.framework's default. `REKCOD_DISK_SYNC=full` restores full flushes.
+- Database-style workloads run at native-Mac durability: guest `fsync` maps to macOS `fsync` (survives VM or app crashes, like any Mac app), not a full media flush on every commit. A power cut or kernel panic can lose the last writes, as for any Mac app; the guest runs `e2fsck -p` on the data disk at every boot. pgbench (8 clients, scale 20): about 15k TPS, versus 1k with Virtualization.framework's default. `REKCOD_DISK_SYNC=full` restores full flushes.
 - The data disk is sparse (256 GiB by default, grown in place by `--disk`), and the build cache is capped at 20 GB.
 
 ## Beyond Docker Desktop
@@ -149,6 +149,9 @@ rekcod snap restore seeded --pull  # on another Mac: downloads it first, then re
 The project is the compose project started from the current directory (`-p` to pick one).
 Snapshots are copies on the VM's disk (a 360 MB Postgres data dir saves or restores in
 under a second). A restore after `compose down -v` recreates the volumes so compose adopts them.
+A save writes a new copy and only deletes the old one once every volume copied, so a save
+that fails or is interrupted leaves the previous snapshot as it was. A restore first saves
+the current volumes as snapshot `pre-restore`, so `rekcod snap restore pre-restore` undoes it.
 `--push` and `--pull` use `$S3_ENDPOINT`/`$S3_BUCKET` with the `AWS_*` keys when they're set
 (an app's bucket, say), else `rekcod storage up`'s RustFS and bucket `rekcod-snaps`. Each
 volume goes up as `snaps/<project>/<name>/<volume>.tar.zst`.
@@ -541,8 +544,10 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 
 | Command | |
 |---|---|
-| `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--disk` (default 256, sparse) grows the data disk, never shrinks it |
-| `rekcod stop [--no-switch]` | Graceful power-off, restore the previous context |
+| `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--disk` (default 256, sparse) grows the data disk, never shrinks it. The values are saved in `~/.rekcod/config.json` and reused when the menu bar or a docker command boots the VM |
+| `rekcod start --install\|--uninstall` | Start the VM at login and boot it again if it stops without `rekcod stop` (LaunchAgent `dev.rekcod.vm`) |
+| `rekcod start --repair` | When the VM won't start because its data disk has errors: `e2fsck -fy` on it and a fresh root disk, then boot. The data disk is never formatted unless it's blank |
+| `rekcod stop [--no-switch] [--force]` | Graceful power-off, restore the previous context. `--force` powers off a hung VM right away |
 | `rekcod status [--json]` | Versions, VM size, forwarded ports (and any that couldn't be bound), data-disk use in the VM and on the Mac, file-cache trips to macOS, warming in progress, the sandbox VM. `--json` is the scriptable form |
 | `rekcod snap save\|restore\|ls\|rm [NAME] [-p PROJECT] [--push\|--pull]` | Volume snapshots of a compose project, optionally through S3 (above) |
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
@@ -661,6 +666,7 @@ Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md)
 
 - First access can be slower than OrbStack for a tree rekcod hasn't seen since boot, when a container touches it before background warming finishes (about 1 s per 20k files). Recently used trees are warmed at boot (a 19.5k-file walk 3 s after `rekcod start`: 34 ms warmed vs 286 ms not). Repeat work is 3–9× faster.
 - Mac→container change latency is about 14 ms p50 (`bench/inotify_rtt.py`; OrbStack measured 12 ms).
+- The VM's directories (`~/.rekcod/vm`, `sb`, `golden`, macOS images) are excluded from Time Machine; back up what's in your volumes with `rekcod snap save --push` or your own dumps.
 - Memory isn't returned to macOS. `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop, even under memory pressure (docs/phase2.md, docs/phase5.md).
 - `--sandbox` and `rekcod sandbox` haven't had an external security review (docs/sandbox.md).
 - A sandbox fork copies the disk, not memory: processes restart in the child (Virtualization.framework can't restore a VM with a virtio-fs share).

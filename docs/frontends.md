@@ -38,6 +38,9 @@ rekcod has three front ends: the CLI (`rekcod ...`), the menu bar item
 |---|---|---|---|
 | VM state, CPUs, memory, disk, file cache, sandbox | `status` | top of menu | sidebar, `/vm` |
 | Start / stop VM | `start` / `stop` | top of menu | sidebar VM menu |
+| Force stop a hung VM | `stop --force` | top of menu while running | sidebar VM menu |
+| Repair the data disk and start | `start --repair` | top of menu while stopped (opens Terminal) | sidebar VM menu |
+| Start at login, boot again after a crash | `start --install` / `start --uninstall` | top of menu | sidebar VM menu |
 | Compact disk | `compact` | top of menu | sidebar VM menu, `/disk` |
 | Open the dashboard | `dashboard` | top of menu | – |
 | Root shell | `shell` | top of menu (opens Terminal) | sidebar VM menu (opens Terminal) |

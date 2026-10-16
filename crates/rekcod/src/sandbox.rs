@@ -394,6 +394,7 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     let t0 = Instant::now();
     let id = new_id()?;
     std::fs::create_dir_all(root(paths))?;
+    crate::cli::exclude_from_backups(&root(paths));
     let sb = Paths::at(root(paths).join(&id))?;
     let golden = golden_home(paths, &o.golden).join("vm/data.img");
     let golden = if macos {
@@ -1054,6 +1055,7 @@ pub fn golden_build(paths: &Paths, name: &str, images: &[String]) -> Result<()> 
     check_name("golden disk", name)?;
     let home = golden_home(paths, name);
     let g = Paths::at(home.clone())?;
+    crate::cli::exclude_from_backups(&paths.home.join("golden"));
     if crate::cli::running_pid(&g).is_some() {
         bail!("golden disk {name} is already being built");
     }

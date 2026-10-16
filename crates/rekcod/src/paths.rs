@@ -165,10 +165,20 @@ impl Paths {
         if let Some(dir) = std::env::var_os("REKCOD_GUEST_DIR") {
             candidates.push(PathBuf::from(dir));
         }
-        candidates.push(self.home.join("guest"));
+        // A release build boots the guest it was built with; a leftover dev guest in
+        // ~/.rekcod/guest must not win over it. Dev builds (no pinned guest) look there.
+        #[cfg(target_os = "macos")]
+        let pinned = crate::fetch::GUEST_VERSION.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let pinned = false;
+        if !pinned {
+            candidates.push(self.home.join("guest"));
+        }
         if let Some(bin_dir) = std::env::current_exe()?.canonicalize()?.parent() {
             candidates.push(bin_dir.join("../share/rekcod/guest"));
-            candidates.push(bin_dir.join("../../out/guest"));
+            if !pinned {
+                candidates.push(bin_dir.join("../../out/guest"));
+            }
         }
         for dir in &candidates {
             if dir.join("Image").exists() && dir.join("root.img").exists() {

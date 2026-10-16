@@ -37,10 +37,10 @@ impl Stats {
     /// a trusted proxy (banning it would ban everyone behind it, so it isn't reported).
     pub fn request(&self, minute: i64, host: Option<&str>, client: Option<IpAddr>, status: u16, ms: u32) {
         if let Some(ip) = client {
-            self.clients.lock().unwrap().entry(ip).or_default().0 += 1;
+            self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(ip).or_default().0 += 1;
         }
         let Some(host) = host else { return };
-        let mut m = self.minutes.lock().unwrap();
+        let mut m = self.minutes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let e = m.entry((host.to_string(), minute)).or_default();
         e.requests += 1;
         if status >= 500 {
@@ -53,13 +53,13 @@ impl Stats {
 
     /// A request refused with 429.
     pub fn limited(&self, client: IpAddr) {
-        self.clients.lock().unwrap().entry(client).or_default().1 += 1;
+        self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(client).or_default().1 += 1;
     }
 
     /// Finished minutes (before `now_minute`) and the clients since the last call; both are
     /// removed from here.
     pub fn take(&self, now_minute: i64) -> (Vec<Value>, Vec<Value>) {
-        let mut m = self.minutes.lock().unwrap();
+        let mut m = self.minutes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let done: Vec<(String, i64)> = m.keys().filter(|(_, min)| *min < now_minute).cloned().collect();
         let traffic = done
             .into_iter()
@@ -71,7 +71,7 @@ impl Stats {
             })
             .collect();
         drop(m);
-        let mut c: Vec<(IpAddr, (u64, u64))> = self.clients.lock().unwrap().drain().collect();
+        let mut c: Vec<(IpAddr, (u64, u64))> = self.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain().collect();
         c.sort_by_key(|x| std::cmp::Reverse(x.1.0 + x.1.1));
         let clients =
             c.into_iter().take(TOP_CLIENTS).map(|(ip, (n, l))| json!({"ip": ip.to_string(), "requests": n, "limited": l})).collect();

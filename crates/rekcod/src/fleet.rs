@@ -308,7 +308,7 @@ fn start_relay(ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
     std::thread::spawn(move || {
         for c in l.incoming().flatten() {
             let peer = c.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]));
-            if !relay_allowed(peer, ip, &RELAY_ALLOW.read().unwrap()) {
+            if !relay_allowed(peer, ip, &RELAY_ALLOW.read().unwrap_or_else(std::sync::PoisonError::into_inner)) {
                 continue;
             }
             std::thread::spawn(move || {
@@ -814,7 +814,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
                     if let Ok(a) = authority(&controller) {
                         ips.extend(a.to_socket_addrs().into_iter().flatten().map(|s| s.ip()));
                     }
-                    *RELAY_ALLOW.write().unwrap() = ips;
+                    *RELAY_ALLOW.write().unwrap_or_else(std::sync::PoisonError::into_inner) = ips;
                 }
                 Err(e) => eprintln!("rekcod: heartbeat: {e:#}"),
             }
@@ -1047,16 +1047,25 @@ impl Controller {
     }
 
     fn config(&self, key: &str) -> Result<Option<String>> {
-        Ok(self.db.lock().unwrap().query_opt("select value from config where key = ?1", &[&key])?.map(|r| r.get(0)))
+        Ok(self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select value from config where key = ?1", &[&key])?
+            .map(|r| r.get(0)))
     }
 
     fn caller(&self, token: &str) -> Result<Option<Caller>> {
-        let row = self.db.lock().unwrap().query_opt("select name, admin, max_sandboxes from tokens where token = ?1", &[&token])?;
+        let row = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select name, admin, max_sandboxes from tokens where token = ?1", &[&token])?;
         Ok(row.map(|r| Caller { name: r.get(0), admin: r.get(1), max: r.get(2) }))
     }
 
     fn audit(&self, ns: &str, who: &str, action: &str, target: &str, ok: bool) {
-        let _ = self.db.lock().unwrap().execute(
+        let _ = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
             "insert into audit (ts, who, action, target, ok, ns) values (?1, ?2, ?3, ?4, ?5, ?6)",
             &[&now(), &who, &action, &target, &ok, &ns],
         );
@@ -1065,7 +1074,7 @@ impl Controller {
     /// `who`'s role in `ns`. Everyone is a member of `default`, where each person only sees
     /// their own things (`can_touch`); fleet admins own every namespace.
     fn role(&self, who: &Caller, ns: &str) -> Result<Option<Role>> {
-        let mut db = self.db.lock().unwrap();
+        let mut db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if db.query_opt("select 1 from namespaces where name = ?1", &[&ns])?.is_none() {
             return Ok(None);
         }
@@ -1091,7 +1100,7 @@ impl Controller {
     /// Ready nodes with at least `mib` free, most free first. A namespace with a node pool
     /// only gets its pool; other namespaces never get pooled nodes.
     fn place(&self, mib: i64, macos: bool, ns: &str) -> Result<Vec<(String, String, String)>> {
-        let rows = self.db.lock().unwrap().query(
+        let rows = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
             "select id, url, secret from nodes where state = 'ready' and last_seen > ?1 and mem_free >= ?2
              and (not ?3 or macos_free > 0)
              and case when exists(select 1 from node_pools where ns = ?4) then id in (select node from node_pools where ns = ?4)
@@ -1103,18 +1112,26 @@ impl Controller {
     }
 
     fn app_lock(&self, app: &str) -> Arc<Mutex<()>> {
-        self.busy.lock().unwrap().entry(app.to_string()).or_default().clone()
+        self.busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(app.to_string()).or_default().clone()
     }
 
     fn node(&self, id: &str) -> Result<(String, String, String)> {
-        let r = self.db.lock().unwrap().query_opt("select url, secret, state from nodes where id = ?1", &[&id])?;
+        let r = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select url, secret, state from nodes where id = ?1", &[&id])?;
         r.map(|r| (r.get(0), r.get(1), r.get(2))).ok_or_else(|| anyhow!("no node {id}"))
     }
 
     /// The node holding sandbox `id` in `ns`, if `who` may use it.
     fn sandbox_node(&self, ns: &str, id: &str, who: &Caller, need: Role) -> Result<(String, String, String)> {
         self.allow(who, ns, need).map_err(|_| anyhow!(sandbox::NoSandbox(id.into())))?;
-        let r = self.db.lock().unwrap().query_opt("select node, owner, state from sandboxes where id = ?1 and ns = ?2", &[&id, &ns])?;
+        let r = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select node, owner, state from sandboxes where id = ?1 and ns = ?2", &[&id, &ns])?;
         let Some(r) = r else { bail!(sandbox::NoSandbox(id.into())) };
         let (node, owner, state): (String, String, String) = (r.get(0), r.get(1), r.get(2));
         if !can_touch(who, ns, &owner) {
@@ -1129,7 +1146,7 @@ impl Controller {
     /// CPUs, GiB and sandbox/job count in use in `ns`, leaving out app `skip_app`. Apps count
     /// while they have a live release (sleeping ones too, so a wake never hits the quota).
     fn usage(&self, ns: &str, skip_app: &str) -> Result<(i64, i64, i64)> {
-        let r = self.db.lock().unwrap().query_one(
+        let r = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_one(
             "select
                coalesce((select sum(instances * cpus) from apps where ns = ?1 and name <> ?2 and live_release is not null), 0)
              + coalesce((select sum(cpus) from sandboxes s where ns = ?1 and state = 'running'
@@ -1151,8 +1168,11 @@ impl Controller {
     /// goes over its quota; the error names the limit.
     fn check_quota(&self, ns: &str, skip_app: &str, cpus: i64, gib: i64, sandboxes: i64) -> Result<()> {
         let (uc, um, us) = self.usage(ns, skip_app)?;
-        let q =
-            self.db.lock().unwrap().query_one("select max_cpus, max_memory_gib, max_sandboxes from namespaces where name = ?1", &[&ns])?;
+        let q = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select max_cpus, max_memory_gib, max_sandboxes from namespaces where name = ?1", &[&ns])?;
         let (mc, mm, ms): (i64, i64, i64) = (q.get(0), q.get(1), q.get(2));
         // A negative limit (`unlimited` on the CLI) is no limit.
         if mc >= 0 && uc + cpus > mc {
@@ -1171,8 +1191,13 @@ impl Controller {
     /// the namespace deletes the salt, so its secrets can't be read from an old backup.
     fn ns_key(&self, ns: &str) -> Result<[u8; 32]> {
         use hmac::Mac;
-        let salt: Vec<u8> =
-            self.db.lock().unwrap().query_opt("select salt from namespaces where name = ?1", &[&ns])?.context("no namespace")?.get(0);
+        let salt: Vec<u8> = self
+            .db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select salt from namespaces where name = ?1", &[&ns])?
+            .context("no namespace")?
+            .get(0);
         let mut m = hmac::Hmac::<sha2::Sha256>::new_from_slice(&self.key).expect("any key length");
         m.update(b"rekcod secrets ");
         m.update(&salt);
@@ -1203,7 +1228,7 @@ impl Controller {
 
     /// Seals every secret still stored in the clear (from before secrets were encrypted).
     fn seal_plain_secrets(&self) -> Result<()> {
-        let rows = self.db.lock().unwrap().query("select name, ns, secrets from apps", &[])?;
+        let rows = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query("select name, ns, secrets from apps", &[])?;
         for r in rows {
             let (name, ns, raw): (String, String, String) = (r.get(0), r.get(1), r.get(2));
             let mut m: serde_json::Map<String, Value> = serde_json::from_str(&raw).unwrap_or_default();
@@ -1215,7 +1240,10 @@ impl Controller {
                 }
             }
             if changed {
-                self.db.lock().unwrap().execute("update apps set secrets = ?2 where name = ?1", &[&name, &Value::Object(m).to_string()])?;
+                self.db
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("update apps set secrets = ?2 where name = ?1", &[&name, &Value::Object(m).to_string()])?;
             }
         }
         Ok(())
@@ -1255,7 +1283,7 @@ fn watchdog(c: Arc<Controller>) {
             }
         }
         let lost = {
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let lost = db
                 .query("update nodes set state = 'lost' where state <> 'lost' and last_seen < ?1 returning id", &[&(now() - 15)])
                 .unwrap_or_default();
@@ -1335,7 +1363,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 let (id, sec) = (format!("n-{}", sandbox::new_id()?), secret()?);
                 let url = body["url"].as_str().context("missing url")?;
                 let total = body["mem_total_mib"].as_i64().unwrap_or(0);
-                c.db.lock().unwrap().execute(
+                c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
                     "insert into nodes (id, url, secret, mem_total, last_seen) values (?1, ?2, ?3, ?4, ?5)",
                     &[&id, &url, &sec, &total, &now()],
                 )?;
@@ -1359,14 +1387,20 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                     body["disk_total_gib"].as_i64().unwrap_or(0),
                     body["disk_free_gib"].as_i64().unwrap_or(0),
                 );
-                c.db.lock().unwrap().execute(
+                c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
                     "update nodes set mem_free = ?2, last_seen = ?3, state = ?4, macos_free = ?5, cpus = ?6, load = ?7,
                        disk_total = ?8, disk_free = ?9 where id = ?1",
                     &[id, &free, &now(), &next, &macos_free, &cpus, &load, &dt, &df],
                 )?;
                 // Edges seen in the last 10 minutes may reach instances on this node.
-                let ingress: Vec<String> =
-                    c.edges.lock().unwrap().iter().filter(|(_, t)| **t > now() - 600).map(|(ip, _)| ip.to_string()).collect();
+                let ingress: Vec<String> = c
+                    .edges
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .iter()
+                    .filter(|(_, t)| **t > now() - 600)
+                    .map(|(ip, _)| ip.to_string())
+                    .collect();
                 Ok(json!({"ingress": ingress}))
             })();
             return json_reply(&mut w, r);
@@ -1381,7 +1415,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
     let admin_only = || -> Result<()> { if who.admin { Ok(()) } else { bail!("admin token required") } };
     let r: Result<Value> = match (req.method.as_str(), seg.as_slice()) {
         ("GET", ["nodes"]) => admin_only().and_then(|_| {
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let rows = db.query(
                 "select id, url, mem_total, mem_free, last_seen, state, cpus, load, disk_total, disk_free,
                    (select count(*) from instances i where i.node = n.id and i.state in ('live', 'starting', 'sleeping', 'draining')),
@@ -1407,7 +1441,10 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             ))
         }),
         ("POST", ["nodes", id, "undrain"]) => admin_only().and_then(|_| {
-            let n = c.db.lock().unwrap().execute("update nodes set state = 'ready' where id = ?1 and state = 'drain'", &[id])?;
+            let n =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("update nodes set state = 'ready' where id = ?1 and state = 'drain'", &[id])?;
             if n == 0 {
                 bail!("node {id} isn't drained");
             }
@@ -1415,7 +1452,10 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             Ok(json!({"undrained": id}))
         }),
         ("POST", ["nodes", id, "drain"]) => admin_only().and_then(|_| {
-            let n = c.db.lock().unwrap().execute("update nodes set state = 'drain' where id = ?1", &[id])?;
+            let n =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("update nodes set state = 'drain' where id = ?1", &[id])?;
             if n == 0 {
                 bail!("no node {id}");
             }
@@ -1426,7 +1466,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         ("POST", ["nodes", id, "pool"]) => admin_only().and_then(|_| {
             c.node(id)?;
             let list: Vec<String> = body["ns"].as_array().into_iter().flatten().filter_map(|n| n.as_str().map(String::from)).collect();
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for n in &list {
                 if db.query_opt("select 1 from namespaces where name = ?1", &[n])?.is_none() {
                     bail!("no namespace {n}");
@@ -1447,7 +1487,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             if let Some(n) = member_of {
                 c.allow(&who, n, Role::Owner)?;
             }
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             db.execute("insert into tokens values (?1, ?2, ?3, ?4)", &[&t, &name, &admin, &max])?;
             if let Some(n) = member_of {
                 db.execute("insert or replace into members values (?1, ?2, ?3)", &[&n, &name, &role.name()])?;
@@ -1459,7 +1499,10 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         // Every token with this name: they're one person's tokens.
         ("POST", ["tokens", name]) => admin_only().and_then(|_| {
             let max = body["max_sandboxes"].as_i64().context("missing max_sandboxes")?;
-            let n = c.db.lock().unwrap().execute("update tokens set max_sandboxes = ?2 where name = ?1", &[name, &max])?;
+            let n =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("update tokens set max_sandboxes = ?2 where name = ?1", &[name, &max])?;
             if n == 0 {
                 bail!("no token named {name}");
             }
@@ -1469,7 +1512,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         // `?peek=1` (the dashboard) reads the table without becoming an edge nodes let in.
         ("GET", ["routes"]) => admin_only().and_then(|_| {
             if let Some(ip) = peer.filter(|_| !req.query.iter().any(|(k, _)| k == "peek")) {
-                c.edges.lock().unwrap().insert(ip, now());
+                c.edges.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(ip, now());
             }
             routes(c)
         }),
@@ -1482,7 +1525,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         }),
         ("POST", ["routes", "activity"]) => admin_only().and_then(|_| {
             let suffix = format!(".{}", c.domain);
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for h in body["hosts"].as_array().into_iter().flatten().filter_map(|h| h.as_str()) {
                 if let Some(app) = h.strip_suffix(&suffix) {
                     db.execute("update apps set last_request = ?2 where name = ?1", &[&app, &now()])?;
@@ -1501,7 +1544,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             db.execute("delete from traffic where minute < ?1", &[&(now() / 60 - 24 * 60)])?;
             drop(db);
             let minute = now() / 60;
-            let mut clients = c.clients.lock().unwrap();
+            let mut clients = c.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for cl in body["clients"].as_array().into_iter().flatten() {
                 let Some(ip) = cl["ip"].as_str() else { continue };
                 let e = clients.entry((minute, ip.to_string())).or_default();
@@ -1529,7 +1572,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             let net = crate::edge::ban::normalize(body["net"].as_str().context("missing net")?)?;
             let until = body["secs"].as_i64().filter(|s| *s > 0).map(|s| now() + s);
             let reason = body["reason"].as_str().unwrap_or("");
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             db.execute("delete from bans where until is not null and until <= ?1", &[&now()])?;
             db.execute(
                 "insert or replace into bans (net, reason, until, created, by) values (?1, ?2, ?3, ?4, ?5)",
@@ -1541,7 +1584,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         }),
         ("DELETE", ["bans"]) => admin_only().and_then(|_| {
             let net = crate::edge::ban::normalize(body["net"].as_str().context("missing net")?)?;
-            if c.db.lock().unwrap().execute("delete from bans where net = ?1", &[&net])? == 0 {
+            if c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute("delete from bans where net = ?1", &[&net])? == 0 {
                 bail!("{net} isn't banned");
             }
             c.audit("-", &who.name, "unban", &net, true);
@@ -1552,7 +1595,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         ("POST", ["sandboxes"]) => create_sandbox(c, &who, &ns, &req, &mut w).map(|_| Value::Null),
         ("GET", ["sandboxes"]) => (|| {
             c.allow(&who, &ns, Role::Viewer)?;
-            let rows = c.db.lock().unwrap().query(
+            let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
                 "select id, node, owner, state, created from sandboxes s where state <> 'removed' and ns = ?1
                    and (?1 <> 'default' or owner = ?2 or ?3) and not exists(select 1 from instances i where i.sandbox = s.id)
                  order by created",
@@ -1577,14 +1620,21 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 Err(e) => Err(e),
                 Ok((url, sec, _)) if fork => (|| {
                     let (cpus, gib): (i64, i64) = {
-                        let r = c.db.lock().unwrap().query_one("select cpus, memory_gib from sandboxes where id = ?1", &[id])?;
+                        let r =
+                            c.db.lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .query_one("select cpus, memory_gib from sandboxes where id = ?1", &[id])?;
                         (r.get(0), r.get(1))
                     };
                     c.check_quota(&ns, "", cpus, gib, 1)?;
                     let mut v = call(&url, "POST", &node_path, Some(&sec), &body)?;
                     let child = v["id"].as_str().context("node returned no id")?.to_string();
-                    let node: String = c.db.lock().unwrap().query_one("select node from sandboxes where id = ?1", &[id])?.get(0);
-                    c.db.lock().unwrap().execute(
+                    let node: String =
+                        c.db.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .query_one("select node from sandboxes where id = ?1", &[id])?
+                            .get(0);
+                    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
                         "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
                         &[&child, &node, &who.name, &now(), &ns, &cpus, &gib],
                     )?;
@@ -1595,7 +1645,9 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 Ok((url, sec, _)) => {
                     proxy(&url, &sec, &req, &node_path, &mut w)?;
                     if delete {
-                        c.db.lock().unwrap().execute("update sandboxes set state = 'removed' where id = ?1", &[id])?;
+                        c.db.lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .execute("update sandboxes set state = 'removed' where id = ?1", &[id])?;
                     }
                     c.audit(&ns, &who.name, &format!("{m} {}", rest.join("/")), id, true);
                     return Ok(());
@@ -1635,7 +1687,10 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
         return respond(w, 404, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
     }
     let count: i64 =
-        c.db.lock().unwrap().query_one("select count(*) from sandboxes where owner = ?1 and state = 'running'", &[&who.name])?.get(0);
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select count(*) from sandboxes where owner = ?1 and state = 'running'", &[&who.name])?
+            .get(0);
     if who.max >= 0 && count >= who.max as i64 {
         return err(w, format!("quota: {count} of {} sandboxes in use", who.max));
     }
@@ -1655,7 +1710,7 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
         Err(e) => return err(w, format!("node {node}: {e:#}")),
     };
     let id = v["id"].as_str().unwrap_or("").to_string();
-    c.db.lock().unwrap().execute(
+    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
         "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
         &[&id, &node, &who.name, &now(), &ns, &cpus, &gib],
     )?;
@@ -1673,12 +1728,15 @@ fn limit(v: i64) -> Value {
 }
 
 fn namespace_json(c: &Controller, name: &str, role: Option<Role>) -> Result<Value> {
-    let q = c.db.lock().unwrap().query_one(
+    let q = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_one(
         "select max_sandboxes, max_cpus, max_memory_gib, max_apps, (select count(*) from apps where ns = ?1) from namespaces where name = ?1",
         &[&name],
     )?;
     let (cpus, gib, sbs) = c.usage(name, "")?;
-    let members = c.db.lock().unwrap().query("select who, role from members where ns = ?1 order by who", &[&name])?;
+    let members =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select who, role from members where ns = ?1 order by who", &[&name])?;
     Ok(json!({
         "name": name, "role": role.map(Role::name),
         "quota": {"sandboxes": limit(q.get(0)), "cpus": limit(q.get(1)), "memory_gib": limit(q.get(2)), "apps": limit(q.get(3))},
@@ -1694,7 +1752,12 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
     match (method, seg) {
         ("GET", ["namespaces"]) => {
             let names: Vec<String> =
-                c.db.lock().unwrap().query("select name from namespaces order by name", &[])?.iter().map(|r| r.get(0)).collect();
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .query("select name from namespaces order by name", &[])?
+                    .iter()
+                    .map(|r| r.get(0))
+                    .collect();
             let mut out = vec![];
             for n in names {
                 if let Some(role) = c.role(who, &n)? {
@@ -1716,7 +1779,9 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
                 .map_err(|_| anyhow!("namespace {name} exists"))?;
             for (k, col) in quota_cols {
                 if let Some(v) = b[k].as_i64() {
-                    c.db.lock().unwrap().execute(&format!("update namespaces set {col} = ?2 where name = ?1"), &[&name, &v])?;
+                    c.db.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .execute(&format!("update namespaces set {col} = ?2 where name = ?1"), &[&name, &v])?;
                 }
             }
             c.audit(name, &who.name, "create namespace", name, true);
@@ -1731,7 +1796,9 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
             c.allow(who, n, Role::Owner)?;
             for (k, col) in quota_cols {
                 if let Some(v) = b[k].as_i64() {
-                    c.db.lock().unwrap().execute(&format!("update namespaces set {col} = ?2 where name = ?1"), &[n, &v])?;
+                    c.db.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .execute(&format!("update namespaces set {col} = ?2 where name = ?1"), &[n, &v])?;
                 }
             }
             namespace_json(c, n, Some(Role::Owner))
@@ -1743,7 +1810,7 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
             }
             let name = b["who"].as_str().context("missing who")?;
             let role = Role::parse(b["role"].as_str().unwrap_or("member"))?;
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if db.query_opt("select 1 from tokens where name = ?1", &[&name])?.is_none() {
                 bail!("no token named {name}; `rekcod controller token {name}` first");
             }
@@ -1754,7 +1821,10 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
         }
         ("DELETE", ["namespaces", n, "members", name]) => {
             c.allow(who, n, Role::Owner)?;
-            let k = c.db.lock().unwrap().execute("delete from members where ns = ?1 and who = ?2", &[n, name])?;
+            let k =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("delete from members where ns = ?1 and who = ?2", &[n, name])?;
             if k == 0 {
                 bail!("no member {name} in {n}");
             }
@@ -1770,7 +1840,7 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
             let force = b["force"].as_bool().unwrap_or(false);
             type IdNode = Vec<(String, String)>;
             let (apps, sbs, jobs): (Vec<String>, IdNode, IdNode) = {
-                let mut db = c.db.lock().unwrap();
+                let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 (
                     db.query("select name from apps where ns = ?1", &[n])?.iter().map(|r| r.get(0)).collect(),
                     db.query(
@@ -1796,9 +1866,11 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
                 if let Ok((url, sec, _)) = c.node(&node) {
                     let _ = call(&url, "DELETE", &format!("/jobs/{id}"), Some(&sec), &Value::Null);
                 }
-                c.db.lock().unwrap().execute("update jobs set state = 'cancelled', finished = ?2 where id = ?1", &[&id, &now()])?;
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("update jobs set state = 'cancelled', finished = ?2 where id = ?1", &[&id, &now()])?;
             }
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for t in ["members", "node_pools", "schedules"] {
                 db.execute(&format!("delete from {t} where ns = ?1"), &[n])?;
             }
@@ -1817,7 +1889,7 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
 /// `{host: {"app", "public", "endpoints": [...], "sleeping"}}` for every app with live or
 /// sleeping instances. A sleeping app has no endpoints; the edge wakes it.
 fn routes(c: &Controller) -> Result<Value> {
-    let rows = c.db.lock().unwrap().query(
+    let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select i.app, i.endpoint, a.public, i.state, a.ns, a.http from instances i join apps a on a.name = i.app
          where i.state in ('live', 'sleeping') order by i.app",
         &[],
@@ -1913,7 +1985,11 @@ struct App {
 fn load_app(c: &Controller, ns: &str, name: &str, who: &Caller, need: Role) -> Result<App> {
     c.allow(who, ns, need).map_err(|e| if e.to_string().starts_with("no ") { anyhow!("no app {name}") } else { e })?;
     let app = load_app_key(c, &app_key(ns, name))?.ok_or_else(|| anyhow!("no app {name}"))?;
-    let owner: String = c.db.lock().unwrap().query_one("select owner from apps where name = ?1", &[&app.name])?.get(0);
+    let owner: String =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select owner from apps where name = ?1", &[&app.name])?
+            .get(0);
     if app.ns != ns || !can_touch(who, ns, &owner) {
         bail!("no app {name}");
     }
@@ -1922,7 +1998,7 @@ fn load_app(c: &Controller, ns: &str, name: &str, who: &Caller, need: Role) -> R
 
 /// App by row key, no access check; secrets come back opened.
 fn load_app_key(c: &Controller, key: &str) -> Result<Option<App>> {
-    let r = c.db.lock().unwrap().query_opt(
+    let r = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
         "select name, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, secrets, ns, idle_stop from apps where name = ?1",
         &[&key],
     )?;
@@ -1957,7 +2033,7 @@ fn delete_instance(c: &Controller, node: &str, sandbox_id: &str) {
     if let Ok((url, sec, _)) = c.node(node) {
         let _ = call(&url, "DELETE", &format!("/sandboxes/{sandbox_id}"), Some(&sec), &Value::Null);
     }
-    let mut db = c.db.lock().unwrap();
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = db.execute("update instances set state = 'removed' where sandbox = ?1", &[&sandbox_id]);
     let _ = db.execute("update sandboxes set state = 'removed' where id = ?1", &[&sandbox_id]);
 }
@@ -1969,15 +2045,19 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         Some(c) => c,
         None => resolve(&app.git_url, &app.git_ref)?,
     };
-    let n: i32 = c.db.lock().unwrap().query_one("select coalesce(max(n), 0) + 1 from releases where app = ?1", &[&app.name])?.get(0);
-    c.db.lock().unwrap().execute(
+    let n: i32 =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select coalesce(max(n), 0) + 1 from releases where app = ?1", &[&app.name])?
+            .get(0);
+    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
         "insert into releases (app, n, commit_sha, state, created, who) values (?1, ?2, ?3, 'building', ?4, ?5)",
         &[&app.name, &n, &commit, &now(), &who],
     )?;
     // The deploy log kept with the release (`app release NAME N`).
     let mut log = vec![format!("release {n} of {} at {commit}, by {who}", app.short)];
     let finish = |state: &str, log: &[String]| {
-        let _ = c.db.lock().unwrap().execute(
+        let _ = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
             "update releases set state = ?3, finished = ?4, log = ?5 where app = ?1 and n = ?2",
             &[&app.name, &n, &state, &now(), &log.join("\n")],
         );
@@ -2049,7 +2129,7 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         }
     }
     {
-        let mut db = c.db.lock().unwrap();
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (node, sb, ep) in &started {
             db.execute(
                 "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
@@ -2095,7 +2175,7 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         bail!("release {n} failed, the previous release keeps serving:\n{}", errors.join("\n"));
     }
     let old: Vec<(String, String)> = {
-        let mut db = c.db.lock().unwrap();
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let old = db.query(
             "update instances set state = 'draining' where app = ?1 and release <> ?2 and state = 'live' returning node, sandbox",
             &[&app.name, &n],
@@ -2117,7 +2197,9 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
     });
     if health != app.health {
         // rekcod.toml's health path, so waking checks the same one.
-        c.db.lock().unwrap().execute("update apps set health = ?2 where name = ?1", &[&app.name, &health])?;
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update apps set health = ?2 where name = ?1", &[&app.name, &health])?;
     }
     c.audit(&app.ns, who, "deploy", &format!("{} r{n}", app.short), true);
     Ok(json!({"app": app.short, "ns": app.ns, "release": n, "commit": commit, "url": format!("http://{}.{}", app.name, c.domain),
@@ -2128,11 +2210,14 @@ fn destroy_app(c: &Arc<Controller>, name: &str) -> Result<Value> {
     if let Err(e) = drop_bucket(c, name) {
         eprintln!("rekcod: {name}: bucket: {e:#}");
     }
-    let rows = c.db.lock().unwrap().query("select node, sandbox from instances where app = ?1 and state <> 'removed'", &[&name])?;
+    let rows =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select node, sandbox from instances where app = ?1 and state <> 'removed'", &[&name])?;
     for r in rows {
         delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
     }
-    let mut db = c.db.lock().unwrap();
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     db.execute("delete from releases where app = ?1", &[&name])?;
     db.execute("delete from instances where app = ?1", &[&name])?;
     db.execute("delete from apps where name = ?1", &[&name])?;
@@ -2150,7 +2235,10 @@ fn live_commit(c: &Controller, app: &str) -> Result<Option<String>> {
 }
 
 fn live_endpoints(c: &Controller, app: &str) -> Result<Vec<String>> {
-    let rows = c.db.lock().unwrap().query("select endpoint from instances where app = ?1 and state = 'live'", &[&app])?;
+    let rows =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select endpoint from instances where app = ?1 and state = 'live'", &[&app])?;
     Ok(rows.iter().map(|r| r.get(0)).collect())
 }
 
@@ -2158,14 +2246,19 @@ fn live_endpoints(c: &Controller, app: &str) -> Result<Vec<String>> {
 /// back to redeploying the live commit if none of them comes back.
 fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
     let lock = c.app_lock(&app.name);
-    let _g = lock.lock().unwrap();
+    let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let eps = live_endpoints(c, &app.name)?;
     if !eps.is_empty() {
         return Ok(eps);
     }
-    let _ = c.db.lock().unwrap().execute("update apps set last_request = ?2 where name = ?1", &[&app.name, &now()]);
+    let _ =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update apps set last_request = ?2 where name = ?1", &[&app.name, &now()]);
     let rows =
-        c.db.lock().unwrap().query("select node, sandbox, endpoint from instances where app = ?1 and state = 'sleeping'", &[&app.name])?;
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select node, sandbox, endpoint from instances where app = ?1 and state = 'sleeping'", &[&app.name])?;
     let handles: Vec<_> = rows
         .iter()
         .map(|r| {
@@ -2186,7 +2279,9 @@ fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
                     std::thread::sleep(Duration::from_millis(200));
                 }
                 if healthy(&ep, &app.health) {
-                    c.db.lock().unwrap().execute("update instances set state = 'live' where sandbox = ?1", &[&sb])?;
+                    c.db.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .execute("update instances set state = 'live' where sandbox = ?1", &[&sb])?;
                 } else {
                     eprintln!("rekcod: {}: {sb} didn't pass {} after waking", app.name, app.health);
                     delete_instance(c, &node, &sb);
@@ -2203,7 +2298,10 @@ fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
     }
     // Node lost or VM gone: a normal deploy of the same commit (a rebuild).
     let commit = live_commit(c, &app.name)?.ok_or_else(|| anyhow!("{} isn't deployed", app.name))?;
-    let _ = c.db.lock().unwrap().execute("update instances set state = 'removed' where app = ?1 and state = 'sleeping'", &[&app.name]);
+    let _ =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update instances set state = 'removed' where app = ?1 and state = 'sleeping'", &[&app.name]);
     deploy(c, app, Some(commit), "wake")?;
     live_endpoints(c, &app.name)
 }
@@ -2211,7 +2309,7 @@ fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
 /// Apps whose last request and live release are older than `idle_stop`: route them away,
 /// then stop their VMs (the disks stay, so waking doesn't rebuild).
 fn sleep_idle(c: &Arc<Controller>) -> Result<()> {
-    let rows = c.db.lock().unwrap().query(
+    let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select a.name from apps a join releases r on r.app = a.name and r.n = a.live_release
          where a.idle_stop > 0 and max(a.last_request, r.created) < ?1 - a.idle_stop
            and exists(select 1 from instances i where i.app = a.name and i.state = 'live')",
@@ -2231,7 +2329,7 @@ fn sleep_idle(c: &Arc<Controller>) -> Result<()> {
         // Holds the app's lock until the VMs are down: a wake that comes in meanwhile waits,
         // instead of finding a VM that's still shutting down.
         std::thread::spawn(move || {
-            let _g = lock.lock().unwrap();
+            let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // After the edge's next route refresh (2 s), so requests in flight finish.
             std::thread::sleep(Duration::from_secs(3));
             for (sb, node) in targets {
@@ -2249,7 +2347,7 @@ fn sleep_idle(c: &Arc<Controller>) -> Result<()> {
 /// Redeploys the live commit of apps whose live release is older than `recycle`, so
 /// fresh VMs replace ones holding memory macOS can't get back.
 fn recycle_due(c: &Arc<Controller>) -> Result<()> {
-    let rows = c.db.lock().unwrap().query(
+    let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select a.name, r.commit_sha from apps a join releases r on r.app = a.name and r.n = a.live_release
          where a.recycle > 0 and r.created < ?1 - a.recycle
            and exists(select 1 from instances i where i.app = a.name and i.state = 'live')
@@ -2288,7 +2386,7 @@ fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
     }
     let marks = (1..=keys.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
     let params: Vec<&dyn rusqlite::ToSql> = keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
-    let mut db = c.db.lock().unwrap();
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let apps = db.query(
         &format!(
             "select name, ns, git_url, git_ref, port, instances, live_release, public, idle_stop, recycle, last_request, http, env, secrets
@@ -2355,7 +2453,7 @@ fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
 /// Top client IPs over the last 10 minutes of edge reports, busiest first.
 fn edge_clients(c: &Controller) -> Value {
     let mut sum: HashMap<String, (i64, i64)> = HashMap::new();
-    for ((_, ip), (n, l)) in c.clients.lock().unwrap().iter() {
+    for ((_, ip), (n, l)) in c.clients.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
         let e = sum.entry(ip.clone()).or_default();
         e.0 += n;
         e.1 += l;
@@ -2381,7 +2479,11 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
     // 0: the commit's rekcod.toml decides (3000 if it doesn't say).
     let port = b["port"].as_i64().unwrap_or(0) as i32;
     // Left out (a deploy without --instances) keeps an existing app's count.
-    let existing: Option<i32> = c.db.lock().unwrap().query_opt("select instances from apps where name = ?1", &[&name])?.map(|r| r.get(0));
+    let existing: Option<i32> =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select instances from apps where name = ?1", &[&name])?
+            .map(|r| r.get(0));
     let instances = b["instances"].as_i64().map(|n| n as i32).or(existing).unwrap_or(1);
     let cpus = b["cpus"].as_i64().unwrap_or(1) as i32;
     let mem = b["memory_gib"].as_i64().unwrap_or(1) as i32;
@@ -2403,7 +2505,8 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
         }
         None => None,
     };
-    let exists = c.db.lock().unwrap().query_opt("select owner, ns from apps where name = ?1", &[&name])?;
+    let exists =
+        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt("select owner, ns from apps where name = ?1", &[&name])?;
     if exists.is_none() {
         let (n, max): (i64, i64) = {
             let r =
@@ -2417,7 +2520,7 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
         }
     }
     c.check_quota(ns, &name, (instances * cpus) as i64, (instances * mem) as i64, 0)?;
-    let mut db = c.db.lock().unwrap();
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(r) = exists {
         let (owner, row_ns): (String, String) = (r.get(0), r.get(1));
         if row_ns != ns || !can_touch(who, ns, &owner) {
@@ -2449,7 +2552,7 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
     match (method, seg) {
         ("GET", ["apps"]) => {
             c.allow(who, ns, Role::Viewer)?;
-            let rows = c.db.lock().unwrap().query(
+            let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
                 "select name, git_url, live_release, instances, preview_of, public,
                    exists(select 1 from instances where app = name and state = 'sleeping')
                    and not exists(select 1 from instances where app = name and state = 'live')
@@ -2483,7 +2586,9 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         ("POST", ["apps", name, "visibility"]) => {
             let app = load(name, Role::Member)?;
             let public = b["public"].as_bool().context("missing public")?;
-            c.db.lock().unwrap().execute("update apps set public = ?2 where name = ?1", &[&app.name, &public])?;
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execute("update apps set public = ?2 where name = ?1", &[&app.name, &public])?;
             c.audit(ns, &who.name, if public { "make public" } else { "make private" }, name, true);
             Ok(json!({"app": name, "ns": ns, "public": public}))
         }
@@ -2491,20 +2596,24 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         ("POST", ["apps", name, "rollback"]) => {
             let app = load(name, Role::Member)?;
             let target: Option<i32> = b["release"].as_i64().map(|n| n as i32);
-            let row = c.db.lock().unwrap().query_opt(
+            let row = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
                 "select commit_sha from releases where app = ?1 and state in ('live', 'old') and n = coalesce(?2,
                    (select max(n) from releases where app = ?1 and n < (select live_release from apps where name = ?1) and state in ('live', 'old')))",
                 &[&app.name, &target],
             )?;
             let commit: String = row.ok_or_else(|| anyhow!("no earlier good release of {name}"))?.get(0);
-            c.db.lock().unwrap().execute("update releases set state = 'old' where app = ?1 and state = 'live'", &[&app.name])?;
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execute("update releases set state = 'old' where app = ?1 and state = 'live'", &[&app.name])?;
             deploy(c, &app, Some(commit), &who.name)
         }
         ("POST", ["apps", name, "scale"]) => {
             let n = b["instances"].as_i64().context("missing instances")? as i32;
             let app = load(name, Role::Member)?;
             c.check_quota(ns, &app.name, (n * app.cpus) as i64, (n * app.memory_gib) as i64, 0)?;
-            c.db.lock().unwrap().execute("update apps set instances = ?2 where name = ?1", &[&app.name, &n])?;
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execute("update apps set instances = ?2 where name = ?1", &[&app.name, &n])?;
             let commit = live_commit(c, &app.name)?;
             deploy(c, &load(name, Role::Member)?, commit, &who.name)
         }
@@ -2525,14 +2634,16 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 }
             }
             let col = if secrets { "secrets" } else { "env" };
-            c.db.lock().unwrap().execute(&format!("update apps set {col} = ?2 where name = ?1"), &[&app.name, &map.to_string()])?;
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execute(&format!("update apps set {col} = ?2 where name = ?1"), &[&app.name, &map.to_string()])?;
             let Some(commit) = live_commit(c, &app.name)? else { return Ok(json!({"updated": col})) };
             deploy(c, &load(name, Role::Member)?, Some(commit), &who.name)
         }
         ("GET", ["apps", name, "releases", n]) => {
             let app = load(name, Role::Viewer)?;
             let n: i32 = n.parse().map_err(|_| anyhow!("release numbers are integers"))?;
-            let r = c.db.lock().unwrap().query_opt(
+            let r = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
                 "select n, commit_sha, state, created, who, finished, log from releases where app = ?1 and n = ?2",
                 &[&app.name, &n],
             )?;
@@ -2556,7 +2667,10 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         }
         ("GET", ["apps", name, "logs"]) => {
             let app = load(name, Role::Viewer)?;
-            let rows = c.db.lock().unwrap().query("select node, sandbox from instances where app = ?1 and state = 'live'", &[&app.name])?;
+            let rows =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .query("select node, sandbox from instances where app = ?1 and state = 'live'", &[&app.name])?;
             let mut out = String::new();
             for r in rows {
                 let (node, sb): (String, String) = (r.get(0), r.get(1));
@@ -2579,7 +2693,7 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             let app = load(name, Role::Member)?;
             let commit = live_commit(c, &app.name)?.ok_or_else(|| anyhow!("{name} has no live release"))?;
             let lock = c.app_lock(&app.name);
-            let _g = lock.lock().unwrap();
+            let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             deploy(c, &app, Some(commit), &who.name)
         }
         ("GET", ["apps", name, "storage"]) => app_storage(c, &load(name, Role::Viewer)?),
@@ -2593,7 +2707,9 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         ("POST", ["apps", name, "storage", "rotate"]) => {
             let app = load(name, Role::Member)?;
             app_s3(c, &app)?;
-            c.db.lock().unwrap().execute("update apps set storage_secret = null where name = ?1", &[&app.name])?;
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execute("update apps set storage_secret = null where name = ?1", &[&app.name])?;
             c.audit(ns, &who.name, "rotate storage key", name, true);
             let Some(commit) = live_commit(c, &app.name)? else {
                 bucket_env(c, &app)?;
@@ -2650,7 +2766,7 @@ fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, sche
     body["id"] = json!(id);
     call(&url, "POST", "/jobs", Some(&sec), &body).with_context(|| format!("node {node}"))?;
     let name = spec["name"].as_str();
-    c.db.lock().unwrap().execute(
+    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
         "insert into jobs (id, owner, node, name, spec, state, created, schedule, ns) values (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8)",
         &[&id, &owner, &node, &name, &spec.to_string(), &now(), &schedule, &ns],
     )?;
@@ -2660,7 +2776,8 @@ fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, sche
 
 /// Asks each running job's node how it's doing; stores the result once it's finished.
 fn poll_jobs(c: &Controller) -> Result<()> {
-    let rows = c.db.lock().unwrap().query("select id, node from jobs where state = 'running'", &[])?;
+    let rows =
+        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query("select id, node from jobs where state = 'running'", &[])?;
     for r in rows {
         let (id, node): (String, String) = (r.get(0), r.get(1));
         let Ok((url, sec, _)) = c.node(&node) else { continue };
@@ -2676,7 +2793,7 @@ fn poll_jobs(c: &Controller) -> Result<()> {
             "failed"
         };
         let (exit, log) = (v["exit"].as_i64(), v["log"].as_str().unwrap_or("").to_string());
-        c.db.lock().unwrap().execute(
+        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
             "update jobs set state = ?2, exit = ?3, finished = ?4, log = ?5 where id = ?1 and state = 'running'",
             &[&id, &state, &exit, &now(), &log],
         )?;
@@ -2686,7 +2803,7 @@ fn poll_jobs(c: &Controller) -> Result<()> {
 
 /// Starts a schedule's next run once its last one has finished and `every` has passed.
 fn run_schedules(c: &Controller) -> Result<()> {
-    let rows = c.db.lock().unwrap().query(
+    let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select s.name, s.owner, s.spec, coalesce(t.max_sandboxes, 10), s.ns from schedules s
            left join (select name, max(max_sandboxes) as max_sandboxes from tokens group by name) t on t.name = s.owner
          where s.last_run <= ?1 - s.every
@@ -2699,7 +2816,9 @@ fn run_schedules(c: &Controller) -> Result<()> {
         // Marked as run even when it can't start, so a full fleet isn't retried every 5 s.
         let job = start_job(c, &ns, &owner, max, &spec, Some(&name));
         let id = job.as_ref().ok().and_then(|v| v["id"].as_str().map(String::from));
-        c.db.lock().unwrap().execute("update schedules set last_run = ?2, last_job = ?3 where name = ?1", &[&name, &now(), &id])?;
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update schedules set last_run = ?2, last_job = ?3 where name = ?1", &[&name, &now(), &id])?;
         if let Err(e) = job {
             eprintln!("rekcod: schedule {name}: {e:#}");
         }
@@ -2721,7 +2840,10 @@ const JOB_COLS: &str = "id, owner, node, name, spec, state, exit, created, finis
 
 fn load_job(c: &Controller, ns: &str, id: &str, who: &Caller, need: Role) -> Result<(Value, String)> {
     c.allow(who, ns, need).map_err(|e| if e.to_string().starts_with("no ") { anyhow!("no job {id}") } else { e })?;
-    let r = c.db.lock().unwrap().query_opt(&format!("select {JOB_COLS}, log from jobs where id = ?1 and ns = ?2"), &[&id, &ns])?;
+    let r =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt(&format!("select {JOB_COLS}, log from jobs where id = ?1 and ns = ?2"), &[&id, &ns])?;
     let r = r.ok_or_else(|| anyhow!("no job {id}"))?;
     if !can_touch(who, ns, &r.get::<String>(1)) {
         bail!("no job {id}");
@@ -2742,7 +2864,7 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 bail!("schedule names are lowercase letters, digits and single dashes");
             }
             let key = app_key(ns, name);
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(r) = db.query_opt("select owner from schedules where name = ?1", &[&key])?
                 && !can_touch(who, ns, &r.get::<String>(0))
             {
@@ -2757,7 +2879,7 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         }
         ("GET", ["jobs"]) => {
             c.allow(who, ns, Role::Viewer)?;
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // `?name=N`: the last 50 runs of one named or scheduled job.
             let name = q.iter().find(|(k, _)| k == "name").map(|(_, v)| v.as_str());
             let jobs = db.query(
@@ -2800,7 +2922,11 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             if v["state"] == "running" {
                 bail!("job {id} is still running");
             }
-            let spec: String = c.db.lock().unwrap().query_one("select spec from jobs where id = ?1", &[id])?.get(0);
+            let spec: String =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .query_one("select spec from jobs where id = ?1", &[id])?
+                    .get(0);
             let mut spec: Value = serde_json::from_str(&spec)?;
             spec.as_object_mut().map(|o| o.remove("every_secs"));
             start_job(c, ns, &who.name, who.max, &spec, None)
@@ -2812,13 +2938,15 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             }
             let (url, sec, _) = c.node(v["node"].as_str().unwrap_or(""))?;
             call(&url, "DELETE", &format!("/jobs/{id}"), Some(&sec), &Value::Null)?;
-            c.db.lock().unwrap().execute("update jobs set state = 'cancelled', finished = ?2 where id = ?1", &[id, &now()])?;
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execute("update jobs set state = 'cancelled', finished = ?2 where id = ?1", &[id, &now()])?;
             c.audit(ns, &who.name, "cancel", id, true);
             Ok(json!({"cancelled": id}))
         }
         ("DELETE", ["schedules", name]) => {
             c.allow(who, ns, Role::Member).map_err(|_| anyhow!("no schedule {name}"))?;
-            let n = c.db.lock().unwrap().execute(
+            let n = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
                 "delete from schedules where name = ?1 and ns = ?2 and (?2 <> 'default' or owner = ?3 or ?4)",
                 &[&app_key(ns, name), &ns, &who.name, &who.admin],
             )?;
@@ -2854,7 +2982,7 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
     let b: Value = serde_json::from_slice(&req.body)?;
     let pr = b["number"].as_i64().context("no PR number")?;
     let urls = [b["repository"]["clone_url"].as_str().unwrap_or(""), b["repository"]["html_url"].as_str().unwrap_or("")];
-    let base = c.db.lock().unwrap().query_opt(
+    let base = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
         "select name, owner, ns from apps where preview_of is null and (git_url = ?1 or git_url = ?2 or git_url = ?3) limit 1",
         &[&urls[0], &urls[1], &format!("{}.git", urls[1])],
     )?;
@@ -2875,7 +3003,7 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
                 // Previews sleep after 15 minutes unless the base app picks its own idle time.
                 "idle_stop_secs": if app.idle_stop > 0 { app.idle_stop } else { 900 },
                 // Its own empty bucket, deleted with the preview.
-                "bucket": c.db.lock().unwrap().query_one("select bucket from apps where name = ?1", &[&base])?.get::<bool>(0),
+                "bucket": c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_one("select bucket from apps where name = ?1", &[&base])?.get::<bool>(0),
             });
             upsert_app(c, &ns, &who, &cfg, Some(&base))?;
             let v = deploy(c, &load_app(c, &ns, &preview, &who, Role::Member)?, Some(head.into()), "github")?;
@@ -2921,7 +3049,7 @@ impl Controller {
                 let mut s = crate::storage::read_credentials(creds)?;
                 s.endpoint = url.trim_end_matches('/').to_string();
                 let sealed = self.seal("default", &s.secret_key)?;
-                let mut db = self.db.lock().unwrap();
+                let mut db = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 for (k, v) in [("storage_url", &s.endpoint), ("storage_access_key", &s.access_key), ("storage_secret_key", &sealed)] {
                     db.execute("insert or replace into config values (?1, ?2)", &[&k, v])?;
                 }
@@ -2964,7 +3092,10 @@ fn release_store(c: &Controller, app: &str, commit: &str) -> Value {
 /// instances get. The user and policy are written on every deploy, so a RustFS that lost
 /// them (reset, restored) gets them back. Nothing for apps without a bucket.
 fn bucket_env(c: &Controller, app: &App) -> Result<Vec<(&'static str, String)>> {
-    let r = c.db.lock().unwrap().query_one("select bucket, storage_key, storage_secret from apps where name = ?1", &[&app.name])?;
+    let r =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select bucket, storage_key, storage_secret from apps where name = ?1", &[&app.name])?;
     let (on, key, sealed): (bool, Option<String>, Option<String>) = (r.get(0), r.get(1), r.get(2));
     if !on {
         return Ok(vec![]);
@@ -2982,7 +3113,9 @@ fn bucket_env(c: &Controller, app: &App) -> Result<Vec<(&'static str, String)>> 
     };
     s.add_bucket_user(&key, &secret_key, &bucket)?;
     let sealed = c.seal(&app.ns, &secret_key)?;
-    c.db.lock().unwrap().execute("update apps set storage_key = ?2, storage_secret = ?3 where name = ?1", &[&app.name, &key, &sealed])?;
+    c.db.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execute("update apps set storage_key = ?2, storage_secret = ?3 where name = ?1", &[&app.name, &key, &sealed])?;
     Ok(vec![
         ("S3_ENDPOINT", s.endpoint.clone()),
         ("S3_BUCKET", bucket),
@@ -2994,7 +3127,11 @@ fn bucket_env(c: &Controller, app: &App) -> Result<Vec<(&'static str, String)>> 
 
 /// The app's bucket with root keys, for the CLI's `app storage`.
 fn app_s3(c: &Controller, app: &App) -> Result<(crate::s3::S3, String)> {
-    let on: bool = c.db.lock().unwrap().query_one("select bucket from apps where name = ?1", &[&app.name])?.get(0);
+    let on: bool =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select bucket from apps where name = ?1", &[&app.name])?
+            .get(0);
     if !on {
         bail!("{} has no bucket; set `[storage] bucket = true` in rekcod.toml and deploy", app.short);
     }
@@ -3003,7 +3140,11 @@ fn app_s3(c: &Controller, app: &App) -> Result<(crate::s3::S3, String)> {
 
 fn app_storage(c: &Controller, app: &App) -> Result<Value> {
     let (s, bucket) = app_s3(c, app)?;
-    let key: Option<String> = c.db.lock().unwrap().query_one("select storage_key from apps where name = ?1", &[&app.name])?.get(0);
+    let key: Option<String> =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select storage_key from apps where name = ?1", &[&app.name])?
+            .get(0);
     let objects = if s.bucket_exists(&bucket)? { s.list(&bucket, "")? } else { vec![] };
     Ok(json!({
         "app": app.short, "endpoint": s.endpoint, "bucket": bucket, "access_key": key,
@@ -3013,7 +3154,11 @@ fn app_storage(c: &Controller, app: &App) -> Result<Value> {
 
 /// How many objects the app's bucket holds; None when it has no bucket.
 fn bucket_objects(c: &Controller, app: &str) -> Result<Option<usize>> {
-    let on: bool = c.db.lock().unwrap().query_one("select bucket from apps where name = ?1", &[&app])?.get(0);
+    let on: bool =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select bucket from apps where name = ?1", &[&app])?
+            .get(0);
     let Some(s) = c.storage.as_ref().filter(|_| on) else { return Ok(None) };
     let bucket = app_bucket(app);
     if !s.bucket_exists(&bucket)? {
@@ -3024,7 +3169,10 @@ fn bucket_objects(c: &Controller, app: &str) -> Result<Option<usize>> {
 
 /// Deletes the app's bucket (objects too), its user and its policy.
 fn drop_bucket(c: &Controller, app: &str) -> Result<()> {
-    let r = c.db.lock().unwrap().query_opt("select bucket, storage_key from apps where name = ?1", &[&app])?;
+    let r =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select bucket, storage_key from apps where name = ?1", &[&app])?;
     let Some(r) = r else { return Ok(()) };
     let (on, key): (bool, Option<String>) = (r.get(0), r.get(1));
     if !on && key.is_none() {
@@ -3048,7 +3196,7 @@ fn backup(c: &Controller) -> Result<Value> {
     let tmp = std::env::temp_dir().join(format!("rekcod-fleet-{}.db", sandbox::new_id()?));
     let path = tmp.display().to_string();
     let r = (|| -> Result<Value> {
-        c.db.lock().unwrap().execute("vacuum into ?1", &[&path])?;
+        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute("vacuum into ?1", &[&path])?;
         let key = format!("fleet-{}.db", crate::s3::amz_date(now() as u64));
         s.put(BACKUPS, &key, crate::s3::Body::File(&tmp))?;
         let mut all: Vec<String> = s.list(BACKUPS, "fleet-")?.into_iter().map(|o| o.key).collect();
@@ -3073,7 +3221,9 @@ fn backup_due(c: &Controller) -> Result<()> {
     if now() - last < 3600 {
         return Ok(());
     }
-    c.db.lock().unwrap().execute("insert or replace into config values ('last_backup', ?1)", &[&now().to_string()])?;
+    c.db.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execute("insert or replace into config values ('last_backup', ?1)", &[&now().to_string()])?;
     backup(c).map(|_| ())
 }
 
@@ -3269,12 +3419,23 @@ mod tests {
         assert_eq!(ids(c.place(8192, false, "default").unwrap()), ["n2"]);
         assert_eq!(ids(c.place(2048, true, "default").unwrap()), ["n2"]);
         // ?N binds by number, whatever order the SQL mentions them in.
-        c.db.lock().unwrap().execute("update nodes set state = ?2 where id = ?1", &[&"n1", &"drain"]).unwrap();
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update nodes set state = ?2 where id = ?1", &[&"n1", &"drain"])
+            .unwrap();
         assert_eq!(ids(c.place(2048, false, "default").unwrap()), ["n2"]);
-        let lost = c.db.lock().unwrap().query("update nodes set state = 'lost' where mem_free < ?1 returning id", &[&10000i64]).unwrap();
+        let lost =
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query("update nodes set state = 'lost' where mem_free < ?1 returning id", &[&10000i64])
+                .unwrap();
         assert_eq!(lost.len(), 1);
         assert_eq!(lost[0].get::<String>(0), "n1");
-        let row = c.db.lock().unwrap().query_one("select count(*), max(state = 'lost') from nodes", &[]).unwrap();
+        let row =
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_one("select count(*), max(state = 'lost') from nodes", &[])
+                .unwrap();
         assert_eq!((row.get::<i64>(0), row.get::<bool>(1)), (2, true));
     }
 
@@ -3314,7 +3475,7 @@ mod tests {
             Caller::system("x"),
         );
         {
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             db.execute("insert into namespaces (name, created, salt, max_cpus, max_memory_gib) values ('team', 0, x'01', 4, 8)", &[])
                 .unwrap();
             db.execute("insert into members values ('team', 'alice', 'member'), ('team', 'bob', 'viewer')", &[]).unwrap();
@@ -3348,14 +3509,17 @@ mod tests {
         // Redeploying the same app replaces its own share.
         assert!(c.check_quota("team", "web--team", 4, 8, 0).is_ok());
         assert!(c.check_quota("default", "", 3, 2, 1).is_ok(), "other namespaces don't count");
-        c.db.lock().unwrap().execute("update namespaces set max_cpus = -1, max_sandboxes = -1 where name = 'team'", &[]).unwrap();
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update namespaces set max_cpus = -1, max_sandboxes = -1 where name = 'team'", &[])
+            .unwrap();
         assert!(c.check_quota("team", "", 1000, 2, 1000).is_ok(), "unlimited CPUs and sandboxes");
         assert!(c.check_quota("team", "", 1, 9, 0).is_err(), "memory is still limited");
         assert_eq!(limit(-1), json!("unlimited"));
 
         // Pooled nodes only take their namespace; the rest only take unpooled nodes.
         {
-            let mut db = c.db.lock().unwrap();
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for (id, free) in [("n1", 8192i64), ("n2", 16384)] {
                 db.execute("insert into nodes (id, url, secret, mem_free, last_seen) values (?1, 'u', 's', ?2, ?3)", &[&id, &free, &now()])
                     .unwrap();
@@ -3372,7 +3536,7 @@ mod tests {
         assert_eq!(c.open_sealed("team", &sealed).unwrap(), "s3cr3t");
         assert!(c.open_sealed("default", &sealed).is_err(), "another namespace's key doesn't open it");
         assert_eq!(c.open_sealed("team", "plain").unwrap(), "plain");
-        c.db.lock().unwrap().execute("delete from namespaces where name = 'team'", &[]).unwrap();
+        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute("delete from namespaces where name = 'team'", &[]).unwrap();
         assert!(c.open_sealed("team", &sealed).is_err());
 
         let (node, edge) = (IpAddr::from([100, 64, 0, 2]), IpAddr::from([100, 64, 0, 9]));

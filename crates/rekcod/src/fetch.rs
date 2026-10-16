@@ -41,13 +41,31 @@ pub fn ensure_guest(rekcod_home: &Path) -> Result<Option<PathBuf>> {
     }
     let parent = dir.parent().unwrap_or(rekcod_home);
     std::fs::create_dir_all(parent)?;
+    // Two commands starting at once on a fresh install: one downloads, the other waits.
+    let _lock = crate::paths::lock(&parent.join(".download.lock"))?;
+    if dir.join("Image").exists() && dir.join("root.img").exists() {
+        return Ok(Some(dir));
+    }
     let tmp = parent.join(format!(".download-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let result = download(gv, sha, &tmp)
         .and_then(|()| std::fs::rename(tmp.join("unpacked"), &dir).with_context(|| format!("install {}", dir.display())));
     let _ = std::fs::remove_dir_all(&tmp);
-    result.map(|()| Some(dir))
+    result?;
+    prune_old_guests(parent, gv);
+    Ok(Some(dir))
+}
+
+/// Deletes guests other than `keep` under `~/.rekcod/guest/`: the root disk is a copy and
+/// the kernel is read at boot, so nothing uses an old one after an upgrade.
+fn prune_old_guests(parent: &Path, keep: &str) {
+    for e in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name != keep && !name.starts_with('.') && e.path().join("root.img").exists() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 fn download(gv: &str, sha: &str, tmp: &Path) -> Result<()> {

@@ -73,7 +73,7 @@ impl Limits {
         self.edge.check_key(&ip).map_err(|e| e.wait_time_from(clock.now()))?;
         let Some(every) = http.rate.as_deref().and_then(|r| parse_rate(r).ok()) else { return Ok(()) };
         let lim = {
-            let mut apps = self.apps.lock().unwrap();
+            let mut apps = self.apps.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             match apps.get(host) {
                 Some((s, l)) if s == http => l.clone(),
                 _ => {
@@ -89,7 +89,7 @@ impl Limits {
 
     /// Counts a 429 for `ip`; true once it has had [`STRIKES`] within [`STRIKE_WINDOW`].
     pub fn strike(&self, ip: IpAddr) -> bool {
-        let mut s = self.strikes.lock().unwrap();
+        let mut s = self.strikes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let e = s.entry(ip).or_insert((Instant::now(), 0));
         if e.0.elapsed() > STRIKE_WINDOW {
             *e = (Instant::now(), 0);
@@ -105,10 +105,10 @@ impl Limits {
     /// Drops buckets that have refilled, so memory follows active clients only.
     pub fn prune(&self) {
         self.edge.retain_recent();
-        for (_, l) in self.apps.lock().unwrap().values() {
+        for (_, l) in self.apps.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values() {
             l.retain_recent();
         }
-        self.strikes.lock().unwrap().retain(|_, (t, _)| t.elapsed() <= STRIKE_WINDOW);
+        self.strikes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|_, (t, _)| t.elapsed() <= STRIKE_WINDOW);
     }
 }
 

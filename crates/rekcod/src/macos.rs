@@ -208,6 +208,7 @@ pub fn install(paths: &Paths, name: &str, disk_gib: u64, cpus: usize, memory_gib
         bail!("macOS image {name} exists; `rekcod macos rm {name}` first");
     }
     std::fs::create_dir_all(&dir)?;
+    crate::cli::exclude_from_backups(&root(paths).join("images"));
     let img = load_image(&restore)?;
     let req = unsafe { img.mostFeaturefulSupportedConfiguration() }.context("this Mac can't run that restore image")?;
     let hw = unsafe { req.hardwareModel() };

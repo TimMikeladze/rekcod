@@ -46,6 +46,13 @@ pub fn ensure_cli(rekcod_home: &Path) -> Result<PathBuf> {
         return Ok(dir);
     }
     let parent = rekcod_home.join("cli");
+    std::fs::create_dir_all(&parent)?;
+    // Another command may be downloading (or already running docker from `dir`): wait for
+    // it instead of deleting the directory under it.
+    let _lock = crate::paths::lock(&parent.join(".download.lock"))?;
+    if ASSETS.iter().all(|a| dir.join(a.dest).exists()) {
+        return Ok(dir);
+    }
     let tmp = parent.join(format!(".download-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("unpacked/cli-plugins"))?;

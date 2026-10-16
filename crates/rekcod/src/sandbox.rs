@@ -832,6 +832,9 @@ pub struct Listed {
     /// macOS guests: the address SSH and the screen tools use.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub address: Option<String>,
+    /// The VM process, while it runs (CPU and memory in `rekcod state`).
+    #[serde(skip)]
+    pub pid: Option<i32>,
 }
 
 fn listed(s: Sandbox) -> Listed {
@@ -841,7 +844,8 @@ fn listed(s: Sandbox) -> Listed {
         .flatten()
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v["mac"].as_str().and_then(crate::macos::running_ip));
-    Listed { running, address, meta: s.meta }
+    let pid = if running { crate::cli::running_pid(&s.paths) } else { None };
+    Listed { running, address, pid, meta: s.meta }
 }
 
 /// Running macOS sandboxes (Apple's licence allows two per Mac).

@@ -9,6 +9,7 @@ pub mod ban;
 mod client_ip;
 mod idle;
 pub mod limit;
+mod stats;
 
 use std::collections::{HashMap, HashSet};
 use std::convert::Infallible;
@@ -86,6 +87,7 @@ pub struct Edge {
     id_prefix: String,
     access_log: bool,
     trusted_proxies: Vec<ipnet::IpNet>,
+    stats: stats::Stats,
 }
 
 impl Edge {
@@ -102,6 +104,7 @@ impl Edge {
             id_prefix,
             access_log: s.access_log,
             trusted_proxies: s.trusted_proxies,
+            stats: Default::default(),
         })
     }
 
@@ -113,8 +116,10 @@ impl Edge {
     fn refresh(&self) {
         let Some(r) = &self.remote else { return };
         let hosts: Vec<String> = self.seen.lock().unwrap().drain().collect();
-        if !hosts.is_empty()
-            && let Err(e) = call(&r.url, "POST", "/routes/activity", Some(&r.token), &json!({"hosts": hosts}))
+        let (traffic, clients) = self.stats.take(minute_now());
+        if !(hosts.is_empty() && traffic.is_empty() && clients.is_empty())
+            && let Err(e) =
+                call(&r.url, "POST", "/routes/activity", Some(&r.token), &json!({"hosts": hosts, "traffic": traffic, "clients": clients}))
         {
             eprintln!("rekcod: edge: activity: {e:#}");
         }
@@ -181,6 +186,10 @@ impl Edge {
     fn request_id(&self) -> String {
         format!("{}-{:x}", self.id_prefix, self.request_ids.fetch_add(1, Ordering::Relaxed))
     }
+}
+
+fn minute_now() -> i64 {
+    (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() / 60) as i64
 }
 
 /// `rekcod edge serve`. `listen` routes every app (for the tailnet); `public_listen` only
@@ -351,15 +360,19 @@ fn prepare(edge: &Edge, p: &mut Parts, client: IpAddr, peer: IpAddr, upgrade: bo
 async fn handle(edge: Arc<Edge>, req: Request<Incoming>, peer: IpAddr, opts: Listener) -> Response<Body> {
     let client = if edge.trusts(peer) { client_ip::forwarded(req.headers()).unwrap_or(peer) } else { peer };
     let host = req_host(&req);
-    let log = edge.access_log.then(|| (Instant::now(), req.method().clone(), req.uri().path().to_string()));
+    let t = Instant::now();
+    let log = edge.access_log.then(|| (req.method().clone(), req.uri().path().to_string()));
     // Also catches a ban made while this connection was kept alive.
     let resp = if edge.bans.is_banned(client) {
         text(StatusCode::FORBIDDEN, "forbidden\n")
     } else {
         forward(&edge, req, &host, client, peer, opts).await
     };
-    if let Some((t, method, path)) = log {
-        eprintln!("{client} {method} {host}{path} {} {}ms", resp.status().as_u16(), t.elapsed().as_millis());
+    let ms = t.elapsed().as_millis().min(u32::MAX as u128) as u32;
+    let known = edge.table.read().unwrap().contains_key(&host);
+    edge.stats.request(minute_now(), known.then_some(host.as_str()), (!edge.trusts(client)).then_some(client), resp.status().as_u16(), ms);
+    if let Some((method, path)) = log {
+        eprintln!("{client} {method} {host}{path} {} {ms}ms", resp.status().as_u16());
     }
     resp
 }
@@ -382,6 +395,7 @@ async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: Ip
         return text(StatusCode::NOT_FOUND, format!("no app at {host}\n"));
     };
     if let Err(wait) = edge.limits.check(client, host, &route.http) {
+        edge.stats.limited(client);
         edge.strike(client);
         let mut r = text(StatusCode::TOO_MANY_REQUESTS, "too many requests\n");
         r.headers_mut().insert(header::RETRY_AFTER, wait.as_secs().max(1).into());

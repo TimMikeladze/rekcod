@@ -199,8 +199,40 @@ pub fn entries(m: &Model) -> Vec<Entry> {
     out.push(if projects.is_empty() {
         Entry::Label("No compose projects or snapshots".into())
     } else {
-        Entry::Submenu("Snapshots".into(), projects)
+        Entry::Submenu("Projects & snapshots".into(), projects)
     });
+    if !m.images.is_empty() {
+        let items = m
+            .images
+            .iter()
+            .map(|i| {
+                let name = i.tags.first().cloned().unwrap_or_else(|| "<none>".into());
+                let used = if i.containers.is_empty() { String::new() } else { format!(", {} container(s)", i.containers.len()) };
+                Entry::Submenu(
+                    format!("{name}  ({}{used})", actions::fmt_bytes(i.size)),
+                    actions::image_actions(i).into_iter().map(Entry::Action).collect(),
+                )
+            })
+            .collect();
+        out.push(Entry::Submenu(format!("Images ({})", m.images.len()), items));
+    }
+    if !m.volumes.is_empty() {
+        let items = m
+            .volumes
+            .iter()
+            .map(|v| {
+                let size = v.size.map(actions::fmt_bytes).unwrap_or_else(|| "size unknown".into());
+                let title = format!("{}  ({size}{})", v.name, if v.containers.is_empty() { ", unused" } else { "" });
+                match actions::volume_actions(v) {
+                    a if a.is_empty() => Entry::Label(title),
+                    a => Entry::Submenu(title, a.into_iter().map(Entry::Action).collect()),
+                }
+            })
+            .collect();
+        out.push(Entry::Submenu(format!("Volumes ({})", m.volumes.len()), items));
+    }
+    let disk = actions::disk_actions(m.running, &m.images, &m.volumes, m.disk.as_ref());
+    out.push(Entry::Submenu("Free up disk space".into(), disk.into_iter().map(Entry::Action).collect()));
     if let Some(sb) = &m.sandbox {
         out.push(Entry::Label(format!("Sandbox VM: {}", sb["project"].as_str().unwrap_or("?"))));
     }
@@ -245,12 +277,27 @@ pub fn entries(m: &Model) -> Vec<Entry> {
             .collect();
         out.push(Entry::Submenu("Jobs".into(), items));
     }
+    if let Some(nodes) = &m.nodes {
+        let items = nodes
+            .iter()
+            .map(|n| Entry::Submenu(format!("{}  ({})", n.id, n.state), actions::node_actions(n).into_iter().map(Entry::Action).collect()))
+            .collect();
+        out.push(Entry::Submenu(format!("Nodes ({})", nodes.len()), items));
+    }
+    let remote = actions::remote_actions(&m.remotes);
+    let controller = actions::controller_actions(m.admin);
+    if let Some(d) = &m.remotes.default {
+        let mut items: Vec<Entry> = m.remote_errors.iter().map(|(what, e)| Entry::Label(format!("{what}: {e}"))).collect();
+        items.extend(remote.into_iter().chain(controller).map(Entry::Action));
+        let title = if m.remote_errors.is_empty() { format!("Remote: {d}") } else { format!("Remote: {d} (error)") };
+        out.push(Entry::Submenu(title, items));
+    }
     if m.namespaces.all.len() > 1 {
         let items = actions::namespace_actions(&m.namespaces).into_iter().map(Entry::Action).collect();
         out.push(Entry::Submenu(format!("Namespace: {}", m.namespaces.current), items));
     }
     if let Some(bans) = &m.bans {
-        let items = actions::ban_actions(bans).into_iter().map(Entry::Action).collect();
+        let items = actions::ban_actions(bans, &m.edge_clients).into_iter().map(Entry::Action).collect();
         out.push(Entry::Submenu(format!("Edge bans ({})", bans.len()), items));
     }
     out
@@ -580,7 +627,17 @@ mod tests {
             namespaces: crate::actions::tests::sample_namespaces(),
             hosts: crate::actions::tests::sample_hosts(),
             bans: Some(crate::actions::tests::sample_bans()),
+            images: crate::actions::tests::sample_images(),
+            volumes: crate::actions::tests::sample_volumes(),
+            disk: None,
+            nodes: Some(crate::actions::tests::sample_nodes()),
+            edge_clients: crate::actions::tests::sample_clients(),
+            remotes: crate::actions::tests::sample_remotes(),
+            admin: true,
+            remote_errors: Default::default(),
         };
+        let done = crate::actions::RemoteJob { state: "done".into(), ..crate::actions::tests::sample_job() };
+        let model = Model { jobs: vec![crate::actions::tests::sample_job(), done], ..model };
         fn kinds(e: &[Entry], out: &mut Vec<crate::actions::Kind>) {
             for e in e {
                 match e {

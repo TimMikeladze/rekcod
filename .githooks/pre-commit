@@ -14,3 +14,9 @@ if rustup target list --installed 2>/dev/null | grep -qx aarch64-unknown-linux-m
 fi
 echo "pre-commit: tests"
 cargo test -q --workspace
+
+# The dashboard, when it's installed (cd dashboard && npm ci) and a staged change touches it.
+if [[ -d dashboard/node_modules ]] && git diff --cached --name-only | grep -q '^dashboard/'; then
+  echo "pre-commit: dashboard"
+  (cd dashboard && npm test --silent && npm run --silent typecheck && npm run --silent lint && npm run --silent test:e2e)
+fi

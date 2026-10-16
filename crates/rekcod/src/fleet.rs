@@ -121,6 +121,7 @@ impl Remote {
 
 /// Paths the controller serves per namespace; everything else is fleet-wide.
 pub fn is_scoped(path: &str) -> bool {
+    let path = path.split('?').next().unwrap_or(path);
     ["/apps", "/sandboxes", "/jobs", "/schedules"].iter().any(|p| path == *p || path.starts_with(&format!("{p}/")))
 }
 
@@ -163,6 +164,18 @@ pub fn remote_use_ns(paths: &Paths, name: Option<&str>, ns: &str) -> Result<()> 
     rem.ns = Some(ns.into()).filter(|n| n != "default");
     save_remotes(paths, &r)?;
     eprintln!("rekcod: remote {name} now uses namespace {ns}");
+    Ok(())
+}
+
+/// `rekcod remote use NAME`: the remote commands without `--remote` go to.
+pub fn remote_use(paths: &Paths, name: &str) -> Result<()> {
+    let mut r = remotes(paths);
+    if !r.remotes.contains_key(name) {
+        bail!("no remote {name}");
+    }
+    r.default = Some(name.into());
+    save_remotes(paths, &r)?;
+    eprintln!("rekcod: default remote is now {name}");
     Ok(())
 }
 
@@ -746,7 +759,10 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             } else {
                 0
             };
-            let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs});
+            let (disk_total, disk_free) = disk_gib(&hb_paths.home);
+            let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs,
+                              "cpus": crate::cli::sysctl_u64("hw.ncpu").unwrap_or(0), "load": load_average(),
+                              "disk_total_gib": disk_total, "disk_free_gib": disk_free});
             match call(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body) {
                 Ok(v) => {
                     let mut ips: Vec<IpAddr> =
@@ -769,6 +785,23 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
         std::thread::spawn(move || crate::sandbox_api::handle(&p, s, Some(&t)));
     }
     Ok(())
+}
+
+/// The 1-minute load average.
+fn load_average() -> f64 {
+    let mut l = [0f64; 3];
+    if unsafe { libc::getloadavg(l.as_mut_ptr(), 3) } < 1 { 0.0 } else { l[0] }
+}
+
+/// (total, free) GiB on the volume holding `dir`.
+fn disk_gib(dir: &Path) -> (u64, u64) {
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else { return (0, 0) };
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
+        return (0, 0);
+    }
+    let bs = s.f_bsize as u64;
+    ((s.f_blocks * bs) >> 30, (s.f_bavail * bs) >> 30)
 }
 
 // ------------------------------------------------------------- controller
@@ -824,6 +857,19 @@ const MIGRATIONS: &[&str] = &[
     "alter table apps add column bucket integer not null default 0",
     "alter table apps add column storage_key text",
     "alter table apps add column storage_secret text",
+    // Release detail (docs/dashboard.md): who deployed, when it finished, the deploy log.
+    "alter table releases add column who text not null default ''",
+    "alter table releases add column finished integer",
+    "alter table releases add column log text not null default ''",
+    // Node load and disk from heartbeats; load is the 1-minute average times 100.
+    "alter table nodes add column cpus integer not null default 0",
+    "alter table nodes add column load integer not null default 0",
+    "alter table nodes add column disk_total integer not null default 0",
+    "alter table nodes add column disk_free integer not null default 0",
+    "alter table bans add column by text not null default ''",
+    // Per-app requests per minute from the edges' activity reports.
+    "create table if not exists traffic (app text not null, minute integer not null, requests integer not null,
+       errors integer not null, p50 integer not null, p95 integer not null, primary key (app, minute))",
 ];
 
 /// The controller's SQLite database. Queries use `?N` parameters; rows come back whole so
@@ -886,6 +932,8 @@ struct Controller {
     edges: Mutex<HashMap<IpAddr, i64>>,
     /// RustFS with root keys (`--storage`): app buckets, release images, backups.
     storage: Option<crate::s3::S3>,
+    /// Edge client reports by minute: (minute, ip) -> (requests, rate-limited). Ten minutes kept.
+    clients: Mutex<HashMap<(i64, String), (i64, i64)>>,
 }
 
 struct Caller {
@@ -949,7 +997,16 @@ fn short_name(key: &str) -> &str {
 
 impl Controller {
     fn new(db: Db, domain: String, drain_secs: u64, key: [u8; 32]) -> Controller {
-        Controller { db: Mutex::new(db), domain, drain_secs, busy: Default::default(), key, edges: Default::default(), storage: None }
+        Controller {
+            db: Mutex::new(db),
+            domain,
+            drain_secs,
+            busy: Default::default(),
+            key,
+            edges: Default::default(),
+            storage: None,
+            clients: Default::default(),
+        }
     }
 
     fn config(&self, key: &str) -> Result<Option<String>> {
@@ -1258,9 +1315,16 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 let free = body["mem_free_mib"].as_i64().unwrap_or(0);
                 let macos_free = body["macos_free"].as_i64().unwrap_or(0) as i32;
                 let next = if state == "lost" { "ready".to_string() } else { state };
+                let load = (body["load"].as_f64().unwrap_or(0.0) * 100.0) as i64;
+                let (cpus, dt, df) = (
+                    body["cpus"].as_i64().unwrap_or(0),
+                    body["disk_total_gib"].as_i64().unwrap_or(0),
+                    body["disk_free_gib"].as_i64().unwrap_or(0),
+                );
                 c.db.lock().unwrap().execute(
-                    "update nodes set mem_free = ?2, last_seen = ?3, state = ?4, macos_free = ?5 where id = ?1",
-                    &[id, &free, &now(), &next, &macos_free],
+                    "update nodes set mem_free = ?2, last_seen = ?3, state = ?4, macos_free = ?5, cpus = ?6, load = ?7,
+                       disk_total = ?8, disk_free = ?9 where id = ?1",
+                    &[id, &free, &now(), &next, &macos_free, &cpus, &load, &dt, &df],
                 )?;
                 // Edges seen in the last 10 minutes may reach instances on this node.
                 let ingress: Vec<String> =
@@ -1280,7 +1344,13 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
     let r: Result<Value> = match (req.method.as_str(), seg.as_slice()) {
         ("GET", ["nodes"]) => admin_only().and_then(|_| {
             let mut db = c.db.lock().unwrap();
-            let rows = db.query("select id, url, mem_total, mem_free, last_seen, state from nodes order by id", &[])?;
+            let rows = db.query(
+                "select id, url, mem_total, mem_free, last_seen, state, cpus, load, disk_total, disk_free,
+                   (select count(*) from instances i where i.node = n.id and i.state in ('live', 'starting', 'sleeping', 'draining')),
+                   (select count(*) from jobs j where j.node = n.id and j.state = 'running')
+                 from nodes n order by id",
+                &[],
+            )?;
             let pools = db.query("select node, ns from node_pools order by ns", &[])?;
             Ok(json!(
                 rows.iter()
@@ -1290,10 +1360,21 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                         json!({
                             "id": id, "url": r.get::<String>(1), "mem_total_mib": r.get::<i64>(2),
                             "mem_free_mib": r.get::<i64>(3), "last_seen": r.get::<i64>(4), "state": r.get::<String>(5), "pool": pool,
+                            "cpus": r.get::<i64>(6), "load": r.get::<i64>(7) as f64 / 100.0,
+                            "disk_total_gib": r.get::<i64>(8), "disk_free_gib": r.get::<i64>(9),
+                            "instances": r.get::<i64>(10), "jobs_running": r.get::<i64>(11),
                         })
                     })
                     .collect::<Vec<_>>()
             ))
+        }),
+        ("POST", ["nodes", id, "undrain"]) => admin_only().and_then(|_| {
+            let n = c.db.lock().unwrap().execute("update nodes set state = 'ready' where id = ?1 and state = 'drain'", &[id])?;
+            if n == 0 {
+                bail!("node {id} isn't drained");
+            }
+            c.audit("-", &who.name, "undrain", id, true);
+            Ok(json!({"undrained": id}))
         }),
         ("POST", ["nodes", id, "drain"]) => admin_only().and_then(|_| {
             let n = c.db.lock().unwrap().execute("update nodes set state = 'drain' where id = ?1", &[id])?;
@@ -1347,12 +1428,14 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             c.audit("-", &who.name, &format!("max_sandboxes {max}"), name, true);
             Ok(json!({"name": name, "tokens": n, "max_sandboxes": limit(max)}))
         }),
+        // `?peek=1` (the dashboard) reads the table without becoming an edge nodes let in.
         ("GET", ["routes"]) => admin_only().and_then(|_| {
-            if let Some(ip) = peer {
+            if let Some(ip) = peer.filter(|_| !req.query.iter().any(|(k, _)| k == "peek")) {
                 c.edges.lock().unwrap().insert(ip, now());
             }
             routes(c)
         }),
+        ("GET", ["edge", "clients"]) => admin_only().map(|_| edge_clients(c)),
         // The edge's hosts with requests since its last report; idle stop counts from these.
         ("POST", ["backups"]) => admin_only().and_then(|_| backup(c)),
         ("GET", ["backups"]) => admin_only().and_then(|_| {
@@ -1367,16 +1450,39 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                     db.execute("update apps set last_request = ?2 where name = ?1", &[&app, &now()])?;
                 }
             }
+            // Several edges report the same minute: counts add up, percentiles keep the worst.
+            for t in body["traffic"].as_array().into_iter().flatten() {
+                let Some(app) = t["host"].as_str().and_then(|h| h.strip_suffix(&suffix)) else { continue };
+                let n = |k: &str| t[k].as_i64().unwrap_or(0);
+                db.execute(
+                    "insert into traffic values (?1, ?2, ?3, ?4, ?5, ?6) on conflict (app, minute) do update set
+                       requests = requests + ?3, errors = errors + ?4, p50 = max(p50, ?5), p95 = max(p95, ?6)",
+                    &[&app, &n("minute"), &n("requests"), &n("errors"), &n("p50_ms"), &n("p95_ms")],
+                )?;
+            }
+            db.execute("delete from traffic where minute < ?1", &[&(now() / 60 - 24 * 60)])?;
+            drop(db);
+            let minute = now() / 60;
+            let mut clients = c.clients.lock().unwrap();
+            for cl in body["clients"].as_array().into_iter().flatten() {
+                let Some(ip) = cl["ip"].as_str() else { continue };
+                let e = clients.entry((minute, ip.to_string())).or_default();
+                e.0 += cl["requests"].as_i64().unwrap_or(0);
+                e.1 += cl["limited"].as_i64().unwrap_or(0);
+            }
+            clients.retain(|(m, _), _| *m > minute - 10);
             Ok(json!({}))
         }),
         ("GET", ["bans"]) => admin_only().and_then(|_| {
-            let rows = c.db.lock().unwrap().query(
-                "select net, reason, until, created from bans where until is null or until > ?1 order by created",
-                &[&now()],
-            )?;
+            let rows = c
+                .db
+                .lock()
+                .unwrap()
+                .query("select net, reason, until, created, by from bans where until is null or until > ?1 order by created", &[&now()])?;
             Ok(json!(
                 rows.iter()
-                    .map(|r| json!({"net": r.get::<String>(0), "reason": r.get::<String>(1), "until": r.get::<Option<i64>>(2), "created": r.get::<i64>(3)}))
+                    .map(|r| json!({"net": r.get::<String>(0), "reason": r.get::<String>(1), "until": r.get::<Option<i64>>(2),
+                                    "created": r.get::<i64>(3), "by": r.get::<String>(4)}))
                     .collect::<Vec<_>>()
             ))
         }),
@@ -1387,7 +1493,10 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             let reason = body["reason"].as_str().unwrap_or("");
             let mut db = c.db.lock().unwrap();
             db.execute("delete from bans where until is not null and until <= ?1", &[&now()])?;
-            db.execute("insert or replace into bans values (?1, ?2, ?3, ?4)", &[&net, &reason, &until, &now()])?;
+            db.execute(
+                "insert or replace into bans (net, reason, until, created, by) values (?1, ?2, ?3, ?4, ?5)",
+                &[&net, &reason, &until, &now(), &who.name],
+            )?;
             drop(db);
             c.audit("-", &who.name, "ban", &net, true);
             Ok(json!({"banned": net, "until": until}))
@@ -1401,7 +1510,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             Ok(json!({"unbanned": net}))
         }),
         (_, ["namespaces", ..]) => namespaces_route(c, &who, &req.method, &seg, &body),
-        (_, ["jobs", ..]) | (_, ["schedules", ..]) => jobs_route(c, &who, &ns, &req.method, &seg, &body),
+        (_, ["jobs", ..]) | (_, ["schedules", ..]) => jobs_route(c, &who, &ns, &req.method, &seg, &body, &req.query),
         ("POST", ["sandboxes"]) => create_sandbox(c, &who, &ns, &req, &mut w).map(|_| Value::Null),
         ("GET", ["sandboxes"]) => (|| {
             c.allow(&who, &ns, Role::Viewer)?;
@@ -1455,7 +1564,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 }
             }
         }
-        _ => apps_route(c, &who, &ns, &req.method, &seg, &body),
+        _ => apps_route(c, &who, &ns, &req.method, &seg, &body, &req.query),
     };
     if matches!(r, Ok(Value::Null)) {
         return Ok(());
@@ -1807,18 +1916,36 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         None => resolve(&app.git_url, &app.git_ref)?,
     };
     let n: i32 = c.db.lock().unwrap().query_one("select coalesce(max(n), 0) + 1 from releases where app = ?1", &[&app.name])?.get(0);
-    c.db.lock().unwrap().execute("insert into releases values (?1, ?2, ?3, 'building', ?4)", &[&app.name, &n, &commit, &now()])?;
+    c.db.lock().unwrap().execute(
+        "insert into releases (app, n, commit_sha, state, created, who) values (?1, ?2, ?3, 'building', ?4, ?5)",
+        &[&app.name, &n, &commit, &now(), &who],
+    )?;
+    // The deploy log kept with the release (`app release NAME N`).
+    let mut log = vec![format!("release {n} of {} at {commit}, by {who}", app.short)];
+    let finish = |state: &str, log: &[String]| {
+        let _ = c.db.lock().unwrap().execute(
+            "update releases set state = ?3, finished = ?4, log = ?5 where app = ?1 and n = ?2",
+            &[&app.name, &n, &state, &now(), &log.join("\n")],
+        );
+    };
     let nodes = c.place(app.memory_gib as i64 * 1024, false, &app.ns)?;
     if nodes.is_empty() {
-        c.db.lock().unwrap().execute("update releases set state = 'failed' where app = ?1 and n = ?2", &[&app.name, &n])?;
+        log.push(format!("no node has {} GiB free", app.memory_gib));
+        finish("failed", &log);
         bail!("no node has {} GiB free", app.memory_gib);
     }
+    log.push(format!(
+        "placing {} instance(s) on {}",
+        app.instances.max(1),
+        nodes.iter().map(|n| n.0.as_str()).collect::<Vec<_>>().join(", ")
+    ));
     let mut env = app.env.clone();
     for (k, v) in app.secrets.as_object().into_iter().flatten() {
         env[k] = v.clone();
     }
-    let bucket = bucket_env(c, app).inspect_err(|_| {
-        let _ = c.db.lock().unwrap().execute("update releases set state = 'failed' where app = ?1 and n = ?2", &[&app.name, &n]);
+    let bucket = bucket_env(c, app).inspect_err(|e| {
+        log.push(format!("bucket: {e:#}"));
+        finish("failed", &log);
     })?;
     for (k, v) in bucket {
         env[k] = json!(v);
@@ -1850,6 +1977,12 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
     for h in results {
         match h {
             Ok((node, Ok(v))) => {
+                log.push(format!(
+                    "{node}: started {} at {}{}",
+                    v["sandbox"].as_str().unwrap_or("?"),
+                    v["endpoint"].as_str().unwrap_or("?"),
+                    if v["pushed"] == json!(true) { " (built, image stored)" } else { "" }
+                ));
                 if let Some(h) = v["health"].as_str().filter(|_| app.health == "/") {
                     health = h.to_string();
                 }
@@ -1873,15 +2006,25 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         let t0 = Instant::now();
         let mut pending: Vec<&(String, String, String)> = started.iter().collect();
         while !pending.is_empty() && t0.elapsed() < Duration::from_secs(30) {
-            pending.retain(|(_, _, ep)| !healthy(ep, &health));
+            pending.retain(|(_, sb, ep)| {
+                let ok = healthy(ep, &health);
+                if ok {
+                    log.push(format!("{sb}: {health} healthy after {:.1}s", t0.elapsed().as_secs_f64()));
+                }
+                !ok
+            });
             if !pending.is_empty() {
                 std::thread::sleep(Duration::from_millis(300));
             }
         }
         for (node, sb, _) in pending {
             let logs = c.node(node).and_then(|(url, sec, _)| call(&url, "GET", &format!("/sandboxes/{sb}/logs"), Some(&sec), &Value::Null));
-            let tail =
-                logs.map(|v| v["logs"].as_str().unwrap_or("").lines().rev().take(10).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+            let tail = logs
+                .map(|v| {
+                    let lines: Vec<&str> = v["logs"].as_str().unwrap_or("").lines().collect();
+                    lines[lines.len().saturating_sub(10)..].join("\n")
+                })
+                .unwrap_or_default();
             errors.push(format!("{sb}: health check {health} failed within 30s; last log lines:\n{tail}"));
         }
     }
@@ -1889,7 +2032,9 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         for (node, sb, _) in &started {
             delete_instance(c, node, sb);
         }
-        c.db.lock().unwrap().execute("update releases set state = 'failed' where app = ?1 and n = ?2", &[&app.name, &n])?;
+        log.extend(errors.iter().cloned());
+        log.push("failed; the previous release keeps serving".into());
+        finish("failed", &log);
         c.audit(&app.ns, who, "deploy", &format!("{} r{n}", app.short), false);
         bail!("release {n} failed, the previous release keeps serving:\n{}", errors.join("\n"));
     }
@@ -1900,10 +2045,13 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
             &[&app.name, &n],
         )?;
         db.execute("update instances set state = 'live' where app = ?1 and release = ?2", &[&app.name, &n])?;
-        db.execute("update releases set state = 'live' where app = ?1 and n = ?2", &[&app.name, &n])?;
         db.execute("update apps set live_release = ?2 where name = ?1", &[&app.name, &n])?;
+        // One live release: the one it replaces is what `rollback` goes back to.
+        db.execute("update releases set state = 'old' where app = ?1 and state = 'live' and n <> ?2", &[&app.name, &n])?;
         old.iter().map(|r| (r.get(0), r.get(1))).collect()
     };
+    log.push(format!("live; draining {} old instance(s) for {}s", old.len(), c.drain_secs));
+    finish("live", &log);
     let (c2, drain) = (c.clone(), c.drain_secs);
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(drain));
@@ -2073,23 +2221,92 @@ fn recycle_due(c: &Arc<Controller>) -> Result<()> {
 }
 
 fn app_status(c: &Controller, app: &App) -> Result<Value> {
+    app_details(c, std::slice::from_ref(&app.name))?.pop().context("app vanished")
+}
+
+/// `GET /apps/{name}` for each row key, from four queries however many apps there are.
+/// Secrets come back as names only, so nothing is unsealed.
+fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
+    if keys.is_empty() {
+        return Ok(vec![]);
+    }
+    let marks = (1..=keys.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
+    let params: Vec<&dyn rusqlite::ToSql> = keys.iter().map(|k| k as &dyn rusqlite::ToSql).collect();
     let mut db = c.db.lock().unwrap();
-    let row =
-        db.query_one("select live_release, public, idle_stop, recycle, last_request, http from apps where name = ?1", &[&app.name])?;
-    let http: Value = serde_json::from_str(&row.get::<String>(5)).unwrap_or(json!({}));
-    let (live, public): (Option<i32>, bool) = (row.get(0), row.get(1));
-    let (idle_stop, recycle, last_request): (i64, i64, i64) = (row.get(2), row.get(3), row.get(4));
-    let rel = db.query("select n, commit_sha, state, created from releases where app = ?1 order by n desc limit 20", &[&app.name])?;
-    let inst =
-        db.query("select release, sandbox, node, endpoint, state from instances where app = ?1 and state <> 'removed'", &[&app.name])?;
-    Ok(json!({
-        "name": app.short, "ns": app.ns, "url": format!("http://{}.{}", app.name, c.domain), "git": {"url": app.git_url, "ref": app.git_ref},
-        "port": app.port, "instances_wanted": app.instances, "live_release": live, "public": public,
-        "idle_stop_secs": idle_stop, "recycle_secs": recycle, "last_request": last_request, "http": http,
-        "env": app.env, "secrets": app.secrets.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
-        "releases": rel.iter().map(|r| json!({"n": r.get::<i32>(0), "commit": r.get::<String>(1), "state": r.get::<String>(2), "created": r.get::<i64>(3)})).collect::<Vec<_>>(),
-        "instances": inst.iter().map(|r| json!({"release": r.get::<i32>(0), "sandbox": r.get::<String>(1), "node": r.get::<String>(2), "endpoint": r.get::<String>(3), "state": r.get::<String>(4)})).collect::<Vec<_>>(),
-    }))
+    let apps = db.query(
+        &format!(
+            "select name, ns, git_url, git_ref, port, instances, live_release, public, idle_stop, recycle, last_request, http, env, secrets
+             from apps where name in ({marks}) order by name"
+        ),
+        &params,
+    )?;
+    let releases = db.query(
+        &format!(
+            "select app, n, commit_sha, state, created, who, finished from
+               (select *, row_number() over (partition by app order by n desc) as k from releases where app in ({marks}))
+             where k <= 20 order by app, n desc"
+        ),
+        &params,
+    )?;
+    let instances = db.query(
+        &format!(
+            "select i.app, i.release, i.sandbox, i.node, i.endpoint, i.state, coalesce(s.created, 0) from instances i
+             left join sandboxes s on s.id = i.sandbox where i.app in ({marks}) and i.state <> 'removed'"
+        ),
+        &params,
+    )?;
+    let since = now() / 60 - 60;
+    let mut tparams = params.clone();
+    tparams.push(&since);
+    let traffic = db.query(
+        &format!(
+            "select app, minute, requests, errors, p50, p95 from traffic where app in ({marks}) and minute >= ?{} order by app, minute",
+            keys.len() + 1
+        ),
+        &tparams,
+    )?;
+    drop(db);
+    Ok(apps
+        .iter()
+        .map(|r| {
+            let name: String = r.get(0);
+            let secrets: Value = serde_json::from_str(&r.get::<String>(13)).unwrap_or(json!({}));
+            json!({
+                "name": short_name(&name), "ns": r.get::<String>(1), "url": format!("http://{name}.{}", c.domain),
+                "git": {"url": r.get::<String>(2), "ref": r.get::<String>(3)},
+                "port": r.get::<i32>(4), "instances_wanted": r.get::<i32>(5), "live_release": r.get::<Option<i32>>(6),
+                "public": r.get::<bool>(7), "idle_stop_secs": r.get::<i64>(8), "recycle_secs": r.get::<i64>(9),
+                "last_request": r.get::<i64>(10), "http": serde_json::from_str::<Value>(&r.get::<String>(11)).unwrap_or(json!({})),
+                "env": serde_json::from_str::<Value>(&r.get::<String>(12)).unwrap_or(json!({})),
+                "secrets": secrets.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
+                "releases": releases.iter().filter(|x| x.get::<String>(0) == name).map(|x| json!({
+                    "n": x.get::<i32>(1), "commit": x.get::<String>(2), "state": x.get::<String>(3), "created": x.get::<i64>(4),
+                    "who": x.get::<String>(5), "finished": x.get::<Option<i64>>(6),
+                })).collect::<Vec<_>>(),
+                "instances": instances.iter().filter(|x| x.get::<String>(0) == name).map(|x| json!({
+                    "release": x.get::<i32>(1), "sandbox": x.get::<String>(2), "node": x.get::<String>(3),
+                    "endpoint": x.get::<String>(4), "state": x.get::<String>(5), "created": x.get::<i64>(6),
+                })).collect::<Vec<_>>(),
+                "traffic": traffic.iter().filter(|x| x.get::<String>(0) == name).map(|x| json!({
+                    "minute": x.get::<i64>(1), "requests": x.get::<i64>(2), "errors": x.get::<i64>(3),
+                    "p50_ms": x.get::<i64>(4), "p95_ms": x.get::<i64>(5),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect())
+}
+
+/// Top client IPs over the last 10 minutes of edge reports, busiest first.
+fn edge_clients(c: &Controller) -> Value {
+    let mut sum: HashMap<String, (i64, i64)> = HashMap::new();
+    for ((_, ip), (n, l)) in c.clients.lock().unwrap().iter() {
+        let e = sum.entry(ip.clone()).or_default();
+        e.0 += n;
+        e.1 += l;
+    }
+    let mut v: Vec<_> = sum.into_iter().collect();
+    v.sort_by(|a, b| (b.1.0, &a.0).cmp(&(a.1.0, &b.0)));
+    json!(v.iter().take(20).map(|(ip, (n, l))| json!({"ip": ip, "requests": n, "limited": l})).collect::<Vec<_>>())
 }
 
 /// Creates or updates app `b.name` in `ns`; returns its short name. The caller has checked
@@ -2107,7 +2324,9 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
     let git_ref = b["git"]["ref"].as_str().unwrap_or("main");
     // 0: the commit's rekcod.toml decides (3000 if it doesn't say).
     let port = b["port"].as_i64().unwrap_or(0) as i32;
-    let instances = b["instances"].as_i64().unwrap_or(1) as i32;
+    // Left out (a deploy without --instances) keeps an existing app's count.
+    let existing: Option<i32> = c.db.lock().unwrap().query_opt("select instances from apps where name = ?1", &[&name])?.map(|r| r.get(0));
+    let instances = b["instances"].as_i64().map(|n| n as i32).or(existing).unwrap_or(1);
     let cpus = b["cpus"].as_i64().unwrap_or(1) as i32;
     let mem = b["memory_gib"].as_i64().unwrap_or(1) as i32;
     let health = b["health"].as_str().unwrap_or("/");
@@ -2169,7 +2388,7 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
     Ok(short)
 }
 
-fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[&str], b: &Value) -> Result<Value> {
+fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[&str], b: &Value, q: &[(String, String)]) -> Result<Value> {
     let load = |name: &str, need: Role| load_app(c, ns, name, who, need);
     match (method, seg) {
         ("GET", ["apps"]) => {
@@ -2181,15 +2400,22 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                  from apps where ns = ?1 and (?1 <> 'default' or owner = ?2 or ?3) order by name",
                 &[&ns, &who.name, &who.admin],
             )?;
-            Ok(json!(
-                rows.iter()
-                    .map(|r| json!({
-                        "name": short_name(&r.get::<String>(0)), "ns": ns, "git": r.get::<String>(1), "live_release": r.get::<Option<i32>>(2),
-                        "instances": r.get::<i32>(3), "preview_of": r.get::<Option<String>>(4).map(|p| short_name(&p).to_string()),
-                        "public": r.get::<bool>(5), "url": format!("http://{}.{}", r.get::<String>(0), c.domain), "sleeping": r.get::<bool>(6),
-                    }))
-                    .collect::<Vec<_>>()
-            ))
+            let mut list: Vec<Value> = rows
+                .iter()
+                .map(|r| json!({
+                    "name": short_name(&r.get::<String>(0)), "ns": ns, "git": r.get::<String>(1), "live_release": r.get::<Option<i32>>(2),
+                    "instances": r.get::<i32>(3), "preview_of": r.get::<Option<String>>(4).map(|p| short_name(&p).to_string()),
+                    "public": r.get::<bool>(5), "url": format!("http://{}.{}", r.get::<String>(0), c.domain), "sleeping": r.get::<bool>(6),
+                }))
+                .collect();
+            // `?detail=1`: each app's `GET /apps/{name}` too, for the dashboard's one call.
+            if q.iter().any(|(k, v)| k == "detail" && v != "0") {
+                let keys: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+                for (a, d) in list.iter_mut().zip(app_details(c, &keys)?) {
+                    a["detail"] = d;
+                }
+            }
+            Ok(json!(list))
         }
         // Create or update the app's config, then deploy it.
         ("POST", ["apps"]) => {
@@ -2246,6 +2472,31 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             c.db.lock().unwrap().execute(&format!("update apps set {col} = ?2 where name = ?1"), &[&app.name, &map.to_string()])?;
             let Some(commit) = live_commit(c, &app.name)? else { return Ok(json!({"updated": col})) };
             deploy(c, &load(name, Role::Member)?, Some(commit), &who.name)
+        }
+        ("GET", ["apps", name, "releases", n]) => {
+            let app = load(name, Role::Viewer)?;
+            let n: i32 = n.parse().map_err(|_| anyhow!("release numbers are integers"))?;
+            let r = c.db.lock().unwrap().query_opt(
+                "select n, commit_sha, state, created, who, finished, log from releases where app = ?1 and n = ?2",
+                &[&app.name, &n],
+            )?;
+            let r = r.ok_or_else(|| anyhow!("{name} has no release {n}"))?;
+            Ok(json!({
+                "app": name, "n": r.get::<i32>(0), "commit": r.get::<String>(1), "state": r.get::<String>(2), "created": r.get::<i64>(3),
+                "who": r.get::<String>(4), "finished": r.get::<Option<i64>>(5), "log": r.get::<String>(6),
+            }))
+        }
+        ("GET", ["apps", name, "instances", sb, "logs"]) => {
+            let app = load(name, Role::Viewer)?;
+            let node: String =
+                c.db.lock()
+                    .unwrap()
+                    .query_opt("select node from instances where app = ?1 and sandbox = ?2", &[&app.name, sb])?
+                    .ok_or_else(|| anyhow!("{name} has no instance {sb}"))?
+                    .get(0);
+            let (url, sec, _) = c.node(&node)?;
+            let v = call(&url, "GET", &format!("/sandboxes/{sb}/logs"), Some(&sec), &Value::Null)?;
+            Ok(json!({"logs": v["logs"].as_str().unwrap_or("")}))
         }
         ("GET", ["apps", name, "logs"]) => {
             let app = load(name, Role::Viewer)?;
@@ -2422,7 +2673,7 @@ fn load_job(c: &Controller, ns: &str, id: &str, who: &Caller, need: Role) -> Res
     Ok((job_json(&r), r.get(11)))
 }
 
-fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[&str], b: &Value) -> Result<Value> {
+fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[&str], b: &Value, q: &[(String, String)]) -> Result<Value> {
     match (method, seg) {
         ("POST", ["jobs"]) => {
             c.allow(who, ns, Role::Member)?;
@@ -2451,11 +2702,14 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         ("GET", ["jobs"]) => {
             c.allow(who, ns, Role::Viewer)?;
             let mut db = c.db.lock().unwrap();
+            // `?name=N`: the last 50 runs of one named or scheduled job.
+            let name = q.iter().find(|(k, _)| k == "name").map(|(_, v)| v.as_str());
             let jobs = db.query(
                 &format!(
-                    "select {JOB_COLS} from jobs where ns = ?1 and (?1 <> 'default' or owner = ?2 or ?3) order by created desc limit 50"
+                    "select {JOB_COLS} from jobs where ns = ?1 and (?1 <> 'default' or owner = ?2 or ?3)
+                       and (?4 is null or name = ?4 or schedule = ?5) order by created desc limit 50"
                 ),
-                &[&ns, &who.name, &who.admin],
+                &[&ns, &who.name, &who.admin, &name, &name.map(|n| app_key(ns, n))],
             )?;
             let sch = db.query(
                 "select name, owner, every, last_run, last_job from schedules where ns = ?1 and (?1 <> 'default' or owner = ?2 or ?3) order by name",
@@ -2463,9 +2717,11 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             )?;
             Ok(json!({
                 "jobs": jobs.iter().map(job_json).collect::<Vec<_>>(),
+                // The watchdog starts it on the first tick after `next_run` once the last run has finished.
                 "schedules": sch.iter().map(|r| json!({
                     "name": short_name(&r.get::<String>(0)), "owner": r.get::<String>(1), "every_secs": r.get::<i64>(2),
                     "last_run": r.get::<i64>(3), "last_job": r.get::<Option<String>>(4),
+                    "next_run": (r.get::<i64>(3) + r.get::<i64>(2)).max(now()),
                 })).collect::<Vec<_>>(),
             }))
         }
@@ -2481,6 +2737,17 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 }
             }
             Ok(v)
+        }
+        // The same spec again as a one-off job (a schedule's run doesn't renew the schedule).
+        ("POST", ["jobs", id, "rerun"]) => {
+            let (v, _) = load_job(c, ns, id, who, Role::Member)?;
+            if v["state"] == "running" {
+                bail!("job {id} is still running");
+            }
+            let spec: String = c.db.lock().unwrap().query_one("select spec from jobs where id = ?1", &[id])?.get(0);
+            let mut spec: Value = serde_json::from_str(&spec)?;
+            spec.as_object_mut().map(|o| o.remove("every_secs"));
+            start_job(c, ns, &who.name, who.max, &spec, None)
         }
         ("POST", ["jobs", id, "cancel"]) => {
             let (v, _) = load_job(c, ns, id, who, Role::Member)?;

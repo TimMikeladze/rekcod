@@ -25,6 +25,31 @@ jobs:
       - run: cargo clippy -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings
       - run: cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
 
+  # The web dashboard against fixtures/state.json: no VM, no rekcod binary needed.
+  dashboard:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - run: npm ci
+      - run: npm test
+      - run: npm run typecheck
+      - run: npm run lint
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: dashboard/playwright-report
+
   guest:
     runs-on: ubuntu-24.04-arm
     steps:

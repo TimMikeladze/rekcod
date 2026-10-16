@@ -166,6 +166,26 @@ compact, root shell; start, stop, restart, logs or remove a container; open a po
 save, restore or delete a snapshot; open a shell in an agent sandbox, diff, apply, stop or delete it. Every item runs the matching `rekcod` command, and
 anything destructive asks first. How it stays in sync with the CLI: [`docs/frontends.md`](docs/frontends.md).
 
+### Dashboard
+
+`dashboard/` is a web version of the menu bar with room for the fleet: containers grouped by
+compose project with live CPU and memory, images, volumes and a disk breakdown, apps with
+traffic, releases (and their deploy logs) and instances, jobs and schedules, nodes, routes,
+backups, bans, sandboxes and snapshots, plus a "needs attention" list. Every detail is a page
+of its own (`/containers/web`, `/apps/blog`, `/nodes/n-1`).
+
+```sh
+rekcod dashboard     # the bundled build, on http://localhost:4500 or the next free port
+# or from a checkout:
+cd dashboard && npm ci && npm run dev
+```
+
+Docker events push changes into the page (a container stopped in a terminal shows in about
+half a second) and the fleet refreshes every 15 s. Every button runs one of the actions
+`rekcod state` lists, the same ones the menu bar offers; logs stream on a page of their own,
+shells open Terminal, and everything run is kept on an Activity page. Details:
+[`docs/dashboard.md`](docs/dashboard.md).
+
 ### Sandbox
 
 `rekcod x --sandbox <command>` runs in a second, throwaway VM whose only Mac
@@ -505,20 +525,22 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod mcp` | MCP server on stdio for the sandbox commands |
 | `rekcod macos fetch\|install\|setup\|authorize\|ls\|rm` | macOS base images for `sandbox create --os macos` |
 | `rekcod sandbox screenshot\|input` | Screen and mouse/keyboard of a macOS sandbox |
-| `rekcod remote add\|ls\|rm` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`) |
+| `rekcod remote add\|ls\|rm\|use` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`); `use` sets the default |
 | `rekcod ns create\|ls\|quota\|member\|use\|rm` | Namespaces on the fleet (`--ns` on `sandbox`, `app` and `job`) |
-| `rekcod node join\|serve\|ls\|drain\|pool\|uninstall` | Run this Mac as a fleet node; list, drain or dedicate nodes |
+| `rekcod node join\|serve\|ls\|drain\|undrain\|pool\|uninstall` | Run this Mac as a fleet node; list, drain, undrain or dedicate nodes |
 | `rekcod controller serve\|token\|limit\|backup\|backups\|restore\|uninstall` | The fleet controller; create user tokens, change their caps, back up `fleet.db` |
 | `rekcod storage serve\|uninstall\|up\|down\|env` | RustFS: the fleet's S3 bucket, or one in the local VM |
 | `rekcod edge serve\|ban\|unban\|bans\|uninstall` | HTTP ingress for apps; ban IPs and ranges on every edge |
-| `rekcod app deploy\|ls\|status\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet |
-| `rekcod job run\|ls\|logs\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every` |
+| `rekcod app deploy\|ls\|status\|release\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet; `release NAME N` prints one release with its deploy log, `logs --instance ID` one instance's logs |
+| `rekcod job run\|ls\|logs\|rerun\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every`; `ls --name N` is one job's last 50 runs, `logs -f` follows a running one, `rerun ID` runs a finished one again |
 | `rekcod host add\|ls\|use\|rm\|forward` | Another Mac's rekcod as the docker engine, over SSH; `add --fleet` also provisions it as a fleet |
 | `rekcod spare setup\|uninstall` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, no sleep) |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
-| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, local S3 storage (start, env, stop), containers (start, stop, restart, logs, remove), ports (click to open), snapshots (save, restore, delete), agent sandboxes (shell, diff, apply, stop, delete), apps on the default remote (open, logs, roll back, wake, restart instances, destroy), jobs (output, cancel). `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
+| `rekcod menubar [--install\|--uninstall]` | Menu bar item with the same actions as the CLI: VM start/stop/compact/shell, local S3 storage (start, env, stop), containers (start, stop, restart, logs, remove), ports (click to open), compose projects (restart, stop, down), snapshots (save, restore, delete), images and volumes (remove, prune), agent sandboxes (shell, diff, apply, stop, delete), apps on the default remote (open, logs, roll back, wake, restart instances, destroy), jobs (output, run again, cancel), nodes (drain, undrain), remotes (switch, back up the controller), edge bans. `--install` starts it at login (LaunchAgent `dev.rekcod.menubar`) |
+| `rekcod state` | Everything the menu bar and dashboard show, with each item's actions (`argv`, `confirm`), as one JSON document; `--local` skips the fleet controller |
+| `rekcod dashboard [--install\|--uninstall]` | Start the web dashboard (or find the running one) and open it; `--install` runs it at login (LaunchAgent `dev.rekcod.dashboard`) |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |
@@ -564,6 +586,7 @@ that can run VMs, so it runs locally.
 ```sh
 cargo test --workspace                       # unit tests
 cargo fmt --all --check                      # formatting (rustfmt.toml; CI enforces it)
+(cd dashboard && npm test && npm run typecheck && npm run lint)  # dashboard
 scripts/e2e.sh                               # real CLI + compose against rekcod
 E2E_IMPORT_FROM=orbstack scripts/e2e.sh      # also exercises import
 python3 bench/headroom.py --context rekcod   # file-sharing benchmark (compare --context orbstack)
@@ -594,7 +617,7 @@ FSEvents   ─▶ rekcodd ──vsock──▶ agent ─▶ fuse rekcod_notify: 
 guest DNS  ─▶ dnsmasq ─▶ agent stub ──vsock──▶ rekcodd ─▶ Mac resolvers
 ```
 
-- `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy (`proxy.rs`, rewrites `containers/create` for `dev.rekcod.local`), the port forwarder (published ports and `rekcod x` listeners), file events, the DNS bridge and clock sync. `snap.rs` and `xrun.rs` implement `rekcod snap` and `rekcod x`; `actions.rs` is the action list that `menubar.rs` renders.
+- `crates/rekcod`: CLI plus the daemon that owns the VM (`objc2-virtualization`), the socket proxy (`proxy.rs`, rewrites `containers/create` for `dev.rekcod.local`), the port forwarder (published ports and `rekcod x` listeners), file events, the DNS bridge and clock sync. `snap.rs` and `xrun.rs` implement `rekcod snap` and `rekcod x`; `actions.rs` is the action list that `menubar.rs` renders and `state.rs` prints for the dashboard (`dashboard/`, Next.js).
 - `crates/rekcod-agent`: static musl guest agent.
 - `crates/rekcod-proto`: vsock ports and wire formats.
 - `guest/`: a 6.12 LTS kernel built from Alpine's `linux-virt` config plus `guest/kernel/rekcod.config` (virtio, ext4, fuse and docker's netfilter built in, no initramfs; [docs/custom-kernel.md](docs/custom-kernel.md)), an Alpine ext4 root with upstream static docker binaries, and busybox init. `--build-arg KERNEL=alpine` builds the stock-kernel guest instead.

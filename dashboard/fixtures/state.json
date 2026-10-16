@@ -1,0 +1,2767 @@
+{
+  "generated": 1792128424,
+  "running": true,
+  "status": {
+    "running": true,
+    "pid": 1,
+    "dockerd": "29.9.0",
+    "api": "1.56",
+    "kernel": "6.12.112-rekcod",
+    "cpus": 6,
+    "memory_mib": 8192,
+    "fs_cache": true,
+    "context": "rekcod",
+    "default_socket": "rekcod",
+    "disk": {
+      "used_in_vm": 56924246016,
+      "size": 269427478528,
+      "on_mac": 58464202752
+    },
+    "uptime_secs": 10920,
+    "socket": "unix:///Users/me/.rekcod/run/docker.sock",
+    "warming": [],
+    "fs_requests": {
+      "1": 948,
+      "3": 2001,
+      "14": 504,
+      "15": 524,
+      "16": 10766,
+      "18": 974,
+      "22": 10766,
+      "27": 2013,
+      "28": 100,
+      "29": 2013,
+      "44": 5600
+    }
+  },
+  "sandbox_vm": null,
+  "socket_installed": true,
+  "vm_actions": [
+    {
+      "kind": "VmStop",
+      "label": "Stop rekcod",
+      "argv": [
+        "stop"
+      ],
+      "interactive": false,
+      "confirm": "Stop rekcod? Running containers stop (and `--rm` ones are deleted)."
+    },
+    {
+      "kind": "Compact",
+      "label": "Compact data disk",
+      "argv": [
+        "compact"
+      ],
+      "interactive": false,
+      "confirm": null
+    },
+    {
+      "kind": "Shell",
+      "label": "Root shell in the VM",
+      "argv": [
+        "shell"
+      ],
+      "interactive": true,
+      "confirm": null
+    },
+    {
+      "kind": "DashboardOpen",
+      "label": "Open the dashboard",
+      "argv": [
+        "dashboard"
+      ],
+      "interactive": false,
+      "confirm": null
+    }
+  ],
+  "storage_actions": [
+    {
+      "kind": "StorageUp",
+      "label": "Start S3 storage (RustFS)",
+      "argv": [
+        "storage",
+        "up"
+      ],
+      "interactive": true,
+      "confirm": null
+    }
+  ],
+  "containers": [
+    {
+      "id": "shop-web-100000000000000000000",
+      "name": "shop-web-1",
+      "image": "shop-web:dev",
+      "state": "running",
+      "status": "Up 3 hours",
+      "project": "shop",
+      "ports": [
+        3000
+      ],
+      "actions": [
+        {
+          "kind": "ContainerStop",
+          "label": "Stop",
+          "argv": [
+            "stop",
+            "shop-web-1"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerRestart",
+          "label": "Restart",
+          "argv": [
+            "restart",
+            "shop-web-1"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerLogs",
+          "label": "Logs",
+          "argv": [
+            "logs",
+            "-f",
+            "--tail",
+            "200",
+            "shop-web-1"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerRemove",
+          "label": "Remove",
+          "argv": [
+            "rm",
+            "-f",
+            "shop-web-1"
+          ],
+          "interactive": false,
+          "confirm": "Remove container shop-web-1?"
+        }
+      ],
+      "service": "web",
+      "volumes": []
+    },
+    {
+      "id": "shop-pg-100000000000000000000",
+      "name": "shop-pg-1",
+      "image": "postgres:17",
+      "state": "running",
+      "status": "Up 3 hours",
+      "project": "shop",
+      "ports": [
+        5432
+      ],
+      "actions": [
+        {
+          "kind": "ContainerStop",
+          "label": "Stop",
+          "argv": [
+            "stop",
+            "shop-pg-1"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerRestart",
+          "label": "Restart",
+          "argv": [
+            "restart",
+            "shop-pg-1"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerLogs",
+          "label": "Logs",
+          "argv": [
+            "logs",
+            "-f",
+            "--tail",
+            "200",
+            "shop-pg-1"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerRemove",
+          "label": "Remove",
+          "argv": [
+            "rm",
+            "-f",
+            "shop-pg-1"
+          ],
+          "interactive": false,
+          "confirm": "Remove container shop-pg-1?"
+        }
+      ],
+      "service": "pg",
+      "volumes": [
+        "shop_pg"
+      ]
+    },
+    {
+      "id": "redis00000000000000000000",
+      "name": "redis",
+      "image": "redis:7",
+      "state": "running",
+      "status": "Up 2 days",
+      "project": null,
+      "ports": [
+        6379
+      ],
+      "actions": [
+        {
+          "kind": "ContainerStop",
+          "label": "Stop",
+          "argv": [
+            "stop",
+            "redis"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerRestart",
+          "label": "Restart",
+          "argv": [
+            "restart",
+            "redis"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerLogs",
+          "label": "Logs",
+          "argv": [
+            "logs",
+            "-f",
+            "--tail",
+            "200",
+            "redis"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerRemove",
+          "label": "Remove",
+          "argv": [
+            "rm",
+            "-f",
+            "redis"
+          ],
+          "interactive": false,
+          "confirm": "Remove container redis?"
+        }
+      ],
+      "service": null,
+      "volumes": [
+        "redis-data"
+      ]
+    },
+    {
+      "id": "old-worker00000000000000000000",
+      "name": "old-worker",
+      "image": "alpine",
+      "state": "exited",
+      "status": "Exited (1) 4 hours ago",
+      "project": null,
+      "ports": [],
+      "actions": [
+        {
+          "kind": "ContainerStart",
+          "label": "Start",
+          "argv": [
+            "start",
+            "old-worker"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerLogs",
+          "label": "Logs",
+          "argv": [
+            "logs",
+            "-f",
+            "--tail",
+            "200",
+            "old-worker"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerRemove",
+          "label": "Remove",
+          "argv": [
+            "rm",
+            "-f",
+            "old-worker"
+          ],
+          "interactive": false,
+          "confirm": "Remove container old-worker?"
+        }
+      ],
+      "service": null,
+      "volumes": []
+    }
+  ],
+  "ports": [
+    {
+      "port": 3000,
+      "udp": false,
+      "container": "shop-web-1",
+      "error": null,
+      "sandbox": false,
+      "actions": [
+        {
+          "kind": "OpenPort",
+          "label": "Open http://localhost:3000",
+          "url": "http://localhost:3000",
+          "interactive": false,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "port": 5432,
+      "udp": false,
+      "container": "shop-pg-1",
+      "error": "address already in use",
+      "sandbox": false,
+      "actions": []
+    }
+  ],
+  "projects": [
+    {
+      "name": "shop",
+      "dir": "/Users/me/shop",
+      "actions": [
+        {
+          "kind": "ProjectRestart",
+          "label": "Restart project",
+          "argv": [
+            "compose",
+            "-p",
+            "shop",
+            "restart"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ProjectStop",
+          "label": "Stop project",
+          "argv": [
+            "compose",
+            "-p",
+            "shop",
+            "stop"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "SnapSave",
+          "label": "Save snapshot (git branch or timestamp)",
+          "argv": [
+            "snap",
+            "save",
+            "-p",
+            "shop"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "dir": "/Users/me/shop"
+        },
+        {
+          "kind": "ProjectDown",
+          "label": "Down (remove containers)",
+          "argv": [
+            "compose",
+            "-p",
+            "shop",
+            "down"
+          ],
+          "interactive": false,
+          "confirm": "Remove shop's 2 container(s) and its networks? Volumes are kept."
+        }
+      ],
+      "snapshots": [
+        {
+          "name": "seeded",
+          "created": 1792042024,
+          "volumes": [
+            "shop_pg"
+          ],
+          "actions": [
+            {
+              "kind": "SnapRestore",
+              "label": "Restore",
+              "argv": [
+                "snap",
+                "restore",
+                "-p",
+                "shop",
+                "seeded"
+              ],
+              "interactive": false,
+              "confirm": "Restore shop to snapshot seeded? Its containers restart and current volume data is replaced."
+            },
+            {
+              "kind": "SnapRemove",
+              "label": "Delete",
+              "argv": [
+                "snap",
+                "rm",
+                "-p",
+                "shop",
+                "seeded"
+              ],
+              "interactive": false,
+              "confirm": "Delete snapshot seeded of shop?"
+            }
+          ],
+          "size": 50331648,
+          "current": true
+        },
+        {
+          "name": "before-migrate",
+          "created": 1792020424,
+          "volumes": [
+            "shop_pg"
+          ],
+          "size": 47185920,
+          "current": false,
+          "actions": [
+            {
+              "kind": "SnapRestore",
+              "label": "Restore",
+              "argv": [
+                "snap",
+                "restore",
+                "-p",
+                "shop",
+                "before-migrate"
+              ],
+              "interactive": false,
+              "confirm": "Restore shop to snapshot before-migrate? Its containers restart and current volume data is replaced."
+            },
+            {
+              "kind": "SnapRemove",
+              "label": "Delete",
+              "argv": [
+                "snap",
+                "rm",
+                "-p",
+                "shop",
+                "before-migrate"
+              ],
+              "interactive": false,
+              "confirm": "Delete snapshot before-migrate of shop?"
+            }
+          ]
+        }
+      ],
+      "containers": 2,
+      "running": 2,
+      "branch": "seeded"
+    }
+  ],
+  "sandboxes": [
+    {
+      "id": "k3j9x2ab",
+      "name": "try-upgrade",
+      "project": "/Users/me/shop",
+      "copy": true,
+      "running": true,
+      "macos": false,
+      "actions": [
+        {
+          "kind": "SandboxShell",
+          "label": "Shell",
+          "argv": [
+            "sandbox",
+            "shell",
+            "k3j9x2ab"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "SandboxDiff",
+          "label": "Diff",
+          "argv": [
+            "sandbox",
+            "diff",
+            "k3j9x2ab"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "SandboxApply",
+          "label": "Apply to project",
+          "argv": [
+            "sandbox",
+            "apply",
+            "k3j9x2ab"
+          ],
+          "interactive": false,
+          "confirm": "Write sandbox k3j9x2ab's changes into /Users/me/shop?"
+        },
+        {
+          "kind": "SandboxStop",
+          "label": "Stop",
+          "argv": [
+            "sandbox",
+            "stop",
+            "k3j9x2ab"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "SandboxRemove",
+          "label": "Delete",
+          "argv": [
+            "sandbox",
+            "rm",
+            "k3j9x2ab"
+          ],
+          "interactive": false,
+          "confirm": "Delete sandbox k3j9x2ab and everything in it? Unapplied changes are lost."
+        }
+      ],
+      "created": 1792123024,
+      "cpus": 4,
+      "memory_gib": 4,
+      "cpu_pct": 12.5,
+      "rss_mib": 1830
+    },
+    {
+      "id": "m4c0s9zz",
+      "name": "ui-check",
+      "project": "/Users/me/shop",
+      "copy": true,
+      "running": true,
+      "macos": true,
+      "created": 1792127524,
+      "cpus": 4,
+      "memory_gib": 8,
+      "cpu_pct": 38.0,
+      "rss_mib": 6100,
+      "actions": [
+        {
+          "kind": "SandboxShell",
+          "label": "Shell",
+          "argv": [
+            "sandbox",
+            "shell",
+            "m4c0s9zz"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "SandboxScreenshot",
+          "label": "Screenshot",
+          "argv": [
+            "sandbox",
+            "screenshot",
+            "m4c0s9zz",
+            "/tmp/rekcod-m4c0s9zz.png",
+            "--open"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "SandboxDiff",
+          "label": "Diff",
+          "argv": [
+            "sandbox",
+            "diff",
+            "m4c0s9zz"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "SandboxApply",
+          "label": "Apply to project",
+          "argv": [
+            "sandbox",
+            "apply",
+            "m4c0s9zz"
+          ],
+          "interactive": false,
+          "confirm": "Write sandbox m4c0s9zz's changes into /Users/me/shop? Files the sandbox changed or deleted are overwritten or removed."
+        },
+        {
+          "kind": "SandboxStop",
+          "label": "Stop",
+          "argv": [
+            "sandbox",
+            "stop",
+            "m4c0s9zz"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "SandboxRemove",
+          "label": "Delete",
+          "argv": [
+            "sandbox",
+            "rm",
+            "m4c0s9zz"
+          ],
+          "interactive": false,
+          "confirm": "Delete sandbox m4c0s9zz and everything in it? Unapplied changes are lost."
+        }
+      ]
+    }
+  ],
+  "apps": [
+    {
+      "name": "dash",
+      "url": "http://dash.apps.example.com",
+      "live_release": 7,
+      "public": true,
+      "sleeping": false,
+      "actions": [
+        {
+          "kind": "AppOpen",
+          "label": "Open http://dash.apps.example.com",
+          "url": "http://dash.apps.example.com",
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "AppLogs",
+          "label": "Logs",
+          "argv": [
+            "app",
+            "logs",
+            "dash"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "AppRecycle",
+          "label": "Restart instances (fresh VMs)",
+          "argv": [
+            "app",
+            "recycle",
+            "dash"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "AppRollback",
+          "label": "Roll back to the previous release",
+          "argv": [
+            "app",
+            "rollback",
+            "dash"
+          ],
+          "interactive": false,
+          "confirm": "Roll dash back to its previous good release?"
+        },
+        {
+          "kind": "AppPrivate",
+          "label": "Make private",
+          "argv": [
+            "app",
+            "private",
+            "dash"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "AppDestroy",
+          "label": "Destroy",
+          "argv": [
+            "app",
+            "destroy",
+            "dash"
+          ],
+          "interactive": false,
+          "confirm": "Destroy dash? Its instances and release history are deleted."
+        }
+      ],
+      "detail": {
+        "git": {
+          "url": "https://github.com/acme/dash",
+          "ref": "main"
+        },
+        "port": 3000,
+        "instances_wanted": 2,
+        "idle_stop_secs": 0,
+        "recycle_secs": 86400,
+        "last_request": 1792128420,
+        "env": {
+          "NODE_ENV": "production"
+        },
+        "secrets": [
+          "DATABASE_URL"
+        ],
+        "releases": [
+          {
+            "n": 7,
+            "commit": "07a9f3c1e7b2d4",
+            "state": "live",
+            "created": 1792124824,
+            "who": "tim",
+            "finished": 1792124919
+          },
+          {
+            "n": 6,
+            "commit": "06a9f3c1e7b2d4",
+            "state": "old",
+            "created": 1792042024,
+            "who": "tim",
+            "finished": 1792042119
+          },
+          {
+            "n": 5,
+            "commit": "05a9f3c1e7b2d4",
+            "state": "old",
+            "created": 1791869224,
+            "who": "tim",
+            "finished": 1791869319
+          }
+        ],
+        "instances": [
+          {
+            "release": 7,
+            "sandbox": "sb-spare-7",
+            "node": "spare",
+            "endpoint": "100.64.0.7:3000",
+            "state": "live",
+            "created": 1792121224
+          },
+          {
+            "release": 7,
+            "sandbox": "sb-mini-7",
+            "node": "mini",
+            "endpoint": "100.64.0.7:3000",
+            "state": "live",
+            "created": 1792121224
+          }
+        ],
+        "traffic": [
+          {
+            "minute": 29868747,
+            "requests": 130,
+            "errors": 0,
+            "p50_ms": 21,
+            "p95_ms": 93
+          },
+          {
+            "minute": 29868748,
+            "requests": 128,
+            "errors": 1,
+            "p50_ms": 18,
+            "p95_ms": 113
+          },
+          {
+            "minute": 29868749,
+            "requests": 151,
+            "errors": 0,
+            "p50_ms": 22,
+            "p95_ms": 103
+          },
+          {
+            "minute": 29868750,
+            "requests": 140,
+            "errors": 0,
+            "p50_ms": 21,
+            "p95_ms": 116
+          },
+          {
+            "minute": 29868751,
+            "requests": 147,
+            "errors": 0,
+            "p50_ms": 18,
+            "p95_ms": 125
+          },
+          {
+            "minute": 29868752,
+            "requests": 164,
+            "errors": 0,
+            "p50_ms": 24,
+            "p95_ms": 126
+          },
+          {
+            "minute": 29868753,
+            "requests": 160,
+            "errors": 0,
+            "p50_ms": 23,
+            "p95_ms": 130
+          },
+          {
+            "minute": 29868754,
+            "requests": 180,
+            "errors": 0,
+            "p50_ms": 22,
+            "p95_ms": 127
+          },
+          {
+            "minute": 29868755,
+            "requests": 178,
+            "errors": 0,
+            "p50_ms": 19,
+            "p95_ms": 92
+          },
+          {
+            "minute": 29868756,
+            "requests": 187,
+            "errors": 0,
+            "p50_ms": 20,
+            "p95_ms": 116
+          },
+          {
+            "minute": 29868757,
+            "requests": 177,
+            "errors": 1,
+            "p50_ms": 18,
+            "p95_ms": 126
+          },
+          {
+            "minute": 29868758,
+            "requests": 185,
+            "errors": 1,
+            "p50_ms": 24,
+            "p95_ms": 101
+          },
+          {
+            "minute": 29868759,
+            "requests": 181,
+            "errors": 1,
+            "p50_ms": 22,
+            "p95_ms": 130
+          },
+          {
+            "minute": 29868760,
+            "requests": 185,
+            "errors": 0,
+            "p50_ms": 18,
+            "p95_ms": 125
+          },
+          {
+            "minute": 29868761,
+            "requests": 201,
+            "errors": 0,
+            "p50_ms": 22,
+            "p95_ms": 93
+          },
+          {
+            "minute": 29868762,
+            "requests": 198,
+            "errors": 0,
+            "p50_ms": 21,
+            "p95_ms": 124
+          },
+          {
+            "minute": 29868763,
+            "requests": 191,
+            "errors": 0,
+            "p50_ms": 21,
+            "p95_ms": 127
+          },
+          {
+            "minute": 29868764,
+            "requests": 190,
+            "errors": 0,
+            "p50_ms": 20,
+            "p95_ms": 105
+          },
+          {
+            "minute": 29868765,
+            "requests": 199,
+            "errors": 0,
+            "p50_ms": 23,
+            "p95_ms": 105
+          },
+          {
+            "minute": 29868766,
+            "requests": 173,
+            "errors": 1,
+            "p50_ms": 20,
+            "p95_ms": 123
+          },
+          {
+            "minute": 29868767,
+            "requests": 182,
+            "errors": 0,
+            "p50_ms": 23,
+            "p95_ms": 118
+          },
+          {
+            "minute": 29868768,
+            "requests": 172,
+            "errors": 1,
+            "p50_ms": 18,
+            "p95_ms": 97
+          },
+          {
+            "minute": 29868769,
+            "requests": 174,
+            "errors": 0,
+            "p50_ms": 19,
+            "p95_ms": 111
+          },
+          {
+            "minute": 29868770,
+            "requests": 157,
+            "errors": 0,
+            "p50_ms": 21,
+            "p95_ms": 92
+          },
+          {
+            "minute": 29868771,
+            "requests": 168,
+            "errors": 0,
+            "p50_ms": 24,
+            "p95_ms": 125
+          },
+          {
+            "minute": 29868772,
+            "requests": 159,
+            "errors": 0,
+            "p50_ms": 20,
+            "p95_ms": 112
+          },
+          {
+            "minute": 29868773,
+            "requests": 154,
+            "errors": 0,
+            "p50_ms": 22,
+            "p95_ms": 119
+          },
+          {
+            "minute": 29868774,
+            "requests": 130,
+            "errors": 0,
+            "p50_ms": 20,
+            "p95_ms": 120
+          },
+          {
+            "minute": 29868775,
+            "requests": 143,
+            "errors": 2,
+            "p50_ms": 18,
+            "p95_ms": 93
+          },
+          {
+            "minute": 29868776,
+            "requests": 138,
+            "errors": 2,
+            "p50_ms": 20,
+            "p95_ms": 126
+          },
+          {
+            "minute": 29868777,
+            "requests": 129,
+            "errors": 0,
+            "p50_ms": 20,
+            "p95_ms": 114
+          },
+          {
+            "minute": 29868778,
+            "requests": 123,
+            "errors": 0,
+            "p50_ms": 18,
+            "p95_ms": 119
+          },
+          {
+            "minute": 29868779,
+            "requests": 106,
+            "errors": 0,
+            "p50_ms": 22,
+            "p95_ms": 97
+          },
+          {
+            "minute": 29868780,
+            "requests": 104,
+            "errors": 0,
+            "p50_ms": 19,
+            "p95_ms": 108
+          },
+          {
+            "minute": 29868781,
+            "requests": 88,
+            "errors": 2,
+            "p50_ms": 19,
+            "p95_ms": 115
+          },
+          {
+            "minute": 29868782,
+            "requests": 91,
+            "errors": 0,
+            "p50_ms": 18,
+            "p95_ms": 100
+          },
+          {
+            "minute": 29868783,
+            "requests": 88,
+            "errors": 0,
+            "p50_ms": 22,
+            "p95_ms": 107
+          },
+          {
+            "minute": 29868784,
+            "requests": 74,
+            "errors": 0,
+            "p50_ms": 24,
+            "p95_ms": 125
+          },
+          {
+            "minute": 29868785,
+            "requests": 75,
+            "errors": 2,
+            "p50_ms": 21,
+            "p95_ms": 112
+          },
+          {
+            "minute": 29868786,
+            "requests": 85,
+            "errors": 0,
+            "p50_ms": 19,
+            "p95_ms": 99
+          },
+          {
+            "minute": 29868787,
+            "requests": 64,
+            "errors": 0,
+            "p50_ms": 19,
+            "p95_ms": 104
+          },
+          {
+            "minute": 29868788,
+            "requests": 81,
+            "errors": 0,
+            "p50_ms": 18,
+            "p95_ms": 121
+          },
+          {
+            "minute": 29868789,
+            "requests": 78,
+            "errors": 0,
+            "p50_ms": 20,
+            "p95_ms": 108
+          },
+          {
+            "minute": 29868790,
+            "requests": 60,
+            "errors": 0,
+            "p50_ms": 21,
+            "p95_ms": 124
+          },
+          {
+            "minute": 29868791,
+            "requests": 71,
+            "errors": 1,
+            "p50_ms": 22,
+            "p95_ms": 110
+          },
+          {
+            "minute": 29868792,
+            "requests": 66,
+            "errors": 2,
+            "p50_ms": 24,
+            "p95_ms": 122
+          },
+          {
+            "minute": 29868793,
+            "requests": 83,
+            "errors": 2,
+            "p50_ms": 23,
+            "p95_ms": 93
+          },
+          {
+            "minute": 29868794,
+            "requests": 81,
+            "errors": 2,
+            "p50_ms": 24,
+            "p95_ms": 125
+          },
+          {
+            "minute": 29868795,
+            "requests": 83,
+            "errors": 0,
+            "p50_ms": 21,
+            "p95_ms": 115
+          },
+          {
+            "minute": 29868796,
+            "requests": 78,
+            "errors": 0,
+            "p50_ms": 23,
+            "p95_ms": 115
+          },
+          {
+            "minute": 29868797,
+            "requests": 81,
+            "errors": 4,
+            "p50_ms": 18,
+            "p95_ms": 103
+          },
+          {
+            "minute": 29868798,
+            "requests": 99,
+            "errors": 4,
+            "p50_ms": 18,
+            "p95_ms": 231
+          },
+          {
+            "minute": 29868799,
+            "requests": 109,
+            "errors": 3,
+            "p50_ms": 18,
+            "p95_ms": 210
+          },
+          {
+            "minute": 29868800,
+            "requests": 114,
+            "errors": 4,
+            "p50_ms": 22,
+            "p95_ms": 216
+          },
+          {
+            "minute": 29868801,
+            "requests": 114,
+            "errors": 7,
+            "p50_ms": 18,
+            "p95_ms": 214
+          },
+          {
+            "minute": 29868802,
+            "requests": 115,
+            "errors": 7,
+            "p50_ms": 21,
+            "p95_ms": 219
+          },
+          {
+            "minute": 29868803,
+            "requests": 136,
+            "errors": 5,
+            "p50_ms": 20,
+            "p95_ms": 248
+          },
+          {
+            "minute": 29868804,
+            "requests": 134,
+            "errors": 6,
+            "p50_ms": 18,
+            "p95_ms": 217
+          },
+          {
+            "minute": 29868805,
+            "requests": 144,
+            "errors": 6,
+            "p50_ms": 21,
+            "p95_ms": 240
+          },
+          {
+            "minute": 29868806,
+            "requests": 145,
+            "errors": 3,
+            "p50_ms": 19,
+            "p95_ms": 216
+          }
+        ]
+      }
+    },
+    {
+      "name": "api",
+      "url": "http://api.apps.example.com",
+      "live_release": null,
+      "public": false,
+      "sleeping": false,
+      "actions": [
+        {
+          "kind": "AppOpen",
+          "label": "Open http://api.apps.example.com",
+          "url": "http://api.apps.example.com",
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "AppLogs",
+          "label": "Logs",
+          "argv": [
+            "app",
+            "logs",
+            "api"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "AppRecycle",
+          "label": "Restart instances (fresh VMs)",
+          "argv": [
+            "app",
+            "recycle",
+            "api"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "AppRollback",
+          "label": "Roll back to the previous release",
+          "argv": [
+            "app",
+            "rollback",
+            "api"
+          ],
+          "interactive": false,
+          "confirm": "Roll api back to its previous good release?"
+        },
+        {
+          "kind": "AppPublic",
+          "label": "Make public",
+          "argv": [
+            "app",
+            "public",
+            "api"
+          ],
+          "interactive": false,
+          "confirm": "Serve api on the edge's public listener? Anyone with the URL can reach it."
+        },
+        {
+          "kind": "AppDestroy",
+          "label": "Destroy",
+          "argv": [
+            "app",
+            "destroy",
+            "api"
+          ],
+          "interactive": false,
+          "confirm": "Destroy api? Its instances and release history are deleted."
+        }
+      ],
+      "detail": {
+        "git": {
+          "url": "https://github.com/acme/api",
+          "ref": "main"
+        },
+        "port": 3000,
+        "instances_wanted": 2,
+        "idle_stop_secs": 0,
+        "recycle_secs": 86400,
+        "last_request": 1792128420,
+        "env": {
+          "NODE_ENV": "production"
+        },
+        "secrets": [
+          "DATABASE_URL"
+        ],
+        "releases": [
+          {
+            "n": 3,
+            "commit": "03a9f3c1e7b2d4",
+            "state": "failed",
+            "created": 1792127824,
+            "who": "tim",
+            "finished": 1792127865
+          },
+          {
+            "n": 2,
+            "commit": "02a9f3c1e7b2d4",
+            "state": "old",
+            "created": 1792042024,
+            "who": "tim",
+            "finished": 1792042119
+          }
+        ],
+        "instances": [
+          {
+            "release": 2,
+            "sandbox": "sb-mini-2",
+            "node": "mini",
+            "endpoint": "100.64.0.2:3000",
+            "state": "lost",
+            "created": 1792121224
+          }
+        ],
+        "traffic": [
+          {
+            "minute": 29868747,
+            "requests": 15,
+            "errors": 2,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868750,
+            "requests": 20,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868753,
+            "requests": 5,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868756,
+            "requests": 16,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868759,
+            "requests": 5,
+            "errors": 4,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868762,
+            "requests": 14,
+            "errors": 0,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868765,
+            "requests": 13,
+            "errors": 4,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868768,
+            "requests": 16,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868771,
+            "requests": 16,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868774,
+            "requests": 15,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868777,
+            "requests": 11,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868780,
+            "requests": 17,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868783,
+            "requests": 11,
+            "errors": 4,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868786,
+            "requests": 20,
+            "errors": 2,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868789,
+            "requests": 5,
+            "errors": 0,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868792,
+            "requests": 13,
+            "errors": 3,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868795,
+            "requests": 13,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868798,
+            "requests": 16,
+            "errors": 3,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868801,
+            "requests": 16,
+            "errors": 2,
+            "p50_ms": 40,
+            "p95_ms": 300
+          },
+          {
+            "minute": 29868804,
+            "requests": 7,
+            "errors": 1,
+            "p50_ms": 40,
+            "p95_ms": 300
+          }
+        ]
+      }
+    },
+    {
+      "name": "blog",
+      "url": "http://blog.apps.example.com",
+      "live_release": 4,
+      "public": true,
+      "sleeping": true,
+      "actions": [
+        {
+          "kind": "AppOpen",
+          "label": "Open http://blog.apps.example.com",
+          "url": "http://blog.apps.example.com",
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "AppLogs",
+          "label": "Logs",
+          "argv": [
+            "app",
+            "logs",
+            "blog"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "AppWake",
+          "label": "Wake (it's scaled to zero)",
+          "argv": [
+            "app",
+            "wake",
+            "blog"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "AppRollback",
+          "label": "Roll back to the previous release",
+          "argv": [
+            "app",
+            "rollback",
+            "blog"
+          ],
+          "interactive": false,
+          "confirm": "Roll blog back to its previous good release?"
+        },
+        {
+          "kind": "AppPrivate",
+          "label": "Make private",
+          "argv": [
+            "app",
+            "private",
+            "blog"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "AppDestroy",
+          "label": "Destroy",
+          "argv": [
+            "app",
+            "destroy",
+            "blog"
+          ],
+          "interactive": false,
+          "confirm": "Destroy blog? Its instances and release history are deleted."
+        }
+      ],
+      "detail": {
+        "git": {
+          "url": "https://github.com/acme/blog",
+          "ref": "main"
+        },
+        "port": 3000,
+        "instances_wanted": 1,
+        "idle_stop_secs": 900,
+        "recycle_secs": 86400,
+        "last_request": 1792121224,
+        "env": {
+          "NODE_ENV": "production"
+        },
+        "secrets": [
+          "DATABASE_URL"
+        ],
+        "releases": [
+          {
+            "n": 4,
+            "commit": "04a9f3c1e7b2d4",
+            "state": "live",
+            "created": 1791523624,
+            "who": "tim",
+            "finished": 1791523719
+          }
+        ],
+        "instances": [
+          {
+            "release": 4,
+            "sandbox": "sb-spare-4",
+            "node": "spare",
+            "endpoint": "100.64.0.4:3000",
+            "state": "sleeping",
+            "created": 1792121224
+          }
+        ],
+        "traffic": []
+      }
+    }
+  ],
+  "jobs": [
+    {
+      "id": "j-8f2k1m",
+      "name": "etl",
+      "state": "running",
+      "exit": null,
+      "created": 1792128329,
+      "finished": null,
+      "cmd": [
+        "python",
+        "etl.py"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": "nightly",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-8f2k1m",
+            "--follow"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "JobCancel",
+          "label": "Cancel",
+          "argv": [
+            "job",
+            "cancel",
+            "j-8f2k1m"
+          ],
+          "interactive": false,
+          "confirm": "Cancel job j-8f2k1m? Its sandbox is deleted."
+        }
+      ]
+    },
+    {
+      "id": "j-77ab01",
+      "name": "migrate",
+      "state": "failed",
+      "exit": 2,
+      "created": 1792124824,
+      "finished": 1792124866,
+      "cmd": [
+        "npm",
+        "run",
+        "migrate"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": null,
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-77ab01"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "JobRerun",
+          "label": "Run again",
+          "argv": [
+            "job",
+            "rerun",
+            "j-77ab01"
+          ],
+          "interactive": false,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync01",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792123144,
+      "finished": 1792123257,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "mini",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync01"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-5c9d22",
+      "name": null,
+      "state": "done",
+      "exit": 0,
+      "created": 1792121224,
+      "finished": 1792121534,
+      "cmd": [
+        "sh",
+        "-c",
+        "pytest -q"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": null,
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-5c9d22"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "JobRerun",
+          "label": "Run again",
+          "argv": [
+            "job",
+            "rerun",
+            "j-5c9d22"
+          ],
+          "interactive": false,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync02",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792117744,
+      "finished": 1792117910,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync02"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync03",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792112344,
+      "finished": 1792112563,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "mini",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync03"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync04",
+      "name": "sync",
+      "state": "failed",
+      "exit": 2,
+      "created": 1792106944,
+      "finished": 1792107216,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync04"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-bkp001",
+      "name": "backup",
+      "state": "done",
+      "exit": 0,
+      "created": 1792106824,
+      "finished": 1792108124,
+      "cmd": [
+        "sh",
+        "-c",
+        "pg_dump shop | gzip > /out/shop.gz"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": null,
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-bkp001"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync05",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792101544,
+      "finished": 1792101629,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "mini",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync05"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync06",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792096144,
+      "finished": 1792096282,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync06"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync07",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792090744,
+      "finished": 1792090935,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "mini",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync07"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync08",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792085344,
+      "finished": 1792085588,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync08"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync09",
+      "name": "sync",
+      "state": "cancelled",
+      "exit": null,
+      "created": 1792079944,
+      "finished": 1792080241,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "mini",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync09"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync10",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792074544,
+      "finished": 1792074654,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync10"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync11",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792069144,
+      "finished": 1792069307,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "mini",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync11"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync12",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792063744,
+      "finished": 1792063960,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync12"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-bkp002",
+      "name": "backup",
+      "state": "done",
+      "exit": 0,
+      "created": 1792063624,
+      "finished": 1792064724,
+      "cmd": [
+        "sh",
+        "-c",
+        "pg_dump shop | gzip > /out/shop.gz"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": null,
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-bkp002"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync13",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792058344,
+      "finished": 1792058613,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "mini",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync13"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    },
+    {
+      "id": "j-sync14",
+      "name": "sync",
+      "state": "done",
+      "exit": 0,
+      "created": 1792052944,
+      "finished": 1792053026,
+      "cmd": [
+        "node",
+        "sync.js"
+      ],
+      "node": "spare",
+      "owner": "tim",
+      "schedule": "sync",
+      "ns": "default",
+      "actions": [
+        {
+          "kind": "JobLogs",
+          "label": "Output",
+          "argv": [
+            "job",
+            "logs",
+            "j-sync14"
+          ],
+          "interactive": true,
+          "confirm": null
+        }
+      ]
+    }
+  ],
+  "namespaces": {
+    "current": "default",
+    "all": [
+      "default",
+      "team"
+    ],
+    "actions": [
+      {
+        "kind": "NsUse",
+        "label": "Switch to team",
+        "argv": [
+          "ns",
+          "use",
+          "team"
+        ],
+        "interactive": false,
+        "confirm": null
+      }
+    ],
+    "detail": [
+      {
+        "name": "default",
+        "role": "owner",
+        "quota": {
+          "sandboxes": 10,
+          "cpus": 16,
+          "memory_gib": 32,
+          "apps": 20
+        },
+        "used": {
+          "sandboxes": 2,
+          "cpus": 7,
+          "memory_gib": 9,
+          "apps": 3
+        },
+        "members": []
+      },
+      {
+        "name": "team",
+        "role": "owner",
+        "quota": {
+          "sandboxes": 4,
+          "cpus": 4,
+          "memory_gib": 4,
+          "apps": "unlimited"
+        },
+        "used": {
+          "sandboxes": 1,
+          "cpus": 4,
+          "memory_gib": 3,
+          "apps": 1
+        },
+        "members": [
+          {
+            "who": "alice",
+            "role": "member"
+          },
+          {
+            "who": "bob",
+            "role": "viewer"
+          }
+        ]
+      }
+    ]
+  },
+  "hosts": {
+    "all": [
+      {
+        "name": "spare",
+        "endpoint": "ssh://me@spare-mac",
+        "current": false
+      }
+    ],
+    "local_current": true,
+    "actions": [
+      {
+        "kind": "HostUse",
+        "label": "Use spare",
+        "argv": [
+          "host",
+          "use",
+          "spare"
+        ],
+        "interactive": false,
+        "confirm": null
+      },
+      {
+        "kind": "HostForward",
+        "label": "Forward ports from spare",
+        "argv": [
+          "host",
+          "forward",
+          "spare"
+        ],
+        "interactive": true,
+        "confirm": null
+      }
+    ]
+  },
+  "bans": {
+    "nets": [
+      "203.0.113.0/24"
+    ],
+    "actions": [
+      {
+        "kind": "EdgeBan",
+        "label": "Ban an IP or range",
+        "argv": [
+          "edge",
+          "ban"
+        ],
+        "interactive": true,
+        "confirm": null
+      },
+      {
+        "kind": "EdgeBan",
+        "label": "Ban 198.51.100.7 (4210 requests)",
+        "argv": [
+          "edge",
+          "ban",
+          "198.51.100.7"
+        ],
+        "interactive": false,
+        "confirm": "Ban 198.51.100.7 on every edge? It made 4210 requests (388 rate-limited) in the last 10 minutes."
+      },
+      {
+        "kind": "EdgeBan",
+        "label": "Ban 192.0.2.44 (930 requests)",
+        "argv": [
+          "edge",
+          "ban",
+          "192.0.2.44"
+        ],
+        "interactive": false,
+        "confirm": "Ban 192.0.2.44 on every edge? It made 930 requests (0 rate-limited) in the last 10 minutes."
+      },
+      {
+        "kind": "EdgeUnban",
+        "label": "Unban 203.0.113.0/24",
+        "argv": [
+          "edge",
+          "unban",
+          "203.0.113.0/24"
+        ],
+        "interactive": false,
+        "confirm": null
+      }
+    ],
+    "clients": [
+      {
+        "ip": "198.51.100.7",
+        "requests": 4210,
+        "limited": 388
+      },
+      {
+        "ip": "192.0.2.44",
+        "requests": 930,
+        "limited": 0
+      },
+      {
+        "ip": "203.0.113.5",
+        "requests": 120,
+        "limited": 0
+      }
+    ],
+    "detail": [
+      {
+        "net": "203.0.113.0/24",
+        "reason": "scraper",
+        "until": null,
+        "created": 1791869224,
+        "by": "tim"
+      }
+    ]
+  },
+  "remote": {
+    "name": "spare",
+    "url": "http://spare.tail1234.ts.net:7700",
+    "ns": "default",
+    "all": [
+      "spare",
+      "work"
+    ],
+    "admin": true,
+    "error": null,
+    "errors": {}
+  },
+  "nodes": [
+    {
+      "id": "spare",
+      "url": "http://100.64.0.2:7701",
+      "mem_total_mib": 32768,
+      "mem_free_mib": 12000,
+      "last_seen": 1792128419,
+      "state": "ready",
+      "pool": [],
+      "cpus": 10,
+      "load": 2.4,
+      "disk_total_gib": 926,
+      "disk_free_gib": 512,
+      "instances": 3,
+      "jobs_running": 1,
+      "actions": [
+        {
+          "kind": "NodeDrain",
+          "label": "Drain",
+          "argv": [
+            "node",
+            "drain",
+            "spare"
+          ],
+          "interactive": false,
+          "confirm": "Drain spare? Nothing new is placed there; what runs keeps running."
+        }
+      ]
+    },
+    {
+      "id": "mini",
+      "url": "http://100.64.0.3:7701",
+      "mem_total_mib": 16384,
+      "mem_free_mib": 900,
+      "last_seen": 1792128024,
+      "state": "ready",
+      "pool": [
+        "team"
+      ],
+      "cpus": 8,
+      "load": 0.0,
+      "disk_total_gib": 460,
+      "disk_free_gib": 38,
+      "instances": 1,
+      "jobs_running": 0,
+      "actions": [
+        {
+          "kind": "NodeDrain",
+          "label": "Drain",
+          "argv": [
+            "node",
+            "drain",
+            "mini"
+          ],
+          "interactive": false,
+          "confirm": "Drain mini? Nothing new is placed there; what runs keeps running."
+        }
+      ]
+    },
+    {
+      "id": "old-air",
+      "url": "http://100.64.0.9:7701",
+      "mem_total_mib": 8192,
+      "mem_free_mib": 5000,
+      "last_seen": 1792128394,
+      "state": "drain",
+      "pool": [],
+      "cpus": 8,
+      "load": 0.3,
+      "disk_total_gib": 228,
+      "disk_free_gib": 90,
+      "instances": 0,
+      "jobs_running": 0,
+      "actions": [
+        {
+          "kind": "NodeUndrain",
+          "label": "Undrain (place sandboxes again)",
+          "argv": [
+            "node",
+            "undrain",
+            "old-air"
+          ],
+          "interactive": false,
+          "confirm": null
+        }
+      ]
+    }
+  ],
+  "schedules": [
+    {
+      "name": "nightly",
+      "owner": "tim",
+      "every_secs": 86400,
+      "last_run": 1792128329,
+      "last_job": "j-8f2k1m",
+      "next_run": 1792214729
+    },
+    {
+      "name": "sync",
+      "owner": "tim",
+      "every_secs": 5400,
+      "last_run": 1792123144,
+      "last_job": "j-sync01",
+      "next_run": 1792128544
+    }
+  ],
+  "images": [
+    {
+      "id": "sha256:dd44",
+      "tags": [
+        "alpine:3.22"
+      ],
+      "size": 27262976,
+      "created": 1788672424,
+      "containers": [
+        "old-worker"
+      ],
+      "dangling": false,
+      "actions": [
+        {
+          "kind": "ImageRemove",
+          "label": "Remove",
+          "argv": [
+            "image",
+            "rm",
+            "sha256:dd44"
+          ],
+          "interactive": false,
+          "confirm": "Remove image alpine:3.22 (26.0 MiB)? old-worker use it and keep it."
+        }
+      ]
+    },
+    {
+      "id": "sha256:bb22",
+      "tags": [
+        "postgres:17"
+      ],
+      "size": 459276288,
+      "created": 1790400424,
+      "containers": [
+        "shop-pg-1"
+      ],
+      "dangling": false,
+      "actions": [
+        {
+          "kind": "ImageRemove",
+          "label": "Remove",
+          "argv": [
+            "image",
+            "rm",
+            "sha256:bb22"
+          ],
+          "interactive": false,
+          "confirm": "Remove image postgres:17 (438.0 MiB)? shop-pg-1 use it and keep it."
+        }
+      ]
+    },
+    {
+      "id": "sha256:cc33",
+      "tags": [
+        "redis:7"
+      ],
+      "size": 122683392,
+      "created": 1786944424,
+      "containers": [
+        "redis"
+      ],
+      "dangling": false,
+      "actions": [
+        {
+          "kind": "ImageRemove",
+          "label": "Remove",
+          "argv": [
+            "image",
+            "rm",
+            "sha256:cc33"
+          ],
+          "interactive": false,
+          "confirm": "Remove image redis:7 (117.0 MiB)? redis use it and keep it."
+        }
+      ]
+    },
+    {
+      "id": "sha256:aa11",
+      "tags": [
+        "shop-web:dev"
+      ],
+      "size": 956301312,
+      "created": 1792114024,
+      "containers": [
+        "shop-web-1"
+      ],
+      "dangling": false,
+      "actions": [
+        {
+          "kind": "ImageRemove",
+          "label": "Remove",
+          "argv": [
+            "image",
+            "rm",
+            "sha256:aa11"
+          ],
+          "interactive": false,
+          "confirm": "Remove image shop-web:dev (912.0 MiB)? shop-web-1 use it and keep it."
+        }
+      ]
+    },
+    {
+      "id": "sha256:ee55",
+      "tags": [],
+      "size": 948961280,
+      "created": 1792027624,
+      "containers": [],
+      "dangling": true,
+      "actions": [
+        {
+          "kind": "ImageRemove",
+          "label": "Remove",
+          "argv": [
+            "image",
+            "rm",
+            "sha256:ee55"
+          ],
+          "interactive": false,
+          "confirm": "Remove image ee55 (905.0 MiB)?"
+        }
+      ]
+    }
+  ],
+  "volumes": [
+    {
+      "name": "redis-data",
+      "driver": "local",
+      "size": 12582912,
+      "containers": [
+        "redis"
+      ],
+      "anonymous": false,
+      "snapshot": false,
+      "actions": []
+    },
+    {
+      "name": "shop_pg",
+      "driver": "local",
+      "size": 50331648,
+      "containers": [
+        "shop-pg-1"
+      ],
+      "anonymous": false,
+      "snapshot": false,
+      "actions": []
+    },
+    {
+      "name": "rekcod-snap.shop.before-migrate.shop_pg",
+      "driver": "local",
+      "size": 47185920,
+      "containers": [],
+      "anonymous": false,
+      "snapshot": true,
+      "actions": [
+        {
+          "kind": "VolumeRemove",
+          "label": "Remove",
+          "argv": [
+            "volume",
+            "rm",
+            "rekcod-snap.shop.before-migrate.shop_pg"
+          ],
+          "interactive": false,
+          "confirm": "Delete volume rekcod-snap.shop.before-migrate.shop_pg (45.0 MiB) and everything in it?"
+        }
+      ]
+    },
+    {
+      "name": "rekcod-snap.shop.seeded.shop_pg",
+      "driver": "local",
+      "size": 50331648,
+      "containers": [],
+      "anonymous": false,
+      "snapshot": true,
+      "actions": [
+        {
+          "kind": "VolumeRemove",
+          "label": "Remove",
+          "argv": [
+            "volume",
+            "rm",
+            "rekcod-snap.shop.seeded.shop_pg"
+          ],
+          "interactive": false,
+          "confirm": "Delete volume rekcod-snap.shop.seeded.shop_pg (48.0 MiB) and everything in it?"
+        }
+      ]
+    },
+    {
+      "name": "3f9c2a1b7d",
+      "driver": "local",
+      "size": 188743680,
+      "containers": [],
+      "anonymous": true,
+      "snapshot": false,
+      "actions": [
+        {
+          "kind": "VolumeRemove",
+          "label": "Remove",
+          "argv": [
+            "volume",
+            "rm",
+            "3f9c2a1b7d"
+          ],
+          "interactive": false,
+          "confirm": "Delete volume 3f9c2a1b7d (180.0 MiB) and everything in it?"
+        }
+      ]
+    }
+  ],
+  "disk": {
+    "checked": 1792128384,
+    "images": 2516582400,
+    "containers": 3145728,
+    "volumes": 349175808,
+    "build_cache": 7516192768,
+    "build_cache_free": 5368709120
+  },
+  "disk_actions": [
+    {
+      "kind": "ImagePrune",
+      "label": "Remove dangling images",
+      "argv": [
+        "image",
+        "prune",
+        "-f"
+      ],
+      "interactive": false,
+      "confirm": "Remove 1 dangling image(s), freeing 905.0 MiB?"
+    },
+    {
+      "kind": "VolumePrune",
+      "label": "Remove unused anonymous volumes",
+      "argv": [
+        "volume",
+        "prune",
+        "-f",
+        "--filter",
+        "label!=dev.rekcod.snap"
+      ],
+      "interactive": false,
+      "confirm": "Delete 1 unused anonymous volume(s), freeing 180.0 MiB? Named volumes and snapshots are kept."
+    },
+    {
+      "kind": "BuildCachePrune",
+      "label": "Clear the build cache",
+      "argv": [
+        "builder",
+        "prune",
+        "-f"
+      ],
+      "interactive": false,
+      "confirm": "Clear unused build cache, freeing 5.0 GiB? The next builds start cold."
+    }
+  ],
+  "remotes": {
+    "default": "spare",
+    "all": [
+      "spare",
+      "work"
+    ],
+    "actions": [
+      {
+        "kind": "RemoteUse",
+        "label": "Use remote work",
+        "argv": [
+          "remote",
+          "use",
+          "work"
+        ],
+        "interactive": false,
+        "confirm": null
+      }
+    ]
+  },
+  "controller_actions": [
+    {
+      "kind": "BackupNow",
+      "label": "Back up the controller now",
+      "argv": [
+        "controller",
+        "backup"
+      ],
+      "interactive": false,
+      "confirm": null
+    }
+  ],
+  "routes": {
+    "dash.apps.example.com": {
+      "app": "dash",
+      "ns": "default",
+      "public": true,
+      "endpoints": [
+        "100.64.0.2:40101",
+        "100.64.0.3:40102"
+      ],
+      "sleeping": false,
+      "http": {
+        "rate": "20/s"
+      }
+    },
+    "blog.apps.example.com": {
+      "app": "blog",
+      "ns": "default",
+      "public": false,
+      "endpoints": [],
+      "sleeping": true,
+      "http": {}
+    }
+  },
+  "backups": {
+    "list": [
+      {
+        "key": "fleet-20261016T040000Z.db",
+        "size": 2400000,
+        "modified": "2026-10-16T04:00:02Z"
+      },
+      {
+        "key": "fleet-20261016T050000Z.db",
+        "size": 2410000,
+        "modified": "2026-10-16T05:00:02Z"
+      }
+    ]
+  }
+}

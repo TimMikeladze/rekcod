@@ -8,7 +8,11 @@ cd "$(dirname "$0")/.."
 
 cargo build --release -p rekcod
 cargo build --release -p rekcod-agent --target aarch64-unknown-linux-musl
-codesign --force --sign - --entitlements rekcod.entitlements target/release/rekcod
+# Sign a copy and move it in: signing rewrites the file, and macOS kills a VM daemon still
+# running from the old one.
+cp target/release/rekcod target/release/rekcod.signing
+codesign --force --sign - --entitlements rekcod.entitlements target/release/rekcod.signing
+mv -f target/release/rekcod.signing target/release/rekcod
 mkdir -p out/agent && cp target/aarch64-unknown-linux-musl/release/rekcod-agent out/agent/
 
 if [[ "${1:-}" != "--host-only" ]]; then

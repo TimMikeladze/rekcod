@@ -1,0 +1,362 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+
+@custom-variant dark (&:is(.dark *));
+/* The sidebar folded into an icon rail (Cmd+B); the attribute is set before first paint. */
+@custom-variant rail {
+  @media (width >= 48rem) {
+    :root[data-sidebar="collapsed"] & {
+      @slot;
+    }
+  }
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+  --font-heading: var(--font-geist-sans);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-ok: var(--ok);
+  --color-warn: var(--warn);
+  --color-warn-text: var(--warn-text);
+  --color-warn-border: var(--warn-border);
+  --color-warn-bg: var(--warn-bg);
+  --color-alert: var(--alert);
+  --color-alert-text: var(--alert-text);
+  --color-alert-border: var(--alert-border);
+  --color-hairline: var(--hairline);
+  --color-subtle: var(--subtle);
+  --color-strong: var(--strong);
+  --color-faint: var(--faint);
+  --color-code: var(--code-text);
+  --color-alert-bg: var(--alert-bg);
+  --color-ok-bg: var(--ok-bg);
+  --color-success: var(--success);
+  --color-success-bg: var(--success-bg);
+  --color-orange: var(--orange);
+  --color-map: var(--map-bg);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  /* Same palette as the dux console: black and white, colour only for state. */
+  --background: #ffffff;
+  --foreground: #0a0a0a;
+  --card: #ffffff;
+  --card-foreground: #0a0a0a;
+  --popover: #ffffff;
+  --popover-foreground: #0a0a0a;
+  --primary: #0a0a0a;
+  --primary-foreground: #ffffff;
+  --secondary: #f2f2f2;
+  --secondary-foreground: #0a0a0a;
+  --muted: #f2f2f2;
+  --muted-foreground: #666666;
+  --accent: #f2f2f2;
+  --accent-foreground: #0a0a0a;
+  --destructive: #d92d20;
+  --border: #e5e5e5;
+  --input: #e5e5e5;
+  --ring: #0a0a0a;
+  --chart-1: #0a0a0a;
+  --chart-2: #525252;
+  --chart-3: #a3a3a3;
+  --chart-4: #d4d4d4;
+  --chart-5: #f0f0f0;
+  --radius: 0.5rem;
+  --sidebar: #fafafa;
+  --sidebar-foreground: #3d3d3d;
+  --sidebar-primary: #0a0a0a;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e9e9e9;
+  --sidebar-accent-foreground: #0a0a0a;
+  --sidebar-border: #e5e5e5;
+  --sidebar-ring: #0a0a0a;
+  /* State */
+  --ok: #0062d1;
+  --warn: #f5a524;
+  --warn-text: #8a5a00;
+  --warn-border: #f5c46b;
+  --warn-bg: #fffaf0;
+  --alert: #d92d20;
+  --alert-text: #b42318;
+  --alert-border: #f4b4ae;
+  --hairline: #f0f0f0;
+  --subtle: #fafafa;
+  --strong: #a3a3a3;
+  --faint: #d4d4d4;
+  --code-text: #444444;
+  --alert-bg: #fff6f5;
+  --ok-bg: #eef4fc;
+  --success: #2f9e44;
+  --success-bg: #f3faf4;
+  --orange: #e8590c;
+  --map-bg: #f5f5f4;
+  --code-block-bg: #0a0a0a;
+  --code-block-fg: #ededed;
+  --code-block-border: #0a0a0a;
+  /* Charts and canvases (SVG attributes, CodeMirror). */
+  --chart-ink: #0a0a0a;
+  --chart-soft: #a3a3a3;
+  --chart-mid: #8f8f8f;
+  --chart-area: #f5f5f5;
+  --chart-fill: #e5e5e5;
+  --syntax-string: #1c5cab;
+  --syntax-number: #8a3b00;
+  --syntax-comment: #8f8f8f;
+  --syntax-selection: #e0e7f1;
+  color-scheme: light;
+}
+
+.dark {
+  /* Same rules as light: near-black and white, colour only for state. */
+  --background: #0a0a0a;
+  --foreground: #ededed;
+  --card: #0a0a0a;
+  --card-foreground: #ededed;
+  --popover: #161616;
+  --popover-foreground: #ededed;
+  --primary: #ededed;
+  --primary-foreground: #0a0a0a;
+  --secondary: #1f1f1f;
+  --secondary-foreground: #ededed;
+  --muted: #1f1f1f;
+  --muted-foreground: #a1a1a1;
+  --accent: #232323;
+  --accent-foreground: #ededed;
+  --destructive: #f04438;
+  --border: #2a2a2a;
+  --input: #2e2e2e;
+  --ring: #ededed;
+  --chart-1: #ededed;
+  --chart-2: #a3a3a3;
+  --chart-3: #6b6b6b;
+  --chart-4: #3d3d3d;
+  --chart-5: #1f1f1f;
+  --sidebar: #111111;
+  --sidebar-foreground: #c7c7c7;
+  --sidebar-primary: #ededed;
+  --sidebar-primary-foreground: #0a0a0a;
+  --sidebar-accent: #232323;
+  --sidebar-accent-foreground: #ededed;
+  --sidebar-border: #2a2a2a;
+  --sidebar-ring: #ededed;
+  --ok: #3b8eea;
+  --warn: #f5a524;
+  --warn-text: #f5c46b;
+  --warn-border: #6b4e14;
+  --warn-bg: #241b0b;
+  --alert: #f04438;
+  --alert-text: #ff8b80;
+  --alert-border: #6b2a24;
+  --hairline: #1f1f1f;
+  --subtle: #141414;
+  --strong: #5c5c5c;
+  --faint: #3d3d3d;
+  --code-text: #c7c7c7;
+  --alert-bg: #241210;
+  --ok-bg: #0f1d2e;
+  --success: #51cf66;
+  --success-bg: #0f2216;
+  --orange: #ff8a4c;
+  --map-bg: #1a1a1a;
+  --code-block-bg: #161616;
+  --code-block-fg: #ededed;
+  --code-block-border: #2a2a2a;
+  --chart-ink: #ededed;
+  --chart-soft: #6b6b6b;
+  --chart-mid: #8f8f8f;
+  --chart-area: #1c1c1c;
+  --chart-fill: #2a2a2a;
+  --syntax-string: #7cb4f5;
+  --syntax-number: #f0a36b;
+  --syntax-comment: #7a7a7a;
+  --syntax-selection: #1f3350;
+  color-scheme: dark;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+@layer base {
+  body {
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  a {
+    color: inherit;
+    text-decoration: none;
+  }
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+}
+
+/* Primitives shadcn has no component for. */
+@layer components {
+  .kbd {
+    font: 500 11px/1 var(--font-geist-mono), monospace;
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 3px 5px;
+    color: var(--muted-foreground);
+    background: var(--background);
+  }
+  .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 9999px;
+    display: inline-block;
+    flex: none;
+  }
+  .code-block {
+    background: var(--code-block-bg);
+    color: var(--code-block-fg);
+    border: 1px solid var(--code-block-border);
+    border-radius: 8px;
+    padding: 16px;
+    font: 400 12.5px/1.7 var(--font-geist-mono), ui-monospace, monospace;
+    overflow-x: auto;
+    white-space: pre;
+    margin: 0;
+  }
+  .kpi {
+    font-size: 24px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1.2;
+  }
+  .cap {
+    font-size: 13px;
+    color: var(--muted-foreground);
+  }
+  .h2 {
+    font-size: 15px;
+    font-weight: 500;
+    margin: 0;
+  }
+  .sr-only-label {
+    position: absolute;
+    left: -9999px;
+  }
+  .num {
+    font-variant-numeric: tabular-nums;
+  }
+  /* Key/value lists on detail pages: a card with one hairline row per pair. */
+  .facts {
+    display: grid;
+    gap: 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--card);
+    font-size: 13px;
+  }
+  .facts > dt,
+  .facts > dd {
+    margin: 0;
+    padding: 9px 14px;
+    border-top: 1px solid var(--hairline);
+    min-width: 0;
+  }
+  .facts > dt {
+    color: var(--muted-foreground);
+  }
+  .facts > dd {
+    padding-left: 0;
+  }
+  .facts > dt:first-of-type,
+  .facts > dt:first-of-type + dd {
+    border-top: 0;
+  }
+}
+
+/* Every page's content column: one width, centred, same gutters. */
+@utility page {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 1280px;
+  margin-inline: auto;
+  padding: 28px 24px 64px;
+  @media (width < 48rem) {
+    padding: 20px 16px 48px;
+  }
+}
+
+/* A row whose state just changed (NavRow `watch`). Reduced motion gets the tint without the fade. */
+@keyframes row-flash {
+  from {
+    background-color: var(--ok-bg);
+  }
+  to {
+    background-color: transparent;
+  }
+}
+[data-flash] {
+  animation: row-flash 1.5s ease-out;
+}
+@media (prefers-reduced-motion: reduce) {
+  [data-flash] {
+    animation: none;
+    background-color: var(--ok-bg);
+  }
+}
+
+/* A row with an action running (Actions sets data-busy). */
+tr:has([data-busy]) {
+  opacity: 0.6;
+}
+
+/* Compact tables (the density switch; set on <html> before first paint). */
+:root[data-density="compact"] [data-slot="table-cell"] {
+  padding-block: 3px;
+}
+:root[data-density="compact"] [data-slot="table-head"] {
+  padding-block: 4px;
+}

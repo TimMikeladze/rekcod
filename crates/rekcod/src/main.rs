@@ -23,6 +23,8 @@ mod cli_fetch;
 #[cfg(target_os = "macos")]
 mod daemon;
 #[cfg(target_os = "macos")]
+mod dashboard;
+#[cfg(target_os = "macos")]
 mod edge;
 #[cfg(target_os = "macos")]
 mod fetch;
@@ -46,6 +48,8 @@ mod service;
 mod snap;
 #[cfg(target_os = "macos")]
 mod spare;
+#[cfg(target_os = "macos")]
+mod state;
 #[cfg(target_os = "macos")]
 mod storage;
 #[cfg(target_os = "macos")]
@@ -228,6 +232,27 @@ enum Cmd {
         /// Remove the login item.
         #[arg(long)]
         uninstall: bool,
+    },
+    /// Everything the menu bar and dashboard show, with each item's actions, as JSON (docs/dashboard.md).
+    State {
+        /// Leave out everything that needs the fleet controller.
+        #[arg(long)]
+        local: bool,
+    },
+    /// The web dashboard: start it (or find the running one) and open it (docs/dashboard.md).
+    Dashboard {
+        /// Start it at login (LaunchAgent).
+        #[arg(long, conflicts_with_all = ["uninstall", "foreground"])]
+        install: bool,
+        /// Remove the login item.
+        #[arg(long, conflicts_with = "foreground")]
+        uninstall: bool,
+        /// Run the server in this process instead of in the background (what the LaunchAgent runs).
+        #[arg(long)]
+        foreground: bool,
+        /// Print the URL without opening a browser.
+        #[arg(long)]
+        no_open: bool,
     },
     #[command(hide = true, subcommand)]
     Research(Research),
@@ -501,6 +526,10 @@ enum RemoteCmd {
     Rm {
         name: String,
     },
+    /// Make NAME the default remote.
+    Use {
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -534,6 +563,12 @@ enum NodeCmd {
     },
     /// Stop placing new sandboxes on a node (admin token).
     Drain {
+        id: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Place sandboxes on a drained node again (admin token).
+    Undrain {
         id: String,
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
@@ -797,6 +832,14 @@ enum AppCmd {
     Secret(AppVars),
     Logs {
         name: String,
+        /// One instance's logs (its sandbox ID from `app status`).
+        #[arg(long)]
+        instance: Option<String>,
+    },
+    /// One release: commit, who deployed it, when it finished, and its deploy log.
+    Release {
+        name: String,
+        n: i64,
     },
     Open {
         name: String,
@@ -888,9 +931,20 @@ enum JobCmd {
         cmd: Vec<String>,
     },
     /// Recent jobs and schedules.
-    Ls,
+    Ls {
+        /// Only the last 50 runs of this named or scheduled job.
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// A job's output (the last 64 KiB once it's finished).
     Logs {
+        id: String,
+        /// Keep printing while it runs.
+        #[arg(long, short)]
+        follow: bool,
+    },
+    /// Run a finished job's command again (same repo, commit and settings) as a new job.
+    Rerun {
         id: String,
     },
     Cancel {
@@ -1048,6 +1102,7 @@ fn main() {
             Ok(())
         }
         Cmd::Remote(RemoteCmd::Rm { name }) => fleet::remote_rm(&paths, &name),
+        Cmd::Remote(RemoteCmd::Use { name }) => fleet::remote_use(&paths, &name),
         Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install }) => {
             fleet::node_join(&paths, &controller, &join_token, &listen, advertise.as_deref(), install)
         }
@@ -1061,6 +1116,9 @@ fn main() {
         }
         Cmd::Node(NodeCmd::Drain { id, remote }) => {
             remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/drain"), &serde_json::json!({}))
+        }
+        Cmd::Node(NodeCmd::Undrain { id, remote }) => {
+            remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/undrain"), &serde_json::json!({}))
         }
         Cmd::Controller(ControllerCmd::Serve { install: true, .. }) => {
             service::install(&paths, "controller", &service::args_without_install())
@@ -1148,6 +1206,10 @@ fn main() {
         Cmd::Menubar { install: true, .. } => menubar::install(),
         Cmd::Menubar { uninstall: true, .. } => menubar::uninstall(),
         Cmd::Menubar { .. } => menubar::run(paths),
+        Cmd::State { local } => state::print(&paths, local),
+        Cmd::Dashboard { install: true, .. } => dashboard::install(&paths),
+        Cmd::Dashboard { uninstall: true, .. } => service::uninstall("dashboard"),
+        Cmd::Dashboard { foreground, no_open, .. } => dashboard::run(&paths, foreground, !no_open),
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
@@ -1319,12 +1381,26 @@ fn run_job(paths: &paths::Paths, remote: &Option<String>, c: JobCmd) -> anyhow::
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
         }
-        JobCmd::Ls => remote_call(paths, remote, "GET", "/jobs", &serde_json::Value::Null),
-        JobCmd::Logs { id } => {
-            let j = fleet::call(&r.url, "GET", &r.scoped(format!("/jobs/{id}")), Some(&r.token), &serde_json::Value::Null)?;
-            print!("{}", j["log"].as_str().unwrap_or(""));
-            Ok(())
+        JobCmd::Ls { name: None } => remote_call(paths, remote, "GET", "/jobs", &serde_json::Value::Null),
+        JobCmd::Ls { name: Some(n) } => {
+            remote_call(paths, remote, "GET", &format!("/jobs?name={}", fleet::percent_encode(&n)), &serde_json::Value::Null)
         }
+        JobCmd::Logs { id, follow } => {
+            use std::io::Write;
+            let mut shown = String::new();
+            loop {
+                let j = fleet::call(&r.url, "GET", &r.scoped(format!("/jobs/{id}")), Some(&r.token), &serde_json::Value::Null)?;
+                let log = j["log"].as_str().unwrap_or("");
+                print!("{}", new_output(&shown, log));
+                std::io::stdout().flush()?;
+                shown = log.to_string();
+                if !follow || j["state"] != "running" {
+                    return Ok(());
+                }
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+        JobCmd::Rerun { id } => remote_call(paths, remote, "POST", &format!("/jobs/{id}/rerun"), &json!({})),
         JobCmd::Cancel { id } => remote_call(paths, remote, "POST", &format!("/jobs/{id}/cancel"), &json!({})),
         JobCmd::Unschedule { name } => remote_call(paths, remote, "DELETE", &format!("/schedules/{name}"), &serde_json::Value::Null),
     }
@@ -1368,7 +1444,8 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 "name": name.or(t.get("app.name").cloned()).unwrap_or(dir_name),
                 "git": {"url": origin, "ref": head},
                 "port": port.or(num("app.port")),
-                "instances": instances.or(num("resources.instances")).unwrap_or(1),
+                // Neither given keeps the app's current count (1 for a new app).
+                "instances": instances.or(num("resources.instances")),
                 "cpus": num("resources.cpus").unwrap_or(1),
                 "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()).unwrap_or(1),
                 "health": t.get("app.health").cloned(),
@@ -1408,7 +1485,11 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
         AppCmd::Secret(AppVars::Unset { name, keys }) => {
             remote_call(paths, remote, "POST", &format!("/apps/{name}/secrets"), &json!({"unset": keys}))
         }
-        AppCmd::Logs { name } => remote_call(paths, remote, "GET", &format!("/apps/{name}/logs"), &serde_json::Value::Null),
+        AppCmd::Logs { name, instance: None } => remote_call(paths, remote, "GET", &format!("/apps/{name}/logs"), &serde_json::Value::Null),
+        AppCmd::Logs { name, instance: Some(id) } => {
+            remote_call(paths, remote, "GET", &format!("/apps/{name}/instances/{id}/logs"), &serde_json::Value::Null)
+        }
+        AppCmd::Release { name, n } => remote_call(paths, remote, "GET", &format!("/apps/{name}/releases/{n}"), &serde_json::Value::Null),
         AppCmd::Open { name } => {
             let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
             let v = fleet::call(&r.url, "GET", &r.scoped(format!("/apps/{name}")), Some(&r.token), &serde_json::Value::Null)?;

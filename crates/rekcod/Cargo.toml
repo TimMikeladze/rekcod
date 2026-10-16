@@ -23,7 +23,7 @@ objc2-virtualization = { version = "0.3", features = ["dispatch2", "objc2-app-ki
 block2 = "0.6"
 dispatch2 = "0.3"
 notify = "8"
-rusqlite = { version = "0.37", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"

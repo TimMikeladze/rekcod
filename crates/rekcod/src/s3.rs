@@ -221,14 +221,19 @@ impl S3 {
             self.access_key,
             &date[..8]
         );
-        let addr = host.to_socket_addrs()?.next().ok_or_else(|| anyhow!("can't resolve {host}"))?;
-        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).with_context(|| format!("connect {}", self.endpoint))?;
-        s.set_read_timeout(Some(Duration::from_secs(300)))?;
         let target = if q.is_empty() { path } else { format!("{path}?{q}") };
-        write!(
-            s,
-            "{method} {target} HTTP/1.1\r\nHost: {host}\r\nx-amz-date: {date}\r\nx-amz-content-sha256: {payload}\r\nAuthorization: {auth}\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n"
-        )?;
+        let extra = format!("x-amz-date: {date}\r\nx-amz-content-sha256: {payload}\r\nAuthorization: {auth}\r\n");
+        raw(method, &host, &target, &extra, len, body)
+    }
+}
+
+/// One HTTP/1.1 request to `host` (`host:port`) with `extra` headers (CRLF-terminated lines).
+fn raw(method: &str, host: &str, target: &str, extra: &str, len: u64, body: Body) -> Result<Response> {
+    {
+        let addr = host.to_socket_addrs()?.next().ok_or_else(|| anyhow!("can't resolve {host}"))?;
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).with_context(|| format!("connect {host}"))?;
+        s.set_read_timeout(Some(Duration::from_secs(300)))?;
+        write!(s, "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: {len}\r\nConnection: close\r\n\r\n")?;
         match body {
             Body::Empty => {}
             Body::Bytes(b) => s.write_all(b)?,
@@ -239,8 +244,7 @@ impl S3 {
         let mut r = BufReader::new(s);
         let mut line = String::new();
         r.read_line(&mut line)?;
-        let status: u16 =
-            line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| anyhow!("bad response from {}", self.endpoint))?;
+        let status: u16 = line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| anyhow!("bad response from {host}"))?;
         let mut headers = Vec::new();
         loop {
             let mut h = String::new();
@@ -263,7 +267,34 @@ impl S3 {
         };
         Ok(Response { status, body })
     }
+}
 
+/// `http://host:port/path?query` split into host and target.
+fn split_url(url: &str) -> Result<(String, String)> {
+    let rest = url.strip_prefix("http://").ok_or_else(|| anyhow!("only http:// URLs"))?;
+    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    Ok((host.to_string(), format!("/{path}")))
+}
+
+/// GET a presigned URL into `w`; returns the size.
+pub fn url_get(url: &str, w: &mut impl Write) -> Result<u64> {
+    let (host, target) = split_url(url)?;
+    let mut r = raw("GET", &host, &target, "", 0, Body::Empty)?.ok("get")?;
+    Ok(std::io::copy(&mut r.body, w)?)
+}
+
+/// PUT to a presigned URL.
+pub fn url_put(url: &str, body: Body) -> Result<()> {
+    let (host, target) = split_url(url)?;
+    let len = match &body {
+        Body::Empty => 0,
+        Body::Bytes(b) => b.len() as u64,
+        Body::File(p) => std::fs::metadata(p)?.len(),
+    };
+    raw("PUT", &host, &target, "", len, body)?.ok("put").map(|_| ())
+}
+
+impl S3 {
     /// Creates `bucket`; one that exists already is fine.
     pub fn create_bucket(&self, bucket: &str) -> Result<()> {
         let r = self.request("PUT", &format!("/{bucket}"), &[], Body::Empty)?;
@@ -338,10 +369,16 @@ impl S3 {
 
     /// A GET URL anyone can use for `secs` seconds.
     pub fn presign(&self, bucket: &str, key: &str, secs: u64) -> Result<String> {
-        self.presign_at(bucket, key, secs, now())
+        self.presign_at("GET", bucket, key, secs, now())
     }
 
-    fn presign_at(&self, bucket: &str, key: &str, secs: u64, t: u64) -> Result<String> {
+    /// A URL that allows one `method` (GET or PUT) on one object for `secs` seconds: what
+    /// a node gets instead of the root keys.
+    pub fn presign_method(&self, method: &str, bucket: &str, key: &str, secs: u64) -> Result<String> {
+        self.presign_at(method, bucket, key, secs, now())
+    }
+
+    fn presign_at(&self, method: &str, bucket: &str, key: &str, secs: u64, t: u64) -> Result<String> {
         let host = self.authority()?;
         let path = uri_encode(&format!("/{bucket}/{key}"), true);
         let date = amz_date(t);
@@ -353,7 +390,7 @@ impl S3 {
             ("X-Amz-SignedHeaders".into(), "host".into()),
         ];
         let cq = canonical_query(&q);
-        let sig = signature(&self.secret_key, &date, "GET", &path, &cq, &[("host".into(), host.clone())], "UNSIGNED-PAYLOAD");
+        let sig = signature(&self.secret_key, &date, method, &path, &cq, &[("host".into(), host.clone())], "UNSIGNED-PAYLOAD");
         Ok(format!("http://{host}{path}?{cq}&X-Amz-Signature={sig}"))
     }
 

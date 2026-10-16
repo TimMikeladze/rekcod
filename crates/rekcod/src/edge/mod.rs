@@ -29,7 +29,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use serde_json::{Value, json};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::fleet::{self, Remote, Route, call};
+use crate::fleet::{self, QUICK, Remote, Route, call, call_within};
 use crate::paths::Paths;
 
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -39,6 +39,11 @@ const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_BODY: u64 = 100 << 20;
 const MAX_CONNS: usize = 10_000;
+/// Upgraded connections (WebSockets) open at once, and how long one may sit silent.
+const MAX_TUNNELS: usize = 5_000;
+const TUNNEL_IDLE: Duration = Duration::from_secs(3600);
+static TUNNELS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
+    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_TUNNELS)));
 const AUTO_BAN: Duration = Duration::from_secs(600);
 const IDLE_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(400) } else { Duration::from_secs(90) };
 
@@ -88,7 +93,18 @@ pub struct Edge {
     access_log: bool,
     trusted_proxies: Vec<ipnet::IpNet>,
     stats: stats::Stats,
+    /// Where the last good route table is kept, so a restart while the controller is down
+    /// still routes (`~/.rekcod/edge-routes.json`).
+    cache: Option<std::path::PathBuf>,
+    /// One wake per host at a time; other requests for it wait on the same one.
+    waking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// When a host's last wake failed: it gets 503s, not another wake, for [`WAKE_BACKOFF`].
+    wake_failed: Mutex<HashMap<String, std::time::Instant>>,
 }
+
+/// After a failed wake, how long the edge answers 503 instead of asking again. Public
+/// traffic would otherwise turn into a rebuild loop.
+const WAKE_BACKOFF: Duration = Duration::from_secs(30);
 
 impl Edge {
     pub fn new(remote: Option<Remote>, s: Settings) -> Arc<Edge> {
@@ -105,7 +121,21 @@ impl Edge {
             access_log: s.access_log,
             trusted_proxies: s.trusted_proxies,
             stats: Default::default(),
+            cache: None,
+            waking: Default::default(),
+            wake_failed: Default::default(),
         })
+    }
+
+    /// Starts from the cached route table, and keeps it up to date from now on.
+    fn with_cache(self: Arc<Self>, path: std::path::PathBuf) -> Arc<Self> {
+        if let Some(m) = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<HashMap<String, Route>>(&b).ok()) {
+            eprintln!("rekcod: edge: {} route(s) from {}", m.len(), path.display());
+            *self.table.write().unwrap_or_else(std::sync::PoisonError::into_inner) = m;
+        }
+        let mut e = Arc::try_unwrap(self).unwrap_or_else(|_| unreachable!("not shared yet"));
+        e.cache = Some(path);
+        Arc::new(e)
     }
 
     fn trusts(&self, peer: IpAddr) -> bool {
@@ -118,21 +148,37 @@ impl Edge {
         let hosts: Vec<String> = self.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).drain().collect();
         let (traffic, clients) = self.stats.take(minute_now());
         if !(hosts.is_empty() && traffic.is_empty() && clients.is_empty())
-            && let Err(e) =
-                call(&r.url, "POST", "/routes/activity", Some(&r.token), &json!({"hosts": hosts, "traffic": traffic, "clients": clients}))
+            && let Err(e) = call_within(
+                &r.url,
+                "POST",
+                "/routes/activity",
+                Some(&r.token),
+                &json!({"hosts": hosts, "traffic": traffic, "clients": clients}),
+                QUICK,
+            )
         {
             eprintln!("rekcod: edge: activity: {e:#}");
         }
-        match call(&r.url, "GET", "/routes", Some(&r.token), &Value::Null) {
-            Ok(v) => {
-                let m: HashMap<String, Route> = serde_json::from_value(v).unwrap_or_default();
+        // A reply that doesn't parse keeps the table we have; emptying it would take every app down.
+        match call_within(&r.url, "GET", "/routes", Some(&r.token), &Value::Null, QUICK)
+            .and_then(|v| Ok(serde_json::from_value::<HashMap<String, Route>>(v)?))
+        {
+            Ok(m) => {
                 let live: HashSet<String> = m.values().flat_map(|r| r.endpoints.iter().cloned()).collect();
                 self.pool.retain(&live);
+                if let Some(path) = &self.cache
+                    && let Ok(b) = serde_json::to_vec(&m)
+                {
+                    let tmp = path.with_extension("tmp");
+                    if std::fs::write(&tmp, b).is_ok() {
+                        let _ = std::fs::rename(tmp, path);
+                    }
+                }
                 *self.table.write().unwrap_or_else(std::sync::PoisonError::into_inner) = m;
             }
             Err(e) => eprintln!("rekcod: edge: routes: {e:#}"),
         }
-        match call(&r.url, "GET", "/bans", Some(&r.token), &Value::Null) {
+        match call_within(&r.url, "GET", "/bans", Some(&r.token), &Value::Null, QUICK) {
             Ok(v) => self.bans.set_remote(
                 v.as_array().into_iter().flatten().filter_map(|b| b["net"].as_str().and_then(|n| ban::parse_net(n).ok())).collect(),
             ),
@@ -144,6 +190,18 @@ impl Edge {
     /// Asks the controller to wake the app and waits (up to its health timeout, or a rebuild).
     async fn wake(&self, host: &str, route: &Route) -> Vec<String> {
         let Some(r) = self.remote.clone() else { return vec![] };
+        if self.wake_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).is_some_and(|t| t.elapsed() < WAKE_BACKOFF)
+        {
+            return vec![];
+        }
+        let lock = self.waking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(host.to_string()).or_default().clone();
+        let _one = lock.lock().await;
+        // Woken by whoever held the lock before us.
+        if let Some(eps) = self.table.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).map(|r| r.endpoints.clone())
+            && !eps.is_empty()
+        {
+            return eps;
+        }
         let ns = if route.ns.is_empty() { "default".to_string() } else { route.ns.clone() };
         let app = route.app.clone();
         let path = format!("/ns/{ns}/apps/{app}/wake");
@@ -155,10 +213,20 @@ impl Edge {
                 if let Some(r) = self.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(host) {
                     r.endpoints = eps.clone();
                 }
+                if eps.is_empty() {
+                    self.wake_failed
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(host.to_string(), std::time::Instant::now());
+                }
                 eps
             }
             Err(e) => {
                 eprintln!("rekcod: edge: wake {app}: {e:#}");
+                self.wake_failed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(host.to_string(), std::time::Instant::now());
                 vec![]
             }
         }
@@ -195,7 +263,7 @@ fn minute_now() -> i64 {
 /// `rekcod edge serve`. `listen` routes every app (for the tailnet); `public_listen` only
 /// apps marked public (point cloudflared or another tunnel at it).
 pub fn serve(paths: &Paths, remote_name: Option<&str>, o: Options) -> Result<()> {
-    let edge = Edge::new(Some(fleet::remote(paths, remote_name)?), o.settings);
+    let edge = Edge::new(Some(fleet::remote(paths, remote_name)?), o.settings).with_cache(paths.home.join("edge-routes.json"));
     let e = edge.clone();
     std::thread::spawn(move || {
         loop {
@@ -358,7 +426,7 @@ fn prepare(edge: &Edge, p: &mut Parts, client: IpAddr, peer: IpAddr, upgrade: bo
 }
 
 async fn handle(edge: Arc<Edge>, req: Request<Incoming>, peer: IpAddr, opts: Listener) -> Response<Body> {
-    let client = if edge.trusts(peer) { client_ip::forwarded(req.headers()).unwrap_or(peer) } else { peer };
+    let client = if edge.trusts(peer) { client_ip::forwarded(req.headers(), &edge.trusted_proxies).unwrap_or(peer) } else { peer };
     let host = req_host(&req);
     let t = Instant::now();
     let log = edge.access_log.then(|| (req.method().clone(), req.uri().path().to_string()));
@@ -435,11 +503,27 @@ async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: Ip
                         && let Some(down) = client_upgrade
                     {
                         let up = hyper::upgrade::on(&mut resp);
-                        tokio::spawn(async move {
-                            if let (Ok(a), Ok(b)) = tokio::join!(down, up) {
-                                let _ = tokio::io::copy_bidirectional(&mut TokioIo::new(a), &mut TokioIo::new(b)).await;
-                            }
-                        });
+                        // The connection's slot is freed once it's upgraded, so tunnels have
+                        // their own cap, and close after an hour with no bytes either way.
+                        if let Ok(slot) = TUNNELS.clone().try_acquire_owned() {
+                            tokio::spawn(async move {
+                                if let (Ok(a), Ok(b)) = tokio::join!(down, up) {
+                                    let act = Arc::new(idle::Activity::new());
+                                    let mut a = idle::Tracked { io: TokioIo::new(a), activity: act.clone() };
+                                    let mut b = idle::Tracked { io: TokioIo::new(b), activity: act.clone() };
+                                    let watch = async {
+                                        while act.idle() < TUNNEL_IDLE {
+                                            tokio::time::sleep(Duration::from_secs(60)).await;
+                                        }
+                                    };
+                                    tokio::select! {
+                                        _ = tokio::io::copy_bidirectional(&mut a, &mut b) => {}
+                                        _ = watch => {}
+                                    }
+                                }
+                                drop(slot);
+                            });
+                        }
                         lease.done(false);
                     } else {
                         strip_hop(resp.headers_mut(), false);

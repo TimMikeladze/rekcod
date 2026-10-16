@@ -626,6 +626,18 @@ enum NodeCmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
+    /// Let a node that joined take work (admin token).
+    Approve {
+        id: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Forget a node; its app instances move to other nodes (admin token).
+    Rm {
+        id: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
     /// Place sandboxes on a drained node again (admin token).
     Undrain {
         id: String,
@@ -723,6 +735,15 @@ enum ControllerCmd {
         /// RustFS root keys (default: ~/.rekcod/storage/credentials.json, which `storage serve` writes).
         #[arg(long)]
         storage_credentials: Option<std::path::PathBuf>,
+        /// Use new nodes right away instead of waiting for `rekcod node approve` (one-Mac fleets).
+        #[arg(long)]
+        auto_approve: bool,
+        /// POST a JSON line ({"text": ...}) here when a node is lost or a deploy or backup fails.
+        #[arg(long)]
+        alert_webhook: Option<String>,
+        /// Also keep the hourly fleet.db backups here (another disk, a synced folder).
+        #[arg(long)]
+        backup_dir: Option<std::path::PathBuf>,
     },
     /// Remove the controller's LaunchAgent.
     Uninstall,
@@ -767,6 +788,23 @@ enum ControllerCmd {
         /// Its role there: viewer, member or owner.
         #[arg(long, default_value = "member", requires = "ns")]
         role: String,
+        /// A token for `rekcod edge serve`: routes, bans and activity only.
+        #[arg(long, conflicts_with_all = ["admin", "ns"])]
+        edge: bool,
+        /// Stop working after this long (`30d`, `12h`).
+        #[arg(long, value_parser = duration_secs)]
+        expires: Option<u64>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Delete every token with this name (admin token).
+    Revoke {
+        name: String,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Make a new join token; the old one stops working (admin token).
+    RotateJoin {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
@@ -774,7 +812,7 @@ enum ControllerCmd {
 
 #[derive(Subcommand)]
 enum EdgeCmd {
-    /// Serve HTTP ingress (needs an admin-token remote).
+    /// Serve HTTP ingress (needs a remote with an edge or admin token).
     Serve {
         /// Routes every app; bind it to the tailnet or loopback.
         #[arg(long, default_value = "127.0.0.1:8080")]
@@ -1181,15 +1219,40 @@ fn main() {
         Cmd::Node(NodeCmd::Drain { id, remote }) => {
             remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/drain"), &serde_json::json!({}))
         }
+        Cmd::Node(NodeCmd::Approve { id, remote }) => {
+            remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/approve"), &serde_json::json!({}))
+        }
+        Cmd::Node(NodeCmd::Rm { id, remote }) => remote_call(&paths, &remote, "DELETE", &format!("/nodes/{id}"), &serde_json::json!({})),
         Cmd::Node(NodeCmd::Undrain { id, remote }) => {
             remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/undrain"), &serde_json::json!({}))
         }
         Cmd::Controller(ControllerCmd::Serve { install: true, .. }) => {
             service::install(&paths, "controller", &service::args_without_install())
         }
-        Cmd::Controller(ControllerCmd::Serve { db, listen, domain, drain, storage, storage_credentials, .. }) => fleet::controller_serve(
+        Cmd::Controller(ControllerCmd::Serve {
+            db,
+            listen,
+            domain,
+            drain,
+            storage,
+            storage_credentials,
+            auto_approve,
+            alert_webhook,
+            backup_dir,
+            ..
+        }) => fleet::controller_serve(
             &paths,
-            fleet::ControllerOptions { db, listen, domain, drain_secs: drain, storage, storage_credentials },
+            fleet::ControllerOptions {
+                db,
+                listen,
+                domain,
+                drain_secs: drain,
+                storage,
+                storage_credentials,
+                auto_approve,
+                alert_webhook,
+                backup_dir,
+            },
         ),
         Cmd::Controller(ControllerCmd::Backup { remote }) => remote_call(&paths, &remote, "POST", "/backups", &serde_json::json!({})),
         Cmd::Controller(ControllerCmd::Backups { remote }) => remote_call(&paths, &remote, "GET", "/backups", &serde_json::Value::Null),
@@ -1205,13 +1268,20 @@ fn main() {
         Cmd::Controller(ControllerCmd::Limit { name, max_sandboxes, remote }) => {
             remote_call(&paths, &remote, "POST", &format!("/tokens/{name}"), &serde_json::json!({"max_sandboxes": max_sandboxes}))
         }
-        Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, ns, role, remote }) => remote_call(
+        Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, ns, role, edge, expires, remote }) => remote_call(
             &paths,
             &remote,
             "POST",
             "/tokens",
-            &serde_json::json!({"name": name, "max_sandboxes": max_sandboxes, "admin": admin, "ns": ns, "role": role}),
+            &serde_json::json!({"name": name, "max_sandboxes": max_sandboxes, "admin": admin, "ns": ns, "role": role,
+                                "edge": edge, "expires_secs": expires}),
         ),
+        Cmd::Controller(ControllerCmd::Revoke { name, remote }) => {
+            remote_call(&paths, &remote, "DELETE", &format!("/tokens/{name}"), &serde_json::json!({}))
+        }
+        Cmd::Controller(ControllerCmd::RotateJoin { remote }) => {
+            remote_call(&paths, &remote, "POST", "/join-token", &serde_json::json!({}))
+        }
         Cmd::Edge(EdgeCmd::Serve { install: true, .. }) => service::install(&paths, "edge", &service::args_without_install()),
         Cmd::Edge(EdgeCmd::Serve { listen, public_listen, proxy_protocol, trusted_proxies, rate, burst, access_log, remote, .. }) => {
             let rate = edge::limit::parse_rate(&rate)?;
@@ -1731,6 +1801,9 @@ mod tests {
         use clap::Parser;
         for a in actions::tests::reachable_kinds() {
             let actions::Run::Rekcod(argv) = &a.run else { continue };
+            use actions::Kind::*;
+            let vm = matches!(a.kind, VmStart | VmStop | VmRepair | VmForceStop | VmAutostartOn | VmAutostartOff);
+            assert!(!vm || route::docker_args(argv).is_none(), "{:?} would go to docker: {argv:?}", a.kind);
             if route::docker_args(argv).is_some() {
                 continue; // docker passthrough (container start/stop/rm/logs)
             }

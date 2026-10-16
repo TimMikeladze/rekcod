@@ -47,9 +47,17 @@ if ! is_ext4; then
     log "formatting data disk"
     mkfs.ext4 -q -L rekcod-data -m 0 -E lazy_itable_init=1,lazy_journal_init=1 /dev/vdb
   else
-    # A damaged primary superblock: e2fsck can rebuild it from the first backup.
+    # A damaged primary superblock: e2fsck can rebuild it from a backup. Plain boots try
+    # the first one; --repair (rekcod.fsck=yes) walks the others too, with -y.
     log "data disk has no readable ext4 superblock; trying the backup"
     e2fsck -p -b 32768 -B 4096 /dev/vdb >/dev/console 2>&1
+    if ! is_ext4 && grep -q 'rekcod\.fsck=yes' /proc/cmdline; then
+      for b in 98304 163840 229376 294912 819200 884736 1605632 2654208 4096000 7962624; do
+        log "trying backup superblock $b"
+        e2fsck -fy -b $b -B 4096 /dev/vdb >/dev/console 2>&1
+        is_ext4 && break
+      done
+    fi
   fi
 fi
 if ! is_ext4; then

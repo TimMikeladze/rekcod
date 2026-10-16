@@ -137,7 +137,19 @@ fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
         std::fs::write(paths.mac_address(), random_mac()?)?;
     }
     exclude_from_backups(&paths.home.join("vm"));
+    rotate(&paths.console_log());
+    rotate(&paths.daemon_log());
     Ok(())
+}
+
+/// Each boot starts a fresh log; the previous boot's is kept as `<name>.1`. Without this
+/// the logs grew forever (the console one also had VZ writing over its start).
+pub(crate) fn rotate(log: &std::path::Path) {
+    if std::fs::metadata(log).is_ok_and(|m| m.len() > 0) {
+        let mut old = log.as_os_str().to_owned();
+        old.push(".1");
+        let _ = std::fs::rename(log, old);
+    }
 }
 
 /// Time Machine would copy a live ext4 image (inconsistent, and up to the disk's size).
@@ -225,7 +237,8 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         if let Some(free) = free_disk_gib(&paths.home).filter(|f| *f < 5) {
             eprintln!("rekcod: warning: only {free} GiB free on the Mac's disk; the VM's disk fails when it runs out");
         }
-        let console_start = std::fs::metadata(paths.console_log()).map(|m| m.len()).unwrap_or(0);
+        // prepare_vm rotated the console log, so everything in it is from this boot.
+        let console_start = 0;
 
         let log = OpenOptions::new().create(true).append(true).open(paths.daemon_log())?;
         let mut cmd = Command::new(std::env::current_exe()?);
@@ -300,9 +313,10 @@ fn data_disk_error(paths: &Paths, from: u64) -> Option<String> {
     use std::io::{Seek, SeekFrom};
     let mut f = std::fs::File::open(paths.console_log()).ok()?;
     f.seek(SeekFrom::Start(from)).ok()?;
-    let mut text = String::new();
-    f.take(1 << 20).read_to_string(&mut text).ok()?;
-    text.lines().find_map(|l| l.split_once("data disk error: ").map(|(_, e)| e.trim().to_string()))
+    // Kernel output can hold bytes that aren't UTF-8.
+    let mut bytes = Vec::new();
+    f.take(4 << 20).read_to_end(&mut bytes).ok()?;
+    String::from_utf8_lossy(&bytes).lines().find_map(|l| l.split_once("data disk error: ").map(|(_, e)| e.trim().to_string()))
 }
 
 /// SIGTERM the daemon and wait for the VM to power off; false if it wasn't running.

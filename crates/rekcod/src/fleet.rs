@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::paths::Paths;
 use crate::sandbox;
-use crate::sandbox_api::{read_request, respond};
+use crate::sandbox_api::respond;
 
 fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
@@ -54,10 +54,29 @@ pub fn percent_encode(s: &str) -> String {
 }
 
 /// Sends a request; returns the status and a reader at the body (read to EOF).
+/// How long a reply may take by default: deploys build images, so minutes. Calls that
+/// should be quick (heartbeats, routes) pass [`QUICK`].
+pub const SLOW: Duration = Duration::from_secs(900);
+pub const QUICK: Duration = Duration::from_secs(30);
+
 pub fn send(base: &str, method: &str, path: &str, token: Option<&str>, body: &[u8]) -> Result<(u16, BufReader<TcpStream>)> {
+    send_within(base, method, path, token, body, Some(SLOW))
+}
+
+/// `send` with a read timeout (None: wait for as long as the reply streams, as for logs -f).
+pub fn send_within(
+    base: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &[u8],
+    timeout: Option<Duration>,
+) -> Result<(u16, BufReader<TcpStream>)> {
     let addr = authority(base)?;
     let sock = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("can't resolve {addr}"))?;
     let mut s = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).with_context(|| format!("connect {base}"))?;
+    s.set_read_timeout(timeout)?;
+    s.set_write_timeout(Some(QUICK))?;
     let auth = token.map(|t| format!("Authorization: Bearer {t}\r\n")).unwrap_or_default();
     write!(
         s,
@@ -80,8 +99,12 @@ pub fn send(base: &str, method: &str, path: &str, token: Option<&str>, body: &[u
 
 /// JSON request; an error status becomes an error carrying the server's message.
 pub fn call(base: &str, method: &str, path: &str, token: Option<&str>, body: &Value) -> Result<Value> {
+    call_within(base, method, path, token, body, SLOW)
+}
+
+pub fn call_within(base: &str, method: &str, path: &str, token: Option<&str>, body: &Value, timeout: Duration) -> Result<Value> {
     let data = if body.is_null() { vec![] } else { serde_json::to_vec(body)? };
-    let (code, mut r) = send(base, method, path, token, &data)?;
+    let (code, mut r) = send_within(base, method, path, token, &data, Some(timeout))?;
     let mut buf = Vec::new();
     r.read_to_end(&mut buf)?;
     let v: Value = serde_json::from_slice(&buf).unwrap_or_else(|_| json!({"text": String::from_utf8_lossy(&buf)}));
@@ -272,6 +295,25 @@ pub fn clone(paths: &Paths, url: &str, rev: &str) -> Result<PathBuf> {
 
 /// The address this node's relays listen on.
 static NODE_IP: OnceLock<IpAddr> = OnceLock::new();
+/// The host others reach this node at (from `--advertise`): instance endpoints use it,
+/// since `--listen 0.0.0.0` says nothing about how to get here.
+static NODE_HOST: OnceLock<String> = OnceLock::new();
+
+/// In a sandbox's home: the fleet made it (the node API, a deploy or a job). Heartbeats
+/// report only these, so the Mac owner's own sandboxes are never touched by the controller.
+pub const FLEET_MARKER: &str = "fleet";
+/// In an instance's home: the controller put it to sleep, so `node serve` doesn't boot it.
+pub const ASLEEP_MARKER: &str = "asleep";
+
+pub fn mark_fleet(paths: &Paths, id: &str) {
+    if let Ok(h) = sandbox::home(paths, id) {
+        let _ = std::fs::write(h.join(FLEET_MARKER), b"");
+    }
+}
+
+/// Jobs this node process is running; one without a result and not in here died with an
+/// earlier node process.
+static RUNNING_JOBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
@@ -294,11 +336,12 @@ fn pipe(mut a: TcpStream, mut b: TcpStream) {
 static RELAY_ALLOW: RwLock<Vec<IpAddr>> = RwLock::new(Vec::new());
 
 fn relay_allowed(peer: IpAddr, node: IpAddr, allow: &[IpAddr]) -> bool {
-    let peer = match peer {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(peer),
+    let unmap = |ip: IpAddr| match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
         v4 => v4,
     };
-    peer.is_loopback() || peer == node || allow.contains(&peer)
+    let peer = unmap(peer);
+    peer.is_loopback() || peer == unmap(node) || allow.contains(&peer)
 }
 
 /// Forwards `ip:ext` (0 picks one) to the Mac's `127.0.0.1:port`; returns the bound port.
@@ -308,9 +351,12 @@ fn start_relay(ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
     std::thread::spawn(move || {
         for c in l.incoming().flatten() {
             let peer = c.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]));
-            if !relay_allowed(peer, ip, &RELAY_ALLOW.read().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+            // This Mac's own address on whichever interface the connection came in on.
+            let local = c.local_addr().map(|a| a.ip()).unwrap_or(ip);
+            if !relay_allowed(peer, local, &RELAY_ALLOW.read().unwrap_or_else(std::sync::PoisonError::into_inner)) {
                 continue;
             }
+            let _ = c.set_read_timeout(None);
             std::thread::spawn(move || {
                 if let Ok(up) = TcpStream::connect(("127.0.0.1", port)) {
                     pipe(c, up);
@@ -357,21 +403,29 @@ pub fn generated_dockerfile(dir: &Path, start: &str) -> Result<String> {
 
 /// Where a release's image is kept in RustFS (docs/rustfs.md): `<bucket>/<key>.tar.zst` is
 /// `docker save | zstd`, `<key>.json` the commit's rekcod.toml. Sent by the controller.
-#[derive(serde::Deserialize)]
+/// Where a node keeps and finds a release's image, as presigned URLs: nodes never see the
+/// RustFS root keys, so one node can't read other apps' buckets or the backups.
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ReleaseStore {
-    s3: crate::s3::S3,
-    bucket: String,
-    key: String,
+    /// `bucket/key`, for logs.
+    name: String,
+    image_get: String,
+    image_put: String,
+    toml_get: String,
+    toml_put: String,
     /// Both objects are there: load them instead of cloning and building.
     cached: bool,
-    /// BuildKit cache bucket.
-    cache: Option<String>,
+    /// BuildKit's cache for the app: URLs, and whether one is stored yet.
+    cache_get: Option<String>,
+    cache_put: Option<String>,
+    #[serde(default)]
+    cache_stored: bool,
 }
 
 /// The stored rekcod.toml of a cached release, if it can be read.
 fn stored_toml(st: &ReleaseStore) -> Option<HashMap<String, String>> {
     let mut b = Vec::new();
-    st.s3.get(&st.bucket, &format!("{}.json", st.key), &mut b).map_err(|e| eprintln!("rekcod: {}: {e:#}", st.key)).ok()?;
+    crate::s3::url_get(&st.toml_get, &mut b).map_err(|e| eprintln!("rekcod: {}: {e:#}", st.name)).ok()?;
     serde_json::from_slice(&b).ok()
 }
 
@@ -388,8 +442,8 @@ fn push_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore, toml: &Ha
         if !out.status.success() {
             bail!("docker save: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
-        st.s3.put(&st.bucket, &format!("{}.tar.zst", st.key), crate::s3::Body::File(&tmp))?;
-        st.s3.put(&st.bucket, &format!("{}.json", st.key), crate::s3::Body::Bytes(&serde_json::to_vec(toml)?))
+        crate::s3::url_put(&st.image_put, crate::s3::Body::File(&tmp))?;
+        crate::s3::url_put(&st.toml_put, crate::s3::Body::Bytes(&serde_json::to_vec(toml)?))
     })();
     let _ = std::fs::remove_file(&tmp);
     r
@@ -399,7 +453,7 @@ fn push_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore, toml: &Ha
 fn load_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore) -> Result<()> {
     let tmp = paths.home.join("remote-ws").join(format!("{}.tar.zst", sandbox::new_id()?));
     let r = (|| -> Result<()> {
-        st.s3.get(&st.bucket, &format!("{}.tar.zst", st.key), &mut std::fs::File::create(&tmp)?)?;
+        crate::s3::url_get(&st.image_get, &mut std::fs::File::create(&tmp)?)?;
         let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
         let mut child = d.arg("load").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let mut stdin = child.stdin.take().context("no stdin")?;
@@ -421,8 +475,8 @@ fn load_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore) -> Result
     r
 }
 
-/// `tar -C dir -c . | zstd` into `bucket/key`.
-fn push_dir(s3: &crate::s3::S3, bucket: &str, key: &str, dir: &Path, tmp: &Path) -> Result<()> {
+/// `tar -C dir -c . | zstd` to a presigned PUT URL.
+fn push_dir(url: &str, dir: &Path, tmp: &Path) -> Result<()> {
     let mut child = Command::new("tar").arg("-C").arg(dir).args(["-cf", "-", "."]).stdout(Stdio::piped()).spawn()?;
     let mut enc = zstd::Encoder::new(std::fs::File::create(tmp)?, 3)?;
     std::io::copy(child.stdout.as_mut().context("no stdout")?, &mut enc)?;
@@ -430,24 +484,21 @@ fn push_dir(s3: &crate::s3::S3, bucket: &str, key: &str, dir: &Path, tmp: &Path)
     if !child.wait()?.success() {
         bail!("tar of {} failed", dir.display());
     }
-    s3.put(bucket, key, crate::s3::Body::File(tmp))
+    crate::s3::url_put(url, crate::s3::Body::File(tmp))
 }
 
-/// The reverse of `push_dir`; false when there's nothing stored yet.
-fn pull_dir(s3: &crate::s3::S3, bucket: &str, key: &str, dir: &Path, tmp: &Path) -> Result<bool> {
-    if !s3.exists(bucket, key)? {
-        return Ok(false);
-    }
-    s3.get(bucket, key, &mut std::fs::File::create(tmp)?)?;
+/// The reverse of `push_dir`.
+fn pull_dir(url: &str, dir: &Path, tmp: &Path) -> Result<()> {
+    crate::s3::url_get(url, &mut std::fs::File::create(tmp)?)?;
     std::fs::create_dir_all(dir)?;
     let mut child = Command::new("tar").arg("-C").arg(dir).args(["-xf", "-"]).stdin(Stdio::piped()).spawn()?;
     let mut stdin = child.stdin.take().context("no stdin")?;
     zstd::stream::copy_decode(std::fs::File::open(tmp)?, &mut stdin)?;
     drop(stdin);
     if !child.wait()?.success() {
-        bail!("untar of {bucket}/{key} failed");
+        bail!("untar of the build cache failed");
     }
-    Ok(true)
+    Ok(())
 }
 
 /// `docker build`. With a store, BuildKit's cache goes to a local directory on this Mac
@@ -459,16 +510,13 @@ fn build_image(paths: &Paths, sb: &str, image: &str, dir: &Path, st: Option<&Rel
         let err = String::from_utf8_lossy(b);
         err.lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
     };
-    if let Some((st, bucket)) = st.and_then(|s| Some((s, s.cache.as_deref()?))) {
-        let key = format!("{}.tar.zst", st.key.split('/').next().unwrap_or("app"));
+    if let Some((st, get, put)) = st.and_then(|s| Some((s, s.cache_get.as_deref()?, s.cache_put.as_deref()?))) {
         let work = paths.home.join("remote-ws").join(format!("cache-{}", sandbox::new_id()?));
         let (from, to, tmp) = (work.join("from"), work.join("to"), work.join("cache.tar.zst"));
         std::fs::create_dir_all(&work)?;
         let r = (|| -> Result<Option<String>> {
-            let had = pull_dir(&st.s3, bucket, &key, &from, &tmp).unwrap_or_else(|e| {
-                eprintln!("rekcod: build cache {bucket}/{key}: {e:#}");
-                false
-            });
+            let had =
+                st.cache_stored && pull_dir(get, &from, &tmp).map_err(|e| eprintln!("rekcod: build cache for {}: {e:#}", st.name)).is_ok();
             let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
             d.args(["buildx", "build", "--load", "-q", "-t", image]);
             if had {
@@ -483,8 +531,8 @@ fn build_image(paths: &Paths, sb: &str, image: &str, dir: &Path, st: Option<&Rel
                 }
                 bail!("build failed: {}", tail(&out.stderr));
             }
-            if let Err(e) = push_dir(&st.s3, bucket, &key, &to, &tmp) {
-                eprintln!("rekcod: build cache {bucket}/{key}: {e:#}");
+            if let Err(e) = push_dir(put, &to, &tmp) {
+                eprintln!("rekcod: build cache for {}: {e:#}", st.name);
             }
             Ok(None)
         })();
@@ -519,11 +567,7 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
     let stored = store.as_ref().filter(|s| s.cached).and_then(stored_toml);
     let (dir, toml) = match &stored {
         Some(t) => {
-            eprintln!(
-                "rekcod: {app} r{release}: loading {}/{}",
-                store.as_ref().map_or("", |s| s.bucket.as_str()),
-                store.as_ref().map_or("", |s| s.key.as_str())
-            );
+            eprintln!("rekcod: {app} r{release}: loading {}", store.as_ref().map_or("", |s| s.name.as_str()));
             let dir = paths.home.join("remote-ws").join(sandbox::new_id()?);
             std::fs::create_dir_all(&dir)?;
             (dir.canonicalize()?, t.clone())
@@ -563,6 +607,7 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         ..Default::default()
     };
     let meta = sandbox::create(paths, o)?;
+    mark_fleet(paths, &meta.id);
     let mut pushed = false;
     let result = (|| -> Result<Value> {
         let image = format!("rekcod-app-{app}:{release}");
@@ -573,7 +618,7 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
                 if let Some(st) = &store {
                     match push_image(paths, &meta.id, &image, st, &toml) {
                         Ok(()) => pushed = true,
-                        Err(e) => eprintln!("rekcod: {app} r{release}: push to {}: {e:#}", st.bucket),
+                        Err(e) => eprintln!("rekcod: {app} r{release}: push to {}: {e:#}", st.name),
                     }
                 }
             }
@@ -599,7 +644,8 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         let ip = *NODE_IP.get().unwrap_or(&IpAddr::from([127, 0, 0, 1]));
         let ext = start_relay(ip, 0, hp)?;
         std::fs::write(sandbox::home(paths, &meta.id)?.join("instance.json"), json!({"hp": hp, "ext": ext}).to_string())?;
-        Ok(json!({"sandbox": meta.id, "endpoint": format!("{ip}:{ext}"), "health": toml.get("app.health"), "pushed": pushed}))
+        let host = NODE_HOST.get().cloned().unwrap_or_else(|| ip.to_string());
+        Ok(json!({"sandbox": meta.id, "endpoint": format!("{host}:{ext}"), "health": toml.get("app.health"), "pushed": pushed}))
     })();
     if result.is_err() {
         let _ = sandbox::rm(paths, std::slice::from_ref(&meta.id), false);
@@ -616,7 +662,9 @@ pub fn instance_logs(paths: &Paths, id: &str) -> Result<String> {
 /// Node op: boots a sleeping instance's VM and starts its app container again; returns
 /// once the published port is back on the Mac.
 pub fn wake_instance(paths: &Paths, id: &str) -> Result<Value> {
-    let v: Value = serde_json::from_slice(&std::fs::read(sandbox::home(paths, id)?.join("instance.json"))?)?;
+    let home = sandbox::home(paths, id)?;
+    let _ = std::fs::remove_file(home.join(ASLEEP_MARKER));
+    let v: Value = serde_json::from_slice(&std::fs::read(home.join("instance.json"))?)?;
     let hp = v["hp"].as_u64().context("instance.json has no port")? as u16;
     let t0 = Instant::now();
     // dockerd may still be coming up right after the boot.
@@ -655,7 +703,15 @@ pub fn run_job(paths: &Paths, a: &Value) -> Result<Value> {
     std::fs::create_dir_all(&dir)?;
     let started = id.clone();
     let (paths, a) = (paths.clone(), a.clone());
+    RUNNING_JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(id.clone());
     std::thread::spawn(move || {
+        struct Done(String);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                RUNNING_JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|j| *j != self.0);
+            }
+        }
+        let _done = Done(id.clone());
         let t0 = Instant::now();
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log"));
         let r = log.map_err(anyhow::Error::from).and_then(|log| job_body(&paths, &id, &a, &dir, log));
@@ -699,6 +755,8 @@ fn job_body(paths: &Paths, id: &str, a: &Value, dir: &Path, log: std::fs::File) 
         ttl_secs: 0,
         ..Default::default()
     };
+    // Not fleet-marked: the controller tracks jobs, not their sandboxes, and the job thread
+    // removes this one itself.
     let meta = sandbox::create(paths, o)?;
     std::fs::write(dir.join("sandbox"), &meta.id)?;
     let r = (|| -> Result<i32> {
@@ -721,9 +779,16 @@ pub fn job_get(paths: &Paths, id: &str) -> Result<Value> {
     }
     let log = std::fs::read(dir.join("log")).unwrap_or_default();
     let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(JOB_LOG_BYTES)..]).to_string();
+    let running = RUNNING_JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|j| j == id);
     let mut v = match std::fs::read(dir.join("result.json")) {
         Ok(b) => serde_json::from_slice::<Value>(&b)?,
-        Err(_) => json!({"running": true}),
+        Err(_) if running => json!({"running": true}),
+        // No result and no thread: the node restarted while it ran. Say so once, for good.
+        Err(_) => {
+            let r = json!({"exit": -1, "error": "the node restarted while the job ran", "cancelled": false});
+            let _ = std::fs::write(dir.join("result.json"), r.to_string());
+            r
+        }
     };
     v["running"] = json!(v["exit"].is_null());
     v["log"] = json!(tail);
@@ -780,23 +845,43 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, listen: &str
 pub fn node_serve(paths: &Paths) -> Result<()> {
     let cfg: NodeConfig = serde_json::from_slice(&std::fs::read(paths.home.join("node.json")).context("not joined; `rekcod node join`")?)?;
     let addr: SocketAddr = cfg.listen.parse()?;
+    graceful_exit(None);
     let ip = if addr.ip().is_unspecified() { IpAddr::from([0, 0, 0, 0]) } else { addr.ip() };
     let _ = NODE_IP.set(ip);
-    // Relays don't survive a restart; bring back each instance's on its old port.
+    let host = authority(&cfg.advertise).ok().and_then(|a| a.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']']).to_string()));
+    let _ = NODE_HOST.set(host.unwrap_or_else(|| ip.to_string()));
+    // Relays don't survive a restart, and after a reboot neither do the VMs: boot each
+    // instance that wasn't put to sleep, then bring its relay back on its old port.
+    if let Ok(v) = std::fs::read(paths.home.join("node-allow.json")) {
+        *RELAY_ALLOW.write().unwrap_or_else(std::sync::PoisonError::into_inner) = serde_json::from_slice(&v).unwrap_or_default();
+    }
     for l in sandbox::list(paths) {
-        let f = sandbox::home(paths, &l.meta.id).map(|h| h.join("instance.json")).ok();
-        if let Some(v) = f.and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
-            let (hp, ext) = (v["hp"].as_u64().unwrap_or(0) as u16, v["ext"].as_u64().unwrap_or(0) as u16);
-            if let Err(e) = start_relay(ip, ext, hp) {
-                eprintln!("rekcod: relay for {}: {e:#}", l.meta.id);
-            }
+        let Ok(home) = sandbox::home(paths, &l.meta.id) else { continue };
+        let Some(v) = std::fs::read(home.join("instance.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
+            continue;
+        };
+        let (hp, ext) = (v["hp"].as_u64().unwrap_or(0) as u16, v["ext"].as_u64().unwrap_or(0) as u16);
+        if let Err(e) = start_relay(ip, ext, hp) {
+            eprintln!("rekcod: relay for {}: {e:#}", l.meta.id);
+        }
+        if !home.join(ASLEEP_MARKER).exists() {
+            let (p, id) = (paths.clone(), l.meta.id.clone());
+            std::thread::spawn(move || {
+                if let Err(e) = wake_instance(&p, &id) {
+                    eprintln!("rekcod: booting instance {id}: {e:#}");
+                }
+            });
         }
     }
     let hb_paths = paths.clone();
     let (controller, id, secret) = (cfg.controller.clone(), cfg.id.clone(), cfg.secret.clone());
     std::thread::spawn(move || {
         loop {
-            let sbs: Vec<String> = sandbox::list(&hb_paths).into_iter().map(|l| l.meta.id).collect();
+            let sbs: Vec<Value> = sandbox::list(&hb_paths)
+                .into_iter()
+                .filter(|l| sandbox::home(&hb_paths, &l.meta.id).is_ok_and(|h| h.join(FLEET_MARKER).exists()))
+                .map(|l| json!({"id": l.meta.id, "created": l.meta.created}))
+                .collect();
             let macos_free = if crate::macos::ready(&hb_paths, "default") {
                 crate::macos::MAX_RUNNING.saturating_sub(sandbox::macos_running(&hb_paths))
             } else {
@@ -806,7 +891,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs,
                               "cpus": crate::cli::sysctl_u64("hw.ncpu").unwrap_or(0), "load": load_average(),
                               "disk_total_gib": disk_total, "disk_free_gib": disk_free});
-            match call(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body) {
+            match call_within(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body, QUICK) {
                 Ok(v) => {
                     let mut ips: Vec<IpAddr> =
                         v["ingress"].as_array().into_iter().flatten().filter_map(|i| i.as_str()?.parse().ok()).collect();
@@ -814,11 +899,29 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
                     if let Ok(a) = authority(&controller) {
                         ips.extend(a.to_socket_addrs().into_iter().flatten().map(|s| s.ip()));
                     }
+                    // Kept for a restart while the controller is down: edges can still connect.
+                    if let Ok(b) = serde_json::to_vec(&ips) {
+                        let _ = std::fs::write(hb_paths.home.join("node-allow.json"), b);
+                    }
                     *RELAY_ALLOW.write().unwrap_or_else(std::sync::PoisonError::into_inner) = ips;
+                    // Fleet sandboxes the controller has no record of (a deploy it gave up on).
+                    for id in v["delete"].as_array().into_iter().flatten().filter_map(|i| i.as_str()) {
+                        if sandbox::home(&hb_paths, id).is_ok_and(|h| h.join(FLEET_MARKER).exists()) {
+                            eprintln!("rekcod: removing {id}: the controller doesn't know it");
+                            let _ = sandbox::rm(&hb_paths, &[id.to_string()], false);
+                        }
+                    }
                 }
                 Err(e) => eprintln!("rekcod: heartbeat: {e:#}"),
             }
             std::thread::sleep(Duration::from_secs(5));
+        }
+    });
+    let gc_paths = paths.clone();
+    std::thread::spawn(move || {
+        loop {
+            node_cleanup(&gc_paths, Duration::from_secs(7 * 86400));
+            std::thread::sleep(Duration::from_secs(3600));
         }
     });
     let l = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
@@ -832,6 +935,26 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
 }
 
 /// The 1-minute load average.
+/// Deletes clones in `remote-ws/` no sandbox uses and finished job directories, once older
+/// than `age`. Both otherwise grow with every deploy and job.
+fn node_cleanup(paths: &Paths, age: Duration) {
+    let in_use: std::collections::HashSet<PathBuf> = sandbox::list(paths).into_iter().map(|l| l.meta.project).collect();
+    let old = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|e| e > age));
+    for e in std::fs::read_dir(paths.home.join("remote-ws")).into_iter().flatten().flatten() {
+        let p = e.path();
+        let canon = p.canonicalize().unwrap_or_else(|_| p.clone());
+        if old(&p) && !in_use.contains(&canon) {
+            let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        }
+    }
+    for e in std::fs::read_dir(paths.home.join("jobs")).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.join("result.json").exists() && old(&p.join("result.json")) {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+}
+
 fn load_average() -> f64 {
     let mut l = [0f64; 3];
     if unsafe { libc::getloadavg(l.as_mut_ptr(), 3) } < 1 { 0.0 } else { l[0] }
@@ -875,8 +998,9 @@ create table if not exists bans (net text primary key, reason text not null defa
 insert or ignore into namespaces (name, created, salt) values ('default', 0, randomblob(16));
 ";
 
-/// Columns added after the first release; `alter table` fails harmlessly once they exist.
-const MIGRATIONS: &[&str] = &[
+/// Columns added before migrations were numbered; `alter table` fails harmlessly once they
+/// exist. Run once, as user_version 1.
+const LEGACY_MIGRATIONS: &[&str] = &[
     "alter table apps add column idle_stop integer not null default 0",
     "alter table apps add column recycle integer not null default 0",
     "alter table apps add column last_request integer not null default 0",
@@ -911,6 +1035,18 @@ const MIGRATIONS: &[&str] = &[
 
 /// The controller's SQLite database. Queries use `?N` parameters; rows come back whole so
 /// call sites read them with `row.get(i)` after the statement is done.
+/// Numbered migrations: entry i takes `PRAGMA user_version` from i + 1 to i + 2. A failure
+/// stops startup, rather than surfacing later as a missing column.
+const MIGRATIONS: &[&str] = &[
+    // Tokens stored as SHA-256 (docs/fleet-hardening.md); `hashed` marks converted rows.
+    "alter table tokens add column hashed integer not null default 0;
+     alter table tokens add column expires integer;
+     alter table tokens add column default_role text not null default 'member';
+     alter table tokens add column edge integer not null default 0;",
+    // GitHub deliveries seen, so a replayed webhook does nothing.
+    "create table if not exists deliveries (id text primary key, ts integer not null);",
+];
+
 pub struct Db(rusqlite::Connection);
 
 pub struct Row(Vec<rusqlite::types::Value>);
@@ -929,8 +1065,31 @@ impl Db {
         let c = rusqlite::Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         c.busy_timeout(Duration::from_secs(5))?;
         c.execute_batch(SCHEMA)?;
-        for m in MIGRATIONS {
-            let _ = c.execute(m, []);
+        let mut version: i64 = c.query_row("pragma user_version", [], |r| r.get(0))?;
+        if version < 1 {
+            for m in LEGACY_MIGRATIONS {
+                let _ = c.execute(m, []);
+            }
+            c.execute_batch("pragma user_version = 1")?;
+            version = 1;
+        }
+        for (i, m) in MIGRATIONS.iter().enumerate() {
+            let to = i as i64 + 2;
+            if version < to {
+                let tx = c.unchecked_transaction()?;
+                tx.execute_batch(m).with_context(|| format!("migration to schema {to}"))?;
+                tx.execute_batch(&format!("pragma user_version = {to}"))?;
+                tx.commit()?;
+                version = to;
+            }
+        }
+        // Tokens from before hashing: hash them in place, so they keep working.
+        let plain: Vec<(String, String)> = {
+            let mut st = c.prepare("select rowid, token from tokens where not hashed")?;
+            st.query_map([], |r| Ok((r.get::<_, i64>(0)?.to_string(), r.get::<_, String>(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        for (rowid, t) in plain {
+            c.execute("update tokens set token = ?2, hashed = 1 where rowid = ?1", rusqlite::params![rowid, hash_token(&t)])?;
         }
         Ok(Db(c))
     }
@@ -971,19 +1130,54 @@ struct Controller {
     storage: Option<crate::s3::S3>,
     /// Edge client reports by minute: (minute, ip) -> (requests, rate-limited). Ten minutes kept.
     clients: Mutex<HashMap<(i64, String), (i64, i64)>>,
+    /// New nodes start `ready` instead of `pending` (one-Mac fleets, `spare setup`).
+    auto_approve: bool,
+    /// `~/.rekcod/controller`: join-token and the other files `serve` writes.
+    dir: PathBuf,
+    /// When this controller started: nothing is declared lost or orphaned in the first
+    /// minutes, while nodes catch up.
+    started: Instant,
+    /// Apps with fewer healthy instances than they want, and since when.
+    short_since: Mutex<HashMap<String, Instant>>,
+    /// Failed health checks in a row, per instance sandbox.
+    strikes: Mutex<HashMap<String, u32>>,
+    /// `--alert-webhook`: gets a JSON line when a node is lost or a deploy or backup fails.
+    alert_webhook: Option<String>,
+    /// fleet.db, for backups on a connection of their own.
+    db_path: PathBuf,
+    /// `--backup-dir`: hourly backups are also copied here.
+    backup_dir: Option<PathBuf>,
+    /// One lock per namespace, held from a quota check until what it allowed is recorded,
+    /// so creates running at once can't all pass the same check.
+    quotas: Mutex<HashMap<String, Arc<Mutex<()>>>>,
 }
 
 struct Caller {
     name: String,
     admin: bool,
     max: i32,
+    /// What this token may do in `default`; None when made for another namespace only.
+    default_role: Option<Role>,
+    /// An edge's token: routes, bans, activity and metrics, nothing else.
+    edge: bool,
 }
 
 impl Caller {
     /// The controller acting for itself (watchdog, webhooks).
     fn system(name: &str) -> Caller {
-        Caller { name: name.into(), admin: true, max: i32::MAX }
+        Caller { name: name.into(), admin: true, max: i32::MAX, default_role: Some(Role::Owner), edge: false }
     }
+
+    #[cfg(test)]
+    fn user(name: &str) -> Caller {
+        Caller { name: name.into(), admin: false, max: 10, default_role: Some(Role::Member), edge: false }
+    }
+}
+
+/// Tokens are kept as SHA-256 hex; the plaintext only exists on the client.
+fn hash_token(t: &str) -> String {
+    use sha2::Digest;
+    hex(&sha2::Sha256::digest(t.as_bytes()))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -1043,7 +1237,30 @@ impl Controller {
             edges: Default::default(),
             storage: None,
             clients: Default::default(),
+            auto_approve: true,
+            dir: PathBuf::new(),
+            started: Instant::now(),
+            short_since: Default::default(),
+            strikes: Default::default(),
+            alert_webhook: None,
+            db_path: PathBuf::new(),
+            backup_dir: None,
+            quotas: Default::default(),
         }
+    }
+
+    /// Posts `{"text": msg}` to `--alert-webhook` (Slack and Discord both take that shape),
+    /// in the background so a slow receiver never holds anything up.
+    fn alert(&self, msg: &str) {
+        let Some(url) = self.alert_webhook.clone() else { return };
+        let body = json!({"text": format!("rekcod: {msg}"), "domain": self.domain}).to_string();
+        std::thread::spawn(move || {
+            let _ = Command::new("curl")
+                .args(["-sf", "-m", "10", "-X", "POST", "-H", "Content-Type: application/json", "-d", &body, &url])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        });
     }
 
     fn config(&self, key: &str) -> Result<Option<String>> {
@@ -1056,12 +1273,20 @@ impl Controller {
     }
 
     fn caller(&self, token: &str) -> Result<Option<Caller>> {
-        let row = self
-            .db
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query_opt("select name, admin, max_sandboxes from tokens where token = ?1", &[&token])?;
-        Ok(row.map(|r| Caller { name: r.get(0), admin: r.get(1), max: r.get(2) }))
+        if token.is_empty() {
+            return Ok(None);
+        }
+        let row = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
+            "select name, admin, max_sandboxes, default_role, edge from tokens where token = ?1 and (expires is null or expires > ?2)",
+            &[&hash_token(token), &now()],
+        )?;
+        Ok(row.map(|r| Caller {
+            name: r.get(0),
+            admin: r.get(1),
+            max: r.get(2),
+            default_role: Role::parse(&r.get::<String>(3)).ok(),
+            edge: r.get(4),
+        }))
     }
 
     fn audit(&self, ns: &str, who: &str, action: &str, target: &str, ok: bool) {
@@ -1081,8 +1306,11 @@ impl Controller {
         if who.admin {
             return Ok(Some(Role::Owner));
         }
+        if who.edge {
+            return Ok(None);
+        }
         if ns == "default" {
-            return Ok(Some(Role::Member));
+            return Ok(who.default_role);
         }
         let r = db.query_opt("select role from members where ns = ?1 and who = ?2", &[&ns, &who.name])?;
         r.map(|r| Role::parse(&r.get::<String>(0))).transpose()
@@ -1109,6 +1337,10 @@ impl Controller {
             &[&(now() - 15), &mib, &macos, &ns],
         )?;
         Ok(rows.iter().map(|r| (r.get(0), r.get(1), r.get(2))).collect())
+    }
+
+    fn quota_lock(&self, ns: &str) -> Arc<Mutex<()>> {
+        self.quotas.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(ns.to_string()).or_default().clone()
     }
 
     fn app_lock(&self, app: &str) -> Arc<Mutex<()>> {
@@ -1268,46 +1500,259 @@ fn can_touch(who: &Caller, ns: &str, owner: &str) -> bool {
 
 /// Every 5 s: marks nodes silent for 15 s as lost (with their sandboxes), deletes week-old
 /// previews, puts idle apps to sleep, recycles old releases, and runs jobs and schedules.
+/// `GET /metrics`: Prometheus text exposition of what the controller knows.
+fn metrics(c: &Controller) -> Result<String> {
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut out = String::new();
+    let mut gauge = |name: &str, help: &str, sql: &str, label: &str| -> Result<()> {
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} gauge\n"));
+        for r in db.query(sql, &[])? {
+            let (k, v): (String, i64) = (r.get(0), r.get(1));
+            out.push_str(&format!("{name}{{{label}=\"{}\"}} {v}\n", k.replace('"', "")));
+        }
+        Ok(())
+    };
+    gauge("rekcod_nodes", "Nodes by state.", "select state, count(*) from nodes group by state", "state")?;
+    gauge(
+        "rekcod_instances",
+        "App instances by state.",
+        "select state, count(*) from instances where state <> 'removed' group by state",
+        "state",
+    )?;
+    gauge("rekcod_releases", "Releases by state (all time).", "select state, count(*) from releases group by state", "state")?;
+    gauge("rekcod_jobs", "Jobs by state.", "select state, count(*) from jobs group by state", "state")?;
+    gauge(
+        "rekcod_sandboxes",
+        "Sandboxes by state.",
+        "select state, count(*) from sandboxes where state <> 'removed' group by state",
+        "state",
+    )?;
+    gauge(
+        "rekcod_app_requests_last_minute",
+        "Requests per app in the last complete minute the edges reported.",
+        &format!("select app, sum(requests) from traffic where minute = {} group by app", now() / 60 - 1),
+        "app",
+    )?;
+    gauge(
+        "rekcod_app_errors_last_minute",
+        "5xx responses per app in the last complete minute.",
+        &format!("select app, sum(errors) from traffic where minute = {} group by app", now() / 60 - 1),
+        "app",
+    )?;
+    Ok(out)
+}
+
+/// The controller's background duties, each on its own thread: one hung node call can't
+/// stop lost-node detection, backups or the others.
 fn watchdog(c: Arc<Controller>) {
-    loop {
-        std::thread::sleep(Duration::from_secs(5));
-        for (what, r) in [
-            ("idle", sleep_idle(&c)),
-            ("recycle", recycle_due(&c)),
-            ("jobs", poll_jobs(&c)),
-            ("schedules", run_schedules(&c)),
-            ("backup", backup_due(&c)),
-        ] {
-            if let Err(e) = r {
-                eprintln!("rekcod: watchdog {what}: {e:#}");
+    let every = |name: &'static str, period: Duration, first: Duration, f: fn(&Arc<Controller>) -> Result<()>| {
+        let c = c.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(first);
+            loop {
+                if let Err(e) = f(&c) {
+                    eprintln!("rekcod: watchdog {name}: {e:#}");
+                }
+                std::thread::sleep(period);
             }
-        }
-        let lost = {
-            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let lost = db
-                .query("update nodes set state = 'lost' where state <> 'lost' and last_seen < ?1 returning id", &[&(now() - 15)])
-                .unwrap_or_default();
-            for r in &lost {
-                let id: String = r.get(0);
-                let _ = db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[&id]);
-                let _ = db.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping')", &[&id]);
-                let _ = db.execute("update jobs set state = 'lost', finished = ?2 where node = ?1 and state = 'running'", &[&id, &now()]);
-            }
-            lost.len()
-        };
-        if lost > 0 {
-            eprintln!("rekcod: {lost} node(s) lost");
-        }
-        let old: Vec<String> =
-            c.db.lock()
-                .unwrap()
-                .query("select name from apps where preview_of is not null and created < ?1", &[&(now() - 7 * 86400)])
-                .map(|rows| rows.iter().map(|r| r.get(0)).collect())
-                .unwrap_or_default();
-        for name in old {
-            let _ = destroy_app(&c, &name);
+        });
+    };
+    let s5 = Duration::from_secs(5);
+    every("idle", s5, s5, sleep_idle);
+    every("recycle", s5, s5, recycle_due);
+    every("jobs", s5, s5, |c| poll_jobs(c));
+    every("schedules", s5, s5, |c| run_schedules(c));
+    every("backup", Duration::from_secs(60), s5, |c| backup_due(c));
+    every("previews", Duration::from_secs(300), s5, expire_previews);
+    every("cleanup", Duration::from_secs(3600), Duration::from_secs(60), cleanup);
+    // Nodes heartbeat every 5 s; give them three beats after a restart before calling any lost.
+    every("lost nodes", s5, Duration::from_secs(20), mark_lost_nodes);
+    every("reconcile", Duration::from_secs(10), Duration::from_secs(30), reconcile);
+}
+
+fn mark_lost_nodes(c: &Arc<Controller>) -> Result<()> {
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let lost =
+        db.query("update nodes set state = 'lost' where state in ('ready', 'drain') and last_seen < ?1 returning id", &[&(now() - 15)])?;
+    for r in &lost {
+        let id: String = r.get(0);
+        db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[&id])?;
+        db.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping')", &[&id])?;
+        db.execute("update jobs set state = 'lost', finished = ?2 where node = ?1 and state = 'running'", &[&id, &now()])?;
+        eprintln!("rekcod: node {id} lost (no heartbeat for 15s)");
+        c.alert(&format!("node {id} lost"));
+    }
+    Ok(())
+}
+
+/// Releases kept in the store per app: rollbacks further back than this rebuild.
+const KEEP_RELEASES: usize = 10;
+
+/// Hourly: drops stored release images beyond the newest [`KEEP_RELEASES`] per app, and
+/// audit rows, finished jobs and old release logs past 90 days.
+fn cleanup(c: &Arc<Controller>) -> Result<()> {
+    let cutoff = now() - 90 * 86400;
+    {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        db.execute("delete from audit where ts < ?1", &[&cutoff])?;
+        db.execute("delete from jobs where state <> 'running' and coalesce(finished, created) < ?1", &[&cutoff])?;
+        db.execute("update releases set log = '' where state in ('old', 'failed') and created < ?1", &[&cutoff])?;
+    }
+    let Some(s) = &c.storage else { return Ok(()) };
+    if !s.bucket_exists(RELEASES)? {
+        return Ok(());
+    }
+    let live: Vec<(String, String)> =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select r.app, r.commit_sha from releases r join apps a on a.name = r.app and a.live_release = r.n", &[])?
+            .iter()
+            .map(|r| (r.get(0), r.get(1)))
+            .collect();
+    let mut by_app: HashMap<String, Vec<crate::s3::Object>> = HashMap::new();
+    for o in s.list(RELEASES, "")? {
+        if let Some((app, _)) = o.key.split_once('/') {
+            by_app.entry(app.to_string()).or_default().push(o);
         }
     }
+    for (app, mut objs) in by_app {
+        // Newest first; `.tar.zst` and `.json` of one commit count as one release.
+        objs.sort_by(|a, b| b.modified.cmp(&a.modified));
+        let mut commits: Vec<String> = Vec::new();
+        for o in &objs {
+            let commit = o.key.trim_start_matches(&format!("{app}/")).split('.').next().unwrap_or("").to_string();
+            if !commits.contains(&commit) {
+                commits.push(commit);
+            }
+        }
+        for commit in commits.iter().skip(KEEP_RELEASES) {
+            if live.iter().any(|(a, c)| *a == app && c == commit) {
+                continue;
+            }
+            for ext in ["tar.zst", "json"] {
+                let _ = s.delete(RELEASES, &format!("{app}/{commit}.{ext}"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn expire_previews(c: &Arc<Controller>) -> Result<()> {
+    let old: Vec<String> =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select name from apps where preview_of is not null and created < ?1", &[&(now() - 7 * 86400)])?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+    for name in old {
+        destroy_app(c, &name)?;
+    }
+    Ok(())
+}
+
+/// Consecutive failed health checks before a live instance counts as lost.
+const HEALTH_STRIKES: u32 = 3;
+
+/// Moves what runs toward what should (docs/fleet-hardening.md, "Convergence"):
+/// instances on a node that came back are checked and taken back; live instances that stop
+/// answering are dropped; an app short of healthy instances for a minute is redeployed at
+/// its live commit (from the release store, so no rebuild).
+fn reconcile(c: &Arc<Controller>) -> Result<()> {
+    let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
+        "select i.sandbox, i.endpoint, a.health, i.state from instances i join apps a on a.name = i.app join nodes n on n.id = i.node
+         where n.state in ('ready', 'drain') and i.state in ('live', 'lost')",
+        &[],
+    )?;
+    let checks: Vec<_> = rows
+        .iter()
+        .map(|r| {
+            let (sb, ep, health, state): (String, String, String, String) = (r.get(0), r.get(1), r.get(2), r.get(3));
+            std::thread::spawn(move || (sb, state, healthy(&ep, &health)))
+        })
+        .collect();
+    for h in checks {
+        let Ok((sb, state, ok)) = h.join() else { continue };
+        let mut strikes = c.strikes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if ok {
+            strikes.remove(&sb);
+            if state == "lost" {
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("update instances set state = 'live' where sandbox = ?1", &[&sb])?;
+                eprintln!("rekcod: instance {sb} answers again; back in the routes");
+            }
+            continue;
+        }
+        let n = strikes.entry(sb.clone()).or_insert(0);
+        *n += 1;
+        if state == "live" && *n >= HEALTH_STRIKES {
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .execute("update instances set state = 'lost' where sandbox = ?1", &[&sb])?;
+            eprintln!("rekcod: instance {sb} failed {HEALTH_STRIKES} health checks; out of the routes");
+        }
+    }
+    let apps = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
+        "select a.name, a.instances,
+           (select count(*) from instances i where i.app = a.name and i.state = 'live'),
+           (select count(*) from instances i where i.app = a.name and i.state = 'sleeping'),
+           r.commit_sha
+         from apps a join releases r on r.app = a.name and r.n = a.live_release",
+        &[],
+    )?;
+    for r in apps {
+        let (name, wanted, live, sleeping, commit): (String, i64, i64, i64, String) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+        let mut short = c.short_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if live >= wanted.max(1) || (live == 0 && sleeping > 0) {
+            short.remove(&name);
+            continue;
+        }
+        let since = *short.entry(name.clone()).or_insert_with(Instant::now);
+        if since.elapsed() < Duration::from_secs(60) {
+            continue;
+        }
+        let lock = c.app_lock(&name);
+        // Deploying, waking or recycling right now: that fixes it, or the next pass will.
+        if lock.try_lock().is_err() {
+            continue;
+        }
+        short.insert(name.clone(), Instant::now());
+        drop(short);
+        let c = c.clone();
+        std::thread::spawn(move || {
+            let Ok(_g) = lock.try_lock() else { return };
+            eprintln!("rekcod: {name} has {live} of {wanted} healthy instance(s); redeploying {commit}");
+            let r = load_app_key(&c, &name)
+                .and_then(|a| a.ok_or_else(|| anyhow!("gone")))
+                .and_then(|app| deploy_locked(&c, &app, Some(commit), "reconcile"));
+            if let Err(e) = r {
+                eprintln!("rekcod: reconcile {name}: {e:#}");
+                c.alert(&format!("{name}: replacing lost instances failed: {e:#}"));
+            }
+        });
+    }
+    Ok(())
+}
+
+/// What a controller restart left half done: deploys that never finished, instances that
+/// were starting or draining. Run once at startup.
+fn sweep(c: &Arc<Controller>) -> Result<()> {
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let n = db.execute(
+        "update releases set state = 'failed', finished = ?1, log = log || char(10) || 'the controller restarted during this deploy'
+         where state = 'building'",
+        &[&now()],
+    )?;
+    let stale = db.query("select node, sandbox from instances where state in ('starting', 'draining')", &[])?;
+    drop(db);
+    if n > 0 || !stale.is_empty() {
+        eprintln!("rekcod: startup: {n} unfinished deploy(s) marked failed, {} instance(s) cleaned up", stale.len());
+    }
+    for r in stale {
+        delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
+    }
+    Ok(())
 }
 
 /// Forwards the request to a node and streams its response back unchanged.
@@ -1340,7 +1785,24 @@ fn json_reply(w: &mut impl Write, r: Result<Value>) -> Result<()> {
 fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
     let peer = stream.peer_addr().ok().map(|a| a.ip());
     let mut r = BufReader::new(stream);
-    let req = read_request(&mut r)?;
+    let mut req = crate::sandbox_api::read_head(&mut r)?;
+    // Requests that need a user token are checked before their body is read, so nobody
+    // without one can make the controller buffer a large body. Registration, heartbeats
+    // and webhooks prove themselves in the body; theirs is capped lower.
+    let open = matches!(
+        req.path.trim_matches('/').split('/').collect::<Vec<_>>().as_slice(),
+        ["nodes", "register"] | ["nodes", _, "heartbeat"] | ["webhooks", "github"]
+    );
+    if !open {
+        let bearer = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
+        if c.caller(bearer)?.is_none() {
+            return respond(r.get_mut(), 401, "application/json", br#"{"error":"bad token"}"#);
+        }
+    }
+    let cap = if open { 8 << 20 } else { crate::sandbox_api::MAX_BODY };
+    if let Err(e) = crate::sandbox_api::read_body(&mut r, &mut req, cap) {
+        return respond(r.get_mut(), 413, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
+    }
     let mut w = r.into_inner();
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
     let all: Vec<&str> = req.path.trim_matches('/').split('/').collect();
@@ -1363,12 +1825,17 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 let (id, sec) = (format!("n-{}", sandbox::new_id()?), secret()?);
                 let url = body["url"].as_str().context("missing url")?;
                 let total = body["mem_total_mib"].as_i64().unwrap_or(0);
+                // Anyone with the join token can register; an admin approves before work lands there.
+                let state = if c.auto_approve { "ready" } else { "pending" };
                 c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-                    "insert into nodes (id, url, secret, mem_total, last_seen) values (?1, ?2, ?3, ?4, ?5)",
-                    &[&id, &url, &sec, &total, &now()],
+                    "insert into nodes (id, url, secret, mem_total, last_seen, state) values (?1, ?2, ?3, ?4, ?5, ?6)",
+                    &[&id, &url, &sec, &total, &now(), &state],
                 )?;
                 c.audit("-", "node", "register", &id, true);
-                Ok(json!({"id": id, "secret": sec}))
+                if state == "pending" {
+                    eprintln!("rekcod: node {id} ({url}) registered; `rekcod node approve {id}` to use it");
+                }
+                Ok(json!({"id": id, "secret": sec, "state": state}))
             })();
             return json_reply(&mut w, r);
         }
@@ -1378,8 +1845,15 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                 if !crate::sandbox_api::ct_eq(sec.as_bytes(), bearer.as_bytes()) {
                     bail!("bad node secret");
                 }
-                let free = body["mem_free_mib"].as_i64().unwrap_or(0);
-                let macos_free = body["macos_free"].as_i64().unwrap_or(0) as i32;
+                // Never more than the node said it had when it joined: a node reporting more
+                // would be handed every deploy (placement sorts by free memory).
+                let total: i64 =
+                    c.db.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .query_one("select mem_total from nodes where id = ?1", &[id])?
+                        .get(0);
+                let free = body["mem_free_mib"].as_i64().unwrap_or(0).clamp(0, if total > 0 { total } else { i64::MAX });
+                let macos_free = (body["macos_free"].as_i64().unwrap_or(0) as i32).clamp(0, crate::macos::MAX_RUNNING as i32);
                 let next = if state == "lost" { "ready".to_string() } else { state };
                 let load = (body["load"].as_f64().unwrap_or(0.0) * 100.0) as i64;
                 let (cpus, dt, df) = (
@@ -1392,6 +1866,32 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                        disk_total = ?8, disk_free = ?9 where id = ?1",
                     &[id, &free, &now(), &next, &macos_free, &cpus, &load, &dt, &df],
                 )?;
+                // What the node really has. Live instances it lacks are lost (the next reconcile
+                // replaces them); fleet sandboxes the controller never recorded, or recorded as
+                // gone, are deleted on the node, once they're older than any deploy in flight.
+                let mut delete: Vec<String> = Vec::new();
+                if let Some(have) = body["sandboxes"].as_array() {
+                    // Nodes from before this send bare ids; their sandboxes are never orphans.
+                    let old_enough: Vec<&str> = have
+                        .iter()
+                        .filter(|v| v["created"].as_i64().is_some_and(|t| t < now() - 600))
+                        .filter_map(|v| v["id"].as_str())
+                        .collect();
+                    let have: Vec<&str> = have.iter().filter_map(|v| v.as_str().or(v["id"].as_str())).collect();
+                    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    for r in db.query("select sandbox from instances where node = ?1 and state in ('live', 'sleeping')", &[id])? {
+                        let sb: String = r.get(0);
+                        if !have.contains(&sb.as_str()) {
+                            db.execute("update instances set state = 'lost' where sandbox = ?1", &[&sb])?;
+                        }
+                    }
+                    for sb in old_enough {
+                        let known = db.query_opt("select 1 from sandboxes where id = ?1 and state in ('running', 'lost')", &[&sb])?;
+                        if known.is_none() && c.started.elapsed() > Duration::from_secs(600) {
+                            delete.push(sb.to_string());
+                        }
+                    }
+                }
                 // Edges seen in the last 10 minutes may reach instances on this node.
                 let ingress: Vec<String> = c
                     .edges
@@ -1401,7 +1901,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                     .filter(|(_, t)| **t > now() - 600)
                     .map(|(ip, _)| ip.to_string())
                     .collect();
-                Ok(json!({"ingress": ingress}))
+                Ok(json!({"ingress": ingress, "delete": delete}))
             })();
             return json_reply(&mut w, r);
         }
@@ -1413,6 +1913,21 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         return respond(&mut w, 401, "application/json", br#"{"error":"bad token"}"#);
     };
     let admin_only = || -> Result<()> { if who.admin { Ok(()) } else { bail!("admin token required") } };
+    // What an edge needs: its route table, bans (it adds automatic ones) and reporting traffic.
+    let edge_or_admin = || -> Result<()> { if who.admin || who.edge { Ok(()) } else { bail!("admin or edge token required") } };
+    if who.edge
+        && !matches!(
+            (req.method.as_str(), seg.as_slice()),
+            ("GET", ["routes"])
+                | ("POST", ["routes", "activity"])
+                | ("GET", ["bans"])
+                | ("POST", ["bans"])
+                | ("GET", ["metrics"])
+                | ("POST", ["apps", _, "wake"])
+        )
+    {
+        return respond(&mut w, 403, "application/json", br#"{"error":"edge tokens only read routes and bans and report activity"}"#);
+    }
     let r: Result<Value> = match (req.method.as_str(), seg.as_slice()) {
         ("GET", ["nodes"]) => admin_only().and_then(|_| {
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1439,6 +1954,40 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                     })
                     .collect::<Vec<_>>()
             ))
+        }),
+        ("POST", ["nodes", id, "approve"]) => admin_only().and_then(|_| {
+            let n =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("update nodes set state = 'ready' where id = ?1 and state = 'pending'", &[id])?;
+            if n == 0 {
+                bail!("node {id} isn't waiting for approval");
+            }
+            c.audit("-", &who.name, "approve", id, true);
+            Ok(json!({"approved": id}))
+        }),
+        // Forget a node; its instances are rescheduled by the next reconcile.
+        ("DELETE", ["nodes", id]) => admin_only().and_then(|_| {
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if db.execute("delete from nodes where id = ?1", &[id])? == 0 {
+                bail!("no node {id}");
+            }
+            db.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping', 'starting')", &[id])?;
+            db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[id])?;
+            db.execute("update jobs set state = 'lost', finished = ?2 where node = ?1 and state = 'running'", &[id, &now()])?;
+            db.execute("delete from node_pools where node = ?1", &[id])?;
+            drop(db);
+            c.audit("-", &who.name, "node rm", id, true);
+            Ok(json!({"removed": id}))
+        }),
+        ("POST", ["join-token"]) => admin_only().and_then(|_| {
+            let t = secret()?;
+            c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute("insert or replace into config values ('join_token', ?1)", &[&t])?;
+            if !c.dir.as_os_str().is_empty() {
+                crate::paths::write_private(&c.dir.join("join-token"), t.as_bytes())?;
+            }
+            c.audit("-", &who.name, "rotate join token", "-", true);
+            Ok(json!({"join_token": t}))
         }),
         ("POST", ["nodes", id, "undrain"]) => admin_only().and_then(|_| {
             let n =
@@ -1482,13 +2031,20 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             let (t, name) = (secret()?, body["name"].as_str().context("missing name")?.to_string());
             let max = body["max_sandboxes"].as_i64().unwrap_or(10) as i32;
             let admin = body["admin"].as_bool().unwrap_or(false);
+            let edge = body["edge"].as_bool().unwrap_or(false);
             let member_of = body["ns"].as_str().filter(|n| *n != "default");
             let role = Role::parse(body["role"].as_str().unwrap_or("member"))?;
+            // Made for one namespace: nothing in `default`, where it would be a member.
+            let default_role = if member_of.is_some() || edge { "none" } else { "member" };
+            let expires = body["expires_secs"].as_i64().map(|s| now() + s);
             if let Some(n) = member_of {
                 c.allow(&who, n, Role::Owner)?;
             }
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            db.execute("insert into tokens values (?1, ?2, ?3, ?4)", &[&t, &name, &admin, &max])?;
+            db.execute(
+                "insert into tokens (token, name, admin, max_sandboxes, hashed, expires, default_role, edge) values (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7)",
+                &[&hash_token(&t), &name, &admin, &max, &expires, &default_role, &edge],
+            )?;
             if let Some(n) = member_of {
                 db.execute("insert or replace into members values (?1, ?2, ?3)", &[&n, &name, &role.name()])?;
             }
@@ -1497,6 +2053,20 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             Ok(json!({"token": t, "name": name}))
         }),
         // Every token with this name: they're one person's tokens.
+        ("DELETE", ["tokens", name]) => admin_only().and_then(|_| {
+            if *name == "admin" && !body["force"].as_bool().unwrap_or(false) {
+                bail!("that's the controller's own admin token; pass force to remove it");
+            }
+            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let n = db.execute("delete from tokens where name = ?1", &[name])?;
+            if n == 0 {
+                bail!("no token named {name}");
+            }
+            db.execute("delete from members where who = ?1", &[name])?;
+            drop(db);
+            c.audit("-", &who.name, "token rm", name, true);
+            Ok(json!({"removed": name, "tokens": n}))
+        }),
         ("POST", ["tokens", name]) => admin_only().and_then(|_| {
             let max = body["max_sandboxes"].as_i64().context("missing max_sandboxes")?;
             let n =
@@ -1510,20 +2080,27 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             Ok(json!({"name": name, "tokens": n, "max_sandboxes": limit(max)}))
         }),
         // `?peek=1` (the dashboard) reads the table without becoming an edge nodes let in.
-        ("GET", ["routes"]) => admin_only().and_then(|_| {
+        ("GET", ["routes"]) => edge_or_admin().and_then(|_| {
             if let Some(ip) = peer.filter(|_| !req.query.iter().any(|(k, _)| k == "peek")) {
                 c.edges.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(ip, now());
             }
             routes(c)
         }),
         ("GET", ["edge", "clients"]) => admin_only().map(|_| edge_clients(c)),
+        ("GET", ["metrics"]) => {
+            if let Err(e) = edge_or_admin() {
+                return json_reply(&mut w, Err(e));
+            }
+            let text = metrics(c)?;
+            return respond(&mut w, 200, "text/plain; version=0.0.4", text.as_bytes());
+        }
         // The edge's hosts with requests since its last report; idle stop counts from these.
         ("POST", ["backups"]) => admin_only().and_then(|_| backup(c)),
         ("GET", ["backups"]) => admin_only().and_then(|_| {
             let s = c.storage_or_err()?;
             Ok(json!(s.list(BACKUPS, "")?))
         }),
-        ("POST", ["routes", "activity"]) => admin_only().and_then(|_| {
+        ("POST", ["routes", "activity"]) => edge_or_admin().and_then(|_| {
             let suffix = format!(".{}", c.domain);
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for h in body["hosts"].as_array().into_iter().flatten().filter_map(|h| h.as_str()) {
@@ -1554,7 +2131,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             clients.retain(|(m, _), _| *m > minute - 10);
             Ok(json!({}))
         }),
-        ("GET", ["bans"]) => admin_only().and_then(|_| {
+        ("GET", ["bans"]) => edge_or_admin().and_then(|_| {
             let rows = c
                 .db
                 .lock()
@@ -1568,7 +2145,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
             ))
         }),
         // A ban for an address that's already banned replaces it (new reason, new expiry).
-        ("POST", ["bans"]) => admin_only().and_then(|_| {
+        ("POST", ["bans"]) => edge_or_admin().and_then(|_| {
             let net = crate::edge::ban::normalize(body["net"].as_str().context("missing net")?)?;
             let until = body["secs"].as_i64().filter(|s| *s > 0).map(|s| now() + s);
             let reason = body["reason"].as_str().unwrap_or("");
@@ -1626,6 +2203,8 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
                                 .query_one("select cpus, memory_gib from sandboxes where id = ?1", &[id])?;
                         (r.get(0), r.get(1))
                     };
+                    let ql = c.quota_lock(&ns);
+                    let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     c.check_quota(&ns, "", cpus, gib, 1)?;
                     let mut v = call(&url, "POST", &node_path, Some(&sec), &body)?;
                     let child = v["id"].as_str().context("node returned no id")?.to_string();
@@ -1686,6 +2265,8 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
     if let Err(e) = c.allow(who, ns, Role::Member) {
         return respond(w, 404, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
     }
+    let ql = c.quota_lock(ns);
+    let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let count: i64 =
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -1952,7 +2533,7 @@ fn resolve(url: &str, rev: &str) -> Result<String> {
 
 /// GET with a 2 s timeout; true on 2xx/3xx.
 fn healthy(endpoint: &str, path: &str) -> bool {
-    let Ok(addr) = endpoint.parse::<SocketAddr>() else { return false };
+    let Some(addr) = endpoint.to_socket_addrs().ok().and_then(|mut a| a.next()) else { return false };
     let Ok(mut s) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else { return false };
     let _ = s.set_read_timeout(Some(Duration::from_secs(2)));
     if write!(s, "GET {path} HTTP/1.1\r\nHost: health\r\nConnection: close\r\n\r\n").is_err() {
@@ -2031,16 +2612,24 @@ fn load_app_key(c: &Controller, key: &str) -> Result<Option<App>> {
 
 fn delete_instance(c: &Controller, node: &str, sandbox_id: &str) {
     if let Ok((url, sec, _)) = c.node(node) {
-        let _ = call(&url, "DELETE", &format!("/sandboxes/{sandbox_id}"), Some(&sec), &Value::Null);
+        let _ = call_within(&url, "DELETE", &format!("/sandboxes/{sandbox_id}"), Some(&sec), &Value::Null, QUICK);
     }
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = db.execute("update instances set state = 'removed' where sandbox = ?1", &[&sandbox_id]);
     let _ = db.execute("update sandboxes set state = 'removed' where id = ?1", &[&sandbox_id]);
 }
 
-/// New release from `commit` (or the app's ref): start instances on distinct nodes where
-/// possible, wait for health, switch routes, drain the old ones.
+/// New release from `commit` (or the app's ref), holding the app's lock: two deploys of
+/// one app at once could leave the older commit live.
 fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> Result<Value> {
+    let lock = c.app_lock(&app.name);
+    let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    deploy_locked(c, app, commit, who)
+}
+
+/// Start instances on distinct nodes where possible, wait for health, switch routes, drain
+/// the old ones. The caller holds the app's lock.
+fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> Result<Value> {
     let commit = match commit {
         Some(c) => c,
         None => resolve(&app.git_url, &app.git_ref)?,
@@ -2172,6 +2761,7 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         log.push("failed; the previous release keeps serving".into());
         finish("failed", &log);
         c.audit(&app.ns, who, "deploy", &format!("{} r{n}", app.short), false);
+        c.alert(&format!("{} r{n} failed to deploy; the previous release keeps serving", app.short));
         bail!("release {n} failed, the previous release keeps serving:\n{}", errors.join("\n"));
     }
     let old: Vec<(String, String)> = {
@@ -2181,6 +2771,9 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
             &[&app.name, &n],
         )?;
         db.execute("update instances set state = 'live' where app = ?1 and release = ?2", &[&app.name, &n])?;
+        // Lost ones of older releases are replaced now; their sandboxes go when their node
+        // reports them (it's told to delete what the controller doesn't know).
+        db.execute("update instances set state = 'removed' where app = ?1 and release <> ?2 and state = 'lost'", &[&app.name, &n])?;
         db.execute("update apps set live_release = ?2 where name = ?1", &[&app.name, &n])?;
         // One live release: the one it replaces is what `rollback` goes back to.
         db.execute("update releases set state = 'old' where app = ?1 and state = 'live' and n <> ?2", &[&app.name, &n])?;
@@ -2209,6 +2802,14 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
 fn destroy_app(c: &Arc<Controller>, name: &str) -> Result<Value> {
     if let Err(e) = drop_bucket(c, name) {
         eprintln!("rekcod: {name}: bucket: {e:#}");
+    }
+    // Its stored images and build cache go with it.
+    if let Some(s) = &c.storage {
+        let objs = s.list(RELEASES, &format!("{name}/")).unwrap_or_default();
+        for o in objs {
+            let _ = s.delete(RELEASES, &o.key);
+        }
+        let _ = s.delete(CACHE, &format!("{name}.tar.zst"));
     }
     let rows =
         c.db.lock()
@@ -2302,7 +2903,7 @@ fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .execute("update instances set state = 'removed' where app = ?1 and state = 'sleeping'", &[&app.name]);
-    deploy(c, app, Some(commit), "wake")?;
+    deploy_locked(c, app, Some(commit), "wake")?;
     live_endpoints(c, &app.name)
 }
 
@@ -2365,7 +2966,7 @@ fn recycle_due(c: &Arc<Controller>) -> Result<()> {
             let Ok(_g) = lock.try_lock() else { return };
             let r = load_app_key(&c, &name)
                 .and_then(|a| a.ok_or_else(|| anyhow!("gone")))
-                .and_then(|app| deploy(&c, &app, Some(commit), "recycle"));
+                .and_then(|app| deploy_locked(&c, &app, Some(commit), "recycle"));
             if let Err(e) = r {
                 eprintln!("rekcod: recycle {name}: {e:#}");
             }
@@ -2380,6 +2981,15 @@ fn app_status(c: &Controller, app: &App) -> Result<Value> {
 
 /// `GET /apps/{name}` for each row key, from four queries however many apps there are.
 /// Secrets come back as names only, so nothing is unsealed.
+/// Viewers see which variables an app has, not their values (env often holds credentials).
+fn mask_env(v: &mut Value) {
+    if let Some(env) = v["env"].as_object_mut() {
+        for val in env.values_mut() {
+            *val = json!("(hidden from viewers)");
+        }
+    }
+}
+
 fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
     if keys.is_empty() {
         return Ok(vec![]);
@@ -2519,6 +3129,8 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
             bail!("quota: {ns} has {n} of {max} apps");
         }
     }
+    let ql = c.quota_lock(ns);
+    let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     c.check_quota(ns, &name, (instances * cpus) as i64, (instances * mem) as i64, 0)?;
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(r) = exists {
@@ -2570,7 +3182,11 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             // `?detail=1`: each app's `GET /apps/{name}` too, for the dashboard's one call.
             if q.iter().any(|(k, v)| k == "detail" && v != "0") {
                 let keys: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
-                for (a, d) in list.iter_mut().zip(app_details(c, &keys)?) {
+                let viewer = c.role(who, ns)? < Some(Role::Member);
+                for (a, mut d) in list.iter_mut().zip(app_details(c, &keys)?) {
+                    if viewer {
+                        mask_env(&mut d);
+                    }
                     a["detail"] = d;
                 }
             }
@@ -2582,7 +3198,13 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             let name = upsert_app(c, ns, who, b, None)?;
             deploy(c, &load(&name, Role::Member)?, None, &who.name)
         }
-        ("GET", ["apps", name]) => app_status(c, &load(name, Role::Viewer)?),
+        ("GET", ["apps", name]) => {
+            let mut v = app_status(c, &load(name, Role::Viewer)?)?;
+            if c.role(who, ns)? < Some(Role::Member) {
+                mask_env(&mut v);
+            }
+            Ok(v)
+        }
         ("POST", ["apps", name, "visibility"]) => {
             let app = load(name, Role::Member)?;
             let public = b["public"].as_bool().context("missing public")?;
@@ -2686,14 +3308,17 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             Ok(json!({"logs": out}))
         }
         ("POST", ["apps", name, "wake"]) => {
-            let app = load(name, Role::Member)?;
+            // The edge wakes apps on their first request; it may wake any app, nothing more.
+            let app = if who.edge {
+                load_app_key(c, &app_key(ns, name))?.ok_or_else(|| anyhow!("no app {name}"))?
+            } else {
+                load(name, Role::Member)?
+            };
             Ok(json!({"app": name, "ns": ns, "endpoints": wake(c, &app)?}))
         }
         ("POST", ["apps", name, "recycle"]) => {
             let app = load(name, Role::Member)?;
             let commit = live_commit(c, &app.name)?.ok_or_else(|| anyhow!("{name} has no live release"))?;
-            let lock = c.app_lock(&app.name);
-            let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             deploy(c, &app, Some(commit), &who.name)
         }
         ("GET", ["apps", name, "storage"]) => app_storage(c, &load(name, Role::Viewer)?),
@@ -2758,6 +3383,8 @@ fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, sche
         bail!("quota: {used} of {max} sandboxes and jobs in use");
     }
     let gib = spec["memory_gib"].as_i64().unwrap_or(2);
+    let ql = c.quota_lock(ns);
+    let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     c.check_quota(ns, "", spec["cpus"].as_i64().unwrap_or(2), gib, 1)?;
     let mib = gib * 1024;
     let (node, url, sec) = c.place(mib, false, ns)?.into_iter().next().ok_or_else(|| anyhow!("no node has {mib} MiB free"))?;
@@ -2979,6 +3606,14 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
     if event != "pull_request" {
         return Ok(json!({"ignored": event}));
     }
+    // A signed body replayed later would redeploy (or destroy) a preview; each delivery once.
+    if let Some(id) = req.header("x-github-delivery") {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        db.execute("delete from deliveries where ts < ?1", &[&(now() - 86400)])?;
+        if db.execute("insert or ignore into deliveries values (?1, ?2)", &[&id, &now()])? == 0 {
+            return Ok(json!({"ignored": "delivery already handled"}));
+        }
+    }
     let b: Value = serde_json::from_slice(&req.body)?;
     let pr = b["number"].as_i64().context("no PR number")?;
     let urls = [b["repository"]["clone_url"].as_str().unwrap_or(""), b["repository"]["html_url"].as_str().unwrap_or("")];
@@ -2991,9 +3626,26 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
     let preview = format!("{}-pr-{pr}", short_name(&base));
     // Previews belong to the base app's owner.
     let who = Caller { name: owner, ..Caller::system("github") };
+    // A fork's code runs with the base app's env and the internet; only with a maintainer's label.
+    let fork = b["pull_request"]["head"]["repo"]["full_name"] != b["repository"]["full_name"];
+    let labelled = b["pull_request"]["labels"].as_array().into_iter().flatten().any(|l| l["name"] == PREVIEW_LABEL);
     match b["action"].as_str().unwrap_or("") {
-        "closed" => destroy_app(c, &app_key(&ns, &preview)),
-        "opened" | "synchronize" | "reopened" => {
+        "closed" => {
+            // Only the preview of this base app, never another app that happens to have that name.
+            let key = app_key(&ns, &preview);
+            let is_preview =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .query_opt("select 1 from apps where name = ?1 and preview_of = ?2", &[&key, &base])?;
+            if is_preview.is_none() {
+                return Ok(json!({"ignored": format!("{preview} isn't a preview of {}", short_name(&base))}));
+            }
+            destroy_app(c, &key)
+        }
+        "opened" | "synchronize" | "reopened" | "labeled" if fork && !labelled => {
+            Ok(json!({"ignored": format!("pull request from a fork; add the {PREVIEW_LABEL} label to deploy it")}))
+        }
+        "opened" | "synchronize" | "reopened" | "labeled" => {
             let app = load_app_key(c, &base)?.context("base app gone")?;
             let head = b["pull_request"]["head"]["sha"].as_str().context("no head sha")?;
             let head_repo = b["pull_request"]["head"]["repo"]["clone_url"].as_str().unwrap_or(&app.git_url);
@@ -3009,16 +3661,27 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
             let v = deploy(c, &load_app(c, &ns, &preview, &who, Role::Member)?, Some(head.into()), "github")?;
             if let (Ok(token), Some(api)) = (std::env::var("GITHUB_TOKEN"), b["pull_request"]["comments_url"].as_str()) {
                 let body = json!({"body": format!("Preview: {}", v["url"].as_str().unwrap_or(""))}).to_string();
-                let _ = Command::new("curl")
-                    .args(["-sf", "-X", "POST", "-H", &format!("Authorization: Bearer {token}"), "-d", &body, api])
+                // The header goes in on stdin: on argv, `ps` would show the token to every user.
+                if let Ok(mut child) = Command::new("curl")
+                    .args(["-sf", "-X", "POST", "-H", "@-", "-d", &body, api])
+                    .stdin(Stdio::piped())
                     .stdout(Stdio::null())
-                    .status();
+                    .spawn()
+                {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = writeln!(stdin, "Authorization: Bearer {token}");
+                    }
+                    let _ = child.wait();
+                }
             }
             Ok(v)
         }
         a => Ok(json!({"ignored": a})),
     }
 }
+
+/// The label that lets a pull request from a fork get a preview.
+const PREVIEW_LABEL: &str = "rekcod-preview";
 
 // ------------------------------------------------------------- storage (docs/rustfs.md)
 
@@ -3077,15 +3740,33 @@ impl Controller {
 }
 
 /// For a node: where the image of `app` at `commit` goes, and whether it's there already.
+/// Presigned URLs live this long: long enough for a slow build, then useless.
+const STORE_URL_SECS: u64 = 6 * 3600;
+
 fn release_store(c: &Controller, app: &str, commit: &str) -> Value {
     let Some(s) = &c.storage else { return Value::Null };
-    let key = format!("{app}/{commit}");
-    let cached = s
-        .create_bucket(RELEASES)
-        .and_then(|_| s.create_bucket(CACHE))
-        .and_then(|_| s.exists(RELEASES, &format!("{key}.json")))
-        .unwrap_or(false);
-    json!({"s3": s, "bucket": RELEASES, "key": key, "cached": cached, "cache": CACHE})
+    let r = (|| -> Result<Value> {
+        s.create_bucket(RELEASES)?;
+        s.create_bucket(CACHE)?;
+        let key = format!("{app}/{commit}");
+        let (image, toml, cache) = (format!("{key}.tar.zst"), format!("{key}.json"), format!("{app}.tar.zst"));
+        let url = |m: &str, b: &str, k: &str| s.presign_method(m, b, k, STORE_URL_SECS);
+        Ok(serde_json::to_value(ReleaseStore {
+            name: format!("{RELEASES}/{key}"),
+            image_get: url("GET", RELEASES, &image)?,
+            image_put: url("PUT", RELEASES, &image)?,
+            toml_get: url("GET", RELEASES, &toml)?,
+            toml_put: url("PUT", RELEASES, &toml)?,
+            cached: s.exists(RELEASES, &toml)?,
+            cache_get: Some(url("GET", CACHE, &cache)?),
+            cache_put: Some(url("PUT", CACHE, &cache)?),
+            cache_stored: s.exists(CACHE, &cache)?,
+        })?)
+    })();
+    r.unwrap_or_else(|e| {
+        eprintln!("rekcod: release store for {app}: {e:#}");
+        Value::Null
+    })
 }
 
 /// The bucket and its key of an app with `bucket = true`, created on first use; the env its
@@ -3191,13 +3872,32 @@ fn drop_bucket(c: &Controller, app: &str) -> Result<()> {
 /// Uploads `fleet.db` (a `VACUUM INTO` copy, so nothing stops) as `fleet-<UTC time>.db` and
 /// keeps the newest 48. `controller/secret-key` isn't in it: keep that somewhere else.
 fn backup(c: &Controller) -> Result<Value> {
-    let s = c.storage_or_err()?;
-    s.create_bucket(BACKUPS)?;
+    let s = c.storage.as_ref();
+    if s.is_none() && c.backup_dir.is_none() {
+        bail!("no backup target: start the controller with --storage or --backup-dir");
+    }
     let tmp = std::env::temp_dir().join(format!("rekcod-fleet-{}.db", sandbox::new_id()?));
     let path = tmp.display().to_string();
     let r = (|| -> Result<Value> {
-        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute("vacuum into ?1", &[&path])?;
+        // Its own connection: WAL lets it read while requests keep using the main one.
+        rusqlite::Connection::open(&c.db_path)?.execute("vacuum into ?1", [&path])?;
         let key = format!("fleet-{}.db", crate::s3::amz_date(now() as u64));
+        // A copy off the RustFS disk (which on a spare is the controller's own disk).
+        if let Some(dir) = &c.backup_dir {
+            std::fs::create_dir_all(dir)?;
+            std::fs::copy(&tmp, dir.join(&key))?;
+            let mut local: Vec<PathBuf> = std::fs::read_dir(dir)?
+                .flatten()
+                .map(|e| e.path())
+                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("fleet-")))
+                .collect();
+            local.sort();
+            for p in &local[..local.len().saturating_sub(KEEP_BACKUPS)] {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+        let Some(s) = s else { return Ok(json!({"backup": key, "dir": c.backup_dir})) };
+        s.create_bucket(BACKUPS)?;
         s.put(BACKUPS, &key, crate::s3::Body::File(&tmp))?;
         let mut all: Vec<String> = s.list(BACKUPS, "fleet-")?.into_iter().map(|o| o.key).collect();
         all.sort();
@@ -3214,7 +3914,7 @@ fn backup(c: &Controller) -> Result<Value> {
 /// Hourly. The attempt is recorded first, so a failing upload is retried in an hour, not
 /// every watchdog tick.
 fn backup_due(c: &Controller) -> Result<()> {
-    if c.storage.is_none() {
+    if c.storage.is_none() && c.backup_dir.is_none() {
         return Ok(());
     }
     let last: i64 = c.config("last_backup")?.and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -3224,7 +3924,7 @@ fn backup_due(c: &Controller) -> Result<()> {
     c.db.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .execute("insert or replace into config values ('last_backup', ?1)", &[&now().to_string()])?;
-    backup(c).map(|_| ())
+    backup(c).map(|_| ()).inspect_err(|e| c.alert(&format!("backup failed: {e:#}")))
 }
 
 /// `rekcod controller restore`: puts a backup in place of fleet.db (the old file is kept
@@ -3243,7 +3943,11 @@ pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>,
     std::fs::create_dir_all(db.parent().context("no parent")?)?;
     let tmp = db.with_extension("restoring");
     s.get(BACKUPS, &key, &mut std::fs::File::create(&tmp)?)?;
-    Db::open(&tmp).context("the backup isn't a usable database")?;
+    // Whatever ran when the backup was taken may not run now: the first reconcile checks
+    // each instance and takes back the ones that answer.
+    Db::open(&tmp)
+        .context("the backup isn't a usable database")?
+        .execute("update instances set state = 'lost' where state in ('live', 'sleeping', 'starting')", &[])?;
     if db.exists() {
         let keep = db.with_extension(format!("db.before-restore-{}", now()));
         std::fs::rename(&db, &keep)?;
@@ -3258,6 +3962,10 @@ pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>,
 }
 
 pub struct ControllerOptions {
+    /// New nodes are `ready` at once instead of waiting for `node approve`.
+    pub auto_approve: bool,
+    pub alert_webhook: Option<String>,
+    pub backup_dir: Option<PathBuf>,
     /// SQLite file (default `~/.rekcod/controller/fleet.db`).
     pub db: Option<PathBuf>,
     pub listen: String,
@@ -3271,14 +3979,22 @@ pub struct ControllerOptions {
 
 /// `controller/secret-key`: 32 random bytes, created on first run. App secrets in fleet.db
 /// can't be read without it, so back it up separately from the database.
-fn secret_key(path: &Path) -> Result<[u8; 32]> {
+/// `controller/secret-key`. Made on first start; if fleet.db already holds values sealed
+/// with a key and the file is gone (a restore on another Mac, say), a new key would make
+/// them unreadable for good, so startup stops instead.
+fn secret_key(path: &Path, sealed_values: i64) -> Result<[u8; 32]> {
     if let Ok(b) = std::fs::read(path) {
         return b.try_into().map_err(|_| anyhow!("{} isn't 32 bytes", path.display()));
     }
+    if sealed_values > 0 {
+        bail!(
+            "{} is missing, and fleet.db holds {sealed_values} app secret(s) sealed with it. \
+             Copy the original key there (it never goes into fleet.db or its backups)",
+            path.display()
+        );
+    }
     let k: [u8; 32] = random_bytes()?;
-    std::fs::write(path, k)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    crate::paths::write_private(path, &k)?;
     Ok(k)
 }
 
@@ -3286,7 +4002,8 @@ fn secret_key(path: &Path) -> Result<[u8; 32]> {
 pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     let dir = paths.home.join("controller");
     std::fs::create_dir_all(&dir)?;
-    let mut db = Db::open(&o.db.unwrap_or_else(|| dir.join("fleet.db")))?;
+    let db_path = o.db.clone().unwrap_or_else(|| dir.join("fleet.db"));
+    let mut db = Db::open(&db_path)?;
     for (key, file) in [("join_token", "join-token"), ("webhook_secret", "webhook-secret")] {
         let v = match db.query_opt("select value from config where key = ?1", &[&key])? {
             Some(r) => r.get::<String>(0),
@@ -3298,33 +4015,48 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
         };
         std::fs::write(dir.join(file), &v)?;
     }
-    let admin: Option<String> = db.query_opt("select token from tokens where admin and name = 'admin'", &[])?.map(|r| r.get(0));
-    let admin = match admin {
-        Some(t) => t,
-        None => {
-            let t = secret()?;
-            db.execute("insert into tokens values (?1, 'admin', true, 100)", &[&t])?;
-            t
-        }
-    };
-    std::fs::write(dir.join("admin-token"), &admin)?;
+    // fleet.db only has the hash; the plaintext lives in admin-token. Without either, a new one.
+    let have_admin = db.query_opt("select 1 from tokens where admin and name = 'admin'", &[])?.is_some();
+    let file = std::fs::read_to_string(dir.join("admin-token")).unwrap_or_default().trim().to_string();
+    if !have_admin || file.is_empty() {
+        let t = secret()?;
+        db.execute("delete from tokens where name = 'admin'", &[])?;
+        db.execute(
+            "insert into tokens (token, name, admin, max_sandboxes, hashed) values (?1, 'admin', true, 100, 1)",
+            &[&hash_token(&t)],
+        )?;
+        std::fs::write(dir.join("admin-token"), &t)?;
+    }
     use std::os::unix::fs::PermissionsExt;
     for f in ["join-token", "webhook-secret", "admin-token"] {
         std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o600))?;
     }
-    let key = secret_key(&dir.join("secret-key"))?;
+    let sealed: i64 = db.query_one("select count(*) from apps where secrets <> '{}' or storage_secret is not null", &[])?.get(0);
+    let key = secret_key(&dir.join("secret-key"), sealed)?;
     let mut ctl = Controller::new(db, o.domain, o.drain_secs, key);
+    ctl.auto_approve = o.auto_approve;
+    ctl.alert_webhook = o.alert_webhook;
+    ctl.db_path = db_path;
+    ctl.backup_dir = o.backup_dir;
+    ctl.dir = dir.clone();
     let creds = o.storage_credentials.unwrap_or_else(|| crate::storage::credentials_file(paths));
     ctl.storage = ctl.load_storage(o.storage.as_deref(), &creds)?;
     let c = Arc::new(ctl);
+    graceful_exit(Some(c.clone()));
     c.seal_plain_secrets()?;
     let l = TcpListener::bind(&o.listen).with_context(|| format!("bind {}", o.listen))?;
     eprintln!("rekcod: controller on http://{} (tokens in {})", o.listen, dir.display());
-    let w = c.clone();
-    std::thread::spawn(move || watchdog(w));
+    if let Err(e) = sweep(&c) {
+        eprintln!("rekcod: startup sweep: {e:#}");
+    }
+    watchdog(c.clone());
     for s in l.incoming().flatten() {
+        if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+        let _ = s.set_read_timeout(Some(crate::sandbox_api::READ_TIMEOUT));
         let c = c.clone();
-        std::thread::spawn(move || {
+        crate::sandbox_api::spawn_limited(move || {
             if let Err(e) = controller_handle(&c, s) {
                 eprintln!("rekcod: controller: {e:#}");
             }
@@ -3333,9 +4065,149 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     Ok(())
 }
 
+/// Set on SIGTERM: stop taking connections, let deploys in flight finish, then exit.
+static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// SIGTERM/SIGINT for the controller and nodes: stop accepting, wait up to 30 s for app
+/// locks (deploys, wakes) to be free, then exit 0 so launchd starts a fresh one if asked.
+/// Call from the main thread before starting any other, so every thread has them blocked.
+fn graceful_exit(c: Option<Arc<Controller>>) {
+    let set = block_term_signals();
+    std::thread::spawn(move || {
+        let mut sig = 0;
+        if unsafe { libc::sigwait(&set, &mut sig) } != 0 {
+            return;
+        }
+        STOPPING.store(true, std::sync::atomic::Ordering::SeqCst);
+        eprintln!("rekcod: stopping; waiting up to 30s for deploys in flight");
+        let t0 = Instant::now();
+        if let Some(c) = c {
+            let locks: Vec<Arc<Mutex<()>>> = c.busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().cloned().collect();
+            for l in locks {
+                while l.try_lock().is_err() && t0.elapsed() < Duration::from_secs(30) {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            }
+        }
+        std::process::exit(0);
+    });
+}
+
+/// Blocks SIGTERM and SIGINT in this thread (and the threads it starts from now on), so
+/// one thread can `sigwait` for them.
+fn block_term_signals() -> libc::sigset_t {
+    let mut set: libc::sigset_t = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::sigemptyset(&mut set);
+        libc::sigaddset(&mut set, libc::SIGTERM);
+        libc::sigaddset(&mut set, libc::SIGINT);
+        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+    }
+    set
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A controller on 127.0.0.1:<random> answering real HTTP, with tokens for each role.
+    fn serve_test(c: Controller) -> (String, Arc<Controller>) {
+        let c = Arc::new(c);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let cc = c.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let c = cc.clone();
+                std::thread::spawn(move || controller_handle(&c, s));
+            }
+        });
+        (url, c)
+    }
+
+    fn add_token(c: &Controller, t: &str, name: &str, admin: bool, default_role: &str, edge: bool, expires: Option<i64>) {
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into tokens (token, name, admin, max_sandboxes, hashed, expires, default_role, edge) values (?1, ?2, ?3, 10, 1, ?4, ?5, ?6)",
+                &[&hash_token(t), &name, &admin, &expires, &default_role, &edge],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn http_auth_matrix() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        add_token(&c, "viewer-t", "vic", false, "none", false, None);
+        add_token(&c, "edge-t", "edge", false, "none", true, None);
+        add_token(&c, "old-t", "old", false, "member", false, Some(now() - 1));
+        let get = |path: &str, t: &str| call(&url, "GET", path, Some(t), &Value::Null);
+        // Unknown and expired tokens look the same.
+        assert!(get("/apps", "nope").unwrap_err().to_string().contains("(401)"));
+        assert!(get("/apps", "old-t").unwrap_err().to_string().contains("(401)"));
+        assert!(get("/apps", "alice-t").is_ok());
+        // Made for another namespace: no access to default.
+        assert!(get("/apps", "viewer-t").unwrap_err().to_string().contains("no namespace"));
+        // The edge reads routes and metrics, and nothing else.
+        assert!(get("/routes", "edge-t").is_ok());
+        assert!(get("/routes", "alice-t").unwrap_err().to_string().contains("admin or edge"));
+        assert!(get("/nodes", "edge-t").unwrap_err().to_string().contains("(403)"));
+        assert!(get("/apps", "edge-t").unwrap_err().to_string().contains("(403)"));
+        let (code, mut r) = send(&url, "GET", "/metrics", Some("edge-t"), b"").unwrap();
+        let mut text = String::new();
+        r.read_to_string(&mut text).unwrap();
+        assert!(code == 200 && text.contains("# TYPE rekcod_nodes gauge"), "{code} {text}");
+        // A new token works; revoking it ends it.
+        let t = call(&url, "POST", "/tokens", Some("admin-t"), &json!({"name": "bob"})).unwrap()["token"].as_str().unwrap().to_string();
+        assert!(get("/apps", &t).is_ok());
+        assert!(c.db.lock().unwrap().query_opt("select 1 from tokens where token = ?1", &[&t]).unwrap().is_none(), "stored hashed");
+        call(&url, "DELETE", "/tokens/bob", Some("admin-t"), &json!({})).unwrap();
+        assert!(get("/apps", &t).unwrap_err().to_string().contains("(401)"));
+        // Big bodies without a token are refused before they're read: a 401, or the
+        // connection closed under the client while it still writes.
+        match send(&url, "POST", "/apps", None, &vec![b'x'; 8 << 20]) {
+            Ok((code, _)) => assert_eq!(code, 401),
+            Err(e) => assert!(e.to_string().contains("reset") || e.to_string().contains("pipe"), "{e:#}"),
+        }
+    }
+
+    #[test]
+    fn plaintext_tokens_are_hashed_on_upgrade() {
+        let f = std::env::temp_dir().join(format!("rekcod-tok-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        {
+            let c = rusqlite::Connection::open(&f).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            c.execute("insert into tokens (token, name, admin, max_sandboxes) values ('plain-secret', 'alice', 0, 10)", []).unwrap();
+        }
+        let c = Controller::new(Db::open(&f).unwrap(), "apps.test".into(), 0, [7; 32]);
+        assert_eq!(c.caller("plain-secret").unwrap().map(|w| w.name).as_deref(), Some("alice"));
+        let v: i64 = c.db.lock().unwrap().query_one("pragma user_version", &[]).unwrap().get(0);
+        assert_eq!(v, MIGRATIONS.len() as i64 + 1);
+        drop(c);
+        // Opening again changes nothing.
+        let c = Controller::new(Db::open(&f).unwrap(), "apps.test".into(), 0, [7; 32]);
+        assert!(c.caller("plain-secret").unwrap().is_some());
+        let _ = std::fs::remove_file(&f);
+    }
+
+    #[test]
+    fn heartbeats_cant_claim_more_memory_than_joined_with() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        c.db.lock()
+            .unwrap()
+            .execute("insert into nodes (id, url, secret, mem_total, last_seen) values ('n-1', 'http://x', 'sec', 16384, 0)", &[])
+            .unwrap();
+        let hb = json!({"mem_free_mib": 9_999_999, "sandboxes": [{"id": "old", "created": now() - 3600}]});
+        let v = call(&url, "POST", "/nodes/n-1/heartbeat", Some("sec"), &hb).unwrap();
+        let free: i64 = c.db.lock().unwrap().query_one("select mem_free from nodes where id = 'n-1'", &[]).unwrap().get(0);
+        assert_eq!(free, 16384);
+        // A freshly started controller never declares orphans.
+        assert_eq!(v["delete"], json!([]));
+        assert!(call(&url, "POST", "/nodes/n-1/heartbeat", Some("wrong"), &hb).is_err());
+    }
 
     #[test]
     fn git_sources_that_run_commands_are_refused() {
@@ -3469,11 +4341,7 @@ mod tests {
     fn namespaces_roles_quotas_pools_and_secrets() {
         let db = Db::open(Path::new(":memory:")).unwrap();
         let c = Controller::new(db, "apps.test".into(), 0, [7; 32]);
-        let (alice, bob, admin) = (
-            Caller { name: "alice".into(), admin: false, max: 10 },
-            Caller { name: "bob".into(), admin: false, max: 10 },
-            Caller::system("x"),
-        );
+        let (alice, bob, admin) = (Caller::user("alice"), Caller::user("bob"), Caller::system("x"));
         {
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             db.execute("insert into namespaces (name, created, salt, max_cpus, max_memory_gib) values ('team', 0, x'01', 4, 8)", &[])
@@ -3485,7 +4353,7 @@ mod tests {
         assert!(c.allow(&alice, "team", Role::Member).is_ok());
         assert!(c.allow(&bob, "team", Role::Viewer).is_ok());
         assert!(c.allow(&bob, "team", Role::Member).unwrap_err().to_string().contains("member role"));
-        let carol = Caller { name: "carol".into(), admin: false, max: 10 };
+        let carol = Caller::user("carol");
         assert!(c.allow(&carol, "team", Role::Viewer).unwrap_err().to_string().starts_with("no namespace"));
         assert!(c.allow(&admin, "team", Role::Owner).is_ok());
         assert!(c.allow(&admin, "nope", Role::Viewer).is_err());

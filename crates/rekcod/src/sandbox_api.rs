@@ -133,7 +133,11 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
                 // Never from the API: it opens a hole to the Mac and LAN.
                 reach: vec![],
             };
-            serde_json::to_value(sandbox::create(paths, o)?)?
+            let meta = sandbox::create(paths, o)?;
+            if policy.roots.is_empty() {
+                crate::fleet::mark_fleet(paths, &meta.id);
+            }
+            serde_json::to_value(meta)?
         }
         "list" => serde_json::to_value(sandbox::list(paths))?,
         "get" => serde_json::to_value(sandbox::get(paths, &id_of(args)?)?)?,
@@ -159,7 +163,13 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             }
             json!({"written": body.len()})
         }
-        "fork" => serde_json::to_value(sandbox::fork(paths, &id_of(args)?, args["name"].as_str().map(String::from))?)?,
+        "fork" => {
+            let meta = sandbox::fork(paths, &id_of(args)?, args["name"].as_str().map(String::from))?;
+            if policy.roots.is_empty() {
+                crate::fleet::mark_fleet(paths, &meta.id);
+            }
+            serde_json::to_value(meta)?
+        }
         "diff" => {
             let (changes, patch) = sandbox::patch(paths, &id_of(args)?)?;
             json!({"changes": changes, "patch": patch})
@@ -171,7 +181,14 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             args["reviewed"].as_bool().unwrap_or(false)
         )?}),
         "stop" => {
-            sandbox::stop(paths, &id_of(args)?)?;
+            let id = id_of(args)?;
+            // An app instance stopped by the controller (idle) stays down across node restarts.
+            if let Ok(h) = sandbox::home(paths, &id)
+                && h.join("instance.json").exists()
+            {
+                let _ = std::fs::write(h.join(crate::fleet::ASLEEP_MARKER), b"");
+            }
+            sandbox::stop(paths, &id)?;
             json!({"stopped": true})
         }
         "remove" => {
@@ -285,6 +302,7 @@ pub(crate) fn read_body(r: &mut impl BufRead, req: &mut Request, max: usize) -> 
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn read_request(r: &mut impl BufRead) -> Result<Request> {
     let mut req = read_head(r)?;
     read_body(r, &mut req, MAX_BODY)?;

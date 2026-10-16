@@ -144,6 +144,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         shares,
     };
     let vm = Vm::create(&cfg)?;
+    log!("kernel command line: {}", cfg.cmdline);
     vm.start().await?;
     log!("VM started ({} CPUs, {} MiB, rosetta={})", cfg.cpus, cfg.memory_mib, vm.rosetta);
 

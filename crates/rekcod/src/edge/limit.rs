@@ -55,6 +55,19 @@ fn quota(every: Duration, burst: u32) -> Quota {
 
 type AppLimiter = (HttpSettings, Arc<DefaultKeyedRateLimiter<IpAddr>>);
 
+/// IPv6 clients are limited per /64: one host usually has a whole /64 and can rotate
+/// through it at will.
+pub fn rate_key(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V6(v6) if v6.to_ipv4_mapped().is_none() => {
+            let s = v6.segments();
+            IpAddr::V6(std::net::Ipv6Addr::new(s[0], s[1], s[2], s[3], 0, 0, 0, 0))
+        }
+        IpAddr::V6(v6) => IpAddr::V4(v6.to_ipv4_mapped().unwrap_or(std::net::Ipv4Addr::UNSPECIFIED)),
+        v4 => v4,
+    }
+}
+
 pub struct Limits {
     edge: DefaultKeyedRateLimiter<IpAddr>,
     /// Per app host: the settings its limiter was built from, so a changed rate rebuilds it.
@@ -69,6 +82,7 @@ impl Limits {
 
     /// `Err(wait)` when `ip` is over the edge's or the app's rate.
     pub fn check(&self, ip: IpAddr, host: &str, http: &HttpSettings) -> Result<(), Duration> {
+        let ip = rate_key(ip);
         let clock = DefaultClock::default();
         self.edge.check_key(&ip).map_err(|e| e.wait_time_from(clock.now()))?;
         let Some(every) = http.rate.as_deref().and_then(|r| parse_rate(r).ok()) else { return Ok(()) };
@@ -89,6 +103,7 @@ impl Limits {
 
     /// Counts a 429 for `ip`; true once it has had [`STRIKES`] within [`STRIKE_WINDOW`].
     pub fn strike(&self, ip: IpAddr) -> bool {
+        let ip = rate_key(ip);
         let mut s = self.strikes.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let e = s.entry(ip).or_insert((Instant::now(), 0));
         if e.0.elapsed() > STRIKE_WINDOW {

@@ -36,7 +36,8 @@ const OWN: &[&str] = &[
 
 /// `start`/`stop` flags; anything else means docker's container start/stop.
 const VM_FLAGS_WITH_VALUE: &[&str] = &["--cpus", "--memory", "--disk"];
-const VM_FLAGS: &[&str] = &["--no-switch", "-h", "--help"];
+/// None of these are flags of docker's `start` or `stop`.
+const VM_FLAGS: &[&str] = &["--no-switch", "--repair", "--install", "--uninstall", "--foreground", "--force", "-h", "--help"];
 
 /// The docker arguments for `args` (argv without the program name), or `None`
 /// when rekcod should handle it itself.
@@ -83,6 +84,11 @@ mod tests {
             "stop",
             "start --cpus 4 --memory=8",
             "stop --no-switch",
+            "stop --force",
+            "start --repair",
+            "start --install",
+            "start --uninstall",
+            "start --no-switch --foreground",
             "status",
             "shell",
             "menubar --install",

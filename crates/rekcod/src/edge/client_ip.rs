@@ -34,13 +34,15 @@ fn parse_v2(head: &[u8; 16], rest: &[u8]) -> Result<Option<IpAddr>> {
     }
 }
 
-/// `CF-Connecting-IP`, else the leftmost `X-Forwarded-For`. Only call this for a listener
-/// whose only clients are a trusted tunnel; anyone else can write these headers.
-pub fn forwarded(h: &HeaderMap) -> Option<IpAddr> {
+/// `CF-Connecting-IP`, else `X-Forwarded-For` read from the right: the first address that
+/// isn't one of `trusted` is the client. The leftmost entry is whatever the client sent, so
+/// taking it would let anyone pick their own IP. Only call this when the peer is trusted.
+pub fn forwarded(h: &HeaderMap, trusted: &[ipnet::IpNet]) -> Option<IpAddr> {
     let get = |k: &str| h.get(k).and_then(|v| v.to_str().ok());
-    get("cf-connecting-ip")
-        .and_then(|v| v.trim().parse().ok())
-        .or_else(|| get("x-forwarded-for").and_then(|v| v.split(',').next()).and_then(|v| v.trim().parse().ok()))
+    get("cf-connecting-ip").and_then(|v| v.trim().parse().ok()).or_else(|| {
+        let hops: Vec<IpAddr> = get("x-forwarded-for")?.split(',').filter_map(|v| v.trim().parse().ok()).collect();
+        hops.iter().rev().find(|ip| !trusted.iter().any(|n| n.contains(*ip))).or(hops.first()).copied()
+    })
 }
 
 #[cfg(test)]
@@ -64,10 +66,14 @@ mod tests {
     #[test]
     fn forwarded_headers() {
         let mut h = HeaderMap::new();
-        assert_eq!(forwarded(&h), None);
+        let trusted: Vec<ipnet::IpNet> = vec!["10.0.0.0/8".parse().unwrap()];
+        assert_eq!(forwarded(&h, &trusted), None);
         h.insert("x-forwarded-for", "198.51.100.2, 10.0.0.1".parse().unwrap());
-        assert_eq!(forwarded(&h), Some("198.51.100.2".parse().unwrap()));
+        assert_eq!(forwarded(&h, &trusted), Some("198.51.100.2".parse().unwrap()));
+        // A client that writes its own X-Forwarded-For only adds entries on the left.
+        h.insert("x-forwarded-for", "1.2.3.4, 198.51.100.2, 10.0.0.1".parse().unwrap());
+        assert_eq!(forwarded(&h, &trusted), Some("198.51.100.2".parse().unwrap()));
         h.insert("cf-connecting-ip", "2001:db8::1".parse().unwrap());
-        assert_eq!(forwarded(&h), Some("2001:db8::1".parse().unwrap()));
+        assert_eq!(forwarded(&h, &trusted), Some("2001:db8::1".parse().unwrap()));
     }
 }

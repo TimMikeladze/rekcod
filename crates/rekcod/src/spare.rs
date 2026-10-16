@@ -104,7 +104,21 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
         std::thread::sleep(Duration::from_millis(500));
     }
     let storage = format!("http://{ip}:7710");
-    run(&exe, &["controller", "serve", "--listen", &format!("{ip}:7700"), "--domain", domain, "--storage", &storage, "--install"])?;
+    run(
+        &exe,
+        &[
+            "controller",
+            "serve",
+            "--listen",
+            &format!("{ip}:7700"),
+            "--domain",
+            domain,
+            "--storage",
+            &storage,
+            "--auto-approve",
+            "--install",
+        ],
+    )?;
     let admin_file = ctl.join("admin-token");
     for _ in 0..60 {
         if std::fs::metadata(&admin_file).is_ok_and(|m| m.len() > 0) {
@@ -123,10 +137,16 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
         run(&exe, &["node", "join", &url, join.trim(), "--listen", &format!("{ip}:7701"), "--install"])?;
     }
     run(&exe, &["remote", "add", "local", &url, "--token", &admin])?;
-    run(
-        &exe,
-        &["edge", "serve", "--remote", "local", "--listen", &format!("{ip}:8080"), "--public-listen", "127.0.0.1:8081", "--install"],
-    )?;
+    // The edge gets a token that can only read routes and bans: taking over whatever runs
+    // the edge shouldn't mean owning the fleet.
+    let edge_token = if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
+        "dry-run".to_string()
+    } else {
+        let v = crate::fleet::call(&url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
+        v["token"].as_str().context("no edge token")?.to_string()
+    };
+    run(&exe, &["remote", "add", "edge", &url, "--token", &edge_token])?;
+    run(&exe, &["edge", "serve", "--remote", "edge", "--listen", &format!("{ip}:8080"), "--public-listen", "127.0.0.1:8081", "--install"])?;
 
     if auto_login_user().is_none() {
         eprintln!(

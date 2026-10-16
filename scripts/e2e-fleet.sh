@@ -70,7 +70,14 @@ alice=$(cr controller token alice --max-sandboxes 2 --remote admin | sed -n 's/.
 bob=$(cr controller token bob --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
 cr remote add alice http://127.0.0.1:17700 --token "$alice"
 cr remote add bob http://127.0.0.1:17700 --token "$bob"
+check "new nodes wait for approval" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"pending\"")" = 2' "$R"
+check "a pending node gets nothing" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.22' "$R" "$url"
+for n in $(cr node ls --remote admin | sed -n 's/.*"id": "\(n-[a-z0-9]*\)".*/\1/p'); do cr node approve "$n" --remote admin >/dev/null; done
 check "two nodes ready" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"ready\"")" = 2' "$R"
+check "a user token can't read routes" sh -c '! "$0" edge bans --remote alice' "$R"
+edge=$(cr controller token edge --edge --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
+cr remote add edge http://127.0.0.1:17700 --token "$edge"
+check "an edge token can't list nodes" sh -c '! "$0" node ls --remote edge' "$R"
 
 s1=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.22 2>"$C/err")
 check "remote create from git" test -n "$s1"
@@ -87,7 +94,7 @@ check "remote rm" sh -c '"$0" sandbox rm --remote alice "$1" "$2"' "$R" "$s1" "$
 sqlite3 "$C/controller/fleet.db" "update nodes set state = 'ready'"
 
 echo "apps"
-REKCOD_HOME=$C "$R" edge serve --remote admin --listen 127.0.0.1:18088 --public-listen 127.0.0.1:18089 >"$C/edge.log" 2>&1 &
+REKCOD_HOME=$C "$R" edge serve --remote edge --listen 127.0.0.1:18088 --public-listen 127.0.0.1:18089 >"$C/edge.log" 2>&1 &
 pids+=($!)
 get() { curl -s -m 3 -H "Host: $1.apps.test" http://127.0.0.1:18088/; }
 check "deploy (generated Dockerfile)" cr app deploy --remote admin --git "$url" --ref main --name hello --instances 2

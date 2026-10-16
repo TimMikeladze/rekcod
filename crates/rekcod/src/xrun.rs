@@ -255,6 +255,15 @@ pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, 
         }
     }
     a.extend(["-v".into(), format!("{p}:{p}"), "-w".into(), p.clone()]);
+    if opts.sandbox {
+        // Raw sockets would skip the sandbox VM's egress rules.
+        a.extend(["--cap-drop".into(), "NET_RAW".into(), "--security-opt".into(), "no-new-privileges".into()]);
+        if project.join(".git").is_dir() {
+            // The share is live, and a .git the sandbox could write is code the Mac runs
+            // (hooks, core.fsmonitor) on the next `git status`.
+            a.extend(["-v".into(), format!("{p}/.git:{p}/.git:ro")]);
+        }
+    }
     for dir in &plan.local_dirs {
         a.extend(["-v".into(), format!("{}:{p}/{dir}", local_volume(project, dir))]);
     }
@@ -312,12 +321,23 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
     }
     let mut docker = crate::docker::any_cli(paths)?;
     docker.env("DOCKER_HOST", target.docker_host()).args(&args);
-    if !opts.sandbox || opts.keep {
+    if !opts.sandbox {
         return Err(docker.exec()).context("exec docker");
     }
-    // Sandbox: power the VM off when the command is done.
+    // The sandbox VM stops itself after SANDBOX_IDLE without a command running, so a killed
+    // `rekcod` or `--keep` doesn't leave it up for good.
+    let used = target.home.join("run/last-used");
+    let _ = std::fs::write(&used, b"");
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            let _ = std::fs::write(&used, b"");
+        }
+    });
     let status = docker.status().context("run docker")?;
-    let _ = crate::cli::stop_daemon(&target);
+    if !opts.keep {
+        let _ = crate::cli::stop_daemon(&target);
+    }
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -330,6 +350,9 @@ fn main_boot(paths: &Paths) -> Result<Paths> {
     }
     Ok(paths.clone())
 }
+
+/// Seconds the `--sandbox` VM stays up with no `rekcod x` running in it.
+const SANDBOX_IDLE: u64 = 30 * 60;
 
 /// The sandbox VM's own home (`~/.rekcod/sandbox`): data disk, MAC, sockets.
 pub fn sandbox_paths(paths: &Paths) -> Result<Paths> {
@@ -355,6 +378,7 @@ fn sandbox_boot(paths: &Paths, project: &Path) -> Result<Paths> {
         disk_gib: 64,
         project: Some(project.to_path_buf()),
         guest_dir: Some(paths.guest_dir()?),
+        idle_ttl: Some(SANDBOX_IDLE),
         ..Default::default()
     };
     crate::cli::boot(&sb, &opts)?;

@@ -39,6 +39,8 @@ mod menubar;
 #[cfg(target_os = "macos")]
 mod s3;
 #[cfg(target_os = "macos")]
+mod safefs;
+#[cfg(target_os = "macos")]
 mod sandbox;
 #[cfg(target_os = "macos")]
 mod sandbox_api;
@@ -150,7 +152,7 @@ enum Cmd {
         cmd: SandboxCmd,
     },
     /// MCP server on stdio exposing the sandbox commands to agents.
-    Mcp,
+    Mcp(ApiPolicyArgs),
     /// macOS guests: base images for `rekcod sandbox create --os macos`.
     #[command(subcommand)]
     Macos(MacosCmd),
@@ -417,6 +419,9 @@ enum SandboxCmd {
         /// Only print what would change; exit 1 if anything would.
         #[arg(long)]
         check: bool,
+        /// Write the copy the last `diff` showed, not the workspace as it is now.
+        #[arg(long)]
+        reviewed: bool,
     },
     /// Save a macOS sandbox's screen as PNG.
     Screenshot {
@@ -467,10 +472,46 @@ enum SandboxCmd {
         /// Also listen on 127.0.0.1:PORT, with a bearer token.
         #[arg(long)]
         listen: Option<String>,
+        #[command(flatten)]
+        policy: ApiPolicyArgs,
     },
     /// Data disks with images already pulled, cloned per sandbox.
     #[command(subcommand)]
     Golden(Golden),
+}
+
+/// What API and MCP callers may ask for. Fixed here, never taken from a request.
+#[derive(clap::Args)]
+struct ApiPolicyArgs {
+    /// Directory callers may create sandboxes for, with everything under it (repeatable;
+    /// default: the current directory).
+    #[arg(long = "root", value_name = "DIR")]
+    roots: Vec<std::path::PathBuf>,
+    /// Let callers share the live directory read-write (`mount`) instead of a copy.
+    #[arg(long)]
+    allow_mount: bool,
+    /// A host callers may add to a sandbox's allowlist (repeatable; `*` allows any).
+    #[arg(long = "allow-host", value_name = "HOST")]
+    allow_hosts: Vec<String>,
+    /// An environment variable callers may pass into a sandbox with `secrets` (repeatable).
+    #[arg(long = "secret", value_name = "NAME")]
+    secrets: Vec<String>,
+}
+
+impl ApiPolicyArgs {
+    fn policy(self) -> anyhow::Result<sandbox_api::Policy> {
+        let roots = if self.roots.is_empty() { vec![std::env::current_dir()?] } else { self.roots };
+        let roots = roots
+            .iter()
+            .map(|r| r.canonicalize().map_err(|e| anyhow::anyhow!("--root {}: {e}", r.display())))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from)
+            && roots.iter().any(|r| home.starts_with(r))
+        {
+            eprintln!("rekcod: warning: a --root includes your whole home directory");
+        }
+        Ok(sandbox_api::Policy { roots, mount: self.allow_mount, allow_hosts: self.allow_hosts, secrets: self.secrets })
+    }
 }
 
 #[derive(Subcommand)]
@@ -1088,7 +1129,7 @@ fn main() {
         }
         Cmd::Sandbox { remote: None, ns: Some(_), .. } => Err(anyhow::anyhow!("--ns is for fleet sandboxes; add --remote")),
         Cmd::Sandbox { remote: None, cmd, .. } => run_sandbox(&paths, cmd),
-        Cmd::Mcp => sandbox_api::mcp(paths),
+        Cmd::Mcp(policy) => sandbox_api::mcp(paths, policy.policy()?),
         Cmd::Macos(MacosCmd::Fetch) => macos::fetch(&paths),
         Cmd::Macos(MacosCmd::Install { name, disk, cpus, memory }) => macos::install(&paths, &name, disk, cpus, memory),
         Cmd::Macos(MacosCmd::Setup { name }) => macos::setup(&paths, &name),
@@ -1592,8 +1633,8 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
             Ok(())
         }
         SandboxCmd::Diff { id, stat } => sandbox::diff(paths, &id, stat),
-        SandboxCmd::Apply { id, check } => {
-            let ch = sandbox::apply(paths, &id, check)?;
+        SandboxCmd::Apply { id, check, reviewed } => {
+            let ch = sandbox::apply(paths, &id, check, reviewed)?;
             sandbox::print_changes(&ch);
             if check && !ch.is_empty() {
                 std::process::exit(1);
@@ -1614,7 +1655,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         SandboxCmd::Ls { json } => sandbox::print_list(paths, json),
         SandboxCmd::Stop { id } => sandbox::stop(paths, &id),
         SandboxCmd::Rm { ids, all } => sandbox::rm(paths, &ids, all),
-        SandboxCmd::Serve { listen } => sandbox_api::serve(paths.clone(), listen),
+        SandboxCmd::Serve { listen, policy } => sandbox_api::serve(paths.clone(), policy.policy()?, listen),
         SandboxCmd::Golden(Golden::Build { name, images }) => sandbox::golden_build(paths, &name, &images),
         SandboxCmd::Golden(Golden::Ls) => sandbox::golden_list(paths),
         SandboxCmd::Golden(Golden::Rm { name }) => sandbox::golden_rm(paths, &name),

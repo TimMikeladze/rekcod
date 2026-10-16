@@ -60,7 +60,7 @@ rekcod sandbox shell ID                     # interactive exec of $SHELL in rekc
 rekcod sandbox cp ID SRC DST                # either side may be ID:/path
 rekcod sandbox fork ID [--name N]           # new sandbox from ID's disk + workspace
 rekcod sandbox diff ID [--stat]             # workspace vs the project it was copied from
-rekcod sandbox apply ID [--check]           # write the diff into the real project
+rekcod sandbox apply ID [--check] [--reviewed]  # write the diff into the real project
 rekcod sandbox ports ID                     # forwarded ports, as in rekcod status
 rekcod sandbox log ID [-f] [--json]         # the exec log
 rekcod sandbox ls [--json]
@@ -138,9 +138,21 @@ a second, because clones don't copy data.
 works when the guest is stopped. It skips VM-local paths (`node_modules`, `.venv`,
 `target`). `apply` writes changed, added and removed files into the real project:
 
+- Both freeze `ws/` first (an APFS clone, taken with the workspace container paused), so a
+  process still running in the sandbox can't change what's compared or written. `diff`
+  keeps its frozen copy in `<sandbox>/reviewed`, and `apply --reviewed` writes exactly that
+  copy. Plain `apply` freezes the workspace as it is at that moment.
 - Before writing, it refuses if any of those files changed in the real project since the
-  copy. It compares mtime and size against the snapshot taken at create.
-- It never writes `.git/` and lists hook changes as a warning.
+  copy. Create records kind, size and mtime (ns) of every project file in
+  `manifest.json`; a path whose state differs now is a conflict, including a file moved in
+  with an old mtime. Each apply updates the manifest for what it wrote.
+- Every write goes through a directory fd opened component by component with
+  `O_NOFOLLOW` (`safefs.rs`). A symlink on the way makes the write fail, a symlink at the
+  destination is replaced rather than written through, and a new symlink must point
+  inside the project. Setuid, setgid and sticky bits are dropped.
+- It never writes `.git/`. FIFOs, sockets and devices are left out of the comparison.
+- `diff` replaces control characters with `^X` text, so escape sequences in the sandbox's
+  files can't hide lines from you in a terminal.
 - `--check` prints what would change and exits 1 if anything would.
 
 `mount` mode has no diff or apply; they exit with `sandbox <id> uses --mount`.
@@ -193,6 +205,22 @@ enforced by each sandbox daemon on itself.
 optionally on `--listen 127.0.0.1:PORT` with a bearer token from
 `~/.rekcod/sandbox-token`. It never listens on other interfaces.
 
+The caller is an agent, so what it may ask for is fixed when the server starts, not taken
+from requests:
+
+```sh
+rekcod sandbox serve --root ~/src/app        # creates only for ~/src/app and below (default: the current directory)
+rekcod mcp --allow-host api.openai.com       # a host callers may add to the allowlist ('*' allows any)
+rekcod mcp --secret NPM_TOKEN                # a variable callers may pass in with "secrets"
+rekcod mcp --allow-mount                     # lets callers ask for a live read-write share
+```
+
+A request outside those gets a 400 that names the flag. `exec` takes `env` only as
+`KEY=VALUE`; a bare `KEY` would make docker copy the value from the server's own
+environment. The token is checked before the body is read. Request lines and headers are
+capped at 16 KiB and 100 headers, bodies at 64 MiB, a peer gets 30 s to send its request,
+and 256 connections are served at once.
+
 | Method | Path | CLI |
 |---|---|---|
 | POST | `/sandboxes` | `create` |
@@ -206,8 +234,10 @@ optionally on `--listen 127.0.0.1:PORT` with a bearer token from
 | POST | `/sandboxes/{id}/stop` | `stop` |
 | DELETE | `/sandboxes/{id}` | `rm` |
 
-`rekcod mcp` is a stdio MCP server with one tool per row above. `sandbox_apply` is the one
-tool marked destructive, so MCP clients ask the user first.
+`rekcod mcp` is a stdio MCP server with one tool per row above and the same flags as
+`serve`. Claude Code starts MCP servers in the project directory, so `claude mcp add rekcod
+-- rekcod mcp` allows that project and nothing else. `sandbox_apply` is the one tool marked
+destructive, so MCP clients ask the user first.
 
 E2B-compatible endpoints are a stretch goal. They'd let existing agent SDKs point at
 rekcod. I'd only do them once the native API has settled.
@@ -360,5 +390,6 @@ Where the code differs from the spec above:
   checks `run/last-used`.
 - **`rekcod x --sandbox` is unchanged.** It still uses `~/.rekcod/sandbox` and a live mount.
 - **`diff` skips `.git`, `node_modules`, `.venv` and `target`**, and compares content, so
-  a file touched without changes doesn't show up. `apply`'s conflict check is by mtime
-  against the sandbox's creation (or last apply).
+  a file touched without changes doesn't show up. `apply`'s conflict check compares each
+  path's state with the manifest taken at create (sandboxes made before the manifest fall
+  back to mtime against creation).

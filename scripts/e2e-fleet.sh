@@ -28,6 +28,8 @@ cleanup() {
 trap cleanup EXIT
 mkdir -p "$C" "$N1" "$N2"
 export REKCOD_HOME=$C
+# The test repo is a local bare repo; real fleets only fetch over https/ssh/http.
+export REKCOD_ALLOW_LOCAL_GIT=1
 for h in "$N1" "$N2"; do
   [[ -d $HOME/.rekcod/golden/default ]] && mkdir -p "$h/golden" && cp -cR "$HOME/.rekcod/golden/default" "$h/golden/"
 done

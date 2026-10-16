@@ -4,6 +4,28 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
 
+/// Runs `f` with the process umask set to `mask`. The umask is process-wide, so keep `f`
+/// short (a bind or a create).
+pub fn with_umask<T>(mask: libc::mode_t, f: impl FnOnce() -> T) -> T {
+    let old = unsafe { libc::umask(mask) };
+    let r = f();
+    unsafe { libc::umask(old) };
+    r
+}
+
+/// Writes a file only this user can read, created 0600 rather than chmodded after.
+pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = path.with_extension("tmp");
+    let _ = std::fs::remove_file(&tmp);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+    f.write_all(data)?;
+    f.sync_all()?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
 /// Data disk size; sparse, so only used space costs anything on the Mac.
 pub const DEFAULT_DISK_GIB: u64 = 256;
 
@@ -26,6 +48,9 @@ impl Paths {
         for dir in ["run", "logs", "vm"] {
             std::fs::create_dir_all(home.join(dir))?;
         }
+        // Sockets in run/ reach dockerd (root in the VM, with /Users mounted): only this user.
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(home.join("run"), std::fs::Permissions::from_mode(0o700));
         Ok(Paths { home })
     }
 

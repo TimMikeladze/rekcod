@@ -47,8 +47,9 @@ project directory.
 ## What it does not protect against
 
 - The project itself. The command can read and change everything in the current
-  directory, including `.git` (hooks!) and any secrets you keep in the project. Run it from
-  a directory that holds only what the command needs.
+  directory and any secrets you keep in it. Run it from a directory that holds only what
+  the command needs. `.git` is mounted read-only, so it can't plant a hook or
+  `core.fsmonitor` that your next `git status` would run on the Mac.
 - Exfiltration over the internet. The internet is open (installs need it). There is
   no egress allowlist yet; `--offline` removes the network entirely.
 - Secrets you pass in. `--secret NAME` hands the value to the command.

@@ -213,6 +213,7 @@ rekcod sandbox exec $id -- npm test  # exits with the command's code
 rekcod sandbox fork $id              # new sandbox from its disk + workspace (~1.2 s)
 rekcod sandbox diff $id              # the copy against your project
 rekcod sandbox apply $id             # write the changes back (refuses files you edited since)
+rekcod sandbox apply $id --reviewed  # exactly what the last diff showed
 rekcod sandbox rm $id
 ```
 
@@ -224,6 +225,9 @@ after 30 minutes without an exec (`--ttl`) and boots again on the next one.
 
 For agents: `rekcod mcp` is an MCP server on stdio with tools for create, exec,
 read/write file, fork, diff, apply, stop and remove (`claude mcp add rekcod -- rekcod mcp`).
+Callers can only create sandboxes for the directory the server started in (`--root DIR`
+adds others), and can't open the network, mount the live directory or pass secrets unless
+the server was started with `--allow-host`, `--allow-mount` or `--secret`.
 `rekcod sandbox serve` serves the same operations over HTTP on
 `~/.rekcod/run/sandbox.sock` (`--listen 127.0.0.1:PORT` adds TCP with a bearer token):
 
@@ -522,7 +526,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod snap save\|restore\|ls\|rm [NAME] [-p PROJECT] [--push\|--pull]` | Volume snapshots of a compose project, optionally through S3 (above) |
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
 | `rekcod sandbox create\|exec\|shell\|cp\|fork\|diff\|apply\|ports\|log\|ls\|stop\|rm\|serve\|golden` | Agent sandboxes (above) |
-| `rekcod mcp` | MCP server on stdio for the sandbox commands |
+| `rekcod mcp [--root DIR] [--allow-host H] [--secret NAME] [--allow-mount]` | MCP server on stdio for the sandbox commands; the flags fix what callers may ask for |
 | `rekcod macos fetch\|install\|setup\|authorize\|ls\|rm` | macOS base images for `sandbox create --os macos` |
 | `rekcod sandbox screenshot\|input` | Screen and mouse/keyboard of a macOS sandbox |
 | `rekcod remote add\|ls\|rm\|use` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`); `use` sets the default |

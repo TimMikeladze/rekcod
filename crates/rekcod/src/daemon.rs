@@ -139,7 +139,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     // Docker socket first so `rekcod start` can poll it while the guest boots.
     let sock = paths.socket();
     let _ = std::fs::remove_file(&sock);
-    let listener = UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
+    let listener = crate::paths::with_umask(0o077, || UnixListener::bind(&sock)).with_context(|| format!("bind {}", sock.display()))?;
     tokio::spawn(docker_proxy(vm.clone(), listener));
 
     let caps = wait_for_agent(&vm).await?;
@@ -176,11 +176,12 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     status.write();
     let ctl = paths.control_socket();
     let _ = std::fs::remove_file(&ctl);
-    tokio::spawn(control_server(vm.clone(), UnixListener::bind(&ctl).with_context(|| format!("bind {}", ctl.display()))?));
+    let control = crate::paths::with_umask(0o077, || UnixListener::bind(&ctl)).with_context(|| format!("bind {}", ctl.display()))?;
+    tokio::spawn(control_server(vm.clone(), control));
     tokio::spawn(clock_sync(vm.clone()));
     if opts.project.is_none() {
         // A sandbox must not reach the Mac's loopback services.
-        tokio::spawn(reverse_pool(vm.clone()));
+        tokio::spawn(reverse_pool(vm.clone(), paths.clone()));
     }
     if std::env::var_os("REKCOD_RESEARCH").is_some() {
         tokio::spawn(meta_server(vm.clone()));
@@ -879,17 +880,25 @@ const REVERSE_POOL: usize = 8;
 /// Keeps [`REVERSE_POOL`] connections parked on the agent's REVERSE_PORT. When
 /// the agent uses one (`connect <port>`), it is spliced to the Mac's
 /// `127.0.0.1:<port>` and a replacement is parked.
-async fn reverse_pool(vm: Vm) {
+async fn reverse_pool(vm: Vm, paths: Paths) {
     let (used_tx, mut used_rx) = mpsc::unbounded_channel::<()>();
     for _ in 0..REVERSE_POOL {
-        tokio::spawn(park(vm.clone(), used_tx.clone()));
+        tokio::spawn(park(vm.clone(), paths.clone(), used_tx.clone()));
     }
     while used_rx.recv().await.is_some() {
-        tokio::spawn(park(vm.clone(), used_tx.clone()));
+        tokio::spawn(park(vm.clone(), paths.clone(), used_tx.clone()));
     }
 }
 
-async fn park(vm: Vm, used: mpsc::UnboundedSender<()>) {
+/// Mac ports containers may not reach through `host.docker.internal`: the dashboard's,
+/// which runs `rekcod` commands as you.
+fn reverse_blocked(paths: &Paths, port: u16) -> bool {
+    let f = paths.home.join("run/dashboard.json");
+    std::fs::read(f).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()).and_then(|v| v["port"].as_u64())
+        == Some(port as u64)
+}
+
+async fn park(vm: Vm, paths: Paths, used: mpsc::UnboundedSender<()>) {
     let stream = loop {
         match vm.connect(REVERSE_PORT).await {
             Ok(s) => break s,
@@ -906,6 +915,10 @@ async fn park(vm: Vm, used: mpsc::UnboundedSender<()>) {
     }
     let _ = used.send(());
     let Some(port) = parse_reverse_header(&line) else { return };
+    if reverse_blocked(&paths, port) {
+        log!("host.docker.internal:{port}: refused, it's the dashboard");
+        return;
+    }
     let mac = match TcpStream::connect(("127.0.0.1", port)).await {
         Ok(s) => Ok(s),
         Err(_) => TcpStream::connect(("::1", port)).await,

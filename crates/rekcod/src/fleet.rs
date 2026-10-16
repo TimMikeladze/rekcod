@@ -212,20 +212,61 @@ pub fn git_origin(dir: &Path) -> Result<(String, String)> {
 
 // ------------------------------------------------------------- node side
 
+/// Local paths and `file://` URLs are refused unless this is set: they'd let any token
+/// holder clone the node owner's own repos. `scripts/e2e-fleet.sh` sets it.
+const ALLOW_LOCAL_GIT: &str = "REKCOD_ALLOW_LOCAL_GIT";
+
+/// Refuses a git URL or ref that git would read as an option (`--upload-pack=...` runs a
+/// command) or that names a transport other than https, ssh and http.
+pub fn check_git_source(url: &str, rev: &str) -> Result<()> {
+    let ok_chars =
+        |s: &str| !s.is_empty() && s.len() <= 1024 && !s.starts_with('-') && !s.chars().any(|c| c.is_control() || c.is_whitespace());
+    if !ok_chars(url) {
+        bail!("bad git URL {url:?}");
+    }
+    if !ok_chars(rev) || rev.contains("..") || rev.contains(':') {
+        bail!("bad git ref {rev:?}");
+    }
+    let remote = url.starts_with("https://")
+        || url.starts_with("http://")
+        || url.starts_with("ssh://")
+        || (!url.contains("://") && url.split_once(':').is_some_and(|(host, _)| host.contains('@') && !host.contains('/')));
+    if !remote && std::env::var_os(ALLOW_LOCAL_GIT).is_none() {
+        bail!("git URL {url} isn't https, ssh or http (local repos need {ALLOW_LOCAL_GIT}=1 on the controller and nodes)");
+    }
+    Ok(())
+}
+
+/// `git` with only network transports allowed (plus `file` under [`ALLOW_LOCAL_GIT`]),
+/// no prompts and no ext:: helpers.
+fn git_cmd() -> Command {
+    let mut c = Command::new("git");
+    let protocols = if std::env::var_os(ALLOW_LOCAL_GIT).is_some() { "https:ssh:http:file" } else { "https:ssh:http" };
+    c.env("GIT_ALLOW_PROTOCOL", protocols).env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null());
+    c
+}
+
 /// Clones `url` at `rev` (branch, tag or commit) into `~/.rekcod/remote-ws/<id>`.
 pub fn clone(paths: &Paths, url: &str, rev: &str) -> Result<PathBuf> {
+    check_git_source(url, rev)?;
     let dir = paths.home.join("remote-ws").join(sandbox::new_id()?);
     std::fs::create_dir_all(&dir)?;
     let git = |args: &[&str]| -> Result<()> {
-        let o = Command::new("git").arg("-C").arg(&dir).args(args).stdin(Stdio::null()).output()?;
+        let o = git_cmd().arg("-C").arg(&dir).args(args).output()?;
         if !o.status.success() {
             bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&o.stderr).trim());
         }
         Ok(())
     };
-    git(&["init", "-q"])?;
-    git(&["fetch", "-q", "--depth", "1", url, rev])?;
-    git(&["checkout", "-q", "FETCH_HEAD"])?;
+    let r = (|| {
+        git(&["init", "-q"])?;
+        git(&["fetch", "-q", "--depth", "1", "--", url, rev])?;
+        git(&["checkout", "-q", "FETCH_HEAD"])
+    })();
+    if let Err(e) = r {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(e);
+    }
     Ok(dir.canonicalize()?)
 }
 
@@ -516,7 +557,9 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         memory_gib: a["memory_gib"].as_u64().unwrap_or(1),
         allow_hosts: vec!["*".into()],
         ttl_secs: 0,
-        reach: storage_reach(a["env"]["S3_ENDPOINT"].as_str()),
+        // Set by the controller only for apps with a bucket; never taken from the app's env,
+        // which the app's owner controls.
+        reach: storage_reach(a["storage_endpoint"].as_str()),
         ..Default::default()
     };
     let meta = sandbox::create(paths, o)?;
@@ -726,7 +769,7 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, listen: &str
         listen: listen.into(),
         advertise,
     };
-    std::fs::write(paths.home.join("node.json"), serde_json::to_vec_pretty(&cfg)?)?;
+    crate::paths::write_private(&paths.home.join("node.json"), &serde_json::to_vec_pretty(&cfg)?)?;
     eprintln!("rekcod: joined {} as node {}", cfg.controller, cfg.id);
     if install {
         return crate::service::install(paths, "node", &["node".into(), "serve".into()]);
@@ -782,7 +825,8 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     eprintln!("rekcod: node {} serving sandboxes on {} ({})", cfg.id, cfg.listen, cfg.advertise);
     for s in l.incoming().flatten() {
         let (p, t) = (paths.clone(), cfg.secret.clone());
-        std::thread::spawn(move || crate::sandbox_api::handle(&p, s, Some(&t)));
+        let _ = s.set_read_timeout(Some(crate::sandbox_api::READ_TIMEOUT));
+        crate::sandbox_api::spawn_limited(move || crate::sandbox_api::handle(&p, &crate::sandbox_api::Policy::node(), s, Some(&t)));
     }
     Ok(())
 }
@@ -793,15 +837,8 @@ fn load_average() -> f64 {
     if unsafe { libc::getloadavg(l.as_mut_ptr(), 3) } < 1 { 0.0 } else { l[0] }
 }
 
-/// (total, free) GiB on the volume holding `dir`.
 fn disk_gib(dir: &Path) -> (u64, u64) {
-    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else { return (0, 0) };
-    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
-        return (0, 0);
-    }
-    let bs = s.f_bsize as u64;
-    ((s.f_blocks * bs) >> 30, (s.f_bavail * bs) >> 30)
+    crate::cli::disk_gib(dir).unwrap_or((0, 0))
 }
 
 // ------------------------------------------------------------- controller
@@ -1291,7 +1328,8 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
     match (req.method.as_str(), seg.as_slice()) {
         ("POST", ["nodes", "register"]) => {
             let r = (|| {
-                if Some(body["join_token"].as_str().unwrap_or("")) != c.config("join_token")?.as_deref() {
+                let want = c.config("join_token")?.unwrap_or_default();
+                if want.is_empty() || !crate::sandbox_api::ct_eq(body["join_token"].as_str().unwrap_or("").as_bytes(), want.as_bytes()) {
                     bail!("bad join token");
                 }
                 let (id, sec) = (format!("n-{}", sandbox::new_id()?), secret()?);
@@ -1309,7 +1347,7 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
         ("POST", ["nodes", id, "heartbeat"]) => {
             let r = (|| {
                 let (_, sec, state) = c.node(id)?;
-                if sec != bearer {
+                if !crate::sandbox_api::ct_eq(sec.as_bytes(), bearer.as_bytes()) {
                     bail!("bad node secret");
                 }
                 let free = body["mem_free_mib"].as_i64().unwrap_or(0);
@@ -1572,11 +1610,26 @@ fn controller_handle(c: &Arc<Controller>, stream: TcpStream) -> Result<()> {
     json_reply(&mut w, r)
 }
 
+/// The fields a user may set on a remote sandbox. Everything else in the body (`dir`,
+/// `mount`, `golden`, `secrets`, `reach`) names things on the node owner's Mac.
+fn create_body(b: &Value) -> Value {
+    let mut out = json!({"git": {"url": b["git"]["url"], "ref": b["git"]["ref"].as_str().unwrap_or("HEAD")}});
+    for k in ["name", "image", "cpus", "memory_gib", "allow_hosts", "offline", "ttl_secs", "os"] {
+        if let Some(v) = b.get(k).filter(|v| !v.is_null()) {
+            out[k] = v.clone();
+        }
+    }
+    out
+}
+
 fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sandbox_api::Request, w: &mut impl Write) -> Result<()> {
     let err = |w: &mut _, msg: String| respond(w, 400, "application/json", json!({"error": msg}).to_string().as_bytes());
-    let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
-    if body["git"]["url"].as_str().is_none() {
+    let body = create_body(&serde_json::from_slice(&req.body).unwrap_or(json!({})));
+    let (Some(url), Some(rev)) = (body["git"]["url"].as_str(), body["git"]["ref"].as_str()) else {
         return err(w, "remote sandboxes need git.url (and git.ref)".into());
+    };
+    if let Err(e) = check_git_source(url, rev) {
+        return err(w, format!("{e:#}"));
     }
     if let Err(e) = c.allow(who, ns, Role::Member) {
         return respond(w, 404, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
@@ -1819,7 +1872,8 @@ fn resolve(url: &str, rev: &str) -> Result<String> {
     if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(rev.into());
     }
-    let o = Command::new("git").args(["ls-remote", url, rev]).output()?;
+    check_git_source(url, rev)?;
+    let o = git_cmd().args(["ls-remote", "--", url, rev]).output()?;
     let text = String::from_utf8_lossy(&o.stdout);
     text.split_whitespace().next().map(String::from).ok_or_else(|| anyhow!("{url} has no ref {rev}"))
 }
@@ -1947,12 +2001,14 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
         log.push(format!("bucket: {e:#}"));
         finish("failed", &log);
     })?;
+    let storage_endpoint = bucket.iter().find(|(k, _)| *k == "S3_ENDPOINT").map(|(_, v)| v.clone());
     for (k, v) in bucket {
         env[k] = json!(v);
     }
     let mut spec = json!({
         "app": app.name, "release": n, "port": app.port, "git": {"url": app.git_url, "ref": commit},
         "cpus": app.cpus, "memory_gib": app.memory_gib, "env": env, "start": app.start, "store": release_store(c, &app.name, &commit),
+        "storage_endpoint": storage_endpoint,
     });
     let launch = |i: usize, spec: &Value| {
         let (node, url, sec) = nodes[i % nodes.len()].clone();
@@ -2787,7 +2843,7 @@ pub fn github_signature(secret: &str, body: &[u8]) -> String {
 fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Result<Value> {
     let secret = c.config("webhook_secret")?.context("no webhook secret")?;
     let sig = req.headers.iter().find(|(k, _)| k == "x-hub-signature-256").map(|(_, v)| v.as_str()).unwrap_or("");
-    use subtle_eq::ct_eq;
+    use crate::sandbox_api::ct_eq;
     if !ct_eq(sig.as_bytes(), github_signature(&secret, &req.body).as_bytes()) {
         bail!("bad signature");
     }
@@ -3051,13 +3107,6 @@ pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>,
     Ok(())
 }
 
-mod subtle_eq {
-    /// Constant-time comparison, so signature checks don't leak timing.
-    pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-        a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-    }
-}
-
 pub struct ControllerOptions {
     /// SQLite file (default `~/.rekcod/controller/fleet.db`).
     pub db: Option<PathBuf>,
@@ -3137,6 +3186,36 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn git_sources_that_run_commands_are_refused() {
+        for (url, rev) in [
+            ("--upload-pack=touch /tmp/x", "main"),
+            ("https://github.com/a/b", "--upload-pack=touch /tmp/x"),
+            ("ext::sh -c touch% /tmp/x", "main"),
+            ("https://github.com/a/b", "main:refs/heads/x"),
+            ("https://github.com/a/b", "a..b"),
+            ("https://github.com/a b", "main"),
+        ] {
+            assert!(check_git_source(url, rev).is_err(), "{url} {rev}");
+        }
+        for url in ["https://github.com/a/b.git", "ssh://git@host/a.git", "git@github.com:a/b.git", "http://git.tailnet:3000/a/b"] {
+            assert!(check_git_source(url, "main").is_ok(), "{url}");
+        }
+        if std::env::var_os(ALLOW_LOCAL_GIT).is_none() {
+            assert!(check_git_source("/Users/me/repo", "main").is_err());
+            assert!(check_git_source("file:///Users/me/repo", "main").is_err());
+        }
+    }
+
+    #[test]
+    fn remote_creates_drop_node_local_fields() {
+        let b = create_body(&json!({
+            "git": {"url": "https://x/y", "ref": "main"}, "name": "n", "cpus": 2,
+            "dir": "/Users/owner", "mount": true, "golden": "..", "secrets": ["GITHUB_TOKEN"], "reach": ["10.0.0.1:22"],
+        }));
+        assert_eq!(b, json!({"git": {"url": "https://x/y", "ref": "main"}, "name": "n", "cpus": 2}));
+    }
 
     #[test]
     fn storage_names_and_reach() {
@@ -3311,6 +3390,10 @@ mod tests {
             github_signature("It's a Secret to Everybody", b"Hello, World!"),
             "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"
         );
-        assert!(subtle_eq::ct_eq(b"abc", b"abc") && !subtle_eq::ct_eq(b"abc", b"abd") && !subtle_eq::ct_eq(b"ab", b"abc"));
+        assert!(
+            crate::sandbox_api::ct_eq(b"abc", b"abc")
+                && !crate::sandbox_api::ct_eq(b"abc", b"abd")
+                && !crate::sandbox_api::ct_eq(b"ab", b"abc")
+        );
     }
 }

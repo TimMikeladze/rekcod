@@ -125,6 +125,18 @@ fn golden_home(paths: &Paths, name: &str) -> PathBuf {
     paths.home.join("golden").join(name)
 }
 
+/// Golden disk and macOS image names become directory names: `[a-z0-9][a-z0-9._-]*`.
+pub fn check_name(what: &str, name: &str) -> Result<()> {
+    let ok = name.len() <= 64
+        && name.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
+        && !name.contains("..");
+    if !ok {
+        bail!("bad {what} name {name:?}: use lowercase letters, digits, '.', '_' and '-'");
+    }
+    Ok(())
+}
+
 /// 8 lowercase base32 characters.
 pub fn new_id() -> Result<String> {
     let mut b = [0u8; 8];
@@ -172,6 +184,13 @@ impl Sandbox {
     fn running(&self) -> bool {
         crate::cli::running_pid(&self.paths).is_some()
     }
+    fn manifest(&self) -> Option<Manifest> {
+        serde_json::from_slice(&std::fs::read(self.paths.home.join("manifest.json")).ok()?).ok()
+    }
+    fn save_manifest(&self, m: &Manifest) -> Result<()> {
+        std::fs::write(self.paths.home.join("manifest.json"), serde_json::to_vec(m)?)?;
+        Ok(())
+    }
     fn docker(&self) -> Result<Command> {
         let mut c = crate::docker::any_cli(&self.paths)?;
         c.env("DOCKER_HOST", self.paths.docker_host());
@@ -197,6 +216,7 @@ impl Sandbox {
             return Ok(());
         }
         let m = &self.meta;
+        check_capacity(main, m.memory_gib)?;
         self.touch();
         let allow = match (&m.allow, m.offline) {
             (_, true) => Some(String::new()),
@@ -227,12 +247,19 @@ impl Sandbox {
         let p = m.project.to_string_lossy().to_string();
         let mut c = self.docker()?;
         c.args(["run", "-d", "--name", WS, "--restart", "unless-stopped", "--init"]);
+        // Raw sockets would skip the guest's egress rules; nothing in a workspace needs them.
+        c.args(["--cap-drop", "NET_RAW", "--security-opt", "no-new-privileges"]);
         if m.offline {
             c.args(["--network", "none"]);
         } else {
             c.args(["--network", "host", "--label", &format!("{}=1", crate::ports::AUTOPORTS_LABEL)]);
         }
         c.args(["-v", &format!("{p}:{p}"), "-w", &p]);
+        if m.mode == "mount" && m.project.join(".git").is_dir() {
+            // A live .git is code the Mac runs: hooks and core.fsmonitor fire on the next
+            // `git status`, which shell prompts run on their own.
+            c.args(["-v", &format!("{p}/.git:{p}/.git:ro")]);
+        }
         if let Some(plan) = crate::xrun::plan(&m.project, &["sh".into()]) {
             for dir in &plan.local_dirs {
                 c.args(["-v", &format!("{}:{p}/{dir}", crate::xrun::local_volume(&m.project, dir))]);
@@ -295,6 +322,19 @@ pub fn home(paths: &Paths, id: &str) -> Result<PathBuf> {
     Ok(find(paths, id)?.paths.home)
 }
 
+/// GiB a sandbox's disk and workspace may need before the Mac's disk is too full to start one.
+const MIN_FREE_GIB: u64 = 10;
+
+/// Refuses a sandbox when the Mac's disk is nearly full: a full APFS volume turns into I/O
+/// errors in every running VM.
+fn check_disk(paths: &Paths) -> Result<()> {
+    let free = crate::cli::free_disk_gib(&paths.home).unwrap_or(u64::MAX);
+    if free < MIN_FREE_GIB {
+        bail!("only {free} GiB free on the Mac's disk; sandboxes need at least {MIN_FREE_GIB}");
+    }
+    Ok(())
+}
+
 /// Refuses a sandbox that would push running VMs past 75% of the Mac's memory.
 fn check_capacity(paths: &Paths, gib: u64) -> Result<()> {
     let host = crate::cli::sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
@@ -312,6 +352,10 @@ fn check_capacity(paths: &Paths, gib: u64) -> Result<()> {
 }
 
 pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
+    check_name("golden disk", &o.golden)?;
+    if let Some(img) = o.image.as_deref().filter(|_| o.os.as_deref() == Some("macos")) {
+        check_name("macOS image", img)?;
+    }
     let project = o.dir.clone().map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
     if !["/Users", "/Volumes", "/private"].iter().any(|r| project.starts_with(r)) {
         bail!("{} isn't under /Users, /Volumes or /private", project.display());
@@ -330,6 +374,11 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     if let Some(os) = o.os.as_deref().filter(|os| *os != "macos" && *os != "linux") {
         bail!("--os takes linux or macos, not {os}");
     }
+    if macos && (o.offline || !o.allow_hosts.is_empty()) {
+        // The macOS guest has plain NAT: no allowlist, and the Mac and LAN are reachable.
+        bail!("--offline and --allow-host don't apply to macOS sandboxes; their network isn't filtered");
+    }
+    check_disk(paths)?;
     if macos {
         let running = macos_running(paths);
         if running >= crate::macos::MAX_RUNNING {
@@ -387,6 +436,7 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     };
     if !o.mount || macos {
         clonefile(&project, &s.ws())?;
+        s.save_manifest(&manifest(&project))?;
     }
     s.save()?;
     let result = if macos {
@@ -600,6 +650,8 @@ pub struct Change {
     pub path: String,
 }
 
+/// Regular files and symlinks under `base`, skipping [`SKIP`]. FIFOs, sockets and devices
+/// are left out: reading a FIFO the sandbox made would hang `diff`.
 fn walk(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
     for e in rd.flatten() {
@@ -610,8 +662,24 @@ fn walk(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
         let r = rel.join(&name);
         match e.file_type() {
             Ok(t) if t.is_dir() => walk(base, &r, out),
-            Ok(_) => out.push(r),
-            Err(_) => {}
+            Ok(t) if t.is_file() || t.is_symlink() => out.push(r),
+            _ => {}
+        }
+    }
+}
+
+/// Compares two files in 64 KiB pieces, not by reading both whole.
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else { return false };
+    let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
+    loop {
+        let Ok(n) = fa.read(&mut ba) else { return false };
+        if n == 0 {
+            return fb.read(&mut bb[..1]).is_ok_and(|m| m == 0);
+        }
+        if fb.read_exact(&mut bb[..n]).is_err() || ba[..n] != bb[..n] {
+            return false;
         }
     }
 }
@@ -621,7 +689,7 @@ fn same(a: &Path, b: &Path) -> bool {
     if ma.file_type().is_symlink() || mb.file_type().is_symlink() {
         return std::fs::read_link(a).ok() == std::fs::read_link(b).ok();
     }
-    ma.len() == mb.len() && ma.permissions() == mb.permissions() && std::fs::read(a).ok() == std::fs::read(b).ok()
+    ma.len() == mb.len() && ma.permissions() == mb.permissions() && same_bytes(a, b)
 }
 
 /// What `apply` would do to `project` to make it match `ws`.
@@ -646,6 +714,17 @@ pub fn changes(project: &Path, ws: &Path) -> Vec<Change> {
     out
 }
 
+/// The project as the sandbox copied it: path to (kind, size, mtime ns). `apply` refuses
+/// to touch a path whose state on the Mac has moved on from this.
+type Manifest = std::collections::BTreeMap<String, crate::safefs::State>;
+
+fn manifest(project: &Path) -> Manifest {
+    let mut files = Vec::new();
+    walk(project, Path::new(""), &mut files);
+    let Ok(dir) = crate::safefs::Dir::open(project) else { return Manifest::new() };
+    files.iter().filter_map(|f| Some((f.to_string_lossy().to_string(), dir.state(f)?))).collect()
+}
+
 fn copy_sandbox(paths: &Paths, id: &str) -> Result<Sandbox> {
     let s = find(paths, id)?;
     if s.meta.mode != "copy" {
@@ -659,14 +738,49 @@ fn copy_sandbox(paths: &Paths, id: &str) -> Result<Sandbox> {
     Ok(s)
 }
 
-/// Unified diff of the workspace against the project (`git diff --no-index` per file).
+/// A frozen copy of the workspace in `<sandbox>/<name>`, so what's compared and written
+/// can't change under us while the sandbox keeps running. Its processes are paused while
+/// the directory is cloned, as for `fork`.
+fn freeze(s: &Sandbox, name: &str) -> Result<PathBuf> {
+    let dst = s.paths.home.join(name);
+    if dst.exists() {
+        std::fs::remove_dir_all(&dst)?;
+    }
+    let pause = !s.macos() && s.running();
+    if pause {
+        let _ = s.docker()?.args(["pause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    let r = clonefile(&s.ws(), &dst);
+    if pause {
+        let _ = s.docker()?.args(["unpause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    r.map(|_| dst)
+}
+
+/// Bytes a terminal would act on (escape sequences can hide lines from the reviewer),
+/// shown as `^[` style text instead. Newlines and tabs stay.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '\n' | '\t' => c.to_string(),
+            c if (c as u32) < 0x20 => format!("^{}", ((c as u8) + 0x40) as char),
+            '\u{7f}' => "^?".into(),
+            c if ('\u{80}'..='\u{9f}').contains(&c) => format!("\\u{{{:x}}}", c as u32),
+            c => c.to_string(),
+        })
+        .collect()
+}
+
+/// Unified diff of the workspace against the project (`git diff --no-index` per file). The
+/// workspace is frozen into `<sandbox>/reviewed`, which `apply --reviewed` writes back.
 pub fn patch(paths: &Paths, id: &str) -> Result<(Vec<Change>, String)> {
     let s = copy_sandbox(paths, id)?;
-    let ch = changes(&s.meta.project, &s.ws());
+    let ws = freeze(&s, "reviewed")?;
+    let ch = changes(&s.meta.project, &ws);
     let mut out = String::new();
     let null = PathBuf::from("/dev/null");
     for c in &ch {
-        let (a, b) = (s.meta.project.join(&c.path), s.ws().join(&c.path));
+        let (a, b) = (s.meta.project.join(&c.path), ws.join(&c.path));
         let (a, b) = match c.kind {
             'A' => (&null, &b),
             'D' => (&a, &null),
@@ -676,8 +790,8 @@ pub fn patch(paths: &Paths, id: &str) -> Result<(Vec<Change>, String)> {
         // git prints absolute paths minus the leading slash; make them project-relative.
         let text = String::from_utf8_lossy(&o.stdout)
             .replace(&format!("a{}/", s.meta.project.display()), "a/")
-            .replace(&format!("b{}/", s.ws().display()), "b/")
-            .replace(&format!("a{}/", s.ws().display()), "a/")
+            .replace(&format!("b{}/", ws.display()), "b/")
+            .replace(&format!("a{}/", ws.display()), "a/")
             .replace(&format!("b{}/", s.meta.project.display()), "b/");
         out.push_str(&text);
     }
@@ -687,9 +801,16 @@ pub fn patch(paths: &Paths, id: &str) -> Result<(Vec<Change>, String)> {
 pub fn diff(paths: &Paths, id: &str, stat: bool) -> Result<()> {
     let (ch, p) = patch(paths, id)?;
     if stat {
-        print_changes(&ch);
+        for c in &ch {
+            println!("{} {}", c.kind, printable(&c.path));
+        }
     } else {
-        print!("{p}");
+        print!("{}", printable(&p));
+    }
+    if !ch.is_empty() {
+        eprintln!(
+            "rekcod: `rekcod sandbox apply {id} --reviewed` writes exactly this; without --reviewed it takes the workspace as it is then"
+        );
     }
     Ok(())
 }
@@ -737,49 +858,76 @@ pub fn input(paths: &Paths, id: &str, action: &[String]) -> Result<()> {
     crate::macos::input(paths, &ip, action)
 }
 
-/// Project files changed on the Mac since the sandbox copied them.
-fn conflicts(project: &Path, since: u64, ch: &[Change]) -> Vec<String> {
+/// Changed paths whose state on the Mac differs from when the sandbox copied them. Without a
+/// manifest (sandboxes made before there was one), anything modified after `since`.
+fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Change]) -> Vec<String> {
+    let dir = crate::safefs::Dir::open(project).ok();
     ch.iter()
-        .filter(|c| {
-            std::fs::symlink_metadata(project.join(&c.path))
+        .filter(|c| match (manifest, &dir) {
+            (Some(m), Some(d)) => d.state(Path::new(&c.path)) != m.get(&c.path).copied(),
+            _ => std::fs::symlink_metadata(project.join(&c.path))
                 .and_then(|m| m.modified())
-                .is_ok_and(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) > since)
+                .is_ok_and(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) > since),
         })
         .map(|c| c.path.clone())
         .collect()
 }
 
-/// Writes the workspace's changes into the real project. Returns what changed.
-pub fn apply(paths: &Paths, id: &str, check: bool) -> Result<Vec<Change>> {
-    let mut s = copy_sandbox(paths, id)?;
-    let ch = changes(&s.meta.project, &s.ws());
-    let bad = conflicts(&s.meta.project, s.meta.created, &ch);
+/// Writes the workspace's changes into the real project. Returns what changed. With
+/// `reviewed`, writes the copy the last `diff` froze instead of the live workspace.
+pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: bool) -> Result<Vec<Change>> {
+    let s = copy_sandbox(paths, id)?;
+    let src = if reviewed {
+        let r = s.paths.home.join("reviewed");
+        if !r.exists() {
+            bail!("nothing reviewed yet; run `rekcod sandbox diff {id}` first");
+        }
+        r
+    } else {
+        freeze(&s, "applying")?
+    };
+    let ch = changes(&s.meta.project, &src);
+    let mut manifest = s.manifest();
+    let bad = conflicts(&s.meta.project, manifest.as_ref(), s.meta.created, &ch);
     if !bad.is_empty() {
         bail!("changed in {} since the sandbox copied it: {}", s.meta.project.display(), bad.join(", "));
     }
     if check {
         return Ok(ch);
     }
+    let dir = crate::safefs::Dir::open(&s.meta.project)?;
     for c in &ch {
-        let (dst, src) = (s.meta.project.join(&c.path), s.ws().join(&c.path));
+        let rel = Path::new(&c.path);
         match c.kind {
-            'D' => std::fs::remove_file(&dst).with_context(|| format!("remove {}", dst.display()))?,
+            'D' => dir.remove(rel)?,
             _ => {
-                if let Some(parent) = dst.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if std::fs::symlink_metadata(&src)?.file_type().is_symlink() {
-                    let _ = std::fs::remove_file(&dst);
-                    std::os::unix::fs::symlink(std::fs::read_link(&src)?, &dst)?;
+                let from = src.join(rel);
+                if std::fs::symlink_metadata(&from)?.file_type().is_symlink() {
+                    dir.write_symlink(rel, &std::fs::read_link(&from)?)?;
                 } else {
-                    std::fs::copy(&src, &dst).with_context(|| format!("write {}", dst.display()))?;
+                    dir.write_file(rel, &from)?;
                 }
             }
         }
+        // What's there now is ours; a later apply mustn't call it a conflict.
+        if let Some(m) = manifest.as_mut() {
+            match dir.state(rel) {
+                Some(st) => m.insert(c.path.clone(), st),
+                None => m.remove(&c.path),
+            };
+        }
     }
-    // Files just written are newer than `created`; a later apply mustn't call them conflicts.
-    s.meta.created = now() + 1;
-    s.save()?;
+    match &manifest {
+        Some(m) => s.save_manifest(m)?,
+        None => {
+            let mut s = s;
+            s.meta.created = now() + 1;
+            s.save()?;
+        }
+    }
+    if !reviewed {
+        let _ = std::fs::remove_dir_all(&src);
+    }
     Ok(ch)
 }
 
@@ -902,6 +1050,7 @@ pub fn rm(paths: &Paths, ids: &[String], every: bool) -> Result<()> {
 }
 
 pub fn golden_build(paths: &Paths, name: &str, images: &[String]) -> Result<()> {
+    check_name("golden disk", name)?;
     let home = golden_home(paths, name);
     let g = Paths::at(home.clone())?;
     if crate::cli::running_pid(&g).is_some() {
@@ -947,6 +1096,7 @@ pub fn golden_list(paths: &Paths) -> Result<()> {
 }
 
 pub fn golden_rm(paths: &Paths, name: &str) -> Result<()> {
+    check_name("golden disk", name)?;
     let home = golden_home(paths, name);
     if !home.exists() {
         bail!("no golden disk {name}");
@@ -997,10 +1147,38 @@ mod tests {
         let ch = changes(&p, &w);
         let got: Vec<(char, &str)> = ch.iter().map(|c| (c.kind, c.path.as_str())).collect();
         assert_eq!(got, vec![('D', "gone.txt"), ('M', "src/a.rs"), ('A', "src/b.rs")]);
-        // Everything in p was just written, so it all counts as changed after an old copy.
-        assert_eq!(conflicts(&p, 0, &ch).len(), 2);
-        assert!(conflicts(&p, now() + 10, &ch).is_empty());
+        // No manifest: everything in p was just written, so it all counts as changed after an old copy.
+        assert_eq!(conflicts(&p, None, 0, &ch).len(), 2);
+        assert!(conflicts(&p, None, now() + 10, &ch).is_empty());
+        // With one, only paths whose state moved on conflict, whatever their mtime.
+        let m = manifest(&p);
+        assert!(conflicts(&p, Some(&m), 0, &ch).is_empty());
+        std::fs::write(p.join("src/a.rs"), "edited on the Mac").unwrap();
+        // A file moved in with an old mtime still conflicts: it wasn't there when copied.
+        std::fs::write(p.join("src/b.rs"), "moved in").unwrap();
+        let got = conflicts(&p, Some(&m), now() + 10, &ch);
+        assert_eq!(got, vec!["src/a.rs", "src/b.rs"]);
+        // FIFOs are left out of the walk rather than read.
+        let fifo = std::ffi::CString::new(w.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        assert!(!changes(&p, &w).iter().any(|c| c.path == "pipe"));
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn printable_hides_escape_sequences() {
+        assert_eq!(printable("ok\n\tx"), "ok\n\tx");
+        assert_eq!(printable("a\x1b[2Kb\r"), "a^[[2Kb^M");
+        assert_eq!(printable("\u{9b}"), "\\u{9b}");
+    }
+
+    #[test]
+    fn names_are_checked() {
+        assert!(check_name("golden disk", "default").is_ok());
+        assert!(check_name("golden disk", "node-22.x").is_ok());
+        for bad in ["..", "../sandboxes/x", "a/b", "", "-x", "A"] {
+            assert!(check_name("golden disk", bad).is_err(), "{bad}");
+        }
     }
 
     #[test]

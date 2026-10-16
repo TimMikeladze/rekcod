@@ -22,13 +22,64 @@ fn id_of(args: &Value) -> Result<String> {
     args["id"].as_str().map(String::from).ok_or_else(|| anyhow!("missing id"))
 }
 
-fn exec_opts(args: &Value) -> ExecOptions {
-    ExecOptions {
-        workdir: args["workdir"].as_str().map(String::from),
-        env: strs(&args["env"]),
-        timeout_secs: args["timeout_secs"].as_u64(),
-        tty: false,
+/// What callers may ask for, fixed when `serve`, `mcp` or a fleet node starts. The caller
+/// is an agent or a remote user, so none of it comes from the request.
+#[derive(Clone, Debug, Default)]
+pub struct Policy {
+    /// Directories a sandbox may be created for (they and anything under them). Empty:
+    /// `dir` is refused and only `git` works, as on fleet nodes.
+    pub roots: Vec<PathBuf>,
+    /// Allows `mount`, a live read-write share of the directory instead of a copy.
+    pub mount: bool,
+    /// Hosts a caller may add to the allowlist; `*` allows any (and `*` itself).
+    pub allow_hosts: Vec<String>,
+    /// Environment variables a caller may pass in by name with `secrets`.
+    pub secrets: Vec<String>,
+}
+
+impl Policy {
+    /// Fleet nodes: only the controller calls them (node secret), and it filters what users send.
+    pub fn node() -> Policy {
+        Policy { roots: vec![], mount: false, allow_hosts: vec!["*".into()], secrets: vec![] }
     }
+
+    /// The project directory for a create, checked against `roots`.
+    fn project(&self, dir: Option<&str>) -> Result<PathBuf> {
+        let Some(first) = self.roots.first() else { bail!("this server only creates sandboxes from git") };
+        let dir = match dir {
+            Some(d) => PathBuf::from(d).canonicalize().with_context(|| format!("dir {d}"))?,
+            None => first.clone(),
+        };
+        if !self.roots.iter().any(|r| dir.starts_with(r)) {
+            let roots: Vec<String> = self.roots.iter().map(|r| r.display().to_string()).collect();
+            bail!("{} is outside the directories this server allows ({}); start it with --root", dir.display(), roots.join(", "));
+        }
+        Ok(dir)
+    }
+
+    fn check(&self, args: &Value) -> Result<()> {
+        if args["mount"].as_bool() == Some(true) && !self.mount {
+            bail!("mount isn't allowed; start the server with --allow-mount");
+        }
+        let any = self.allow_hosts.iter().any(|h| h == "*");
+        if let Some(h) = strs(&args["allow_hosts"]).into_iter().find(|h| !any && !self.allow_hosts.contains(h)) {
+            bail!("allow_hosts {h} isn't allowed; start the server with --allow-host {h}");
+        }
+        if let Some(s) = strs(&args["secrets"]).into_iter().find(|s| !self.secrets.contains(s)) {
+            bail!("secret {s} isn't allowed; start the server with --secret {s}");
+        }
+        Ok(())
+    }
+}
+
+/// `env` entries must be `KEY=VALUE`: a bare `KEY` makes docker copy the value from this
+/// process's environment, which would hand the caller any secret it can name.
+fn exec_opts(args: &Value) -> Result<ExecOptions> {
+    let env = strs(&args["env"]);
+    if let Some(e) = env.iter().find(|e| !e.contains('=')) {
+        bail!("env {e}: use KEY=VALUE");
+    }
+    Ok(ExecOptions { workdir: args["workdir"].as_str().map(String::from), env, timeout_secs: args["timeout_secs"].as_u64(), tty: false })
 }
 
 /// Runs a command to completion: (exit, stdout, stderr).
@@ -37,7 +88,7 @@ fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<&[u8]>) -> 
     if cmd.is_empty() {
         bail!("missing cmd");
     }
-    let mut c = sandbox::exec_cmd(paths, id, &exec_opts(args), &cmd)?;
+    let mut c = sandbox::exec_cmd(paths, id, &exec_opts(args)?, &cmd)?;
     let t0 = Instant::now();
     let mut child = c
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
@@ -56,14 +107,15 @@ fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<&[u8]>) -> 
 }
 
 /// One API operation. `exec` here collects output; HTTP streams it separately.
-pub fn op(paths: &Paths, name: &str, args: &Value) -> Result<Value> {
+pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Value> {
     Ok(match name {
         "create" => {
             let d = CreateOptions::default();
+            policy.check(args)?;
             // Fleet nodes: the workspace arrives as a git ref, not a Mac directory.
             let dir = match args["git"]["url"].as_str() {
                 Some(url) => Some(crate::fleet::clone(paths, url, args["git"]["ref"].as_str().unwrap_or("HEAD"))?),
-                None => args["dir"].as_str().map(PathBuf::from),
+                None => Some(policy.project(args["dir"].as_str())?),
             };
             let o = CreateOptions {
                 dir,
@@ -112,7 +164,12 @@ pub fn op(paths: &Paths, name: &str, args: &Value) -> Result<Value> {
             let (changes, patch) = sandbox::patch(paths, &id_of(args)?)?;
             json!({"changes": changes, "patch": patch})
         }
-        "apply" => json!({"changes": sandbox::apply(paths, &id_of(args)?, args["check"].as_bool().unwrap_or(false))?}),
+        "apply" => json!({"changes": sandbox::apply(
+            paths,
+            &id_of(args)?,
+            args["check"].as_bool().unwrap_or(false),
+            args["reviewed"].as_bool().unwrap_or(false)
+        )?}),
         "stop" => {
             sandbox::stop(paths, &id_of(args)?)?;
             json!({"stopped": true})
@@ -171,27 +228,41 @@ pub(crate) fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into()
 }
 
-pub(crate) fn read_request(r: &mut impl BufRead) -> Result<Request> {
+/// Longest request line or header line accepted.
+const MAX_LINE: u64 = 16 << 10;
+const MAX_HEADERS: usize = 100;
+/// Largest body: `write_file` and deploy specs.
+pub(crate) const MAX_BODY: usize = 64 << 20;
+/// How long a peer may take to send its request.
+pub(crate) const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn read_line_capped(r: &mut impl BufRead, out: &mut String) -> Result<usize> {
+    let n = r.by_ref().take(MAX_LINE).read_line(out)?;
+    if n as u64 == MAX_LINE && !out.ends_with('\n') {
+        bail!("header line too long");
+    }
+    Ok(n)
+}
+
+/// The request line and headers; the body is left unread for [`read_body`].
+pub(crate) fn read_head(r: &mut impl BufRead) -> Result<Request> {
     let mut line = String::new();
-    r.read_line(&mut line)?;
+    read_line_capped(r, &mut line)?;
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("/").to_string());
     let mut headers = Vec::new();
     loop {
         let mut h = String::new();
-        if r.read_line(&mut h)? == 0 || h.trim().is_empty() {
+        if read_line_capped(r, &mut h)? == 0 || h.trim().is_empty() {
             break;
+        }
+        if headers.len() == MAX_HEADERS {
+            bail!("too many headers");
         }
         if let Some((k, v)) = h.split_once(':') {
             headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
         }
     }
-    let len: usize = headers.iter().find(|(k, _)| k == "content-length").and_then(|(_, v)| v.parse().ok()).unwrap_or(0);
-    if len > 64 << 20 {
-        bail!("body too large");
-    }
-    let mut body = vec![0; len];
-    r.read_exact(&mut body)?;
     let (path, q) = target.split_once('?').unwrap_or((&target, ""));
     let query = q
         .split('&')
@@ -201,7 +272,34 @@ pub(crate) fn read_request(r: &mut impl BufRead) -> Result<Request> {
             (percent_decode(k), percent_decode(v))
         })
         .collect();
-    Ok(Request { method, path: path.to_string(), query, headers, body })
+    Ok(Request { method, path: path.to_string(), query, headers, body: vec![] })
+}
+
+pub(crate) fn read_body(r: &mut impl BufRead, req: &mut Request, max: usize) -> Result<()> {
+    let len: usize = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if len > max {
+        bail!("body too large");
+    }
+    req.body = vec![0; len];
+    r.read_exact(&mut req.body)?;
+    Ok(())
+}
+
+pub(crate) fn read_request(r: &mut impl BufRead) -> Result<Request> {
+    let mut req = read_head(r)?;
+    read_body(r, &mut req, MAX_BODY)?;
+    Ok(req)
+}
+
+impl Request {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+    }
+}
+
+/// Constant-time comparison, so token and signature checks don't leak timing.
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 pub(crate) fn respond(w: &mut impl Write, code: u16, ctype: &str, body: &[u8]) -> Result<()> {
@@ -210,7 +308,11 @@ pub(crate) fn respond(w: &mut impl Write, code: u16, ctype: &str, body: &[u8]) -
         201 => "Created",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        413 => "Payload Too Large",
+        429 => "Too Many Requests",
+        503 => "Service Unavailable",
         _ => "Error",
     };
     write!(w, "HTTP/1.1 {code} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len())?;
@@ -226,11 +328,12 @@ fn error_code(e: &anyhow::Error) -> u16 {
 pub fn route(method: &str, path: &str, query: &[(String, String)], body: &Value) -> Option<(&'static str, Value)> {
     let seg: Vec<&str> = path.trim_matches('/').split('/').collect();
     let mut args = if body.is_object() { body.clone() } else { json!({}) };
-    if let Some(id) = seg.get(1) {
-        args["id"] = json!(id);
-    }
     for (k, v) in query {
         args[k.as_str()] = json!(v);
+    }
+    // Last: the controller authorizes the ID in the path, so nothing else may replace it.
+    if let Some(id) = seg.get(1) {
+        args["id"] = json!(id);
     }
     let op = match (method, seg.as_slice()) {
         ("POST", ["sandboxes"]) => "create",
@@ -264,7 +367,7 @@ fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Resu
     if cmd.is_empty() {
         bail!("missing cmd");
     }
-    let mut c = sandbox::exec_cmd(paths, &id, &exec_opts(args), &cmd)?;
+    let mut c = sandbox::exec_cmd(paths, &id, &exec_opts(args)?, &cmd)?;
     let t0 = Instant::now();
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")?;
@@ -295,16 +398,20 @@ fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Resu
     Ok(())
 }
 
-pub(crate) fn handle(paths: &Paths, stream: impl Read + Write + Send, token: Option<&str>) -> Result<()> {
+pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write + Send, token: Option<&str>) -> Result<()> {
     let mut r = BufReader::new(stream);
-    let req = read_request(&mut r)?;
-    let mut w = r.into_inner();
+    let mut req = read_head(&mut r)?;
+    // The token is checked before the body is read, so nobody without it can make us buffer 64 MiB.
     if let Some(t) = token {
-        let auth = req.headers.iter().find(|(k, _)| k == "authorization").map(|(_, v)| v.as_str());
-        if auth != Some(&format!("Bearer {t}")) {
-            return respond(&mut w, 401, "application/json", br#"{"error":"bad token"}"#);
+        let auth = req.header("authorization").unwrap_or("");
+        if !ct_eq(auth.as_bytes(), format!("Bearer {t}").as_bytes()) {
+            return respond(r.get_mut(), 401, "application/json", br#"{"error":"bad token"}"#);
         }
     }
+    if let Err(e) = read_body(&mut r, &mut req, MAX_BODY) {
+        return respond(r.get_mut(), 413, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
+    }
+    let mut w = r.into_inner();
     let body: Value = if req.body.is_empty() { json!({}) } else { serde_json::from_slice(&req.body).unwrap_or(json!({})) };
     let Some((name, mut args)) = route(&req.method, &req.path, &req.query, &body) else {
         return respond(&mut w, 404, "application/json", br#"{"error":"no such endpoint"}"#);
@@ -318,7 +425,7 @@ pub(crate) fn handle(paths: &Paths, stream: impl Read + Write + Send, token: Opt
         }
         return Ok(());
     }
-    match op(paths, name, &args) {
+    match op(paths, policy, name, &args) {
         Ok(v) if name == "screenshot" => {
             let png = base64_decode(v["png_base64"].as_str().unwrap_or(""));
             respond(&mut w, 200, "image/png", &png)
@@ -330,12 +437,16 @@ pub(crate) fn handle(paths: &Paths, stream: impl Read + Write + Send, token: Opt
 }
 
 /// `rekcod sandbox serve`: the unix socket always; TCP on 127.0.0.1 only, with a token.
-pub fn serve(paths: Paths, listen: Option<String>) -> Result<()> {
+pub fn serve(paths: Paths, policy: Policy, listen: Option<String>) -> Result<()> {
     let sock = paths.home.join("run/sandbox.sock");
     let _ = std::fs::remove_file(&sock);
-    let unix = std::os::unix::net::UnixListener::bind(&sock).with_context(|| format!("bind {}", sock.display()))?;
+    // Bound under a 077 umask, so the socket is never reachable by others, even briefly.
+    let unix = crate::paths::with_umask(0o077, || std::os::unix::net::UnixListener::bind(&sock))
+        .with_context(|| format!("bind {}", sock.display()))?;
     std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600))?;
     eprintln!("rekcod: sandbox API on {}", sock.display());
+    let roots: Vec<String> = policy.roots.iter().map(|r| r.display().to_string()).collect();
+    eprintln!("rekcod: sandboxes allowed for {}", roots.join(", "));
     if let Some(addr) = listen {
         let addr: std::net::SocketAddr = addr.parse().context("--listen takes 127.0.0.1:PORT")?;
         if !addr.ip().is_loopback() {
@@ -343,25 +454,52 @@ pub fn serve(paths: Paths, listen: Option<String>) -> Result<()> {
         }
         let token_file = paths.home.join("sandbox-token");
         if !token_file.exists() {
-            std::fs::write(&token_file, sandbox::new_id()? + &sandbox::new_id()? + &sandbox::new_id()? + &sandbox::new_id()?)?;
-            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600))?;
+            let token = sandbox::new_id()? + &sandbox::new_id()? + &sandbox::new_id()? + &sandbox::new_id()?;
+            crate::paths::write_private(&token_file, token.as_bytes())?;
         }
         let token = std::fs::read_to_string(&token_file)?.trim().to_string();
         let tcp = std::net::TcpListener::bind(addr)?;
         eprintln!("rekcod: sandbox API on http://{addr} (token in {})", token_file.display());
-        let p = paths.clone();
+        let (p, pol) = (paths.clone(), policy.clone());
         std::thread::spawn(move || {
             for s in tcp.incoming().flatten() {
-                let (p, t) = (p.clone(), token.clone());
-                std::thread::spawn(move || handle(&p, s, Some(&t)));
+                let _ = s.set_read_timeout(Some(READ_TIMEOUT));
+                let (p, pol, t) = (p.clone(), pol.clone(), token.clone());
+                spawn_limited(move || handle(&p, &pol, s, Some(&t)));
             }
         });
     }
     for s in unix.incoming().flatten() {
-        let p = paths.clone();
-        std::thread::spawn(move || handle(&p, s, None));
+        let _ = s.set_read_timeout(Some(READ_TIMEOUT));
+        let (p, pol) = (paths.clone(), policy.clone());
+        spawn_limited(move || handle(&p, &pol, s, None));
     }
     Ok(())
+}
+
+/// Connections served at once by the threaded HTTP servers (sandbox API, node, controller).
+const MAX_CONNECTIONS: usize = 256;
+static CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Runs `f` on its own thread unless [`MAX_CONNECTIONS`] are already being served; then the
+/// connection (owned by `f`) is dropped, which closes it.
+pub(crate) fn spawn_limited<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) {
+    use std::sync::atomic::Ordering;
+    if CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
+        CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        eprintln!("rekcod: {MAX_CONNECTIONS} connections open; refusing another");
+        return;
+    }
+    std::thread::spawn(move || {
+        struct Done;
+        impl Drop for Done {
+            fn drop(&mut self) {
+                CONNECTIONS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _done = Done;
+        f()
+    });
 }
 
 fn base64_decode(s: &str) -> Vec<u8> {
@@ -462,7 +600,11 @@ fn tools() -> Vec<Tool> {
             "apply",
             "Write the sandbox's workspace changes into the real project on the Mac.",
             true,
-            json!({"id": id, "check": {"type": "boolean", "description": "Only report what would change"}}),
+            json!({
+                "id": id,
+                "check": {"type": "boolean", "description": "Only report what would change"},
+                "reviewed": {"type": "boolean", "description": "Write the copy the last sandbox_diff showed, not the workspace as it is now"}
+            }),
             vec!["id"],
         ),
         ("sandbox_screenshot", "screenshot", "PNG of a macOS sandbox's screen.", false, json!({"id": id}), vec!["id"]),
@@ -479,7 +621,7 @@ fn tools() -> Vec<Tool> {
     ]
 }
 
-pub fn mcp_reply(paths: &Paths, msg: &Value) -> Option<Value> {
+pub fn mcp_reply(paths: &Paths, policy: &Policy, msg: &Value) -> Option<Value> {
     let id = msg.get("id")?.clone();
     let result = match msg["method"].as_str().unwrap_or("") {
         "initialize" => Ok(json!({
@@ -499,7 +641,7 @@ pub fn mcp_reply(paths: &Paths, msg: &Value) -> Option<Value> {
             let args = msg["params"]["arguments"].clone();
             match tools().into_iter().find(|t| t.0 == name) {
                 None => Err(json!({"code": -32602, "message": format!("unknown tool {name}")})),
-                Some(t) => Ok(match op(paths, t.1, &args) {
+                Some(t) => Ok(match op(paths, policy, t.1, &args) {
                     Ok(v) if t.1 == "screenshot" => {
                         json!({"content": [{"type": "image", "mimeType": "image/png", "data": v["png_base64"]}], "isError": false})
                     }
@@ -519,7 +661,7 @@ pub fn mcp_reply(paths: &Paths, msg: &Value) -> Option<Value> {
 }
 
 /// `rekcod mcp`: newline-delimited JSON-RPC on stdin/stdout.
-pub fn mcp(paths: Paths) -> Result<()> {
+pub fn mcp(paths: Paths, policy: Policy) -> Result<()> {
     let stdin = std::io::stdin();
     let mut out = std::io::stdout();
     for line in stdin.lock().lines() {
@@ -528,7 +670,7 @@ pub fn mcp(paths: Paths) -> Result<()> {
             continue;
         }
         let reply = match serde_json::from_str::<Value>(&line) {
-            Ok(msg) => mcp_reply(&paths, &msg),
+            Ok(msg) => mcp_reply(&paths, &policy, &msg),
             Err(e) => Some(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": e.to_string()}})),
         };
         if let Some(r) = reply {
@@ -555,17 +697,58 @@ mod tests {
     }
 
     #[test]
+    fn path_id_wins_over_query_and_body() {
+        let q = vec![("id".to_string(), "victim".to_string())];
+        let (_, a) = route("POST", "/sandboxes/mine/exec", &q, &json!({"id": "victim2"})).unwrap();
+        assert_eq!(a["id"], "mine");
+    }
+
+    #[test]
+    fn policy_limits_what_callers_ask_for() {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!("rekcod-pol-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("app")).unwrap();
+        let p = Policy { roots: vec![root.clone()], mount: false, allow_hosts: vec!["example.com".into()], secrets: vec!["TOKEN".into()] };
+        assert_eq!(p.project(None).unwrap(), root);
+        assert_eq!(p.project(Some(root.join("app").to_str().unwrap())).unwrap(), root.join("app"));
+        assert!(p.project(Some("/")).is_err());
+        assert!(p.project(Some(root.join("app/../..").to_str().unwrap())).is_err());
+        assert!(p.check(&json!({"mount": true})).is_err());
+        assert!(p.check(&json!({"allow_hosts": ["example.com"], "secrets": ["TOKEN"]})).is_ok());
+        assert!(p.check(&json!({"allow_hosts": ["*"]})).is_err());
+        assert!(p.check(&json!({"secrets": ["AWS_SECRET_ACCESS_KEY"]})).is_err());
+        assert!(Policy::node().project(Some("/Users")).is_err());
+        assert!(exec_opts(&json!({"env": ["AWS_SECRET_ACCESS_KEY"]})).is_err());
+        assert!(exec_opts(&json!({"env": ["A=1"]})).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn requests_are_capped() {
+        let long = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(20 << 10));
+        assert!(read_request(&mut std::io::Cursor::new(long)).is_err());
+        let many = format!("GET / HTTP/1.1\r\n{}\r\n", "X: y\r\n".repeat(200));
+        assert!(read_request(&mut std::io::Cursor::new(many)).is_err());
+        let big = format!("POST / HTTP/1.1\r\nContent-Length: {}\r\n\r\n", MAX_BODY + 1);
+        assert!(read_request(&mut std::io::Cursor::new(big)).is_err());
+        let ok = read_request(&mut std::io::Cursor::new("POST /x?a=1 HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi")).unwrap();
+        assert_eq!((ok.path.as_str(), ok.body.as_slice(), ok.header("content-length")), ("/x", &b"hi"[..], Some("2")));
+        assert!(ct_eq(b"abc", b"abc") && !ct_eq(b"abc", b"abd") && !ct_eq(b"ab", b"abc"));
+    }
+
+    #[test]
     fn mcp_lists_every_tool_and_rejects_unknown() {
         let paths = Paths { home: std::env::temp_dir() };
-        let init = mcp_reply(&paths, &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"})).unwrap();
+        let init = mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"})).unwrap();
         assert_eq!(init["result"]["protocolVersion"], PROTOCOL);
-        let list = mcp_reply(&paths, &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+        let list = mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         let tools = list["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 12);
         let apply = tools.iter().find(|t| t["name"] == "sandbox_apply").unwrap();
         assert_eq!(apply["annotations"]["destructiveHint"], true);
-        assert!(mcp_reply(&paths, &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
-        let bad = mcp_reply(&paths, &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "x"}})).unwrap();
+        assert!(mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
+        let bad =
+            mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "x"}}))
+                .unwrap();
         assert_eq!(bad["error"]["code"], -32602);
     }
 }

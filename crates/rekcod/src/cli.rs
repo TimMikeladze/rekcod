@@ -34,6 +34,21 @@ pub(crate) fn running_pid(paths: &Paths) -> Option<i32> {
     (unsafe { libc::kill(pid, 0) } == 0).then_some(pid)
 }
 
+/// (total, free) GiB on the volume holding `dir`.
+pub(crate) fn disk_gib(dir: &std::path::Path) -> Option<(u64, u64)> {
+    let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+    let mut s: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    let bs = s.f_bsize as u64;
+    Some(((s.f_blocks * bs) >> 30, (s.f_bavail * bs) >> 30))
+}
+
+pub(crate) fn free_disk_gib(dir: &std::path::Path) -> Option<u64> {
+    disk_gib(dir).map(|(_, free)| free)
+}
+
 pub(crate) fn sysctl_u64(name: &str) -> Option<u64> {
     let name = std::ffi::CString::new(name).ok()?;
     let mut value: u64 = 0;

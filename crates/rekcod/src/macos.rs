@@ -196,6 +196,9 @@ fn configuration(dir: &Path, g: &GuestConfig) -> Result<Retained<VZVirtualMachin
 
 /// Installs the downloaded restore image into a new base image `name`.
 pub fn install(paths: &Paths, name: &str, disk_gib: u64, cpus: usize, memory_gib: u64) -> Result<()> {
+    crate::sandbox::check_name("macOS image", name)?;
+    // A new base image has a new host key.
+    let _ = std::fs::remove_file(known_hosts(paths));
     let restore = ipsw(paths);
     if !restore.exists() {
         bail!("no restore image; run `rekcod macos fetch` first");
@@ -372,6 +375,7 @@ pub fn list(paths: &Paths) -> Result<()> {
 }
 
 pub fn remove(paths: &Paths, name: &str) -> Result<()> {
+    crate::sandbox::check_name("macOS image", name)?;
     let dir = image_dir(paths, name);
     if !dir.exists() {
         bail!("no macOS image {name}");
@@ -412,30 +416,21 @@ pub fn reidentify(home: &Path) -> Result<()> {
     Ok(())
 }
 
-fn ssh_base(paths: &Paths, ip: &str) -> Result<Command> {
-    let mut c = Command::new("ssh");
-    c.args([
-        "-q",
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-o",
-        "ConnectTimeout=5",
-        "-o",
-        "BatchMode=yes",
-        "-i",
-    ])
-    .arg(key(paths)?)
-    .arg(format!("{USER}@{ip}"));
-    Ok(c)
+/// Guest host keys seen so far. Clones share their base image's key, so the first one
+/// learned for an address holds for every guest given it; another VM on the vmnet that
+/// answers there with a different key is refused. `macos install` starts it over.
+fn known_hosts(paths: &Paths) -> PathBuf {
+    root(paths).join("known_hosts")
 }
 
-fn ssh_opt(paths: &Paths) -> Result<String> {
-    Ok(format!(
-        "ssh -q -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes -i {}",
-        crate::actions::shell_quote(&key(paths)?.to_string_lossy())
-    ))
+fn ssh_base(paths: &Paths, ip: &str) -> Result<Command> {
+    let mut c = Command::new("ssh");
+    c.args(["-q", "-o", "StrictHostKeyChecking=accept-new", "-o"])
+        .arg(format!("UserKnownHostsFile={}", known_hosts(paths).display()))
+        .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-i"])
+        .arg(key(paths)?)
+        .arg(format!("{USER}@{ip}"));
+    Ok(c)
 }
 
 /// Boots the sandbox's guest if needed and waits for SSH; returns its address.
@@ -469,31 +464,44 @@ pub fn boot(paths: &Paths, home: &Path, idle_ttl: u64) -> Result<String> {
     }
 }
 
-/// Copies the sandbox's workspace into the guest (`~/ws`).
+/// Copies the sandbox's workspace into the guest (`~/ws`), as a tar stream over ssh.
 pub fn push_ws(paths: &Paths, ip: &str, ws: &Path) -> Result<()> {
-    let ok = Command::new("rsync")
-        .args(["-a", "--delete", "-e", &ssh_opt(paths)?])
-        .arg(format!("{}/", ws.display()))
-        .arg(format!("{USER}@{ip}:ws/"))
-        .status()?
-        .success();
-    if !ok {
+    let mut tar = Command::new("tar").args(["-C"]).arg(ws).args(["-cf", "-", "."]).stdout(Stdio::piped()).spawn()?;
+    let out = tar.stdout.take().context("tar stdout")?;
+    let ok = ssh_base(paths, ip)?.arg("rm -rf ~/ws && mkdir -p ~/ws && tar -C ~/ws -xf -").stdin(out).status()?.success();
+    if !tar.wait()?.success() || !ok {
         bail!("copying the workspace into the guest failed");
     }
     Ok(())
 }
 
-/// Brings the guest's `~/ws` back into the sandbox's workspace, for diff and apply.
+/// Brings the guest's `~/ws` back into the sandbox's workspace, for diff and apply. The
+/// guest is untrusted, so its tar stream goes into an empty directory with the Mac's bsdtar,
+/// which refuses absolute paths, `..` and writing through symlinks; `apply` then refuses
+/// symlinks that point out of the project. The workspace's own `.git` is kept.
 pub fn pull_ws(paths: &Paths, ip: &str, ws: &Path) -> Result<()> {
-    let ok = Command::new("rsync")
-        .args(["-a", "--delete", "--exclude", ".git", "-e", &ssh_opt(paths)?])
-        .arg(format!("{USER}@{ip}:ws/"))
-        .arg(format!("{}/", ws.display()))
-        .status()?
-        .success();
-    if !ok {
+    let parent = ws.parent().context("workspace has no parent")?;
+    let fresh = parent.join("ws.pull");
+    let old = parent.join("ws.old");
+    for d in [&fresh, &old] {
+        if d.exists() {
+            std::fs::remove_dir_all(d)?;
+        }
+    }
+    std::fs::create_dir_all(&fresh)?;
+    let mut ssh = ssh_base(paths, ip)?.arg("tar -C ~/ws --exclude ./.git -cf - .").stdout(Stdio::piped()).spawn()?;
+    let out = ssh.stdout.take().context("ssh stdout")?;
+    let ok = Command::new("tar").arg("-C").arg(&fresh).args(["-xf", "-"]).stdin(out).status()?.success();
+    if !ssh.wait()?.success() || !ok {
+        let _ = std::fs::remove_dir_all(&fresh);
         bail!("copying the workspace out of the guest failed");
     }
+    if ws.join(".git").exists() {
+        std::fs::rename(ws.join(".git"), fresh.join(".git"))?;
+    }
+    std::fs::rename(ws, &old)?;
+    std::fs::rename(&fresh, ws)?;
+    let _ = std::fs::remove_dir_all(&old);
     Ok(())
 }
 
@@ -597,6 +605,7 @@ pub fn run(home: PathBuf, idle_ttl: u64) -> Result<()> {
             let s = vm.with(|v| unsafe { v.state() });
             s == VZVirtualMachineState::Stopped || s == VZVirtualMachineState::Error
         };
+        let mut asked_to_stop: Option<Instant> = None;
         loop {
             tokio::select! {
                 _ = kill.recv() => {
@@ -619,12 +628,22 @@ pub fn run(home: PathBuf, idle_ttl: u64) -> Result<()> {
                     if stopped() {
                         break;
                     }
+                    if let Some(at) = asked_to_stop
+                        && at.elapsed() > Duration::from_secs(60)
+                    {
+                        // The guest ignored the power button (a dialog, a hung app).
+                        eprintln!("rekcod: guest didn't shut down within 60s, forcing it off");
+                        let _ = vm.force_stop().await;
+                        break;
+                    }
                     if idle_ttl > 0
+                        && asked_to_stop.is_none()
                         && let Ok(used) = std::fs::metadata(home.join("run/last-used")).and_then(|m| m.modified())
                         && used.elapsed().is_ok_and(|e| e.as_secs() > idle_ttl)
                     {
                         eprintln!("rekcod: idle for {idle_ttl}s, shutting down");
                         vm.request_stop();
+                        asked_to_stop = Some(Instant::now());
                     }
                 }
             }

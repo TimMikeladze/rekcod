@@ -91,6 +91,8 @@ pub struct Policy {
     pub resolved: Arc<Resolved>,
     /// Tests only: 127.0.0.0/8 counts as the internet.
     loopback: bool,
+    /// The main VM on `--network user`: everything a NAT would reach, the LAN included.
+    everything: bool,
     tls_ports: Vec<u16>,
     http_ports: Vec<u16>,
     /// The Mac's own interface addresses, re-read every 10 s.
@@ -104,6 +106,7 @@ impl Policy {
             reach,
             resolved,
             loopback: false,
+            everything: false,
             tls_ports: vec![443],
             http_ports: vec![80],
             local: Mutex::default(),
@@ -122,7 +125,17 @@ impl Policy {
         }
     }
 
+    /// The main VM's policy for `--network user`: no filtering, as with Virtualization.
+    /// framework's NAT, but the connections are the daemon's own, so a VPN that drops
+    /// forwarded VM traffic (Mullvad, other full-tunnel clients) still carries them.
+    pub fn everything() -> Policy {
+        Policy { everything: true, ..Policy::new(None, vec![], Arc::default()) }
+    }
+
     pub fn check(&self, tcp: bool, dst: SocketAddrV4) -> Verdict {
+        if self.everything {
+            return Verdict::Allow;
+        }
         if tcp && self.reach.contains(&dst) {
             return Verdict::Allow;
         }
@@ -1168,6 +1181,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(got, Some((b"ping".to_vec(), to.port())));
+    }
+
+    #[test]
+    fn the_main_vm_policy_reaches_everything_nat_would() {
+        let p = Policy::everything();
+        for dst in ["1.1.1.1:443", "192.168.1.10:445", "10.0.0.5:5432", "8.8.8.8:53"] {
+            assert!(matches!(p.check(true, dst.parse().unwrap()), Verdict::Allow), "{dst}");
+        }
+        // Sandboxes keep refusing the LAN.
+        let s = Policy::new(None, vec![], Arc::default());
+        assert!(matches!(s.check(true, "192.168.1.10:445".parse().unwrap()), Verdict::Refuse(_)));
     }
 
     #[test]

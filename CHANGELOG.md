@@ -77,6 +77,9 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 - `rekcod start --repair` (e2fsck the data disk, fresh root disk), `start --install` (boot at
   login and again after a crash), `stop --force`. Start settings are saved and reused.
 - `rekcod upgrade`, `rekcod uninstall`, `rekcod doctor`.
+- `rekcod start --network auto|user|nat`: the main VM can use rekcod's userspace network
+  (the one sandboxes use, unfiltered) so full-tunnel VPNs like Mullvad, which drop
+  Virtualization.framework NAT traffic, don't cut the VM off. `auto` is the default.
 - Fleet: a reconcile loop that takes back instances that answer again and replaces missing
   ones, `node approve|rm`, `controller ca|revoke|rotate-join`, `--alert-webhook`,
   `--backup-dir`, `GET /metrics`, kept logs of removed instances, graceful SIGTERM.

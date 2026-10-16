@@ -68,6 +68,8 @@ pub struct Options {
     pub idle_ttl: Option<u64>,
     /// `e2fsck -fy` the data disk at boot (`rekcod start --repair`).
     pub repair: bool,
+    /// Main VM: the daemon's userspace network instead of NAT (`rekcod start --network user`).
+    pub network_user: bool,
 }
 
 /// `IP:PORT,...` checked, so nothing else lands on the kernel command line (boot.sh reads it).
@@ -146,7 +148,16 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let reach = reach_addrs(opts.reach.as_deref().unwrap_or(""))?;
     let resolved = Arc::new(netstack::Resolved::default());
     let mut host_net = None;
+    let mut main_user_net = false;
     let net = match &opts.project {
+        None if opts.network_user => {
+            let (vm_end, ours) = netstack::socketpair().context("create the VM network socket")?;
+            cmdline.push(' ');
+            cmdline.push_str(netstack::CMDLINE);
+            host_net = Some(ours);
+            main_user_net = true;
+            Net::Socket(vm_end)
+        }
         None => Net::Nat,
         // Offline: an empty allowlist and nothing to reach.
         Some(_) if allow.as_ref().is_some_and(|a| a.is_empty()) && reach.is_empty() => Net::None,
@@ -157,6 +168,12 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             host_net = Some(ours);
             Net::Socket(vm_end)
         }
+    };
+    let network_name = match (&opts.project, main_user_net, host_net.is_some()) {
+        (None, true, _) => "user",
+        (None, false, _) => "nat",
+        (Some(_), _, true) => "filtered",
+        (Some(_), _, false) => "none",
     };
     let mut cfg = VmConfig {
         cpus: opts.cpus,
@@ -180,7 +197,8 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     };
     let _net = match host_net {
         Some(fd) => {
-            let policy = Arc::new(netstack::Policy::new(allow, reach, resolved));
+            let policy =
+                Arc::new(if main_user_net { netstack::Policy::everything() } else { netstack::Policy::new(allow, reach, resolved) });
             Some(netstack::start(fd, policy, Arc::new(|line| log!("{line}"))).context("start the sandbox network")?)
         }
         None => None,
@@ -235,7 +253,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     for line in watch.set_roots(Default::default()) {
         log!("{line}");
     }
-    let status = Arc::new(Status::new(paths.clone(), cfg.cpus, cfg.memory_mib, fs_cache, watch, opts.project.clone()));
+    let status = Arc::new(Status::new(paths.clone(), cfg.cpus, cfg.memory_mib, fs_cache, watch, opts.project.clone(), network_name));
     status.write();
     let ctl = paths.control_socket();
     let _ = std::fs::remove_file(&ctl);
@@ -753,6 +771,8 @@ struct StatusFile<'a> {
     pid: u32,
     /// The daemon's own version; after an upgrade it can differ from the CLI's.
     version: &'static str,
+    /// `nat` or `user` (main VM), `filtered` or `none` (sandboxes).
+    network: &'a str,
     guest_version: &'a str,
     started_at: u64,
     cpus: usize,
@@ -772,6 +792,7 @@ struct Forward {
 
 struct Status {
     paths: Paths,
+    network: String,
     watch: Arc<Watch>,
     started_at: u64,
     cpus: usize,
@@ -792,10 +813,19 @@ struct Status {
 }
 
 impl Status {
-    fn new(paths: Paths, cpus: usize, memory_mib: u64, fs_cache: bool, watch: Arc<Watch>, project: Option<PathBuf>) -> Status {
+    fn new(
+        paths: Paths,
+        cpus: usize,
+        memory_mib: u64,
+        fs_cache: bool,
+        watch: Arc<Watch>,
+        project: Option<PathBuf>,
+        network: &str,
+    ) -> Status {
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
         Status {
             paths,
+            network: network.to_string(),
             watch,
             started_at,
             cpus,
@@ -833,6 +863,7 @@ impl Status {
             pid: std::process::id(),
             version: env!("CARGO_PKG_VERSION"),
             guest_version: guest_version.trim(),
+            network: &self.network,
             started_at: self.started_at,
             cpus: self.cpus,
             memory_mib: self.memory_mib,

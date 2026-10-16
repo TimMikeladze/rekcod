@@ -22,9 +22,12 @@ kernel and boot), each with the previous boot's copy as `.1`. Inside the VM,
 ## Containers can't reach the internet
 
 DNS working while connections time out is Virtualization.framework's NAT being blocked,
-usually by a VPN or firewall app that filters the `bridge100`/vmnet traffic. `rekcod doctor`
-tests a connection from a throwaway container. Allow the VM's NAT in that app, or
-`rekcod stop && rekcod start` after connecting the VPN. DNS for VPN-only names goes
+usually by a VPN or firewall app that filters the `bridge100`/vmnet traffic (Mullvad does,
+with its default settings). `rekcod doctor` tests a connection from a throwaway container
+and says which network the VM uses. `rekcod stop && rekcod start --network user` makes
+rekcod open the VM's connections itself, from the Mac, so the VPN carries them like any
+app's. `--network auto` (the default) does that by itself when the default route goes
+through a tunnel at boot; a VPN connected after the VM started needs a restart. DNS for VPN-only names goes
 through the Mac's resolvers, including per-domain ones (`scutil --dns`).
 
 ## A port isn't on localhost

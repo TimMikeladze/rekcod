@@ -47,11 +47,38 @@ fn pid_is_rekcod(pid: i32) -> bool {
     n > 0 && std::str::from_utf8(&buf[..n as usize]).is_ok_and(|p| p.ends_with("/rekcod"))
 }
 
-#[derive(serde::Serialize, serde::Deserialize, Default, Clone, Copy, PartialEq, Debug)]
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone, PartialEq, Debug)]
 pub struct Saved {
     pub cpus: Option<usize>,
     pub memory_gib: Option<u64>,
     pub disk_gib: Option<u64>,
+    /// `auto`, `user` or `nat` (`rekcod start --network`); None is auto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub network: Option<String>,
+}
+
+/// Whether the Mac's default route goes through a tunnel (`utun*`): a full-tunnel VPN.
+/// Several of them (Mullvad, for one) drop traffic forwarded from Virtualization.framework's
+/// NAT, so `--network auto` uses rekcod's own connections then.
+pub(crate) fn default_route_is_tunnel() -> bool {
+    Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .any(|l| l.trim().strip_prefix("interface:").is_some_and(|i| i.trim().starts_with("utun")))
+        })
+        .unwrap_or(false)
+}
+
+/// The main VM's network for this boot: true for rekcod's userspace one.
+fn user_network(saved: &Saved) -> bool {
+    match saved.network.as_deref().unwrap_or("auto") {
+        "user" => true,
+        "nat" => false,
+        _ => default_route_is_tunnel(),
+    }
 }
 
 /// `rekcod start --cpus/--memory/--disk`, kept so the menu bar, passthrough commands and
@@ -60,12 +87,13 @@ pub(crate) fn saved(paths: &Paths) -> Saved {
     std::fs::read(paths.config()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-fn save_settings(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64) -> Result<()> {
+fn save_settings(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, network: Option<String>) -> Result<()> {
     let old = saved(paths);
     let new = Saved {
         cpus: cpus.or(old.cpus),
         memory_gib: memory_gib.or(old.memory_gib),
         disk_gib: Some(disk_gib.max(old.disk_gib.unwrap_or(0))),
+        network: network.or(old.network.clone()),
     };
     if new != old {
         std::fs::write(paths.config(), serde_json::to_vec_pretty(&new)?)?;
@@ -265,6 +293,9 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         if opts.repair {
             cmd.arg("--repair");
         }
+        if opts.project.is_none() && user_network(&saved) {
+            cmd.arg("--network-user");
+        }
         // Detach from the terminal so closing it doesn't kill the VM.
         unsafe {
             cmd.pre_exec(|| {
@@ -346,12 +377,20 @@ pub(crate) fn signal_daemon(paths: &Paths, sig: libc::c_int) -> Result<bool> {
     Ok(true)
 }
 
-pub fn start(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, no_switch: bool, repair: bool) -> Result<()> {
+pub fn start(
+    paths: &Paths,
+    cpus: Option<usize>,
+    memory_gib: Option<u64>,
+    disk_gib: u64,
+    no_switch: bool,
+    repair: bool,
+    network: Option<String>,
+) -> Result<()> {
     let t0 = Instant::now();
     if repair && let Some(pid) = running_pid(paths) {
         bail!("rekcod is running (pid {pid}); `rekcod stop` first, then `rekcod start --repair`");
     }
-    save_settings(paths, cpus, memory_gib, disk_gib)?;
+    save_settings(paths, cpus, memory_gib, disk_gib, network)?;
     if autostart_installed() && !repair {
         // Let the login agent own the VM, so a crash brings it back. Whoever boots first
         // wins the boot lock; the agent supervises either way.

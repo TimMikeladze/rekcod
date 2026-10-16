@@ -596,6 +596,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 |---|---|
 | `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--disk` (default 256, sparse) grows the data disk, never shrinks it. The values are saved in `~/.rekcod/config.json` and reused when the menu bar or a docker command boots the VM |
 | `rekcod start --install\|--uninstall` | Start the VM at login and boot it again if it stops without `rekcod stop` (LaunchAgent `dev.rekcod.vm`) |
+| `rekcod start --network auto\|user\|nat` | How the VM reaches the network. `nat` is Virtualization.framework's NAT; `user` makes rekcod open the connections itself, which full-tunnel VPNs (Mullvad and others) don't drop; `auto`, the default, picks `user` while the Mac's default route goes through a VPN tunnel. Saved; `rekcod status --json` shows which is in use |
 | `rekcod start --repair` | When the VM won't start because its data disk has errors: `e2fsck -fy` on it and a fresh root disk, then boot. The data disk is never formatted unless it's blank |
 | `rekcod stop [--no-switch] [--force]` | Graceful power-off, restore the previous context. `--force` powers off a hung VM right away |
 | `rekcod status [--json]` | Versions, VM size, forwarded ports (and any that couldn't be bound), data-disk use in the VM and on the Mac, file-cache trips to macOS, warming in progress, the sandbox VM. `--json` is the scriptable form |

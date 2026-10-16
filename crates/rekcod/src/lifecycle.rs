@@ -247,8 +247,16 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
         add(
             "VM reaches the internet",
             net,
-            if net { "1.1.1.1:443 answers".into() } else { "a container can't connect out".into() },
-            "check VPN/firewall rules for Virtualization.framework NAT; `rekcod stop && rekcod start`",
+            format!(
+                "{} ({} network)",
+                if net { "1.1.1.1:443 answers" } else { "a container can't connect out" },
+                status["network"].as_str().unwrap_or("nat")
+            ),
+            if status["network"].as_str().unwrap_or("nat") == "nat" {
+                "a VPN or firewall is dropping the VM's NAT traffic: `rekcod stop && rekcod start --network user` routes it through rekcod instead"
+            } else {
+                "check the Mac's own internet, then `rekcod stop && rekcod start`"
+            },
         );
     }
     let mut bad = 0;

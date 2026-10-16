@@ -103,6 +103,11 @@ enum Cmd {
         /// For when the VM won't start because its disk has errors.
         #[arg(long)]
         repair: bool,
+        /// How the VM reaches the network: `nat` (Virtualization.framework), `user` (rekcod's
+        /// own connections, which full-tunnel VPNs like Mullvad don't drop), or `auto` (user
+        /// while the Mac's default route goes through a VPN tunnel, else nat). Saved.
+        #[arg(long, value_parser = ["auto", "user", "nat"])]
+        network: Option<String>,
         /// Start now and at every login, and boot again if the VM stops without `rekcod stop`.
         #[arg(long, conflicts_with_all = ["uninstall", "repair"])]
         install: bool,
@@ -320,6 +325,8 @@ enum Cmd {
         idle_ttl: Option<u64>,
         #[arg(long)]
         repair: bool,
+        #[arg(long)]
+        network_user: bool,
     },
 }
 
@@ -1221,8 +1228,8 @@ fn main() {
     let result = paths::Paths::new().and_then(|paths| match command {
         Cmd::Start { install: true, .. } => cli::autostart_install(&paths),
         Cmd::Start { uninstall: true, .. } => service::uninstall(cli::AUTOSTART),
-        Cmd::Start { cpus, memory, disk, no_switch, repair, foreground, .. } => {
-            let r = cli::start(&paths, cpus, memory, disk, no_switch, repair);
+        Cmd::Start { cpus, memory, disk, no_switch, repair, foreground, network, .. } => {
+            let r = cli::start(&paths, cpus, memory, disk, no_switch, repair, network);
             if foreground { cli::supervise(&paths, r) } else { r }
         }
         Cmd::Stop { no_switch, force } => cli::stop(&paths, no_switch, force),
@@ -1413,8 +1420,8 @@ fn main() {
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib, project, workspace, allow, reach, idle_ttl, repair } => {
-            daemon::run(paths, daemon::Options { cpus, memory_mib, project, workspace, allow, reach, idle_ttl, repair })
+        Cmd::Daemon { cpus, memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user } => {
+            daemon::run(paths, daemon::Options { cpus, memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user })
         }
     });
     if let Err(e) = result {

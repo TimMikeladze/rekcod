@@ -17,7 +17,7 @@ typecheck and lint clean, `npm audit --omit=dev` reports 7 high (all via `shadcn
 What changed since this audit, item by item, is in `CHANGELOG.md` (Unreleased) and the
 commits after f994023. In short:
 
-- Section 1: all fixed (S7 also moves to the host, `docs/sandbox-network.md`).
+- Section 1: all fixed. S7: sandbox egress is now decided by the daemon on the Mac (smoltcp, SNI/Host checks), so guest root can't bypass it (`docs/sandbox-network.md`).
 - Sections 2 and 3: all fixed, except the per-mount `strict` cache mode (not built) and
   memory return to macOS (unchanged, a Virtualization.framework limit).
 - Sections 4 and 5: all fixed. App traffic between the edge and nodes stays plain TCP;
@@ -34,6 +34,7 @@ commits after f994023. In short:
 - Section 9: request-level controller tests, the `Conn` spill test, `safefs` tests and
   `scripts/e2e-lifecycle.sh` (VM crashes, damaged disks, repair) were added.
 - An external security review of the sandboxes is still not done.
+- Verified on this Mac with isolated homes: `scripts/e2e-lifecycle.sh` 21/21, `scripts/e2e-sandbox.sh` 26/26, `scripts/e2e-fleet.sh` 79/79, `cargo test --workspace` 121 + 5, agent tests 7 in a Linux container. `scripts/e2e.sh` was not run: it drives your main VM.
 
 ## Where it stands
 

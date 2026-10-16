@@ -176,9 +176,15 @@ of its own (`/containers/web`, `/apps/blog`, `/nodes/n-1`).
 
 ```sh
 rekcod dashboard     # the bundled build, on http://localhost:4500 or the next free port
-# or from a checkout:
+# or from a checkout (prints the sign-in link):
 cd dashboard && npm ci && npm run dev
 ```
+
+It runs commands as you, and every container can reach the Mac's 127.0.0.1, so each launch
+makes a new token. `rekcod dashboard` opens `/auth?token=...`, which swaps it for a cookie;
+without that cookie every page and API route answers 401. The token is in
+`~/.rekcod/run/dashboard.json` (0600), and running `rekcod dashboard` again opens the running
+one signed in.
 
 Docker events push changes into the page (a container stopped in a terminal shows in about
 half a second) and the fleet refreshes every 15 s. Every button runs one of the actions

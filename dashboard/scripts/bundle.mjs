@@ -16,7 +16,9 @@ if (!existsSync(path.join(out, "server.js"))) {
 }
 cpSync(path.join(dist, "static"), path.join(out, dist, "static"), { recursive: true })
 if (existsSync("public")) cpSync("public", path.join(out, "public"), { recursive: true })
-console.log(`bundle: ${path.resolve(out)} (node server.js)`)
+// The entry `rekcod dashboard` runs; it refuses a build without it.
+cpSync("scripts/start.cjs", path.join(out, "start.cjs"))
+console.log(`bundle: ${path.resolve(out)} (node start.cjs)`)
 
 if (process.argv.includes("--install")) {
   const dest = path.join(process.env.REKCOD_HOME || path.join(os.homedir(), ".rekcod"), "dashboard")

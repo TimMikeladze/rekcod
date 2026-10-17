@@ -44,10 +44,17 @@ old meaning, a fixed IP you manage.
 ## Docker over SSH
 
 The docker context is `ssh://user@host`, which docker resolves itself. `host add --fleet`
-on a LAN spare stores the Bonjour instance in the context's description.
-`rekcod host refresh [NAME]` resolves it again, checks over SSH that
-`~/.rekcod/controller/ca-fingerprint` there is the one it expects, then updates the
-context's host. `host use` and `host forward` refresh first.
+on a LAN spare reads the spare's `/etc/ssh/ssh_host_ed25519_key.pub` over the SSH session it
+just authenticated and stores it, with the Bonjour instance, in the context's description.
+`rekcod host refresh [NAME]` resolves the instance again and connects to whatever answered
+with `StrictHostKeyChecking=yes` and a known_hosts holding only that pinned key. Only if that
+succeeds does it write the key for the new name to `~/.ssh/known_hosts` (docker's ssh can't
+answer a prompt) and update the context. `host use` and `host forward` refresh first.
+
+The CA fingerprint can't be the proof here: Bonjour advertises its prefix and any client can
+fetch the CA, so an impostor's SSH server could hand it back. The host key it can't fake.
+A context added before host keys were pinned has no `hostkey=` and is never refreshed;
+re-run `host add` to pin one.
 
 ## Not covered
 

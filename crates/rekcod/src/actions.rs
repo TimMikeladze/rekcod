@@ -1204,7 +1204,9 @@ pub mod tests {
 
     pub fn sample_hosts() -> Hosts {
         let h = |n: &str, current| crate::host::Host { name: n.into(), endpoint: format!("ssh://me@{n}"), current, bonjour: None };
-        let lan = crate::host::Host { bonjour: Some(("rekcod-3f9a1c2b7d4e".into(), "sha256:3f9a".into())), ..h("mini", false) };
+        let lan =
+            crate::host::Lan { instance: "rekcod-3f9a1c2b7d4e".into(), fp: "sha256:3f9a".into(), host_key: "ssh-ed25519 AAAA".into() };
+        let lan = crate::host::Host { bonjour: Some(lan), ..h("mini", false) };
         Hosts { all: vec![h("spare", true), lan], local_current: false }
     }
 

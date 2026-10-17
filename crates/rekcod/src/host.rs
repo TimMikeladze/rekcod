@@ -40,22 +40,55 @@ pub struct Host {
     pub name: String,
     pub endpoint: String,
     pub current: bool,
-    /// A LAN spare's Bonjour instance and CA fingerprint, kept in the context's description.
-    pub bonjour: Option<(String, String)>,
+    /// A LAN spare, kept in the context's description.
+    pub bonjour: Option<Lan>,
+}
+
+/// How a LAN spare is found again (Bonjour) and recognised (its SSH host key, pinned when
+/// it was added; the CA fingerprint is public, so it can't be the proof).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lan {
+    pub instance: String,
+    pub fp: String,
+    /// `ssh-ed25519 AAAA...`
+    pub host_key: String,
 }
 
 const DESCRIPTION: &str = "rekcod host";
 
-fn description(bonjour: Option<(&str, &str)>) -> String {
-    match bonjour {
-        Some((i, fp)) => format!("{DESCRIPTION} bonjour={i} fp={fp}"),
+fn description(lan: Option<&Lan>) -> String {
+    match lan {
+        Some(l) => format!("{DESCRIPTION} bonjour={} fp={} hostkey={}", l.instance, l.fp, l.host_key.replacen(' ', ":", 1)),
         None => DESCRIPTION.into(),
     }
 }
 
-fn parse_description(d: &str) -> Option<(String, String)> {
+fn parse_description(d: &str) -> Option<Lan> {
     let field = |k: &str| d.split_whitespace().find_map(|w| w.strip_prefix(k)).map(String::from);
-    Some((field("bonjour=")?, field("fp=")?))
+    let host_key = field("hostkey=")?.replacen(':', " ", 1);
+    host_key.contains(' ').then_some(())?;
+    Some(Lan { instance: field("bonjour=")?, fp: field("fp=")?, host_key })
+}
+
+/// `user@host[:port]` as it appears in known_hosts: `host` or `[host]:port`.
+fn known_hosts_name(dest: &str) -> String {
+    let rest = dest.split_once('@').map_or(dest, |(_, r)| r);
+    match rest.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() && p != "22" => format!("[{h}]:{p}"),
+        Some((h, p)) if p.parse::<u16>().is_ok() => h.to_string(),
+        _ => rest.to_string(),
+    }
+}
+
+/// The spare's ed25519 host key, read over the SSH session `add` just authenticated.
+fn host_key(dest: &str) -> Result<String> {
+    let out = ssh(dest).arg("cat /etc/ssh/ssh_host_ed25519_key.pub").stdin(Stdio::null()).output().context("run ssh")?;
+    let line = String::from_utf8_lossy(&out.stdout);
+    let mut it = line.split_whitespace();
+    match (it.next(), it.next()) {
+        (Some(t @ "ssh-ed25519"), Some(k)) if out.status.success() => Ok(format!("{t} {k}")),
+        _ => bail!("can't read {dest}'s SSH host key (/etc/ssh/ssh_host_ed25519_key.pub)"),
+    }
 }
 
 fn context(name: &str) -> String {
@@ -147,8 +180,11 @@ pub fn add_fleet(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet)
         bail!("`rekcod start` failed on {dest}; the fleet is set up, docker isn't (re-run with --no-docker to skip it)");
     }
     let authority = crate::fleet::authority(&url)?;
-    let bonjour = crate::bonjour::instance_of(&authority).zip(fp.as_deref());
-    add_described(name, dest, switch, &description(bonjour))
+    let lan = match (crate::bonjour::instance_of(&authority), fp) {
+        (Some(i), Some(fp)) => Some(Lan { instance: i.into(), fp, host_key: host_key(dest)? }),
+        _ => None,
+    };
+    add_described(name, dest, switch, &description(lan.as_ref()))
 }
 
 pub fn add(name: &str, dest: &str, switch: bool) -> Result<()> {
@@ -202,25 +238,55 @@ fn retarget(dest: &str, target: &str) -> String {
 }
 
 /// A LAN spare's docker context pointed at wherever its Bonjour instance is now, after
-/// checking over SSH that the Mac there holds the same controller CA. Hosts without one
-/// are left alone.
+/// proving with the SSH host key pinned at `add` that the Mac there is the same one.
+/// Hosts without one are left alone.
 pub fn refresh(name: &str) -> Result<()> {
     let (hosts, _) = list();
     let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
-    let Some((instance, fp)) = &host.bonjour else { return Ok(()) };
+    let Some(lan) = &host.bonjour else { return Ok(()) };
     let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?;
-    let (target, _) = crate::bonjour::resolve(instance, Duration::from_secs(3))?;
+    let (target, _) = crate::bonjour::resolve(&lan.instance, Duration::from_secs(3))?;
     let new = retarget(dest, &target);
     if new == dest {
         return Ok(());
     }
-    let out = ssh(&new).arg("cat ~/.rekcod/controller/ca-fingerprint").stdin(Stdio::null()).output().context("run ssh")?;
-    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if !out.status.success() || !got.eq_ignore_ascii_case(fp) {
-        bail!("{new} doesn't hold {name}'s controller CA ({fp}, found {got:?}); leaving {name} on {dest}");
+    // Anyone on the LAN can answer for a Bonjour name, so the answer only counts once the
+    // SSH server there proves it holds the pinned key: a known_hosts with nothing else in it.
+    let known = tempfile_known_hosts(&known_hosts_name(&new), &lan.host_key)?;
+    let ok = Command::new("ssh")
+        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"])
+        .args(["-o", &format!("UserKnownHostsFile={}", known.display()), "-o", "GlobalKnownHostsFile=/dev/null"])
+        .args(ssh_dest(&new))
+        .arg("true")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("run ssh")?
+        .success();
+    let _ = std::fs::remove_file(&known);
+    if !ok {
+        bail!("{new} answered for {name} on Bonjour but doesn't have its SSH host key; leaving {name} on {dest}");
     }
+    trust_host_key(&known_hosts_name(&new), &lan.host_key)?;
     docker::run_ok(&["context", "update", &context(name), "--docker", &format!("host=ssh://{new}")])?;
     println!("host {name}: now {new}");
+    Ok(())
+}
+
+fn tempfile_known_hosts(host: &str, key: &str) -> Result<std::path::PathBuf> {
+    let p = std::env::temp_dir().join(format!("rekcod-known-{}-{}", std::process::id(), crate::sandbox::new_id()?));
+    std::fs::write(&p, format!("{host} {key}\n"))?;
+    Ok(p)
+}
+
+/// docker's own ssh reads ~/.ssh/known_hosts and can't answer a prompt: give it the
+/// verified key for the new name, replacing whatever that name had.
+fn trust_host_key(host: &str, key: &str) -> Result<()> {
+    let _ = Command::new("ssh-keygen").args(["-R", host]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let dir = std::path::PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".ssh");
+    std::fs::create_dir_all(&dir)?;
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("known_hosts"))?;
+    writeln!(f, "{host} {key}")?;
     Ok(())
 }
 
@@ -420,11 +486,21 @@ mod tests {
 
     #[test]
     fn lan_spare_description() {
-        let d = description(Some(("rekcod-3f9a1c2b7d4e", "sha256:3f9a")));
-        assert_eq!(parse_description(&d), Some(("rekcod-3f9a1c2b7d4e".into(), "sha256:3f9a".into())));
+        let lan = Lan { instance: "rekcod-3f9a1c2b7d4e".into(), fp: "sha256:3f9a".into(), host_key: "ssh-ed25519 AAAAC3Nza+/=".into() };
+        let d = description(Some(&lan));
+        assert_eq!(parse_description(&d), Some(lan));
         assert_eq!(parse_description(DESCRIPTION), None);
+        // Added before host keys were pinned: no refresh, rather than an unchecked one.
+        assert_eq!(parse_description("rekcod host bonjour=rekcod-3f9a fp=sha256:3f9a"), None);
         let raw = format!(r#"{{"Name":"rekcod-mini","Current":false,"DockerEndpoint":"ssh://me@mini.local","Description":"{d}"}}"#);
         assert!(parse_hosts(&raw).0[0].bonjour.is_some());
+    }
+
+    #[test]
+    fn known_hosts_names() {
+        assert_eq!(known_hosts_name("me@Spare.local"), "Spare.local");
+        assert_eq!(known_hosts_name("me@Spare.local:2222"), "[Spare.local]:2222");
+        assert_eq!(known_hosts_name("Spare.local:22"), "Spare.local");
     }
 
     #[test]

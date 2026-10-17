@@ -64,9 +64,9 @@ spare has no Tailscale address (or you pass `--lan`):
   fingerprint>`. The remote on your Mac is `https://rekcod-3f9a1c2b7d4e.bonjour`, resolved
   on every call, and TLS is still checked against the pinned CA. A spare with a new IP or
   name is found again; another machine on its old IP fails the CA check.
-- The docker context remembers the Bonjour name. `rekcod host use spare` and
-  `rekcod host forward spare` re-resolve it first, check over SSH that the Mac they find
-  holds the same CA, then update the context. `rekcod host refresh spare` does only that.
+- The docker context remembers the Bonjour name and the spare's SSH host key. `rekcod host
+  use spare` and `rekcod host forward spare` re-resolve the name first and switch only if the
+  Mac they find proves it has that host key. `rekcod host refresh spare` does only that.
 
 ```sh
 rekcod host add spare me@spare-mac --fleet --domain apps.example.com --lan

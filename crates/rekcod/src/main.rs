@@ -3,6 +3,8 @@
 //! The user-facing commands live in `cli`; `daemon` is the long-running
 //! process that owns the VM (started by `rekcod start`).
 
+#[cfg(target_os = "macos")]
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 
 mod dns;
@@ -654,6 +656,9 @@ enum NodeCmd {
         /// URL the controller should use, when --listen is 0.0.0.0.
         #[arg(long)]
         advertise: Option<String>,
+        /// Failure domain for app replica spreading (for example rack-a).
+        #[arg(long)]
+        zone: Option<String>,
         /// After joining, run `node serve` as a LaunchAgent instead of in this terminal.
         #[arg(long)]
         install: bool,
@@ -674,7 +679,7 @@ enum NodeCmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
-    /// Stop placing new sandboxes on a node (admin token).
+    /// Stop new placements and move app replicas after their replacements are healthy.
     Drain {
         id: String,
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
@@ -1210,8 +1215,17 @@ enum ServerCmd {
     /// Controller, node, edge, RustFS and the VM as LaunchDaemons (LaunchAgents without sudo); no sleep with the lid shut.
     Setup {
         /// Apps are served at <app>.<domain>.
-        #[arg(long)]
-        domain: String,
+        #[arg(long, required_unless_present = "edge_only", conflicts_with = "edge_only")]
+        domain: Option<String>,
+        /// Join an existing fleet as a node and edge, without a controller or RustFS.
+        #[arg(long, requires = "remote")]
+        edge_only: bool,
+        /// Configured admin remote for the existing fleet (with --edge-only).
+        #[arg(long, requires = "edge_only")]
+        remote: Option<String>,
+        /// Existing controller's join token, required when this Mac has not joined yet.
+        #[arg(long, requires = "edge_only")]
+        join_token: Option<String>,
         /// Listen here instead of the Tailscale IP.
         #[arg(long, conflicts_with = "lan")]
         addr: Option<String>,
@@ -1317,9 +1331,18 @@ fn main() {
         }
         Cmd::Remote(RemoteCmd::Rm { name }) => fleet::remote_rm(&paths, &name),
         Cmd::Remote(RemoteCmd::Use { name }) => fleet::remote_use(&paths, &name),
-        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install, ca_fingerprint }) => {
-            fleet::node_join(&paths, &controller, &join_token, &listen, advertise.as_deref(), install, ca_fingerprint.as_deref())
-        }
+        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install, ca_fingerprint, zone }) => fleet::node_join(
+            &paths,
+            &controller,
+            &join_token,
+            fleet::NodeJoinOptions {
+                listen: &listen,
+                advertise: advertise.as_deref(),
+                install,
+                ca_fingerprint: ca_fingerprint.as_deref(),
+                zone: zone.as_deref(),
+            },
+        ),
         Cmd::Node(NodeCmd::Serve { install: true }) => service::install(&paths, "node", &["node".into(), "serve".into()]),
         Cmd::Node(NodeCmd::Serve { install: false }) => fleet::node_serve(&paths),
         Cmd::Node(NodeCmd::Uninstall) => service::uninstall("node"),
@@ -1450,7 +1473,20 @@ fn main() {
             let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker };
             host::add_server(&paths, &name, &dest, !no_use, &f)
         }
-        Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power }) => server::setup(&paths, &domain, addr.as_deref(), lan, no_power),
+        Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token }) => {
+            if edge_only {
+                server::setup_edge(
+                    &paths,
+                    remote.as_deref().context("--edge-only requires --remote")?,
+                    join_token.as_deref(),
+                    addr.as_deref(),
+                    lan,
+                    no_power,
+                )
+            } else {
+                server::setup(&paths, domain.as_deref().context("server setup requires --domain")?, addr.as_deref(), lan, no_power)
+            }
+        }
         Cmd::Server(ServerCmd::Uninstall) => server::uninstall(),
         Cmd::Server(ServerCmd::AtBoot { user }) => server::at_boot(user.as_deref()),
         Cmd::Server(ServerCmd::Restart) => server::restart(),
@@ -1716,6 +1752,7 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 "port": port.or(num("app.port")),
                 // Neither given keeps the app's current count (1 for a new app).
                 "instances": instances.or(num("resources.instances")),
+                "spread": t.get("resources.spread"),
                 "cpus": num("resources.cpus").unwrap_or(1),
                 "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()).unwrap_or(1),
                 "health": t.get("app.health").cloned(),

@@ -73,6 +73,14 @@ rekcod has three front ends: the CLI (`rekcod ...`), the menu bar item
 | Make another remote the default | `remote use NAME` | Remote › Use remote … | sidebar remote menu, `/fleet` |
 | Ban one of the busiest client IPs (admin token) | `edge ban IP` | Edge bans › Ban IP (N requests) | `/fleet` › Edge bans |
 
+Drain uses the same action in every frontend: app replicas keep serving until their
+replacements are healthy. Insufficient capacity leaves replicas on the draining Mac and
+reconciliation retries the move. `node join --zone rack-a` and `resources.spread` configure
+placement through the existing join and deploy commands; they add no separate action.
+`server setup --edge-only --remote NAME` provisions an additional node and edge through
+the existing CLI-only server setup flow. It needs a configured admin remote and a join
+token for a new node; it adds no menu or dashboard action.
+
 Creating, exec, fork, `cp` and golden disks are for agents and scripts, so they're CLI,
 HTTP and MCP only. So are deploys, scaling and env changes (they take arguments; the dashboard's app page has
 "Copy command" with the line filled in), `node pool` (takes namespaces; the node page shows the command), the

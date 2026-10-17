@@ -416,9 +416,23 @@ a tailnet or LAN you trust.
 
 New nodes wait as `pending` until `rekcod node approve ID` (`controller serve --auto-approve`
 skips that, as `server setup` does). `node rm ID` forgets one and its instances move.
+Join with `--zone rack-a` to label Macs that share power or another failure domain.
+Placement spreads an app's replicas across zones first, then Macs, reserving memory for
+each instance. Unlabelled Macs each count as a separate failure domain.
 `controller rotate-join` replaces the join token. Tokens are stored hashed. An `--edge`
 token reads routes and bans, reports traffic and wakes sleeping apps; a token made with
 `--ns` has no access to `default`.
+
+Add another Mac as a node and edge against an existing admin remote:
+
+```sh
+rekcod server setup --edge-only --remote fleet --join-token JOIN_TOKEN
+```
+
+This installs no controller or RustFS. Repeat without `--join-token` after joining.
+Both edges serve the same routes; reported traffic and client counts add together.
+Configure ingress to use a surviving edge: [two edges](docs/fleet-edges.md) covers the
+same Cloudflare tunnel on two Macs and tailnet clients with failover.
 
 Apps are private until you make them public (`app public NAME`, `app deploy --public`, or
 `public = true` under `[app]` in `rekcod.toml`). `--listen` routes every app; bind it to
@@ -470,8 +484,14 @@ sealed secrets but no key refuses to start rather than make a new one.
 
 The controller keeps the fleet converging on what it should run. Every 10 s it health-checks
 instances: one that fails three checks leaves the routes, one on a node that comes back
-returns once it answers, and an app short of healthy instances for a minute is redeployed
-at its live commit (from stored images, so no rebuild). Nodes boot their instance VMs when
+returns if it hasn't been replaced, and an app short of healthy instances for a minute
+gets only its missing replicas replaced at the same live release. Healthy replicas keep
+serving with their existing IDs. Failed nodes are skipped for the current launch attempt;
+partial recovery keeps successful replacements and retries the rest every minute.
+`node drain ID` moves app replicas after replacements pass health checks. Without enough
+capacity, existing replicas keep serving on the draining Mac; `remaining_instances` reports
+how many still need moving. Draining can wake sleeping apps. Other sandboxes and their disks
+stay on that Mac. Nodes boot their instance VMs when
 they start, and report their sandboxes in every heartbeat. A restart marks deploys that
 were in flight failed. `--alert-webhook URL` posts `{"text": ...}` when a node is lost or a
 deploy or backup fails (Slack and Discord take that), and `GET /metrics` (admin or edge
@@ -516,12 +536,18 @@ start = "python3 app.py"
 health = "/healthz"
 [resources]
 instances = 2
+spread = "soft"       # best effort; "strict" requires distinct Macs and labelled zones
 memory = "1GiB"
 idle_stop = "15m"      # stop the VMs after 15 min without a request; off by default
 recycle = "24h"        # fresh VMs every day; off by default
 [env]
 GREETING = "hi"
 ```
+
+`app status NAME` reports placement, including shared Macs and zones. Soft spreading also
+records sharing in the release log. Strict spreading fails a deploy if it can't separate
+every replica; the previous release keeps serving. Multiple workers do not provide
+controller failover: the controller remains a single instance ([HA plan](docs/fleet-ha.md)).
 
 A VM doesn't give its base RAM back to macOS while it runs (elastic memory, which VMs given
 more than 4 GiB have, does), so these two are how a fleet gets it back. `idle_stop` routes the app away and stops its VMs; the disks stay. The next request
@@ -640,7 +666,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod app deploy\|ls\|status\|release\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet; `release NAME N` prints one release with its deploy log, `logs --instance ID` one instance's logs (also after a redeploy removed it: the last lines of the 20 newest gone instances are kept) |
 | `rekcod job run\|ls\|logs\|rerun\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every`; `ls --name N` is one job's last 50 runs, `logs -f` follows a running one, `rerun ID` runs a finished one again |
 | `rekcod host add\|ls\|use\|rm\|forward\|refresh\|restart\|uninstall` | Another Mac's rekcod as the docker engine, over SSH; `add --server` also provisions it as a fleet (`--lan`: found over Bonjour, `refresh` follows it to a new address) |
-| `rekcod server setup\|uninstall\|at-boot\|restart` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, VM, no sleep), started at boot; `at-boot` moves a setup done without sudo from login to boot; `restart` reboots past FileVault once (one password prompt) |
+| `rekcod server setup\|uninstall\|at-boot\|restart` | This Mac as a headless fleet; `setup --edge-only --remote NAME` adds a node and edge to an existing fleet; `at-boot` moves services from login to boot; `restart` reboots past FileVault once (one password prompt) |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |
@@ -713,7 +739,8 @@ python3 bench/tcp_rtt.py --context rekcod    # 64-byte round trip through a publ
 bench/sandbox.sh                             # agent sandbox create/fork/rm timings, 16 at once
 scripts/e2e-sandbox.sh                       # agent sandbox checks only; leaves the main VM alone
 scripts/e2e-macos.sh                         # macOS sandbox checks; needs a ready base image
-scripts/e2e-fleet.sh                         # controller, 2 nodes, edge, apps; own homes and database
+scripts/e2e-fleet.sh                         # controller, 3 nodes, edge, apps; own homes and database
+python3 scripts/e2e-edges.py                 # two edges: setup, summed metrics, process loss; no VMs or launchd
 scripts/e2e-storage.sh                       # RustFS: app buckets, stored images, backups; own homes
 rekcod x cargo test -p rekcod-agent          # the guest agent's Linux-only tests
 python3 tests/stress/fsx.py --ops 500        # random Mac/container file ops must converge

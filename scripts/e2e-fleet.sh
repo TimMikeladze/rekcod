@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fleet and app hosting checks (docs/platform.md, tracks 2-3): a controller, two nodes and
+# Fleet and app hosting checks (docs/platform.md, tracks 2-3): a controller, three nodes and
 # an edge on this Mac, each in its own REKCOD_HOME. Leaves the main VM alone.
 # Needs git and sqlite3 (both ship with macOS).
 set -uo pipefail
@@ -13,24 +13,25 @@ check() {
 }
 
 # Short homes: sandbox docker sockets must fit in sun_path.
-C=$HOME/.rkfc N1=$HOME/.rkf1 N2=$HOME/.rkf2
+test_root=$(mktemp -d /tmp/rkf.XXXXXX) || exit 1
+C=$test_root/c N1=$test_root/n1 N2=$test_root/n2 N3=$test_root/n3
 pids=()
 cleanup() {
   if [[ $failures -gt 0 ]]; then
     logs=$(mktemp -d "${TMPDIR:-/tmp}/rekcod-e2e-fleet-logs-XXXXXX")
-    cp "$C"/*.log "$logs/" 2>/dev/null; cp "$N1/node.log" "$logs/node1.log" 2>/dev/null; cp "$N2/node.log" "$logs/node2.log" 2>/dev/null
+    cp "$C"/*.log "$logs/" 2>/dev/null; cp "$N1/node.log" "$logs/node1.log" 2>/dev/null; cp "$N2/node.log" "$logs/node2.log" 2>/dev/null; cp "$N3/node.log" "$logs/node3.log" 2>/dev/null
     echo "logs: $logs"
   fi
   for p in "${pids[@]}"; do kill "$p" 2>/dev/null; done
-  for h in "$N1" "$N2"; do REKCOD_HOME=$h "$R" sandbox rm --all >/dev/null 2>&1; done
-  rm -rf "$C" "$N1" "$N2"
+  for h in "$N1" "$N2" "$N3"; do REKCOD_HOME=$h "$R" sandbox rm --all >/dev/null 2>&1; done
+  rm -rf "$test_root"
 }
 trap cleanup EXIT
-mkdir -p "$C" "$N1" "$N2"
+mkdir -p "$C" "$N1" "$N2" "$N3"
 export REKCOD_HOME=$C
 # The test repo is a local bare repo; real fleets only fetch over https/ssh/http.
 export REKCOD_ALLOW_LOCAL_GIT=1
-for h in "$N1" "$N2"; do
+for h in "$N1" "$N2" "$N3"; do
   [[ -d $HOME/.rekcod/golden/default ]] && mkdir -p "$h/golden" && cp -cR "$HOME/.rekcod/golden/default" "$h/golden/"
 done
 
@@ -55,7 +56,7 @@ v1=$(commit v1)
 url="$repo/app.git"
 
 echo "fleet"
-REKCOD_HOME=$C "$R" controller serve --listen 127.0.0.1:17700 --domain apps.test --drain 2s >"$C/controller.log" 2>&1 &
+REKCOD_HOME=$C "$R" controller serve --listen 127.0.0.1:17700 --domain apps.test --tls-name fleet-controller.test --drain 2s >"$C/controller.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 50); do [[ -f $C/controller/ca-fingerprint ]] && break; sleep 0.2; done
 join=$(cat "$C/controller/join-token") admin=$(cat "$C/controller/admin-token") fp=$(cat "$C/controller/ca-fingerprint")
@@ -65,6 +66,8 @@ REKCOD_HOME=$N1 "$R" node join https://127.0.0.1:17700 "$join" --listen 127.0.0.
 pids+=($!)
 REKCOD_HOME=$N2 "$R" node join https://127.0.0.1:17700 "$join" --listen 127.0.0.1:17702 --ca-fingerprint "$fp" >"$N2/node.log" 2>&1 &
 pids+=($!) node2=$!
+REKCOD_HOME=$N3 "$R" node join https://127.0.0.1:17700 "$join" --listen 127.0.0.1:17703 --ca-fingerprint "$fp" >"$N3/node.log" 2>&1 &
+pids+=($!)
 sleep 2
 cr() { REKCOD_HOME=$C "$R" "$@"; }
 cr remote add admin https://127.0.0.1:17700 --token "$admin" --ca-fingerprint "$fp"
@@ -72,10 +75,10 @@ alice=$(cr controller token alice --max-sandboxes 2 --remote admin | sed -n 's/.
 bob=$(cr controller token bob --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
 cr remote add alice https://127.0.0.1:17700 --token "$alice" --ca-fingerprint "$fp"
 cr remote add bob https://127.0.0.1:17700 --token "$bob" --ca-fingerprint "$fp"
-check "new nodes wait for approval" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"pending\"")" = 2' "$R"
+check "new nodes wait for approval" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"pending\"")" = 3' "$R"
 check "a pending node gets nothing" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.22' "$R" "$url"
 for n in $(cr node ls --remote admin | sed -n 's/.*"id": "\(n-[a-z0-9]*\)".*/\1/p'); do cr node approve "$n" --remote admin >/dev/null; done
-check "two nodes ready" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"ready\"")" = 2' "$R"
+check "three nodes ready" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"ready\"")" = 3' "$R"
 check "a user token can't read routes" sh -c '! "$0" edge bans --remote alice' "$R"
 edge=$(cr controller token edge --edge --remote admin | sed -n 's/.*"token": "\(.*\)".*/\1/p')
 cr remote add edge https://127.0.0.1:17700 --token "$edge" --ca-fingerprint "$fp"
@@ -111,7 +114,7 @@ check "the query string can't name another sandbox" sh -c 'curl -s -m 10 --cacer
 check "an edge token can't deploy" sh -c 'curl -s -m 10 --cacert "$0" -H "Authorization: Bearer $1" -X POST -d "{}" https://127.0.0.1:17700/apps/hello/deploy | grep -q "edge tokens only"' "$ca" "$edge"
 check "a user token can't change another user's app" sh -c 'curl -s -m 10 --cacert "$0" -H "Authorization: Bearer $1" -X POST -d "{\"set\":{\"A\":\"1\"}}" https://127.0.0.1:17700/apps/hello/env | grep -q "no app"' "$ca" "$bob"
 check "git options are refused on deploy" sh -c 'curl -s -m 10 --cacert "$0" -H "Authorization: Bearer $1" -X POST -d "{\"name\":\"x\",\"git\":{\"url\":\"https://github.com/a/b\",\"ref\":\"--upload-pack=touch /tmp/rekcod-pwned\"}}" https://127.0.0.1:17700/apps | grep -q "bad git ref" && test ! -e /tmp/rekcod-pwned' "$ca" "$alice"
-check "a node can't register the controller's name" sh -c 'curl -s -m 10 --cacert "$0" -X POST -d "{\"join_token\":\"$1\",\"url\":\"https://$(hostname -s):17999\"}" https://127.0.0.1:17700/nodes/register | grep -q "controller.s own"' "$ca" "$join"
+check "a node can't register the controller's name" sh -c 'curl -s -m 10 --cacert "$0" -X POST -d "{\"join_token\":\"$1\",\"url\":\"https://fleet-controller.test:17999\"}" https://127.0.0.1:17700/nodes/register | grep -q "controller.s own"' "$ca" "$join"
 # curl exits 60 when the certificate doesn't verify (not a connection error).
 check "a client pinned to the fleet CA refuses a node certificate" sh -c 'curl -s -m 5 --cacert "$0" https://127.0.0.1:17701/sandboxes >/dev/null; test $? -eq 60' "$ca"
 check "the node CA does verify it" sh -c 'curl -s -m 5 --cacert "$0" https://127.0.0.1:17701/sandboxes >/dev/null; test $? -ne 60' "$C/controller/node-ca.pem"
@@ -161,11 +164,12 @@ echo "scale to zero, recycle"
 check "deploy with --idle-stop 5s" cr app deploy --remote admin --git "$url" --ref "$v1" --name nap --idle-stop 5s
 napget() { curl -s -m 90 -H "Host: nap.apps.test" http://127.0.0.1:18088/; }
 sleep 3
-check "awake app serves" sh -c 'test "$(curl -s -m 3 -H "Host: nap.apps.test" http://127.0.0.1:18088/)" = "v1 "'
+# The 5 s idle timer can expire while a cold deploy builds; allow the normal wake hold.
+check "deployed app serves" sh -c 'test "$(curl -s -m 90 -H "Host: nap.apps.test" http://127.0.0.1:18088/)" = "v1 "'
 asleep() { cr app ls --remote admin | grep -A8 '"name": "nap"' | grep -q '"sleeping": true'; }
 for _ in $(seq 30); do asleep && break; sleep 1; done
 check "idle app goes to sleep" asleep
-vmstopped() { for h in "$N1" "$N2"; do REKCOD_HOME=$h "$R" sandbox ls; done | grep "nap-" | grep -q stopped; }
+vmstopped() { for h in "$N1" "$N2" "$N3"; do REKCOD_HOME=$h "$R" sandbox ls; done | grep "nap-" | grep -q stopped; }
 for _ in $(seq 40); do vmstopped && break; sleep 1; done
 check "its VM is stopped" vmstopped
 t0=$(date +%s)
@@ -232,9 +236,24 @@ check "ns rm --force" cr ns rm team --force --remote admin
 sleep 2.5
 check "its app is gone from the edge" sh -c 'curl -s -m 3 -H "Host: hello--team.apps.test" http://127.0.0.1:18088/ | grep -q "no app"'
 
+check "deploy three HA replicas" cr app deploy --remote admin --git "$url" --ref "$v1" --name ha --instances 3
+check "HA replicas occupy three Macs" sh -c 'test "$(sqlite3 "$0" "select count(distinct node) from instances where app = '\''ha'\'' and state = '\''live'\''")" = 3' "$C/controller/fleet.db"
+ha_release=$(sqlite3 "$C/controller/fleet.db" "select live_release from apps where name = 'ha'")
+node2_id=$(sqlite3 "$C/controller/fleet.db" "select id from nodes where url = 'https://127.0.0.1:17702'")
+survivors=$(sqlite3 "$C/controller/fleet.db" "select sandbox from instances where app = 'ha' and state = 'live' and node <> '$node2_id' order by sandbox")
 kill "$node2"
 sleep 22
 check "silent node marked lost" sh -c '"$0" node ls --remote admin | grep -q "\"lost\""' "$R"
+for _ in $(seq 90); do
+  [[ $(sqlite3 "$C/controller/fleet.db" "select count(*) from instances where app = 'ha' and state = 'live'") = 3 ]] && break
+  sleep 2
+done
+check "HA restores three replicas after node loss" sh -c 'test "$(sqlite3 "$0" "select count(*) from instances where app = '\''ha'\'' and state = '\''live'\''")" = 3' "$C/controller/fleet.db"
+check "HA recovery keeps the release number" test "$(sqlite3 "$C/controller/fleet.db" "select live_release from apps where name = 'ha'")" = "$ha_release"
+for sb in $survivors; do
+  check "HA preserves healthy replica $sb" test "$(sqlite3 "$C/controller/fleet.db" "select state from instances where sandbox = '$sb'")" = live
+done
+check "HA app still serves" sh -c 'test "$(curl -s -m 3 -H "Host: ha.apps.test" http://127.0.0.1:18088/)" = "v1 "'
 
 echo
 if [[ $failures -eq 0 ]]; then echo "all fleet checks passed"; else echo "$failures fleet check(s) failed"; exit 1; fi

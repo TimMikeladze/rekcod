@@ -73,6 +73,34 @@ The Rust version of the old setup shell script, plus the headless bits.
 `~/.rekcod` alone. To take rekcod off the server entirely, from your Mac:
 `rekcod host uninstall NAME` ([install-upgrade.md](install-upgrade.md#another-mac-in-your-fleet)).
 
+## Add another Mac to an existing fleet
+
+On the additional Mac, configure the existing controller's admin remote and join token:
+
+```sh
+rekcod remote add fleet https://controller:7700 --token ADMIN_TOKEN --ca-fingerprint sha256:...
+rekcod server setup --edge-only --remote fleet --join-token JOIN_TOKEN
+```
+
+This installs a node and an edge. It uses the existing controller and storage; the additional
+Mac gets no controller, RustFS or main Docker VM. Its node starts sandbox VMs as needed.
+The edge uses a node-specific restricted token. The configured admin remote stays available
+for setup and administration, separate from the edge service's remote.
+
+Address selection is `--addr IP`, then Tailscale, then the LAN. On a LAN the node listens
+on `0.0.0.0:7701` and advertises the Mac's Sharing hostname with `.local`; the controller must
+be able to resolve it. The edge listens on port 8080, and public apps on `127.0.0.1:8081`.
+If the controller requires approval, run `rekcod node approve NODE_ID --remote fleet` from
+an admin client using the ID setup prints.
+
+Repeat the setup command without `--join-token` once joined. It preserves the node ID.
+A node joined with another controller or address causes an error before service changes;
+use the individual node commands to change that configuration. The existing `--no-power`
+and boot service behavior apply to edge-only setup too.
+
+For traffic failover, connect both edges to an ingress that can use a surviving Mac.
+[Two edges](fleet-edges.md) covers Cloudflare Tunnel and tailnet clients.
+
 ## Starting at boot
 
 LaunchAgents run in a login session, so a server built from them comes back after a reboot

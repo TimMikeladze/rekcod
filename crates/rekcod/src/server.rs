@@ -76,6 +76,9 @@ fn filevault_on() -> bool {
 /// doesn't switch automatic login on itself (that takes the user's password), so it says
 /// what's in the way and opens the setting.
 fn after_reboot(daemons: bool, exe: &Path) {
+    if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
+        return;
+    }
     if daemons {
         if filevault_on() {
             eprintln!(
@@ -362,6 +365,79 @@ pub fn layout(net: &Net) -> Layout {
     }
 }
 
+struct EdgeLayout {
+    node_listen: String,
+    advertise: String,
+    edge_listen: String,
+}
+
+fn edge_layout(net: &Net, lan_name: Option<&str>) -> Result<EdgeLayout> {
+    match net {
+        Net::Lan => {
+            let name = lan_name.context("LAN edge setup needs this Mac's LocalHostName; set it in Sharing or use --addr IP")?;
+            if !name.split('.').all(|p| {
+                !p.is_empty()
+                    && p.len() <= 63
+                    && !p.starts_with('-')
+                    && !p.ends_with('-')
+                    && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+            }) {
+                bail!("invalid LAN host name");
+            }
+            Ok(EdgeLayout {
+                node_listen: "0.0.0.0:7701".into(),
+                advertise: format!("http://{name}:7701"),
+                edge_listen: "0.0.0.0:8080".into(),
+            })
+        }
+        Net::Fixed(ip) | Net::Tailnet { ip, .. } => {
+            let ip: std::net::IpAddr = ip.parse().context("--addr must be an IP address")?;
+            let node_listen = std::net::SocketAddr::new(ip, 7701).to_string();
+            Ok(EdgeLayout {
+                advertise: format!("http://{node_listen}"),
+                node_listen,
+                edge_listen: std::net::SocketAddr::new(ip, 8080).to_string(),
+            })
+        }
+    }
+}
+
+fn edge_node_args(
+    remote: &crate::fleet::Remote,
+    l: &EdgeLayout,
+    join_token: Option<&str>,
+    joined: Option<&serde_json::Value>,
+) -> Result<Vec<String>> {
+    let secure = remote.url.starts_with("https://");
+    let advertise = if secure { l.advertise.replacen("http://", "https://", 1) } else { l.advertise.clone() };
+    if let Some(j) = joined {
+        if j["controller"].as_str().map(|s| s.trim_end_matches('/')) != Some(remote.url.trim_end_matches('/'))
+            || j["listen"].as_str() != Some(&l.node_listen)
+            || j["advertise"].as_str() != Some(&advertise)
+        {
+            bail!("this Mac's node is already joined with a different controller or address; use node serve or configure it separately");
+        }
+        return Ok(["node", "serve", "--install"].map(String::from).into());
+    }
+    let token = join_token.filter(|s| !s.is_empty()).context("a new node needs --join-token TOKEN (from the existing controller)")?;
+    let mut args = vec![
+        "node".into(),
+        "join".into(),
+        remote.url.clone(),
+        token.into(),
+        "--listen".into(),
+        l.node_listen.clone(),
+        "--advertise".into(),
+        advertise,
+    ];
+    if secure {
+        let ca = remote.ca.as_deref().context("the remote needs its pinned CA; add it with remote add --ca-fingerprint first")?;
+        args.extend(["--ca-fingerprint".into(), crate::tls::fingerprint(ca)?]);
+    }
+    args.push("--install".into());
+    Ok(args)
+}
+
 /// Whether `ip` is on one of this Mac's interfaces.
 fn assigned(ip: &str) -> bool {
     ip.parse::<std::net::IpAddr>().is_ok_and(|a| std::net::UdpSocket::bind((a, 0)).is_ok())
@@ -395,10 +471,7 @@ fn pick_net(addr: Option<&str>, lan: bool) -> Net {
     }
 }
 
-pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_power: bool) -> Result<()> {
-    let exe = std::env::current_exe()?.canonicalize()?;
-    let net = pick_net(addr, lan);
-    let l = layout(&net);
+fn prepare_services(paths: &Paths, exe: &Path, no_power: bool) -> Result<bool> {
     let dry = std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some();
     // LaunchDaemons start at boot with nobody logged in; they need root to install.
     // Without it, LaunchAgents, which need a login (docs/server.md).
@@ -412,10 +485,73 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
             "nobody is logged in on this Mac's screen, and without sudo the services can only be LaunchAgents, which need that; run this in a terminal (sudo makes them LaunchDaemons that start at boot)"
         );
     }
-    firewall(&exe);
-    if !no_power {
-        power(paths);
+    if !dry {
+        firewall(exe);
+        if !no_power {
+            power(paths);
+        }
     }
+    Ok(daemons)
+}
+
+pub fn setup_edge(paths: &Paths, remote_name: &str, join_token: Option<&str>, addr: Option<&str>, lan: bool, no_power: bool) -> Result<()> {
+    if paths.home.join("controller/admin-token").exists() {
+        bail!("this Mac already has a controller; run edge serve for an additional edge");
+    }
+    let remote = crate::fleet::remote(paths, Some(remote_name))?;
+    let net = pick_net(addr, lan);
+    let name = if matches!(net, Net::Lan) {
+        Command::new("/usr/sbin/scutil")
+            .args(["--get", "LocalHostName"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| format!("{}.local", String::from_utf8_lossy(&o.stdout).trim()))
+    } else {
+        None
+    };
+    let l = edge_layout(&net, name.as_deref())?;
+    let node_file = paths.home.join("node.json");
+    let joined = match std::fs::read(&node_file) {
+        Ok(b) => Some(serde_json::from_slice::<serde_json::Value>(&b).context("invalid node.json")?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let args = edge_node_args(&remote, &l, join_token, joined.as_ref())?;
+    // Check admin access before installing anything or changing power settings.
+    crate::fleet::call(&remote.url, "GET", "/nodes", Some(&remote.token), &serde_json::Value::Null)?;
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let daemons = prepare_services(paths, &exe, no_power)?;
+    run(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let node: serde_json::Value = serde_json::from_slice(&std::fs::read(&node_file)?)?;
+    let id = node["id"].as_str().context("node.json has no node id")?;
+    let edge_name = format!("edge-{id}");
+    let v = crate::fleet::call(&remote.url, "POST", "/tokens", Some(&remote.token), &serde_json::json!({"name":edge_name,"edge":true}))?;
+    let token = v["token"].as_str().context("controller returned no edge token")?;
+    // Store only the restricted token in the remote used by the edge service.
+    crate::fleet::remote_add(
+        paths,
+        &edge_name,
+        &remote.url,
+        token,
+        None,
+        remote.ca.as_deref().map(crate::tls::fingerprint).transpose()?.as_deref(),
+    )?;
+    run(&exe, &["edge", "serve", "--remote", &edge_name, "--listen", &l.edge_listen, "--public-listen", "127.0.0.1:8081", "--install"])?;
+    after_reboot(daemons, &exe);
+    eprintln!("rekcod: node {id} and edge installed; approve the node on the existing fleet if it is pending");
+    eprintln!(
+        "rekcod: edge on {}, public apps on 127.0.0.1:8081; use another connector of the existing tunnel for public failover",
+        l.edge_listen
+    );
+    Ok(())
+}
+
+pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_power: bool) -> Result<()> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let net = pick_net(addr, lan);
+    let l = layout(&net);
+    let daemons = prepare_services(paths, &exe, no_power)?;
 
     let ctl = paths.home.join("controller");
     // RustFS first: the controller reads its keys on start.
@@ -1005,6 +1141,44 @@ mod tests {
         assert_eq!(String::from_utf8(out).unwrap(), "Password:ok\r\nreminder\n");
         assert_eq!(r, Some(("http://s:7700".into(), "t".into(), None)));
         assert!(remote_setup("s", Command::new("true"), "/x", "a.com'; rm -rf ~", None, false, true).is_err());
+    }
+
+    #[test]
+    fn edge_only_node_commands_join_or_resume_the_same_fleet() {
+        let remote = crate::fleet::Remote { url: "http://100.64.0.1:7700".into(), token: "admin".into(), ns: None, ca: None };
+        let l = edge_layout(&Net::Fixed("100.64.0.2".into()), None).unwrap();
+        assert_eq!(l.node_listen, "100.64.0.2:7701");
+        assert_eq!(l.advertise, "http://100.64.0.2:7701");
+        let args = edge_node_args(&remote, &l, Some("join-secret"), None).unwrap();
+        assert_eq!(
+            args,
+            [
+                "node",
+                "join",
+                "http://100.64.0.1:7700",
+                "join-secret",
+                "--listen",
+                "100.64.0.2:7701",
+                "--advertise",
+                "http://100.64.0.2:7701",
+                "--install"
+            ]
+        );
+        assert!(edge_node_args(&remote, &l, None, None).is_err());
+        let matching = serde_json::json!({"controller":remote.url, "listen":l.node_listen, "advertise":l.advertise});
+        assert_eq!(edge_node_args(&remote, &l, None, Some(&matching)).unwrap(), ["node", "serve", "--install"]);
+        let other = serde_json::json!({"controller":"http://100.64.0.3:7700", "listen":l.node_listen});
+        assert!(edge_node_args(&remote, &l, Some("join-secret"), Some(&other)).is_err());
+    }
+
+    #[test]
+    fn edge_only_lan_layout_advertises_a_name_other_macs_can_reach() {
+        let l = edge_layout(&Net::Lan, Some("mini.local")).unwrap();
+        assert_eq!(l.node_listen, "0.0.0.0:7701");
+        assert_eq!(l.advertise, "http://mini.local:7701");
+        assert_eq!(l.edge_listen, "0.0.0.0:8080");
+        assert!(edge_layout(&Net::Lan, None).is_err());
+        assert!(edge_layout(&Net::Lan, Some("bad/name.local")).is_err());
     }
 
     #[test]

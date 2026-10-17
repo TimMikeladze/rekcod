@@ -1,6 +1,8 @@
 # Fleet HA
 
-**Status:** plan, 2026-10-16. Nothing here is built yet.
+**Status:** placement, replica recovery and two-edge provisioning verified, 2026-10-17.
+Controller standby, storage replication and lost-job retries remain plans. Configure an
+external ingress or clients to fail over between the edges.
 
 What it takes for a fleet of Macs to keep serving apps, and keep accepting deploys, when any
 one Mac dies. Builds on [`fleet-hardening.md`](fleet-hardening.md) (reconcile, lost nodes)
@@ -12,32 +14,24 @@ Read from `crates/rekcod/src/fleet.rs` and `edge/`, not from the older specs.
 
 | Piece | Copies | When its Mac dies |
 |---|---|---|
-| App instances | `instances` per app, on nodes from `place()` | Edge skips them on the next connect (3 s timeout, out for 5 s). Node marked lost after 15 s; reconcile replaces after 60 s more |
+| App instances | `instances` per app, on nodes from `place()` | Edge skips them on the next connect (3 s timeout, out for 5 s). Node marked lost after 15 s; reconcile tops up the live release after 60 s short |
 | Node | as many Macs as you have | Its sandboxes, instances and jobs go `lost`. Only instances come back elsewhere |
-| Edge | one per `edge serve` | Public traffic stops unless something in front fails over |
+| Edge | one per `edge serve`; multiple supported | Ingress or clients must select another surviving edge |
 | Controller | one, SQLite in `controller/fleet.db` | Apps keep serving from each edge's `edge-routes.json`. No deploys, wakes, reconcile, jobs, schedules or webhooks until it's back |
 | RustFS | one, usually on the controller's Mac | Release images, build cache, backups and app buckets are gone with that disk. Deploys fall back to building from git; apps using their bucket break |
 
-Problems I found in the code, beyond "one controller":
+Placement now reserves memory per assignment and spreads across zones and nodes. Recovery
+starts only missing instances, keeps partial progress, and skips failed nodes for the current
+attempt. Healthy replicas keep their sandbox IDs and release number.
 
-1. **Spreading is round-robin over a list, not anti-affinity.** `deploy_locked` puts instance
-   `i` on `nodes[i % nodes.len()]` (`fleet.rs:2901`). `place()` filters on room for *one*
-   instance, so a node with room for one can get two. Two instances can land on one Mac
-   while another sits idle.
-2. **Reconcile redeploys everything to replace one instance.** `reconcile` calls
-   `deploy_locked` (`fleet.rs:1882`), which makes a new release, starts `instances` new VMs
-   and drains all the healthy ones. Losing 1 of 5 instances starts 5 VMs.
-3. **Deploys are all-or-nothing per node.** One node failing `POST /instances` deletes every
-   instance the deploy started (`fleet.rs:2969`). A flaky node fails every deploy, and
-   reconcile then retries every 60 s and alerts each time.
-4. **No partial capacity.** If the surviving nodes fit 2 of 3 instances, reconcile fails and
-   the app stays at whatever survived, rather than going back up to 2.
-5. **Nodes, edges and CLIs know one controller URL** (`NodeConfig.controller`,
+Remaining controller limitations:
+
+1. **Nodes, edges and CLIs know one controller URL** (`NodeConfig.controller`,
    `Remote.url`). There's nowhere to put a second one.
-6. **The standby would need the controller's private material**: `secret-key` (seals
+2. **The standby would need the controller's private material**: `secret-key` (seals
    secrets), `ca.pem`/key and `node-ca.pem`/key (what nodes and CLIs pin), `admin-token`.
    None of it is in fleet.db.
-7. **Backups are hourly** (`backup_due`), to RustFS and/or `--backup-dir`. Up to an hour of
+3. **Backups are hourly** (`backup_due`), to RustFS and/or `--backup-dir`. Up to an hour of
    deploys, tokens and secrets is lost on restore, and the restore is by hand.
 
 Not in scope: stateful sandboxes and volumes (their disk is on one Mac, as `platform.md`
@@ -45,49 +39,54 @@ says), databases (keep them off the fleet), more than one controller writing at 
 
 ## Pieces, in build order
 
-### 1. Placement: spread and top up
+### 1. Placement: spread and top up (implemented)
 
-The cheapest change with the most effect. All in `fleet.rs`.
+- `node join --zone rack-a` stores the node's failure domain in `nodes.zone`. Without a
+  label, a Mac counts as its own domain. Placement ranks candidates by app replicas in the
+  zone, then on the node, then free memory, and reserves memory for each assignment.
+- `[resources] spread = "soft"` is the default. Shared Macs and labelled zones appear in
+  `app status`'s `placement` field and the release log. `spread = "strict"` requires a
+  separate Mac and failure domain for every replica of the new release; failure leaves
+  the previous release serving. An old release does not block rolling placement.
+- Reconcile tops up the live release, without creating a release or restarting survivors.
+  A failed launch or health check excludes that node for the current attempt and tries
+  another. Successful partial recovery stays live. Remaining replicas retry after 60 s;
+  capacity alerts are sent once until recovery completes.
+- Replaced lost replicas are retired, including their sandbox records, so a returning node
+  cannot bring them back. Replicas not yet replaced can return after a successful check.
+- `node drain` tops up before removing routes to old replicas. With insufficient capacity,
+  existing replicas keep serving and reconcile retries the move. `remaining_instances`
+  reports outstanding moves. Explicit drain can wake sleeping apps; ordinary reconcile
+  leaves sleeping apps asleep. Other sandboxes and their disks stay on the draining Mac.
 
-- `assign(app, count, exclude)`: for each instance, pick the ready node with the fewest
-  instances of this app, then the most free memory, then subtract `memory_gib` from that
-  node's free memory before picking the next. Replaces the `nodes[i % len]` loop.
-- Nodes get an optional `zone` (`node join --zone rack-a`, stored in `nodes.zone`).
-  `assign` spreads across zones first, then nodes. A zone is whatever fails together: a
-  power strip, a shelf, a building.
-- Soft by default. When two instances share a node (or zone) the deploy log says so and
-  `app status` shows it. `[resources] spread = "strict"` fails the deploy instead.
-- Reconcile tops up: it starts only the missing instances of the *live* release on nodes
-  `assign` picks, waits for health, marks them live. No new release number, no drain. Same
-  code path as a deploy's launch step, factored out of `deploy_locked`.
-- A node that fails `POST /instances` during a deploy or top-up is skipped and the instance
-  retried on the next node `assign` gives. The deploy fails only when no node is left.
-- Partial top-up: if only 1 of 2 missing instances fits, start that one and alert once.
-  Retry the rest on the next pass, not every 60 s with an alert each time.
-- `node drain` moves instances off with a top-up first, then drains, so a drain doesn't
-  drop the app below `instances`.
+Controller tests exercise memory accounting, zones, strict placement, pools, partial
+recovery, launch retry, safe drain and returning nodes through SQLite and loopback HTTP.
+`scripts/e2e-fleet.sh` adds a three-node deploy and worker loss: all three replicas recover
+on the surviving two Macs, with the release number and both surviving sandbox IDs unchanged.
+Soft spreading permits sharing when the failure leaves fewer Macs than replicas.
 
-Tests: `place`/`assign` unit tests next to the existing ones at `fleet.rs:4769`
-(two-per-node never while a node is empty, zones before nodes, memory subtracted per
-assignment). `e2e-fleet.sh`: 3 instances on 3 nodes land on 3 nodes; kill one node, the
-replacement goes to a node without one and the release number doesn't change.
+### 2. Two edges (implemented)
 
-### 2. Two edges
+`server setup --edge-only --remote NAME --join-token TOKEN` installs an additional node
+and edge against an existing admin remote. It creates a restricted edge token tied to the
+node ID and installs no local controller, storage service or main Docker VM. Repeating
+setup preserves the node registration; a different controller or address causes an error
+before service changes. The join token is only needed for a new node.
 
-Mostly setup and docs. The edge already keeps no state that matters: routes come from the
-controller, bans too, and rate limits and strike counts being per edge is fine.
+The controller already sums traffic and reported clients from multiple edges, unions
+active hosts and retains the worst reported percentiles. HTTP tests verify this behavior.
+Wakes from different edges still share the controller's app lock. Rate limits, in-flight
+connections and unfinished-minute statistics stay on each edge.
 
-- Public: run `cloudflared` on two Macs as connectors of the same tunnel, each pointing at
-  its local edge. Cloudflare fails over between connectors.
-- Tailnet: `--listen` on each edge Mac, and a name with both addresses, or clients that pick.
-- Check the controller sums `/routes/activity` traffic and clients from two edges instead of
-  one overwriting the other. Activity hosts are a union already. Wakes from two edges
-  share one wake through the controller's app lock.
-- `server setup` gains `--edge-only` for a Mac that runs a node and an edge but no
-  controller.
+`scripts/e2e-edges.py` runs two edge processes and a controller, checks provisioning and
+scoped tokens without loading launchd jobs, verifies that metrics and clients sum 12 + 8
+requests, then terminates one edge during 100 requests through a client with failover.
+The survivor serves every request. CI runs this check without guest VMs.
 
-Tests: e2e with two edges; kill one mid-load, the other keeps returning 200s;
-`/metrics` request counts equal the sum from both.
+[Two edges](fleet-edges.md) documents connector replicas of the same Cloudflare tunnel
+and tailnet clients with retries or a health-aware load balancer. The process test does
+not configure or test Cloudflare. A host outage drops its connector; an edge-only process
+failure needs origin health checks or supervision of the connector with the edge.
 
 ### 3. Controller standby
 
@@ -189,7 +188,7 @@ N times. Schedules already start the next run regardless.
 
 ## Order and cut lines
 
-1 and 2 are worth doing on their own and don't depend on anything. 3 is most of the work and
+1 and 2 are implemented. 3 is most of the work and
 only pays off with 3+ nodes. 4 needs research before it's a plan. 5 is small and can go
 anywhere.
 

@@ -907,15 +907,16 @@ struct NodeConfig {
     key: Option<String>,
 }
 
-pub fn node_join(
-    paths: &Paths,
-    controller: &str,
-    join_token: &str,
-    listen: &str,
-    advertise: Option<&str>,
-    install: bool,
-    ca_fingerprint: Option<&str>,
-) -> Result<()> {
+pub struct NodeJoinOptions<'a> {
+    pub listen: &'a str,
+    pub advertise: Option<&'a str>,
+    pub install: bool,
+    pub ca_fingerprint: Option<&'a str>,
+    pub zone: Option<&'a str>,
+}
+
+pub fn node_join(paths: &Paths, controller: &str, join_token: &str, options: NodeJoinOptions<'_>) -> Result<()> {
+    let NodeJoinOptions { listen, advertise, install, ca_fingerprint, zone } = options;
     let controller = controller.trim_end_matches('/');
     let addr: SocketAddr = listen.parse().context("--listen takes IP:PORT")?;
     // An https controller issues this node a certificate, so the node serves https too.
@@ -935,7 +936,13 @@ pub fn node_join(
         None
     };
     let host = crate::cli::sysctl_u64("hw.memsize").unwrap_or(0) >> 20;
-    let r = call(controller, "POST", "/nodes/register", None, &json!({"join_token": join_token, "url": advertise, "mem_total_mib": host}))?;
+    let r = call(
+        controller,
+        "POST",
+        "/nodes/register",
+        None,
+        &json!({"join_token": join_token, "url": advertise, "mem_total_mib": host, "zone": zone}),
+    )?;
     let cfg = NodeConfig {
         controller: controller.into(),
         id: r["id"].as_str().context("no node id")?.into(),
@@ -1188,6 +1195,8 @@ const MIGRATIONS: &[&str] = &[
        from nodes;
      drop table nodes;
      alter table nodes_new rename to nodes;",
+    "alter table nodes add column zone text not null default '';
+     alter table apps add column spread text not null default 'soft';",
 ];
 
 pub struct Db(rusqlite::Connection);
@@ -1282,6 +1291,7 @@ struct Controller {
     started: Instant,
     /// Apps with fewer healthy instances than they want, and since when.
     short_since: Mutex<HashMap<String, Instant>>,
+    short_alerted: Mutex<HashMap<String, ()>>,
     /// Failed health checks in a row, per instance sandbox.
     strikes: Mutex<HashMap<String, u32>>,
     /// `--alert-webhook`: gets a JSON line when a node is lost or a deploy or backup fails.
@@ -1391,6 +1401,7 @@ impl Controller {
             dir: PathBuf::new(),
             started: Instant::now(),
             short_since: Default::default(),
+            short_alerted: Default::default(),
             strikes: Default::default(),
             alert_webhook: None,
             db_path: PathBuf::new(),
@@ -1810,9 +1821,8 @@ fn expire_previews(c: &Arc<Controller>) -> Result<()> {
 const HEALTH_STRIKES: u32 = 3;
 
 /// Moves what runs toward what should (docs/fleet-hardening.md, "Convergence"):
-/// instances on a node that came back are checked and taken back; live instances that stop
-/// answering are dropped; an app short of healthy instances for a minute is redeployed at
-/// its live commit (from the release store, so no rebuild).
+/// Instances on a returning node are checked and taken back; live instances that stop
+/// answering are dropped. After a minute short of replicas, top up the live release.
 fn reconcile(c: &Arc<Controller>) -> Result<()> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select i.sandbox, i.endpoint, a.health, i.state from instances i join apps a on a.name = i.app join nodes n on n.id = i.node
@@ -1832,10 +1842,30 @@ fn reconcile(c: &Arc<Controller>) -> Result<()> {
         if ok {
             strikes.remove(&sb);
             if state == "lost" {
-                c.db.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .execute("update instances set state = 'live' where sandbox = ?1", &[&sb])?;
-                eprintln!("rekcod: instance {sb} answers again; back in the routes");
+                let name: String =
+                    c.db.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .query_one("select app from instances where sandbox = ?1", &[&sb])?
+                        .get(0);
+                let lock = c.app_lock(&name);
+                let Ok(_g) = lock.try_lock() else { continue };
+                let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let restored = db.execute(
+                    "update instances set state = 'live' where sandbox = ?1 and state = 'lost'
+                     and release = (select live_release from apps where name = instances.app)
+                     and (select count(*) from instances i where i.app = ?2 and i.state = 'live')
+                       < (select max(instances, 1) from apps where name = ?2)
+                     and ((select spread from apps where name = ?2) <> 'strict' or not exists
+                       (select 1 from instances i join nodes n on n.id = i.node
+                        join nodes rn on rn.id = instances.node
+                        where i.app = ?2 and i.state = 'live'
+                          and (i.node = instances.node or (rn.zone <> '' and rn.zone = n.zone))))",
+                    &[&sb, &name],
+                )?;
+                if restored > 0 {
+                    db.execute("update sandboxes set state = 'running' where id = ?1", &[&sb])?;
+                    eprintln!("rekcod: instance {sb} answers again; back in the routes");
+                }
             }
             continue;
         }
@@ -1844,23 +1874,25 @@ fn reconcile(c: &Arc<Controller>) -> Result<()> {
         if state == "live" && *n >= HEALTH_STRIKES {
             c.db.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execute("update instances set state = 'lost' where sandbox = ?1", &[&sb])?;
+                .execute("update instances set state = 'lost' where sandbox = ?1 and state = 'live'", &[&sb])?;
             eprintln!("rekcod: instance {sb} failed {HEALTH_STRIKES} health checks; out of the routes");
         }
     }
     let apps = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select a.name, a.instances,
-           (select count(*) from instances i where i.app = a.name and i.state = 'live'),
+           (select count(*) from instances i join nodes n on n.id = i.node where i.app = a.name and i.state = 'live'
+             and n.state = 'ready' and n.last_seen > ?1),
            (select count(*) from instances i where i.app = a.name and i.state = 'sleeping'),
            r.commit_sha
          from apps a join releases r on r.app = a.name and r.n = a.live_release",
-        &[],
+        &[&(now() - 15)],
     )?;
     for r in apps {
-        let (name, wanted, live, sleeping, commit): (String, i64, i64, i64, String) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+        let (name, wanted, live, sleeping): (String, i64, i64, i64) = (r.get(0), r.get(1), r.get(2), r.get(3));
         let mut short = c.short_since.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if live >= wanted.max(1) || (live == 0 && sleeping > 0) {
             short.remove(&name);
+            c.short_alerted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&name);
             continue;
         }
         let since = *short.entry(name.clone()).or_insert_with(Instant::now);
@@ -1877,13 +1909,14 @@ fn reconcile(c: &Arc<Controller>) -> Result<()> {
         let c = c.clone();
         std::thread::spawn(move || {
             let Ok(_g) = lock.try_lock() else { return };
-            eprintln!("rekcod: {name} has {live} of {wanted} healthy instance(s); redeploying {commit}");
-            let r = load_app_key(&c, &name)
-                .and_then(|a| a.ok_or_else(|| anyhow!("gone")))
-                .and_then(|app| deploy_locked(&c, &app, Some(commit), "reconcile"));
+            eprintln!("rekcod: {name} has {live} of {wanted} healthy instance(s); topping up");
+            let r = load_app_key(&c, &name).and_then(|a| a.ok_or_else(|| anyhow!("gone"))).and_then(|app| top_up_locked(&c, &app));
             if let Err(e) = r {
                 eprintln!("rekcod: reconcile {name}: {e:#}");
-                c.alert(&format!("{name}: replacing lost instances failed: {e:#}"));
+                let first = c.short_alerted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.clone(), ()).is_none();
+                if first {
+                    c.alert(&format!("{name}: replacing lost instances failed: {e:#}"));
+                }
             }
         });
     }
@@ -2001,11 +2034,15 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                 let (id, sec) = (format!("n-{}", sandbox::new_id()?), secret()?);
                 let url = body["url"].as_str().context("missing url")?;
                 let total = body["mem_total_mib"].as_i64().unwrap_or(0);
+                let zone = body["zone"].as_str().unwrap_or("");
+                if !zone.is_empty() && !valid_label(zone) {
+                    bail!("zone must be a lowercase label, at most 40 characters");
+                }
                 // Anyone with the join token can register; an admin approves before work lands there.
                 let state = if c.auto_approve { "ready" } else { "pending" };
                 c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-                    "insert into nodes (id, url, secret, mem_total, last_seen, state) values (?1, ?2, ?3, ?4, ?5, ?6)",
-                    &[&id, &url, &sec, &total, &now(), &state],
+                    "insert into nodes (id, url, secret, mem_total, last_seen, state, zone) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    &[&id, &url, &sec, &total, &now(), &state, &zone],
                 )?;
                 c.audit("-", "node", "register", &id, true);
                 if state == "pending" {
@@ -2135,7 +2172,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             let rows = db.query(
                 "select id, url, mem_total, mem_free, last_seen, state, cpus, load, disk_total, disk_free,
                    (select count(*) from instances i where i.node = n.id and i.state in ('live', 'starting', 'sleeping', 'draining')),
-                   (select count(*) from jobs j where j.node = n.id and j.state = 'running')
+                   (select count(*) from jobs j where j.node = n.id and j.state = 'running'), zone
                  from nodes n order by id",
                 &[],
             )?;
@@ -2151,6 +2188,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                             "cpus": r.get::<Option<i64>>(6), "load": r.get::<Option<i64>>(7).map(|l| l as f64 / 100.0),
                             "disk_total_gib": r.get::<Option<i64>>(8), "disk_free_gib": r.get::<Option<i64>>(9),
                             "instances": r.get::<i64>(10), "jobs_running": r.get::<i64>(11),
+                            "zone": r.get::<String>(12),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -2202,15 +2240,9 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             Ok(json!({"undrained": id}))
         }),
         ("POST", ["nodes", id, "drain"]) => admin_only().and_then(|_| {
-            let n =
-                c.db.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .execute("update nodes set state = 'drain' where id = ?1", &[id])?;
-            if n == 0 {
-                bail!("no node {id}");
-            }
+            let result = drain_node(c, id)?;
             c.audit("-", &who.name, "drain", id, true);
-            Ok(json!({"drained": id}))
+            Ok(result)
         }),
         // Dedicate a node to namespaces; an empty list gives it back to everyone.
         ("POST", ["nodes", id, "pool"]) => admin_only().and_then(|_| {
@@ -2761,6 +2793,77 @@ struct App {
     env: Value,
     secrets: Value,
     idle_stop: i64,
+    strict_spread: bool,
+}
+
+struct PlacementNode {
+    id: String,
+    url: String,
+    secret: String,
+    zone: String,
+    free: i64,
+    copies: i64,
+    failed: bool,
+}
+
+struct Placement {
+    nodes: Vec<PlacementNode>,
+    zones: HashMap<String, i64>,
+}
+
+impl Placement {
+    fn failed(&mut self, i: usize, mib: i64) {
+        let n = &mut self.nodes[i];
+        n.failed = true;
+        n.free += mib;
+        n.copies -= 1;
+        *self.zones.get_mut(&n.zone).unwrap() -= 1;
+    }
+
+    fn pick(&mut self, mib: i64, strict: bool) -> Option<usize> {
+        let i = self
+            .nodes
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| !n.failed && n.free >= mib && (!strict || (n.copies == 0 && self.zones[&n.zone] == 0)))
+            .min_by_key(|(_, n)| (self.zones[&n.zone], n.copies, std::cmp::Reverse(n.free), &n.id))
+            .map(|(i, _)| i)?;
+        let n = &mut self.nodes[i];
+        n.free -= mib;
+        n.copies += 1;
+        *self.zones.get_mut(&n.zone).unwrap() += 1;
+        Some(i)
+    }
+}
+
+impl Controller {
+    fn assignment(&self, app: &App, release: i32, exclude: &[String]) -> Result<Placement> {
+        let rows = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
+            "select n.id, n.url, n.secret, n.zone, n.mem_free,
+               (select count(*) from instances i where i.node = n.id and i.app = ?1 and i.release = ?2
+                 and i.state in ('live', 'starting', 'sleeping'))
+             from nodes n where n.state = 'ready' and n.last_seen > ?3
+               and case when exists(select 1 from node_pools where ns = ?4)
+                 then n.id in (select node from node_pools where ns = ?4)
+                 else n.id not in (select node from node_pools) end",
+            &[&app.name, &release, &(now() - 15), &app.ns],
+        )?;
+        let mut nodes = Vec::new();
+        let mut zones = HashMap::new();
+        for r in rows {
+            let id: String = r.get(0);
+            if exclude.contains(&id) {
+                continue;
+            }
+            let zone: String = r.get(3);
+            // Without a zone label, each Mac is its own failure domain.
+            let zone = if zone.is_empty() { format!("node:{id}") } else { format!("zone:{zone}") };
+            let copies: i64 = r.get(5);
+            *zones.entry(zone.clone()).or_insert(0) += copies;
+            nodes.push(PlacementNode { id, url: r.get(1), secret: r.get(2), zone, free: r.get(4), copies, failed: false });
+        }
+        Ok(Placement { nodes, zones })
+    }
 }
 
 /// App `name` in `ns`, if `who` has at least `need` there.
@@ -2781,7 +2884,7 @@ fn load_app(c: &Controller, ns: &str, name: &str, who: &Caller, need: Role) -> R
 /// App by row key, no access check; secrets come back opened.
 fn load_app_key(c: &Controller, key: &str) -> Result<Option<App>> {
     let r = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
-        "select name, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, secrets, ns, idle_stop from apps where name = ?1",
+        "select name, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, secrets, ns, idle_stop, spread from apps where name = ?1",
         &[&key],
     )?;
     let Some(r) = r else { return Ok(None) };
@@ -2808,6 +2911,7 @@ fn load_app_key(c: &Controller, key: &str) -> Result<Option<App>> {
         env: serde_json::from_str(&r.get::<String>(9)).unwrap_or(json!({})),
         secrets,
         idle_stop: r.get(12),
+        strict_spread: r.get::<String>(13) == "strict",
     }))
 }
 
@@ -2845,6 +2949,309 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
     deploy_locked(c, app, commit, who)
 }
 
+type StartedInstance = (String, String, String);
+
+struct Launched {
+    started: Vec<StartedInstance>,
+    errors: Vec<String>,
+    health: String,
+}
+
+fn register_instance(c: &Controller, app: &App, release: i32, node: &PlacementNode, reply: &Value, who: &str) -> Result<StartedInstance> {
+    let sb = reply["sandbox"].as_str().filter(|s| !s.is_empty()).context("node returned no sandbox")?;
+    let registered = (|| {
+        let ep = reply["endpoint"].as_str().filter(|s| !s.is_empty()).context("node returned no endpoint")?;
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db.0.transaction()?;
+        tx.execute(
+            "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
+            rusqlite::params![sb, node.id, who, now(), app.ns, app.cpus, app.memory_gib],
+        )?;
+        tx.execute("insert into instances values (?1, ?2, ?3, ?4, ?5, 'starting')", rusqlite::params![app.name, release, sb, node.id, ep])?;
+        tx.commit()?;
+        Ok((node.id.clone(), sb.to_string(), ep.to_string()))
+    })();
+    if registered.is_err() {
+        // Never delete an existing tracked sandbox if a node replies with a duplicate ID.
+        let known =
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_opt("select 1 from sandboxes where id = ?1", &[&sb])
+                .map(|r| r.is_some())
+                .unwrap_or(true);
+        if !known {
+            let _ =
+                call_within(&node.url, "DELETE", &format!("/sandboxes/{}", percent_encode(sb)), Some(&node.secret), &Value::Null, QUICK);
+        }
+    }
+    registered
+}
+
+fn launch_instances(
+    c: &Arc<Controller>,
+    app: &App,
+    release: i32,
+    commit: &str,
+    count: usize,
+    who: &str,
+    log: &mut Vec<String>,
+) -> Result<Launched> {
+    let mut placement = c.assignment(app, release, &[])?;
+    let mut env = app.env.clone();
+    for (k, v) in app.secrets.as_object().into_iter().flatten() {
+        env[k] = v.clone();
+    }
+    let bucket = bucket_env(c, app)?;
+    let storage_endpoint = bucket.iter().find(|(k, _)| *k == "S3_ENDPOINT").map(|(_, v)| v.clone());
+    for (k, v) in bucket {
+        env[k] = json!(v);
+    }
+    let mut spec = json!({
+        "app": app.name, "release": release, "port": app.port, "git": {"url": app.git_url, "ref": commit},
+        "cpus": app.cpus, "memory_gib": app.memory_gib, "env": env, "start": app.start,
+        "store": release_store(c, &app.name, commit), "storage_endpoint": storage_endpoint,
+    });
+    let mut result = Launched { started: Vec::new(), errors: Vec::new(), health: app.health.clone() };
+    while result.started.len() < count {
+        let mut handles = Vec::new();
+        // Build and store once before launching the other replicas in parallel.
+        let batch = if spec["store"]["cached"] == json!(false) { 1 } else { count - result.started.len() };
+        for _ in 0..batch {
+            let Some(i) = placement.pick(i64::from(app.memory_gib) * 1024, app.strict_spread) else { break };
+            let n = &placement.nodes[i];
+            log.push(format!("placing instance on {}", n.id));
+            let (url, secret, spec) = (n.url.clone(), n.secret.clone(), spec.clone());
+            handles.push((i, std::thread::spawn(move || call(&url, "POST", "/instances", Some(&secret), &spec))));
+        }
+        if handles.is_empty() {
+            break;
+        }
+        let mut pending = Vec::new();
+        for (i, handle) in handles {
+            let n = &placement.nodes[i];
+            let launched = handle
+                .join()
+                .unwrap_or_else(|_| Err(anyhow!("deploy thread panicked")))
+                .and_then(|v| register_instance(c, app, release, n, &v, who).map(|instance| (v, instance)));
+            match launched {
+                Ok((v, instance)) => {
+                    if v["pushed"] == json!(true) {
+                        spec["store"]["cached"] = json!(true);
+                    }
+                    if let Some(h) = v["health"].as_str().filter(|_| app.health == "/") {
+                        result.health = h.to_string();
+                    }
+                    log.push(format!("{}: started {} at {}", n.id, instance.1, instance.2));
+                    pending.push((i, instance));
+                }
+                Err(e) => {
+                    log.push(format!("{}: {e:#}; trying another node", n.id));
+                    result.errors.push(format!("{}: {e:#}", n.id));
+                    placement.failed(i, i64::from(app.memory_gib) * 1024);
+                }
+            }
+        }
+        let t0 = Instant::now();
+        while !pending.is_empty() && t0.elapsed() < Duration::from_secs(30) {
+            pending.retain(|(_, instance)| {
+                if healthy(&instance.2, &result.health) {
+                    log.push(format!("{}: {} healthy after {:.1}s", instance.1, result.health, t0.elapsed().as_secs_f64()));
+                    result.started.push(instance.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if !pending.is_empty() {
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        }
+        for (i, (node, sb, _)) in pending {
+            let tail = c
+                .node(&node)
+                .and_then(|(url, sec, _)| call_within(&url, "GET", &format!("/sandboxes/{sb}/logs"), Some(&sec), &Value::Null, QUICK))
+                .map(|v| {
+                    v["logs"]
+                        .as_str()
+                        .unwrap_or("")
+                        .lines()
+                        .rev()
+                        .take(10)
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            let error = format!("{sb}: health check {} failed within 30s; last log lines:\n{tail}", result.health);
+            log.push(error.clone());
+            result.errors.push(error);
+            delete_instance(c, &node, &sb);
+            placement.failed(i, i64::from(app.memory_gib) * 1024);
+        }
+    }
+    if result.started.len() < count {
+        result.errors.push(format!(
+            "placed {} of {count} instance(s): no eligible node has {} GiB free with the requested spread",
+            result.started.len(),
+            app.memory_gib
+        ));
+    }
+    if result.started.len() == count {
+        result.errors.clear();
+    }
+    Ok(result)
+}
+
+fn log_shared_placement(c: &Controller, app: &str, log: &mut Vec<String>) -> Result<()> {
+    let placement = placement_status(c, app)?;
+    for (key, label) in [("shared_nodes", "Mac"), ("shared_zones", "zone")] {
+        for name in placement[key].as_array().into_iter().flatten().filter_map(Value::as_str) {
+            log.push(format!("warning: replicas share {label} {name}"));
+        }
+    }
+    Ok(())
+}
+
+/// The caller holds the app lock. Healthy replicas keep their IDs and release number.
+fn top_up_locked(c: &Arc<Controller>, app: &App) -> Result<usize> {
+    let (release, commit, live, sleeping) = {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(r) = db.query_opt(
+            "select r.n, r.commit_sha,
+               (select count(*) from instances i join nodes n on n.id = i.node where i.app = a.name and i.release = r.n
+                 and i.state = 'live' and n.state = 'ready' and n.last_seen > ?2),
+               (select count(*) from instances i where i.app = a.name and i.state = 'sleeping')
+             from apps a join releases r on r.app = a.name and r.n = a.live_release where a.name = ?1",
+            &[&app.name, &(now() - 15)],
+        )?
+        else {
+            return Ok(0);
+        };
+        (r.get::<i32>(0), r.get::<String>(1), r.get::<i64>(2), r.get::<i64>(3))
+    };
+    if sleeping > 0 && live == 0 {
+        return Ok(0);
+    }
+    let missing = (i64::from(app.instances.max(1)) - live).max(0) as usize;
+    if missing == 0 {
+        retire_drained(c, app, release)?;
+        return Ok(0);
+    }
+    let mut log = vec![format!("recovering {missing} missing instance(s) of r{release}")];
+    let launched = launch_instances(c, app, release, &commit, missing, "reconcile", &mut log)?;
+    let added = launched.started.len();
+    {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // A returning worker must not revive a replica already replaced elsewhere.
+        for (_, sb, _) in &launched.started {
+            db.execute("update instances set state = 'live' where sandbox = ?1", &[sb])?;
+            let retired = db.query_opt(
+                "update instances set state = 'removed' where sandbox = (select sandbox from instances
+                   where app = ?1 and release = ?2 and state = 'lost' order by sandbox limit 1) returning sandbox",
+                &[&app.name, &release],
+            )?;
+            if let Some(r) = retired {
+                db.execute("update sandboxes set state = 'removed' where id = ?1", &[&r.get::<String>(0)])?;
+            }
+        }
+    }
+    log.extend(launched.errors);
+    log_shared_placement(c, &app.name, &mut log)?;
+    c.db.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .execute("update releases set log = log || char(10) || ?3 where app = ?1 and n = ?2", &[&app.name, &release, &log.join("\n")])?;
+    eprintln!("rekcod: {} r{release}: restored {added} of {missing} missing instance(s)", app.name);
+    retire_drained(c, app, release)?;
+    if added < missing {
+        let mut alerted = c.short_alerted.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !alerted.contains_key(&app.name) {
+            alerted.insert(app.name.clone(), ());
+            drop(alerted);
+            c.alert(&format!(
+                "{} r{release}: restored {added} of {missing} missing instance(s); insufficient capacity or healthy nodes",
+                app.short
+            ));
+        }
+    } else {
+        c.short_alerted.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&app.name);
+    }
+    Ok(added)
+}
+
+fn retire_drained(c: &Arc<Controller>, app: &App, release: i32) -> Result<()> {
+    let old = {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let total: i64 = db
+            .query_one("select count(*) from instances where app = ?1 and release = ?2 and state = 'live'", &[&app.name, &release])?
+            .get(0);
+        let surplus = (total - i64::from(app.instances.max(1))).max(0);
+        let rows = db.query(
+            "update instances set state = 'draining' where sandbox in
+               (select i.sandbox from instances i join nodes n on n.id = i.node where i.app = ?1 and i.release = ?2
+                 and i.state = 'live' and n.state = 'drain' order by i.sandbox limit ?3) returning node, sandbox",
+            &[&app.name, &release, &surplus],
+        )?;
+        rows.into_iter().map(|r| (r.get::<String>(0), r.get::<String>(1))).collect::<Vec<_>>()
+    };
+    if !old.is_empty() {
+        let c = c.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(c.drain_secs));
+            for (node, sb) in old {
+                delete_instance(&c, &node, &sb);
+            }
+        });
+    }
+    Ok(())
+}
+
+fn drain_node(c: &Arc<Controller>, id: &str) -> Result<Value> {
+    {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if db.execute("update nodes set state = 'drain' where id = ?1", &[&id])? == 0 {
+            bail!("no node {id}");
+        }
+    }
+    // A deploy can have selected this Mac before the drain, but not registered its VM yet.
+    // Stop placement first, then wait for those app operations before inspecting instances.
+    let locks: Vec<_> = c.busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().cloned().collect();
+    for lock in locks {
+        drop(lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner));
+    }
+    let apps =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select distinct app from instances where node = ?1 and state in ('live', 'sleeping', 'starting')", &[&id])?;
+    let mut errors = Vec::new();
+    for r in apps {
+        let name: String = r.get(0);
+        let Some(app) = load_app_key(c, &name)? else { continue };
+        // Explicit maintenance can wake a sleeping app to move it off this Mac.
+        let sleeping =
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_opt("select 1 from instances where app = ?1 and state = 'sleeping'", &[&name])?
+                .is_some();
+        if sleeping && let Err(e) = wake(c, &app) {
+            errors.push(format!("{name}: {e:#}"));
+            continue;
+        }
+        let lock = c.app_lock(&name);
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = top_up_locked(c, &app) {
+            errors.push(format!("{name}: {e:#}"));
+        }
+    }
+    let remaining: i64 =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select count(*) from instances where node = ?1 and state in ('live', 'sleeping')", &[&id])?
+            .get(0);
+    Ok(json!({"drained":id, "remaining_instances":remaining, "errors":errors}))
+}
+
 /// Start instances on distinct nodes where possible, wait for health, switch routes, drain
 /// the old ones. The caller holds the app's lock.
 fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> Result<Value> {
@@ -2869,108 +3276,15 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
             &[&app.name, &n, &state, &now(), &log.join("\n")],
         );
     };
-    let nodes = c.place(app.memory_gib as i64 * 1024, false, &app.ns)?;
-    if nodes.is_empty() {
-        log.push(format!("no node has {} GiB free", app.memory_gib));
-        finish("failed", &log);
-        bail!("no node has {} GiB free", app.memory_gib);
-    }
-    log.push(format!(
-        "placing {} instance(s) on {}",
-        app.instances.max(1),
-        nodes.iter().map(|n| n.0.as_str()).collect::<Vec<_>>().join(", ")
-    ));
-    let mut env = app.env.clone();
-    for (k, v) in app.secrets.as_object().into_iter().flatten() {
-        env[k] = v.clone();
-    }
-    let bucket = bucket_env(c, app).inspect_err(|e| {
-        log.push(format!("bucket: {e:#}"));
-        finish("failed", &log);
-    })?;
-    let storage_endpoint = bucket.iter().find(|(k, _)| *k == "S3_ENDPOINT").map(|(_, v)| v.clone());
-    for (k, v) in bucket {
-        env[k] = json!(v);
-    }
-    let mut spec = json!({
-        "app": app.name, "release": n, "port": app.port, "git": {"url": app.git_url, "ref": commit},
-        "cpus": app.cpus, "memory_gib": app.memory_gib, "env": env, "start": app.start, "store": release_store(c, &app.name, &commit),
-        "storage_endpoint": storage_endpoint,
-    });
-    let launch = |i: usize, spec: &Value| {
-        let (node, url, sec) = nodes[i % nodes.len()].clone();
-        let spec = spec.clone();
-        std::thread::spawn(move || (node.clone(), call(&url, "POST", "/instances", Some(&sec), &spec)))
+    let launched = match launch_instances(c, app, n, &commit, app.instances.max(1) as usize, who, &mut log) {
+        Ok(v) => v,
+        Err(e) => {
+            log.push(format!("launch: {e:#}"));
+            finish("failed", &log);
+            return Err(e);
+        }
     };
-    let count = app.instances.max(1) as usize;
-    let mut results = Vec::new();
-    // Not stored yet: the first instance builds and pushes it, the rest load it.
-    if spec["store"]["cached"] == json!(false) && count > 1 {
-        let first = launch(0, &spec).join();
-        if matches!(&first, Ok((_, Ok(v))) if v["pushed"] == json!(true)) {
-            spec["store"]["cached"] = json!(true);
-        }
-        results.push(first);
-    }
-    let handles: Vec<_> = (results.len()..count).map(|i| launch(i, &spec)).collect();
-    results.extend(handles.into_iter().map(|h| h.join()));
-    let mut started = Vec::new();
-    let mut errors = Vec::new();
-    let mut health = app.health.clone();
-    for h in results {
-        match h {
-            Ok((node, Ok(v))) => {
-                log.push(format!(
-                    "{node}: started {} at {}{}",
-                    v["sandbox"].as_str().unwrap_or("?"),
-                    v["endpoint"].as_str().unwrap_or("?"),
-                    if v["pushed"] == json!(true) { " (built, image stored)" } else { "" }
-                ));
-                if let Some(h) = v["health"].as_str().filter(|_| app.health == "/") {
-                    health = h.to_string();
-                }
-                started.push((node, v["sandbox"].as_str().unwrap_or("").to_string(), v["endpoint"].as_str().unwrap_or("").to_string()))
-            }
-            Ok((node, Err(e))) => errors.push(format!("{node}: {e:#}")),
-            Err(_) => errors.push("deploy thread panicked".into()),
-        }
-    }
-    {
-        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        for (node, sb, ep) in &started {
-            db.execute(
-                "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
-                &[sb, node, &who, &now(), &app.ns, &app.cpus, &app.memory_gib],
-            )?;
-            db.execute("insert into instances values (?1, ?2, ?3, ?4, ?5, 'starting')", &[&app.name, &n, sb, node, ep])?;
-        }
-    }
-    if errors.is_empty() {
-        let t0 = Instant::now();
-        let mut pending: Vec<&(String, String, String)> = started.iter().collect();
-        while !pending.is_empty() && t0.elapsed() < Duration::from_secs(30) {
-            pending.retain(|(_, sb, ep)| {
-                let ok = healthy(ep, &health);
-                if ok {
-                    log.push(format!("{sb}: {health} healthy after {:.1}s", t0.elapsed().as_secs_f64()));
-                }
-                !ok
-            });
-            if !pending.is_empty() {
-                std::thread::sleep(Duration::from_millis(300));
-            }
-        }
-        for (node, sb, _) in pending {
-            let logs = c.node(node).and_then(|(url, sec, _)| call(&url, "GET", &format!("/sandboxes/{sb}/logs"), Some(&sec), &Value::Null));
-            let tail = logs
-                .map(|v| {
-                    let lines: Vec<&str> = v["logs"].as_str().unwrap_or("").lines().collect();
-                    lines[lines.len().saturating_sub(10)..].join("\n")
-                })
-                .unwrap_or_default();
-            errors.push(format!("{sb}: health check {health} failed within 30s; last log lines:\n{tail}"));
-        }
-    }
+    let Launched { started, errors, health } = launched;
     if !errors.is_empty() {
         for (node, sb, _) in &started {
             delete_instance(c, node, sb);
@@ -2988,7 +3302,7 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
             "update instances set state = 'draining' where app = ?1 and release <> ?2 and state = 'live' returning node, sandbox",
             &[&app.name, &n],
         )?;
-        db.execute("update instances set state = 'live' where app = ?1 and release = ?2", &[&app.name, &n])?;
+        db.execute("update instances set state = 'live' where app = ?1 and release = ?2 and state = 'starting'", &[&app.name, &n])?;
         // Lost ones of older releases are replaced now; their sandboxes go when their node
         // reports them (it's told to delete what the controller doesn't know).
         db.execute("update instances set state = 'removed' where app = ?1 and release <> ?2 and state = 'lost'", &[&app.name, &n])?;
@@ -2998,6 +3312,7 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
         old.iter().map(|r| (r.get(0), r.get(1))).collect()
     };
     log.push(format!("live; draining {} old instance(s) for {}s", old.len(), c.drain_secs));
+    log_shared_placement(c, &app.name, &mut log)?;
     finish("live", &log);
     let (c2, drain) = (c.clone(), c.drain_secs);
     std::thread::spawn(move || {
@@ -3208,6 +3523,31 @@ fn mask_env(v: &mut Value) {
     }
 }
 
+fn placement_status(c: &Controller, app: &str) -> Result<Value> {
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let rows = db.query(
+        "select i.node, n.zone, count(*) from instances i join nodes n on n.id = i.node
+         join apps a on a.name = i.app where i.app = ?1 and i.release = a.live_release
+           and i.state in ('live', 'sleeping') group by i.node, n.zone order by i.node",
+        &[&app],
+    )?;
+    let mut shared_nodes = Vec::new();
+    let mut zones: std::collections::BTreeMap<String, i64> = Default::default();
+    let mut nodes = Vec::new();
+    for r in rows {
+        let (id, zone, count): (String, String, i64) = (r.get(0), r.get(1), r.get(2));
+        if count > 1 {
+            shared_nodes.push(id.clone());
+        }
+        if !zone.is_empty() {
+            *zones.entry(zone.clone()).or_default() += count;
+        }
+        nodes.push(json!({"node":id, "zone":zone, "instances":count}));
+    }
+    let shared_zones: Vec<String> = zones.into_iter().filter(|(_, n)| *n > 1).map(|(z, _)| z).collect();
+    Ok(json!({"nodes":nodes, "shared_nodes":shared_nodes, "shared_zones":shared_zones}))
+}
+
 fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
     if keys.is_empty() {
         return Ok(vec![]);
@@ -3217,7 +3557,7 @@ fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let apps = db.query(
         &format!(
-            "select name, ns, git_url, git_ref, port, instances, live_release, public, idle_stop, recycle, last_request, http, env, secrets
+            "select name, ns, git_url, git_ref, port, instances, live_release, public, idle_stop, recycle, last_request, http, env, secrets, spread
              from apps where name in ({marks}) order by name"
         ),
         &params,
@@ -3258,6 +3598,7 @@ fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
                 "git": {"url": r.get::<String>(2), "ref": r.get::<String>(3)},
                 "port": r.get::<i32>(4), "instances_wanted": r.get::<i32>(5), "live_release": r.get::<Option<i32>>(6),
                 "public": r.get::<bool>(7), "idle_stop_secs": r.get::<i64>(8), "recycle_secs": r.get::<i64>(9),
+                "spread": r.get::<String>(14), "placement": placement_status(c, &name).unwrap_or(Value::Null),
                 "last_request": r.get::<i64>(10), "http": serde_json::from_str::<Value>(&r.get::<String>(11)).unwrap_or(json!({})),
                 "env": serde_json::from_str::<Value>(&r.get::<String>(12)).unwrap_or(json!({})),
                 "secrets": secrets.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default(),
@@ -3313,6 +3654,10 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
             .query_opt("select instances from apps where name = ?1", &[&name])?
             .map(|r| r.get(0));
     let instances = b["instances"].as_i64().map(|n| n as i32).or(existing).unwrap_or(1);
+    let spread = b["spread"].as_str();
+    if spread.is_some_and(|s| !matches!(s, "soft" | "strict")) {
+        bail!("spread must be soft or strict");
+    }
     let cpus = b["cpus"].as_i64().unwrap_or(1) as i32;
     let mem = b["memory_gib"].as_i64().unwrap_or(1) as i32;
     let health = b["health"].as_str().unwrap_or("/");
@@ -3359,8 +3704,11 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
         db.execute(
             "update apps set git_url = ?2, git_ref = ?3, port = ?4, instances = ?5, cpus = ?6, memory_gib = ?7, health = ?8,
              start = ?9, env = coalesce(?10, env), public = coalesce(?11, public), idle_stop = coalesce(?12, idle_stop),
-             recycle = coalesce(?13, recycle), http = coalesce(?14, http) where name = ?1",
-            &[&name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &public, &idle_stop, &recycle, &http],
+             recycle = coalesce(?13, recycle), http = coalesce(?14, http), spread = coalesce(?15, spread) where name = ?1",
+            &[
+                &name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &public, &idle_stop, &recycle, &http,
+                &spread,
+            ],
         )?;
     } else {
         db.execute(
@@ -3373,6 +3721,9 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
     }
     if let Some(on) = b["bucket"].as_bool() {
         db.execute("update apps set bucket = ?2 where name = ?1", &[&name, &on])?;
+    }
+    if let Some(spread) = spread {
+        db.execute("update apps set spread = ?2 where name = ?1", &[&name, &spread])?;
     }
     Ok(short)
 }
@@ -4475,6 +4826,36 @@ mod tests {
     }
 
     #[test]
+    fn two_edges_add_activity_traffic_clients_and_metrics() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        for t in ["edge-a", "edge-b"] {
+            add_token(&c, t, t, false, "none", true, None);
+        }
+        add_token(&c, "admin", "admin", true, "member", false, None);
+        for name in ["web", "api"] {
+            upsert_app(&c, "default", &Caller::system("test"), &json!({"name":name,"git":{"url":"u"}}), None).unwrap();
+        }
+        let minute = now() / 60 - 1;
+        for (token, host, requests, errors, latency) in [("edge-a", "web.apps.test", 12, 1, 10), ("edge-b", "api.apps.test", 8, 2, 20)] {
+            call(&url, "POST", "/routes/activity", Some(token), &json!({
+                "hosts":[host], "traffic":[{"host":"web.apps.test","minute":minute,"requests":requests,"errors":errors,"p50_ms":latency,"p95_ms":latency*2}],
+                "clients":[{"ip":"203.0.113.9","requests":requests,"limited":errors}],
+            })).unwrap();
+        }
+        let mut db = c.db.lock().unwrap();
+        let r = db.query_one("select requests,errors,p50,p95 from traffic where app = 'web' and minute = ?1", &[&minute]).unwrap();
+        assert_eq!((r.get::<i64>(0), r.get::<i64>(1), r.get::<i64>(2), r.get::<i64>(3)), (20, 3, 20, 40));
+        assert_eq!(db.query_one("select count(*) from apps where last_request > 0", &[]).unwrap().get::<i64>(0), 2);
+        drop(db);
+        let clients = call(&url, "GET", "/edge/clients", Some("admin"), &Value::Null).unwrap();
+        assert_eq!(clients[0]["requests"], 20);
+        assert_eq!(clients[0]["limited"], 3);
+        let text = metrics(&c).unwrap();
+        assert!(text.contains("rekcod_app_requests_last_minute{app=\"web\"} 20"), "{text}");
+        assert!(text.contains("rekcod_app_errors_last_minute{app=\"web\"} 3"), "{text}");
+    }
+
+    #[test]
     fn http_auth_matrix() {
         let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
         add_token(&c, "admin-t", "admin", true, "member", false, None);
@@ -4658,8 +5039,9 @@ mod tests {
             for m in LEGACY_MIGRATIONS {
                 let _ = c.execute(m, []);
             }
-            c.execute_batch(&MIGRATIONS[..MIGRATIONS.len() - 1].join("\n")).unwrap();
-            c.execute_batch(&format!("pragma user_version = {}", MIGRATIONS.len())).unwrap();
+            // The nullable-readings migration is version 5, even after newer migrations exist.
+            c.execute_batch(&MIGRATIONS[..3].join("\n")).unwrap();
+            c.execute_batch("pragma user_version = 4").unwrap();
             c.execute_batch(
                 "insert into nodes (id, url, secret, cpus, load, disk_total, disk_free) values ('old', 'u', 's', 0, 0, 0, 0);
                  insert into nodes (id, url, secret, cpus, load, disk_total, disk_free) values ('new', 'u', 's', 8, 0, 500, 100);",
@@ -4752,6 +5134,357 @@ mod tests {
                 assert!(check_plain_http(bad, "x").is_err(), "{bad}");
             }
         }
+    }
+
+    #[test]
+    fn spread_setting_is_validated_and_preserved() {
+        let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        let put = |spread: Value| {
+            upsert_app(&c, "default", &Caller::system("test"), &json!({"name":"web", "git":{"url":"u"}, "spread":spread}), None)
+        };
+        assert!(put(json!("strcit")).is_err());
+        put(json!("strict")).unwrap();
+        assert!(load_app_key(&c, "web").unwrap().unwrap().strict_spread);
+        put(Value::Null).unwrap();
+        assert!(load_app_key(&c, "web").unwrap().unwrap().strict_spread);
+        put(json!("soft")).unwrap();
+        assert!(!load_app_key(&c, "web").unwrap().unwrap().strict_spread);
+    }
+
+    // Only VM creation is simulated: controller SQL, placement, HTTP and health checks are real.
+    fn instance_node(c: &Controller, id: &str, free: i64, fail_launch: bool) -> String {
+        node_fixture(c, id, free, if fail_launch { TestNode::LaunchFailure } else { TestNode::Ready })
+    }
+
+    #[derive(Clone, Copy)]
+    enum TestNode {
+        Ready,
+        LaunchFailure,
+        Unhealthy,
+        Malformed,
+    }
+
+    fn node_fixture(c: &Controller, id: &str, free: i64, mode: TestNode) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = l.local_addr().unwrap().to_string();
+        let url = format!("http://{endpoint}");
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into nodes (id, url, secret, mem_free, mem_total, last_seen) values (?1, ?2, 's', ?3, ?3, ?4)",
+                &[&id, &url, &free, &now()],
+            )
+            .unwrap();
+        let ep = if matches!(mode, TestNode::Unhealthy) { "127.0.0.1:0".into() } else { endpoint.clone() };
+        let id = id.to_string();
+        std::thread::spawn(move || {
+            let mut count = 0;
+            for s in l.incoming().flatten() {
+                let mut r = BufReader::new(s);
+                let req = crate::sandbox_api::read_request(&mut r).unwrap();
+                let (code, body) = if req.method == "POST" && req.path == "/instances" {
+                    if matches!(mode, TestNode::LaunchFailure) {
+                        (500, json!({"error":"node unavailable"}))
+                    } else if matches!(mode, TestNode::Malformed) {
+                        (200, json!({"sandbox":format!("{id}-broken")}))
+                    } else {
+                        count += 1;
+                        (200, json!({"sandbox":format!("{id}-{count}"), "endpoint":ep, "health":"/healthz", "pushed":false}))
+                    }
+                } else {
+                    (200, json!({"logs":"", "ok":true}))
+                };
+                let _ = respond(r.get_mut(), code, "application/json", body.to_string().as_bytes());
+            }
+        });
+        endpoint
+    }
+
+    fn recovery_app(c: &Controller, instances: i32) -> App {
+        upsert_app(
+            c,
+            "default",
+            &Caller::system("test"),
+            &json!({"name":"web", "git":{"url":"u"}, "instances":instances, "health":"/healthz"}),
+            None,
+        )
+        .unwrap();
+        let mut db = c.db.lock().unwrap();
+        db.execute("insert into releases (app, n, commit_sha, state, created) values ('web', 7, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'live', 0)", &[]).unwrap();
+        db.execute("update apps set live_release = 7 where name = 'web'", &[]).unwrap();
+        drop(db);
+        load_app_key(c, "web").unwrap().unwrap()
+    }
+
+    #[test]
+    fn top_up_keeps_survivors_release_and_partial_progress() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let ep = instance_node(&c, "n1", 0, false);
+        instance_node(&c, "n2", 1024, false);
+        let app = recovery_app(&c, 3);
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("insert into instances values ('web', 7, 'survivor', 'n1', ?1, 'live'), ('web', 7, 'lost1', 'gone', 'ep', 'lost'), ('web', 7, 'lost2', 'gone', 'ep', 'lost')", &[&ep]).unwrap();
+            db.execute("insert into sandboxes (id, node, owner, state, created) values ('survivor', 'n1', 'a', 'running', 0), ('lost1', 'gone', 'a', 'lost', 0), ('lost2', 'gone', 'a', 'lost', 0)", &[]).unwrap();
+        }
+        assert_eq!(top_up_locked(&c, &app).unwrap(), 1);
+        let mut db = c.db.lock().unwrap();
+        let row = db.query_one("select count(*), min(release), max(release) from instances where state = 'live'", &[]).unwrap();
+        assert_eq!((row.get::<i64>(0), row.get::<i32>(1), row.get::<i32>(2)), (2, 7, 7));
+        assert_eq!(db.query_one("select state from instances where sandbox = 'survivor'", &[]).unwrap().get::<String>(0), "live");
+        assert_eq!(db.query_one("select count(*) from releases", &[]).unwrap().get::<i64>(0), 1);
+        assert_eq!(db.query_one("select count(*) from instances where state = 'lost'", &[]).unwrap().get::<i64>(0), 1);
+        assert_eq!(db.query_one("select count(*) from sandboxes where state = 'removed'", &[]).unwrap().get::<i64>(0), 1);
+    }
+
+    #[test]
+    fn deploy_retries_a_failed_node_without_discarding_good_instances() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        instance_node(&c, "bad", 8192, true);
+        instance_node(&c, "good", 4096, false);
+        let app = recovery_app(&c, 2);
+        let v = deploy_locked(&c, &app, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()), "test").unwrap();
+        assert_eq!(v["release"], 8);
+        assert_eq!(v["instances"].as_array().unwrap().len(), 2);
+        assert!(v["instances"].as_array().unwrap().iter().all(|v| v["node"] == "good"));
+        let detail = app_details(&c, &["web".into()]).unwrap();
+        assert_eq!(detail[0]["placement"]["shared_nodes"], json!(["good"]));
+        let log: String = c.db.lock().unwrap().query_one("select log from releases where app = 'web' and n = 8", &[]).unwrap().get(0);
+        assert!(log.contains("replicas share Mac good"));
+    }
+
+    #[test]
+    fn health_retry_never_routes_the_deleted_instance() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        node_fixture(&c, "unhealthy", 8192, TestNode::Unhealthy);
+        let good = instance_node(&c, "good", 4096, false);
+        let app = recovery_app(&c, 1);
+        deploy_locked(&c, &app, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()), "test").unwrap();
+        let r: HashMap<String, Route> = serde_json::from_value(routes(&c).unwrap()).unwrap();
+        assert_eq!(r["web.apps.test"].endpoints, vec![good]);
+        assert_eq!(
+            c.db.lock().unwrap().query_one("select state from instances where sandbox = 'unhealthy-1'", &[]).unwrap().get::<String>(0),
+            "removed"
+        );
+    }
+
+    #[test]
+    fn malformed_node_reply_keeps_successful_partial_recovery_live() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let good = node_fixture(&c, "a-good", 1024, TestNode::Ready);
+        node_fixture(&c, "z-bad", 1024, TestNode::Malformed);
+        let app = recovery_app(&c, 2);
+        assert_eq!(top_up_locked(&c, &app).unwrap(), 1);
+        let r: HashMap<String, Route> = serde_json::from_value(routes(&c).unwrap()).unwrap();
+        assert_eq!(r["web.apps.test"].endpoints, vec![good]);
+        assert_eq!(
+            c.db.lock().unwrap().query_one("select count(*) from instances where state = 'starting'", &[]).unwrap().get::<i64>(0),
+            0
+        );
+    }
+
+    #[test]
+    fn strict_recovery_does_not_reclaim_an_occupied_zone() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        recovery_app(&c, 3);
+        for (id, zone, state) in [("survivor", "c", "live"), ("replacement", "b", "live"), ("returning", "b", "lost")] {
+            let ep = instance_node(&c, id, 0, false);
+            let mut db = c.db.lock().unwrap();
+            db.execute("update nodes set zone = ?2 where id = ?1", &[&id, &zone]).unwrap();
+            db.execute("insert into instances values ('web', 7, ?1, ?1, ?2, ?3)", &[&id, &ep, &state]).unwrap();
+        }
+        c.db.lock().unwrap().execute("update apps set spread = 'strict' where name = 'web'", &[]).unwrap();
+        reconcile(&c).unwrap();
+        let mut db = c.db.lock().unwrap();
+        assert_eq!(db.query_one("select count(*) from instances where state = 'live'", &[]).unwrap().get::<i64>(0), 2);
+        assert_eq!(db.query_one("select state from instances where sandbox = 'returning'", &[]).unwrap().get::<String>(0), "lost");
+    }
+
+    #[test]
+    fn strict_deploy_preserves_previous_release_if_spreading_is_impossible() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let ep = instance_node(&c, "only", 8192, false);
+        recovery_app(&c, 2);
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("update apps set spread = 'strict' where name = 'web'", &[]).unwrap();
+            db.execute("insert into instances values ('web', 7, 'old', 'only', ?1, 'live')", &[&ep]).unwrap();
+        }
+        let app = load_app_key(&c, "web").unwrap().unwrap();
+        assert!(deploy_locked(&c, &app, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()), "test").is_err());
+        let mut db = c.db.lock().unwrap();
+        assert_eq!(db.query_one("select live_release from apps where name = 'web'", &[]).unwrap().get::<i32>(0), 7);
+        assert_eq!(db.query_one("select state from instances where sandbox = 'old'", &[]).unwrap().get::<String>(0), "live");
+        assert_eq!(db.query_one("select count(*) from instances where release = 8 and state <> 'removed'", &[]).unwrap().get::<i64>(0), 0);
+    }
+
+    #[test]
+    fn three_replica_deploy_uses_three_nodes() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        for id in ["a", "b", "c"] {
+            instance_node(&c, id, 8192, false);
+        }
+        let app = recovery_app(&c, 3);
+        deploy_locked(&c, &app, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into()), "test").unwrap();
+        let mut db = c.db.lock().unwrap();
+        assert_eq!(
+            db.query_one("select count(distinct node) from instances where app = 'web' and state = 'live'", &[]).unwrap().get::<i64>(0),
+            3
+        );
+    }
+
+    #[test]
+    fn top_up_skips_sleeping_apps_and_is_idempotent_when_full() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        instance_node(&c, "n1", 4096, false);
+        let app = recovery_app(&c, 1);
+        c.db.lock().unwrap().execute("insert into instances values ('web', 7, 'asleep', 'n1', 'ep', 'sleeping')", &[]).unwrap();
+        assert_eq!(top_up_locked(&c, &app).unwrap(), 0);
+        c.db.lock().unwrap().execute("update instances set state = 'removed'", &[]).unwrap();
+        assert_eq!(top_up_locked(&c, &app).unwrap(), 1);
+        assert_eq!(top_up_locked(&c, &app).unwrap(), 0);
+    }
+
+    #[test]
+    fn drain_waits_for_deployments_that_already_selected_the_node() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let ep = instance_node(&c, "drainme", 2048, false);
+        instance_node(&c, "replacement", 2048, false);
+        recovery_app(&c, 1);
+        let lock = c.app_lock("web");
+        let guard = lock.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let cc = c.clone();
+        std::thread::spawn(move || {
+            tx.send(drain_node(&cc, "drainme")).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let state: String = c.db.lock().unwrap().query_one("select state from nodes where id = 'drainme'", &[]).unwrap().get(0);
+            if state == "drain" {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        let premature = rx.recv_timeout(Duration::from_millis(50));
+        // The in-flight deployment registers its chosen instance before releasing the lock.
+        c.db.lock().unwrap().execute("insert into instances values ('web', 7, 'original', 'drainme', ?1, 'live')", &[&ep]).unwrap();
+        drop(guard);
+        assert!(premature.is_err(), "drain must wait for a deployment before declaring the Mac empty");
+        let result = rx.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
+        assert_eq!(result["remaining_instances"], 0);
+        assert_eq!(
+            c.db.lock().unwrap().query_one("select node from instances where state = 'live'", &[]).unwrap().get::<String>(0),
+            "replacement"
+        );
+    }
+
+    #[test]
+    fn drain_keeps_routes_until_capacity_exists_then_moves_without_new_release() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let ep = instance_node(&c, "drainme", 2048, false);
+        let app = recovery_app(&c, 1);
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("insert into instances values ('web', 7, 'original', 'drainme', ?1, 'live')", &[&ep]).unwrap();
+            db.execute("insert into sandboxes (id, node, owner, state, created) values ('original', 'drainme', 'a', 'running', 0)", &[])
+                .unwrap();
+        }
+        let v = drain_node(&c, "drainme").unwrap();
+        assert_eq!(v["remaining_instances"], 1);
+        let routes: HashMap<String, Route> = serde_json::from_value(routes(&c).unwrap()).unwrap();
+        assert_eq!(routes["web.apps.test"].endpoints, vec![ep]);
+        instance_node(&c, "replacement", 2048, false);
+        assert_eq!(top_up_locked(&c, &app).unwrap(), 1);
+        let mut db = c.db.lock().unwrap();
+        assert_eq!(db.query_one("select count(*) from instances where state = 'live'", &[]).unwrap().get::<i64>(0), 1);
+        assert_eq!(db.query_one("select node from instances where state = 'live'", &[]).unwrap().get::<String>(0), "replacement");
+        assert_eq!(db.query_one("select count(*) from releases", &[]).unwrap().get::<i64>(0), 1);
+    }
+
+    #[test]
+    fn returning_worker_does_not_revive_replaced_replicas() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let ep = instance_node(&c, "returning", 0, false);
+        instance_node(&c, "replacement", 1024, false);
+        let app = recovery_app(&c, 1);
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("update nodes set state = 'lost' where id = 'returning'", &[]).unwrap();
+            db.execute("insert into instances values ('web', 7, 'old', 'returning', ?1, 'lost')", &[&ep]).unwrap();
+            db.execute("insert into sandboxes (id, node, owner, state, created) values ('old', 'returning', 'a', 'lost', 0)", &[]).unwrap();
+        }
+        assert_eq!(top_up_locked(&c, &app).unwrap(), 1);
+        c.db.lock().unwrap().execute("update nodes set state = 'ready' where id = 'returning'", &[]).unwrap();
+        reconcile(&c).unwrap();
+        let mut db = c.db.lock().unwrap();
+        assert_eq!(db.query_one("select count(*) from instances where state = 'live'", &[]).unwrap().get::<i64>(0), 1);
+        assert_eq!(db.query_one("select state from instances where sandbox = 'old'", &[]).unwrap().get::<String>(0), "removed");
+    }
+
+    #[test]
+    fn assignment_spreads_reserves_memory_and_honours_zones() {
+        let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        {
+            let mut db = c.db.lock().unwrap();
+            for (id, free, zone) in [("n1", 2048i64, "a"), ("n2", 8192, "a"), ("n3", 1024, "b")] {
+                db.execute(
+                    "insert into nodes (id, url, secret, mem_free, last_seen, zone) values (?1, 'u', 's', ?2, ?3, ?4)",
+                    &[&id, &free, &now(), &zone],
+                )
+                .unwrap();
+            }
+        }
+        upsert_app(&c, "default", &Caller::system("test"), &json!({"name":"web", "git":{"url":"u"}}), None).unwrap();
+        let app = load_app_key(&c, "web").unwrap().unwrap();
+        let mut placement = c.assignment(&app, 1, &[]).unwrap();
+        let mut ids = Vec::new();
+        while let Some(i) = placement.pick(1024, false) {
+            ids.push(placement.nodes[i].id.clone());
+        }
+        assert_eq!(&ids[..3], ["n2", "n3", "n1"], "spread zones, then nodes, before sharing");
+        assert_eq!(ids.len(), 11, "each assignment consumes memory");
+        let mut placement = c.assignment(&app, 1, &[]).unwrap();
+        let first = placement.pick(1024, true).unwrap();
+        assert_eq!(placement.nodes[first].id, "n2");
+        let second = placement.pick(1024, true).unwrap();
+        assert_eq!(placement.nodes[second].id, "n3");
+        assert!(placement.pick(1024, true).is_none(), "strict refuses a shared zone");
+    }
+
+    #[test]
+    fn assignment_counts_survivors_and_excludes_unavailable_nodes_and_other_pools() {
+        let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        {
+            let mut db = c.db.lock().unwrap();
+            for (id, state, seen) in [
+                ("survivor", "ready", now()),
+                ("empty", "ready", now()),
+                ("drained", "drain", now()),
+                ("stale", "ready", 0),
+                ("pending", "pending", now()),
+                ("pooled", "ready", now()),
+                ("excluded", "ready", now()),
+            ] {
+                db.execute(
+                    "insert into nodes (id, url, secret, mem_free, last_seen, state) values (?1, 'u', 's', 2048, ?2, ?3)",
+                    &[&id, &seen, &state],
+                )
+                .unwrap();
+            }
+            db.execute("insert into node_pools values ('pooled', 'team')", &[]).unwrap();
+            db.execute("insert into instances values ('web', 7, 'keep', 'survivor', 'ep', 'live')", &[]).unwrap();
+        }
+        upsert_app(&c, "default", &Caller::system("test"), &json!({"name":"web", "git":{"url":"u"}}), None).unwrap();
+        let app = load_app_key(&c, "web").unwrap().unwrap();
+        let mut placement = c.assignment(&app, 7, &["excluded".into()]).unwrap();
+        let i = placement.pick(1024, true).unwrap();
+        assert_eq!(placement.nodes[i].id, "empty");
+        assert!(placement.pick(1024, true).is_none(), "the survivor already occupies its failure domain");
+        let mut fresh_release = c.assignment(&app, 8, &["excluded".into()]).unwrap();
+        assert!(fresh_release.pick(1024, true).is_some(), "old release doesn't block a rolling deploy");
+        assert!(fresh_release.pick(1024, true).is_some());
     }
 
     #[test]

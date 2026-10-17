@@ -16,10 +16,15 @@ No Docker engine is needed. The guest image builds inside a running rekcod VM.
 git config core.hooksPath .githooks   # once per clone: fmt, clippy and tests before each commit
 scripts/build.sh --host-only          # target/release/rekcod (signed) and the agent
 scripts/build.sh                      # also out/guest; needs `rekcod start` first
+scripts/link.sh                       # once: ~/.local/bin/rekcod -> target/release/rekcod
 ```
 
-`target/release/rekcod` uses `out/guest` when it exists. Guest builds are described in
-[docs/guest-build.md](docs/guest-build.md); its downloads are pinned in `guest/versions.env`.
+`scripts/link.sh` links `~/.local/bin/rekcod` (or `DIR=...`) to `target/release/rekcod`, so every
+later build is the `rekcod` on your PATH. It won't replace a real binary there, and
+`--remove` takes the link away.
+
+`target/release/rekcod` uses `out/guest` when it exists, through the link too. Guest builds
+are described in [docs/guest-build.md](docs/guest-build.md); its downloads are pinned in `guest/versions.env`.
 
 Don't re-sign `target/release/rekcod` in place while a VM runs from it: macOS kills the
 daemon. `scripts/build.sh` and `scripts/package.sh` sign a copy and move it in.

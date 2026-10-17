@@ -673,6 +673,7 @@ See `docs/guest-build.md`.
 scripts/build.sh                                   # host binary (signed), agent, out/guest
 KERNEL=alpine scripts/build.sh                     # Alpine's stock linux-virt instead
 scripts/build.sh --host-only                       # skip the guest image
+scripts/link.sh                                    # put this build on PATH as ~/.local/bin/rekcod (once)
 scripts/package.sh                                 # release tarballs + SHA256SUMS in out/release
 ```
 

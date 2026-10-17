@@ -4,7 +4,7 @@
 //! your Mac and adds the remote it prints.
 
 use std::io::{IsTerminal, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -67,10 +67,60 @@ fn auto_login_user() -> Option<String> {
     (o.status.success() && !u.is_empty()).then_some(u)
 }
 
+fn filevault_on() -> bool {
+    Command::new("fdesetup").arg("status").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("FileVault is On"))
+}
+
+/// What happens after a reboot or power cut. Daemons start once macOS is up, which with
+/// FileVault on waits for someone to unlock the disk. Agents also need a login: rekcod
+/// doesn't switch automatic login on itself (that takes the user's password), so it says
+/// what's in the way and opens the setting.
+fn after_reboot(daemons: bool, exe: &Path) {
+    if daemons {
+        if filevault_on() {
+            eprintln!(
+                "rekcod: the services start at boot, but FileVault holds a cold boot at its unlock screen until someone \
+                 types the password there. For a restart you plan: `rekcod host restart NAME` from your Mac"
+            );
+        }
+        return;
+    }
+    eprintln!(
+        "rekcod: without sudo the services are LaunchAgents, which wait for a login after a reboot. To start them at boot \
+         with nobody logged in: sudo {} server at-boot",
+        exe.display()
+    );
+    if auto_login_user().is_some() {
+        return;
+    }
+    let user = std::env::var("USER").unwrap_or_else(|_| "you".into());
+    if filevault_on() {
+        eprintln!(
+            "rekcod: FileVault is on, and macOS never logs in automatically while it is. After a reboot or power cut \
+             nothing runs until {user} logs in at this Mac's screen. To come back on its own: `sudo fdesetup disable` \
+             (the disk is then readable by whoever holds the Mac; decrypting takes a while), then turn on automatic \
+             login in System Settings › Users & Groups"
+        );
+        return;
+    }
+    eprintln!(
+        "rekcod: automatic login is off, so after a reboot nothing runs until {user} logs in. Turn it on in \
+         System Settings › Users & Groups › Automatic login (opened on this Mac's screen), or: \
+         sudo sysadminctl -autologin set -userName {user} -password <{user}'s password>"
+    );
+    let _ = Command::new("open")
+        .arg("x-apple.systempreferences:com.apple.Users-Groups-Settings.extension")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+fn can_sudo() -> bool {
+    std::io::stdin().is_terminal() || Command::new("sudo").args(["-n", "true"]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
 fn power() {
-    let can_sudo = std::io::stdin().is_terminal()
-        || Command::new("sudo").args(["-n", "true"]).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-    if !can_sudo {
+    if !can_sudo() {
         eprintln!("rekcod: skipped `sudo {}` (sudo needs a terminal); run it once so the lid can stay shut", PMSET.join(" "));
         return;
     }
@@ -78,6 +128,52 @@ fn power() {
     match Command::new("sudo").args(PMSET).status() {
         Ok(s) if s.success() => eprintln!("rekcod: never sleeps, lid shut or not; boots again after a power cut"),
         _ => eprintln!("rekcod: pmset failed; the Mac sleeps when its lid shuts"),
+    }
+}
+
+const SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
+
+/// `socketfilterfw` arguments that let `exe` take connections from other Macs.
+fn firewall_allow(exe: &str) -> [Vec<String>; 2] {
+    [vec![SOCKETFILTERFW.into(), "--add".into(), exe.into()], vec![SOCKETFILTERFW.into(), "--unblockapp".into(), exe.into()]]
+}
+
+/// Whether `--listapps` output has `exe` with "Allow incoming connections" (the line after
+/// its path). `--getappblocked` is no use: it says "permitted" for apps it has never seen.
+fn firewall_allows(listapps: &str, exe: &str) -> bool {
+    let mut lines = listapps.lines();
+    while let Some(l) = lines.next() {
+        if l.trim().split_once(" : ").is_some_and(|(_, p)| p.trim() == exe) {
+            return lines.next().is_some_and(|n| n.contains("Allow incoming"));
+        }
+    }
+    false
+}
+
+/// With the application firewall on, other Macs' connections to the controller and edge
+/// are accepted and then get no data back.
+fn firewall(exe: &Path) {
+    let out = |arg: &str| Command::new(SOCKETFILTERFW).arg(arg).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    if !out("--getglobalstate").is_ok_and(|s| s.contains("enabled")) {
+        return;
+    }
+    let exe = exe.display().to_string();
+    if out("--listapps").is_ok_and(|s| firewall_allows(&s, &exe)) {
+        return;
+    }
+    let cmds = firewall_allow(&exe);
+    if !can_sudo() {
+        let line = cmds.iter().map(|c| format!("sudo {}", c.join(" "))).collect::<Vec<_>>().join(" && ");
+        eprintln!(
+            "rekcod: the firewall is on and blocks other Macs from the controller and edge; run once (sudo needs a terminal):\n  {line}"
+        );
+        return;
+    }
+    eprintln!("rekcod: the firewall is on; letting {exe} accept connections");
+    for c in &cmds {
+        if !Command::new("sudo").args(c).stdout(Stdio::null()).status().is_ok_and(|s| s.success()) {
+            eprintln!("rekcod: `sudo {}` failed; other Macs can't reach this one", c.join(" "));
+        }
     }
 }
 
@@ -137,6 +233,11 @@ pub fn layout(net: &Net) -> Layout {
     }
 }
 
+/// Whether `ip` is on one of this Mac's interfaces.
+fn assigned(ip: &str) -> bool {
+    ip.parse::<std::net::IpAddr>().is_ok_and(|a| std::net::UdpSocket::bind((a, 0)).is_ok())
+}
+
 /// `--addr`, else the Tailscale address, else (or with `--lan`) Bonjour.
 fn pick_net(addr: Option<&str>, lan: bool) -> Net {
     if let Some(a) = addr {
@@ -149,7 +250,9 @@ fn pick_net(addr: Option<&str>, lan: bool) -> Net {
     let o = Command::new(&ts).args(["ip", "-4"]).output();
     let ip =
         o.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string());
-    match ip.filter(|i| !i.is_empty()) {
+    // `tailscale ip` still prints the old address while Tailscale is stopped; listening on
+    // it then fails with "Can't assign requested address".
+    match ip.filter(|i| !i.is_empty() && assigned(i)) {
         Some(ip) => {
             // The tailnet DNS name goes into the controller's certificate, so remotes can use it.
             let name =
@@ -157,7 +260,7 @@ fn pick_net(addr: Option<&str>, lan: bool) -> Net {
             Net::Tailnet { ip, name }
         }
         None => {
-            eprintln!("rekcod: no Tailscale address; the fleet goes on the LAN and is found over Bonjour (docs/lan-discovery.md)");
+            eprintln!("rekcod: no Tailscale address up; the fleet goes on the LAN and is found over Bonjour (docs/lan-discovery.md)");
             Net::Lan
         }
     }
@@ -167,11 +270,20 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
     let exe = std::env::current_exe()?.canonicalize()?;
     let net = pick_net(addr, lan);
     let l = layout(&net);
-    if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_none() && !gui_session() {
+    let dry = std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some();
+    // LaunchDaemons start at boot with nobody logged in; they need root to install.
+    // Without it, LaunchAgents, which need a login (docs/server.md).
+    let daemons = !dry && crate::service::can_install_daemons();
+    if daemons {
+        // SAFETY: nothing else runs yet; the children `run` starts read it to install
+        // their jobs as daemons too.
+        unsafe { std::env::set_var("REKCOD_LAUNCHD", "system") };
+    } else if !dry && !gui_session() {
         bail!(
-            "nobody is logged in on this Mac's screen, and LaunchAgents need that; turn on automatic login, `sudo reboot`, then run this again"
+            "nobody is logged in on this Mac's screen, and without sudo the services can only be LaunchAgents, which need that; run this in a terminal (sudo makes them LaunchDaemons that start at boot)"
         );
     }
+    firewall(&exe);
     if !no_power {
         power();
     }
@@ -219,6 +331,17 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
         Err(_) => bail!("the controller wrote no CA fingerprint; see {}", paths.home.join("logs/controller.log").display()),
     };
     let url = &l.controller_url;
+    // On a re-run the token and fingerprint files are already there while the controller
+    // restarts on the new binary: wait until it listens.
+    if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_none() {
+        let a: std::net::SocketAddr = crate::fleet::authority(url)?.parse().context("controller address")?;
+        for _ in 0..60 {
+            if std::net::TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
     run(&exe, &["remote", "add", "local", url, "--token", &admin, "--ca-fingerprint", &fp])?;
     // A node that joined on another address (the LAN IP it had, a switch to or from --lan)
     // would serve its old one forever: forget it and join again.
@@ -245,17 +368,17 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
     let edge_token = if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
         "dry-run".to_string()
     } else {
+        // `remote add local` ran in a child process; reading the remotes here trusts its CA.
+        crate::fleet::remotes(paths);
         let v = crate::fleet::call(url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
         v["token"].as_str().context("no edge token")?.to_string()
     };
     run(&exe, &["remote", "add", "edge", url, "--token", &edge_token, "--ca-fingerprint", &fp])?;
     run(&exe, &["edge", "serve", "--remote", "edge", "--listen", &l.edge_listen, "--public-listen", "127.0.0.1:8081", "--install"])?;
 
-    if auto_login_user().is_none() {
-        eprintln!(
-            "rekcod: automatic login is off, so after a reboot nothing runs until someone logs in (System Settings › Users & Groups)"
-        );
-    }
+    // The docker VM, so docker over SSH works after a reboot too.
+    run(&exe, &["start", "--install"])?;
+    after_reboot(daemons, &exe);
     let (on, remote) = match &net {
         Net::Lan => {
             let i = crate::bonjour::instance(&fp);
@@ -279,9 +402,124 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
     Ok(())
 }
 
+/// Reads a line from the terminal without echoing it.
+fn read_password(prompt: &str) -> Result<String> {
+    use std::io::BufRead;
+    use std::os::fd::AsRawFd;
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").context("no terminal to ask for the password")?;
+    let fd = tty.as_raw_fd();
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut old) } != 0 {
+        bail!("can't read the terminal's settings");
+    }
+    let mut quiet = old;
+    quiet.c_lflag &= !libc::ECHO;
+    let mut w = &tty;
+    write!(w, "{prompt}")?;
+    w.flush()?;
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    let mut line = String::new();
+    let r = std::io::BufReader::new(&tty).read_line(&mut line);
+    unsafe { libc::tcsetattr(fd, libc::TCSANOW, &old) };
+    writeln!(w)?;
+    r?;
+    Ok(line.trim_end_matches(['\r', '\n']).to_string())
+}
+
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
+}
+
+/// `fdesetup authrestart -inputplist`'s input: the account that unlocks FileVault.
+fn unlock_plist(user: &str, password: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist version=\"1.0\"><dict><key>Username</key><string>{}</string><key>Password</key><string>{}</string></dict></plist>\n",
+        xml_escape(user),
+        xml_escape(password)
+    )
+}
+
+/// Runs sudo with `input` on stdin (`-S`: the password, or a command's input).
+fn sudo_fed(args: &[&str], input: &str) -> Result<std::process::Output> {
+    let mut child = Command::new("sudo").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    child.stdin.take().context("sudo stdin")?.write_all(input.as_bytes())?;
+    Ok(child.wait_with_output()?)
+}
+
+/// `rekcod server restart`: a reboot the server comes back from on its own. With FileVault
+/// on that's `fdesetup authrestart`, which unlocks the disk once; a plain restart would stop
+/// at the unlock screen. It asks for the password once, checks it with sudo, and gives
+/// fdesetup the same one on stdin (never a file or an argument), so macOS doesn't ask its
+/// three unlabelled questions.
+pub fn restart() -> Result<()> {
+    let user = crate::service::RunAs::current()?.user;
+    let fv = filevault_on();
+    let pw = read_password(&format!("{user}'s login password on this Mac: "))?;
+    if !sudo_fed(&["-S", "-p", "", "-v"], &format!("{pw}\n"))?.status.success() {
+        bail!("that isn't {user}'s password here (sudo refused it); nothing restarted");
+    }
+    if !fv {
+        eprintln!("rekcod: restarting; the services are back about a minute after it boots");
+        let out = Command::new("sudo").args(["-n", "shutdown", "-r", "now"]).output()?;
+        if !out.status.success() {
+            bail!("shutdown -r failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        return Ok(());
+    }
+    let list = Command::new("sudo").args(["-n", "fdesetup", "list"]).output()?;
+    let users = String::from_utf8_lossy(&list.stdout);
+    if !users.lines().any(|l| l.split(',').next() == Some(user.as_str())) {
+        bail!(
+            "{user} can't unlock FileVault on this Mac, so the restart would stop at its unlock screen; accounts that can: {}",
+            users.lines().filter_map(|l| l.split(',').next()).collect::<Vec<_>>().join(", ")
+        );
+    }
+    eprintln!("rekcod: restarting with FileVault unlocked for this one boot; the services are back about a minute after it boots");
+    let out = sudo_fed(&["-n", "fdesetup", "authrestart", "-inputplist"], &unlock_plist(&user, &pw))?;
+    if !out.status.success() {
+        bail!(
+            "fdesetup authrestart failed, nothing restarted: {}{}",
+            String::from_utf8_lossy(&out.stdout).trim(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The jobs `server setup` installs.
+pub const SERVICES: &[&str] = &["storage", "controller", "node", "edge", crate::cli::AUTOSTART];
+
 pub fn uninstall() -> Result<()> {
-    for n in ["edge", "node", "controller", "storage"] {
+    for n in SERVICES.iter().rev() {
         crate::service::uninstall(n)?;
+    }
+    Ok(())
+}
+
+/// `rekcod server at-boot [--user U]`: a server set up without sudo (LaunchAgents, which
+/// wait for a login) switched to LaunchDaemons that start at boot. Root, or sudo.
+pub fn at_boot(user: Option<&str>) -> Result<()> {
+    let is_root = unsafe { libc::geteuid() == 0 };
+    let run_as = match user {
+        Some(u) => crate::service::RunAs::named(u)?,
+        None if is_root => bail!("as root, say whose server this is: --user NAME"),
+        None => crate::service::RunAs::current()?,
+    };
+    if !is_root {
+        // Re-run under sudo: root writes /Library/LaunchDaemons, and it has to read this
+        // user's agents.
+        let exe = std::env::current_exe()?;
+        let st = Command::new("sudo").arg(&exe).args(["server", "at-boot", "--user", &run_as.user]).status()?;
+        if !st.success() {
+            bail!("`sudo rekcod server at-boot` failed");
+        }
+        return Ok(());
+    }
+    let moved = crate::service::agents_to_daemons(&run_as, SERVICES)?;
+    if moved.is_empty() {
+        println!("no rekcod LaunchAgents for {} (already daemons, or not set up: `rekcod server setup`)", run_as.user);
+    } else {
+        println!("{} now start at boot as {}, nobody logged in", moved.join(", "), run_as.user);
     }
     Ok(())
 }
@@ -298,7 +536,9 @@ const FIND: &str = "command -v rekcod || { [ -x ~/.rekcod/bin/rekcod ] && echo ~
 
 /// The server's rekcod, copying this one over when it has none.
 pub fn ensure_binary(dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String]) -> Result<String> {
-    let o = ssh().args(["/bin/zsh", "-lc", FIND]).stdin(Stdio::null()).output()?;
+    eprintln!("rekcod: looking for rekcod on {dest}");
+    // One quoted string: ssh joins its arguments, and the remote shell would split FIND.
+    let o = ssh().arg(format!("/bin/zsh -lc '{FIND}'")).stdin(Stdio::null()).output()?;
     let found = String::from_utf8_lossy(&o.stdout).lines().map(str::trim).find(|l| l.starts_with('/')).map(String::from);
     let exe = std::env::current_exe()?.canonicalize()?;
     if let Some(p) = &found {
@@ -306,8 +546,15 @@ pub fn ensure_binary(dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String])
         // into ~/.rekcod/bin, which FIND prefers next time only if nothing is on PATH.
         let v = ssh().args([p.as_str(), "--version"]).stdin(Stdio::null()).output()?;
         let theirs = String::from_utf8_lossy(&v.stdout).split_whitespace().nth(1).unwrap_or("").to_string();
-        if theirs == env!("CARGO_PKG_VERSION") {
+        // A copy rekcod made is replaced whenever it differs: dev builds all say the same
+        // version. One the user installed is theirs to upgrade.
+        let ours = p.ends_with("/.rekcod/bin/rekcod");
+        if theirs == env!("CARGO_PKG_VERSION") && (!ours || same_file(&exe, &ssh, p)) {
             return Ok(p.clone());
+        }
+        if theirs == env!("CARGO_PKG_VERSION") {
+            eprintln!("rekcod: {dest}'s {p} is another build of {theirs}; copying {} over it", exe.display());
+            return copy_binary(dest, &exe, &ssh, scp_dest);
         }
         eprintln!(
             "rekcod: {dest} has rekcod {theirs} at {p}; copying {} ({}) to ~/.rekcod/bin/rekcod",
@@ -317,17 +564,68 @@ pub fn ensure_binary(dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String])
     } else {
         eprintln!("rekcod: no rekcod on {dest}; copying {} to ~/.rekcod/bin/rekcod", exe.display());
     }
+    copy_binary(dest, &exe, &ssh, scp_dest)
+}
+
+/// Whether the remote file at `p` has the same sha256 as `local`.
+fn same_file(local: &Path, ssh: &impl Fn() -> Command, p: &str) -> bool {
+    let sum = |o: std::process::Output| crate::fetch::parse_shasum(&String::from_utf8_lossy(&o.stdout)).map(str::to_lowercase);
+    let here = Command::new("shasum").args(["-a", "256"]).arg(local).output().ok().and_then(sum);
+    let there = ssh().args(["shasum", "-a", "256", p]).stdin(Stdio::null()).output().ok().and_then(sum);
+    here.is_some() && here == there
+}
+
+const ENTITLEMENTS: &str = include_str!("../../../rekcod.entitlements");
+
+/// `exe`, or a signed copy of it when it lacks the virtualization entitlement (a plain
+/// `cargo build` links it ad hoc without one), so the server's `rekcod start` can boot.
+fn signed(exe: &Path) -> Result<(PathBuf, Option<PathBuf>)> {
+    let o = Command::new("/usr/bin/codesign").args(["-d", "--entitlements", "-"]).arg(exe).output()?;
+    if String::from_utf8_lossy(&o.stdout).contains("com.apple.security.virtualization") {
+        return Ok((exe.to_path_buf(), None));
+    }
+    let dir = std::env::temp_dir().join(format!("rekcod-sign-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let (copy, plist) = (dir.join("rekcod"), dir.join("rekcod.entitlements"));
+    std::fs::copy(exe, &copy)?;
+    std::fs::write(&plist, ENTITLEMENTS)?;
+    let ok = Command::new("/usr/bin/codesign")
+        .args(["--force", "--sign", "-", "--entitlements"])
+        .arg(&plist)
+        .arg(&copy)
+        .stderr(Stdio::null())
+        .status()?
+        .success();
+    if !ok {
+        let _ = std::fs::remove_dir_all(&dir);
+        bail!("{} has no virtualization entitlement and signing a copy failed; run scripts/build.sh", exe.display());
+    }
+    eprintln!("rekcod: {} isn't signed for Virtualization.framework (scripts/build.sh signs it); sending a signed copy", exe.display());
+    Ok((copy, Some(dir)))
+}
+
+fn copy_binary(dest: &str, exe: &Path, ssh: &impl Fn() -> Command, scp_dest: &[String]) -> Result<String> {
+    let (exe, tmp) = signed(exe)?;
+    let r = copy_signed(dest, &exe, ssh, scp_dest);
+    if let Some(d) = tmp {
+        let _ = std::fs::remove_dir_all(d);
+    }
+    r
+}
+
+fn copy_signed(dest: &str, exe: &Path, ssh: &impl Fn() -> Command, scp_dest: &[String]) -> Result<String> {
     let ok = ssh().args(["mkdir", "-p", ".rekcod/bin"]).stdin(Stdio::null()).status()?.success();
     let (mut scp, host) = scp_target(dest, scp_dest)?;
     // Copied beside it and renamed over: macOS kills a process whose binary changes under
     // it, and the server's agents run this one.
     if !ok
-        || !scp.arg(&exe).arg(format!("{host}:.rekcod/bin/.rekcod.tmp")).status()?.success()
+        || !scp.arg(exe).arg(format!("{host}:.rekcod/bin/.rekcod.tmp")).status()?.success()
         || !ssh().args(["mv", "-f", ".rekcod/bin/.rekcod.tmp", ".rekcod/bin/rekcod"]).stdin(Stdio::null()).status()?.success()
     {
         bail!("copying rekcod to {dest} failed");
     }
-    let o = ssh().args(["/bin/sh", "-c", "echo $HOME"]).stdin(Stdio::null()).output()?;
+    // One string: ssh joins its arguments, so `sh -c echo $HOME` would run a bare `echo`.
+    let o = ssh().arg("echo $HOME").stdin(Stdio::null()).output()?;
     Ok(format!("{}/.rekcod/bin/rekcod", String::from_utf8_lossy(&o.stdout).trim()))
 }
 
@@ -340,7 +638,7 @@ fn scp_target(dest: &str, scp_dest: &[String]) -> Result<(Command, String)> {
         _ => bail!("bad destination {dest}"),
     };
     let mut scp = Command::new("scp");
-    scp.args(["-q", "-o", "BatchMode=yes"]);
+    scp.args(["-q", "-o", "BatchMode=yes"]).args(crate::host::mux_opts());
     if let Some(p) = port {
         scp.args(["-P", &p]);
     }
@@ -444,6 +742,7 @@ pub fn remote_setup(
     if no_power {
         cmd += " --no-power";
     }
+    eprintln!("rekcod: running `rekcod server setup` on {dest}; sudo there asks for the password of that Mac's account");
     let mut child = ssh.arg(cmd).stdout(Stdio::piped()).spawn().context("run ssh")?;
     let remote = pass_through(child.stdout.take().context("ssh stdout")?, std::io::stdout())?;
     if !child.wait()?.success() {
@@ -470,6 +769,46 @@ mod tests {
         assert_eq!(t.tls_name.as_deref(), Some("mini.tail1.ts.net"));
         assert_eq!((t.node_listen.as_str(), t.bonjour), ("100.64.0.9:7701", false));
         assert_eq!(layout(&Net::Fixed("10.0.0.4".into())).tls_name.as_deref(), Some("10.0.0.4"));
+    }
+
+    /// The test binary has no entitlements, like a plain `cargo build`: what gets sent is a
+    /// signed copy that has the virtualization one.
+    #[test]
+    fn unsigned_binary_is_sent_signed() {
+        let (copy, dir) = signed(&std::env::current_exe().unwrap()).unwrap();
+        let o = Command::new("/usr/bin/codesign").args(["-d", "--entitlements", "-"]).arg(&copy).output().unwrap();
+        assert!(String::from_utf8_lossy(&o.stdout).contains("com.apple.security.virtualization"));
+        let (again, none) = signed(&copy).unwrap();
+        assert_eq!((again, none), (copy, None));
+        std::fs::remove_dir_all(dir.unwrap()).unwrap();
+    }
+
+    /// fdesetup reads the account from stdin; a password with XML in it stays one string.
+    #[test]
+    fn unlock_plist_escapes() {
+        let p = unlock_plist("tim", "a<b&c\"d");
+        assert!(p.contains("<key>Username</key><string>tim</string>"));
+        assert!(p.contains("<key>Password</key><string>a&lt;b&amp;c&quot;d</string>"), "{p}");
+        let f = std::env::temp_dir().join(format!("rekcod-unlock-{}.plist", std::process::id()));
+        std::fs::write(&f, &p).unwrap();
+        let ok = Command::new("plutil").arg("-lint").arg(&f).output().unwrap().status.success();
+        std::fs::remove_file(&f).unwrap();
+        assert!(ok);
+    }
+
+    #[test]
+    fn firewall_list() {
+        let list = "Total number of apps = 2 \n1 : /Users/me/.rekcod/bin/rekcod \n             (Allow incoming connections)\n2 : /Applications/X.app \n             (Block incoming connections)\n";
+        assert!(firewall_allows(list, "/Users/me/.rekcod/bin/rekcod"));
+        assert!(!firewall_allows(list, "/Applications/X.app"));
+        assert!(!firewall_allows(list, "/usr/local/bin/rekcod"));
+    }
+
+    #[test]
+    fn only_local_addresses_are_assigned() {
+        assert!(assigned("127.0.0.1"));
+        assert!(!assigned("192.0.2.1"));
+        assert!(!assigned("not an ip"));
     }
 
     #[test]

@@ -38,7 +38,6 @@ pair=$home/Desktop/rekcod-pair.txt
 
 check() {
   grep -qx "server setup --domain apps.example.com --no-power" "$t/calls" || fail "$1: setup args: $(cat "$t/calls")"
-  grep -qx "start --install" "$t/calls" || fail "$1: no start --install"
   grep -qxF "$want" "$pair" || fail "$1: pair file: $(cat "$pair")"
   [[ $(stat -f %Lp "$pair") == 600 ]] || fail "$1: pair file isn't 0600"
   [[ $(cat "$t/clip") == "$want" ]] || fail "$1: clipboard: $(cat "$t/clip")"
@@ -49,11 +48,13 @@ check() {
 echo old > "$pair" && chmod 644 "$pair"
 run || fail "as user: exited $?"
 check "as user"
+! grep -q "at-boot" "$t/calls" || fail "as user: at-boot without root"
 
 rm -f "$t/calls" "$t/log"
 REKCOD_PKG_TEST_ROOT=1 run || fail "as root: exited $?"
 check "as root"
 grep -q "^pmset -a sleep 0" "$t/calls" || fail "as root: no pmset"
+grep -qx "server at-boot --user tim" "$t/calls" || fail "as root: no at-boot: $(cat "$t/calls")"
 
 # Setup Assistant owns the console: pmset still runs, setup doesn't.
 rm -f "$t/calls"

@@ -319,21 +319,22 @@ rekcod app deploy --remote mini           # http://<server's tailnet name>:8080,
 docker ps                                 # runs on the server too
 ```
 
-The server needs Remote Login, Tailscale on your tailnet and automatic login. Without
+The server needs Remote Login and, ideally, Tailscale on your tailnet. Without
 Tailscale (or with `--lan`) it goes on the LAN and your Mac finds it over Bonjour as
 `https://rekcod-<CA fingerprint>.bonjour`, so a new IP or a renamed Mac doesn't break it
-([`docs/lan-discovery.md`](docs/lan-discovery.md)); `--addr IP` pins one address instead. It needs automatic login
-because the services are LaunchAgents and those only run in a logged-in session. When SSH
+([`docs/lan-discovery.md`](docs/lan-discovery.md)); `--addr IP` pins one address instead. When SSH
 there only takes a password, `host add` creates `~/.rekcod/ssh/id_ed25519` and installs it with
 `ssh-copy-id` (one password prompt), so docker's ssh never has to ask
 ([`docs/ssh-keys.md`](docs/ssh-keys.md)). rekcod doesn't
 have to be installed there: `host add` copies this binary to `~/.rekcod/bin/rekcod` if it's
-missing, and from a dev build it copies the local guest image too. Then it runs `rekcod server setup` over SSH, which installs RustFS, the controller, node and
-edge as LaunchAgents on the Tailscale address and runs `sudo pmset -a sleep 0 disablesleep 1
-autorestart 1` so the lid can shut and a power cut doesn't leave it off (sudo asks for the
-server's password; `--no-power` skips it). It adds the remote `mini` here, then starts the
+missing, and from a dev build it copies the local guest image too. Then it runs `rekcod server setup` over SSH, which installs RustFS, the controller, node,
+edge and the docker VM as LaunchDaemons that run as you and start at boot, nobody logged in.
+It runs `sudo pmset -a sleep 0 disablesleep 1 autorestart 1` so the lid can shut and a power
+cut doesn't leave it off (sudo asks for the server's password once; `--no-power` skips
+pmset). Without sudo they're LaunchAgents, which wait for a login; `rekcod server at-boot`
+moves them to boot later. It adds the remote `mini` here, then starts the
 server's VM and adds the docker host (`--no-docker` skips that). Re-running it is safe.
-`rekcod server uninstall` on the server removes the agents. Details: [`docs/server.md`](docs/server.md). Step-by-step guide: [`docs/self-hosting.md`](docs/self-hosting.md).
+`rekcod server uninstall` on the server removes them. Details: [`docs/server.md`](docs/server.md). Step-by-step guide: [`docs/self-hosting.md`](docs/self-hosting.md).
 
 No SSH yet? Build an installer, AirDrop it to the server and double-click it there:
 
@@ -362,11 +363,12 @@ rekcod host forward mini               # its published ports on 127.0.0.1 here, 
 rekcod host use local                  # back to this Mac's rekcod
 ```
 
-`host add` writes a marked block to that Mac's `~/.zshenv`. For non-interactive SSH only, it
-puts the docker CLI on `PATH` (non-login SSH has no `/opt/homebrew/bin`) and points
-`DOCKER_HOST` at `~/.rekcod/run/docker.sock`, so it doesn't matter which context that Mac
-has active. Its login shell has to be zsh; otherwise `add` prints the two lines to
-add by hand. `forward` follows containers as they start and stop, and reports a port that's
+`host add` writes a marked block to that Mac's `~/.zshenv`. It puts `~/.rekcod/bin` and the
+docker CLI on `PATH` (non-login SSH has no `/opt/homebrew/bin`), so `rekcod` and `docker` work
+in a shell you open there too. For non-interactive SSH it points `DOCKER_HOST` at
+`~/.rekcod/run/docker.sock`, so it doesn't matter which context that Mac has active; when the
+only docker CLI there is rekcod's own, every shell gets that. Its login shell has to be zsh;
+otherwise `add` prints the lines to add by hand. `forward` follows containers as they start and stop, and reports a port that's
 already taken here once instead of retrying it.
 
 Bind mounts (`-v ./src:/app`) are paths on the other Mac, and `docker build` sends its context
@@ -635,8 +637,8 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod edge serve\|ban\|unban\|bans\|uninstall` | HTTP ingress for apps; ban IPs and ranges on every edge |
 | `rekcod app deploy\|ls\|status\|release\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet; `release NAME N` prints one release with its deploy log, `logs --instance ID` one instance's logs (also after a redeploy removed it: the last lines of the 20 newest gone instances are kept) |
 | `rekcod job run\|ls\|logs\|rerun\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every`; `ls --name N` is one job's last 50 runs, `logs -f` follows a running one, `rerun ID` runs a finished one again |
-| `rekcod host add\|ls\|use\|rm\|forward\|refresh` | Another Mac's rekcod as the docker engine, over SSH; `add --server` also provisions it as a fleet (`--lan`: found over Bonjour, `refresh` follows it to a new address) |
-| `rekcod server setup\|uninstall` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, no sleep) |
+| `rekcod host add\|ls\|use\|rm\|forward\|refresh\|restart` | Another Mac's rekcod as the docker engine, over SSH; `add --server` also provisions it as a fleet (`--lan`: found over Bonjour, `refresh` follows it to a new address) |
+| `rekcod server setup\|uninstall\|at-boot\|restart` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, VM, no sleep), started at boot; `at-boot` moves a setup done without sudo from login to boot; `restart` reboots past FileVault once (one password prompt) |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |

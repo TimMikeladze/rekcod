@@ -18,6 +18,10 @@ rekcod host use local                 # back to this Mac's rekcod
 
 ## Pieces
 
+`add` and `add --server` reuse one SSH connection for everything they run on the other Mac
+(`ControlMaster`, socket `~/.rekcod/run/ssh-%C`, kept 60s): a fresh connection is a second or
+more over Wi-Fi, and they run a dozen. Each step prints a line as it starts.
+
 - `rekcod host add NAME DEST [--no-use]`
   1. `ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new DEST true` (records the host key on first use). docker's ssh
      helper can't answer a password prompt, so on `Permission denied` in a terminal it installs
@@ -25,11 +29,14 @@ rekcod host use local                 # back to this Mac's rekcod
      then checks again. `host rm` drops the key's config block.
   2. Finds a docker CLI on that Mac: `command -v docker` in a login shell, else rekcod's
      bundled one under `~/.rekcod/cli/`.
-  3. Writes a marked block to that Mac's `~/.zshenv`, replacing an older one. It applies only
-     to non-interactive SSH sessions, which is what docker's helper uses:
-     `PATH` gets the docker CLI's directory, and `DOCKER_HOST` points at
-     `~/.rekcod/run/docker.sock`. Non-login SSH on macOS has no `/opt/homebrew/bin`, and the
-     Mac's active context can change (`rekcod stop` switches it back), so this pins both.
+  3. Writes a marked block to that Mac's `~/.zshenv`, replacing an older one. `PATH` gets
+     `~/.rekcod/bin` and the docker CLI's directory in every shell, so `rekcod` and `docker`
+     work when you SSH in yourself. For non-interactive SSH, which is what docker's helper
+     uses, `DOCKER_HOST` points at `~/.rekcod/run/docker.sock`. Non-login SSH on macOS has no
+     `/opt/homebrew/bin`, and the Mac's active context can change (`rekcod stop` switches it
+     back), so this pins both. When the docker CLI is rekcod's own (`~/.rekcod/cli/`), there's
+     no other engine on that Mac, so every shell gets `DOCKER_HOST` and
+     `DOCKER_CONFIG=~/.rekcod/docker` (where compose and buildx are).
   4. Creates or updates the docker context `rekcod-NAME` (`host=ssh://DEST`), checks
      `docker --context rekcod-NAME version` reaches the engine, then switches to it.
 - Hosts are the docker contexts named `rekcod-*`. No other state is stored.

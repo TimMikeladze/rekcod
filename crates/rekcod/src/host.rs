@@ -16,24 +16,36 @@ const PREFIX: &str = "rekcod-";
 
 /// Runs on the server in a login shell (so Homebrew's PATH is there) and writes the
 /// `~/.zshenv` block that docker's non-interactive `ssh ... docker system dial-stdio` reads.
-const SETUP: &str = r#"
+/// It also puts rekcod and docker on PATH for a shell you open there, and when the only
+/// docker CLI is rekcod's own, points every shell at rekcod.
+const SETUP: &str = r##"
 case $SHELL in */zsh) ;; *) echo "shell:$SHELL"; exit 3;; esac
 d=$(command -v docker)
-[[ -z $d ]] && d=$(ls -d ~/.rekcod/cli/*/docker 2>/dev/null | tail -1)
+[[ -z $d ]] && d=$(print -l ~/.rekcod/cli/*/docker(N) | tail -1)
 [[ -n $d ]] || { echo nodocker; exit 4; }
 f=~/.zshenv
 touch $f
 sed -i '' '/^# >>> rekcod host/,/^# <<< rekcod host/d' $f
 cat >> $f <<EOF
-# >>> rekcod host (written by rekcod host add): docker over SSH reaches rekcod
+# >>> rekcod host (written by rekcod host add): rekcod and docker on PATH; docker over SSH reaches rekcod
+export PATH="\$HOME/.rekcod/bin:${d:h}:\$PATH"
+EOF
+if [[ $d == $HOME/.rekcod/cli/* ]]; then
+  # rekcod's own docker CLI, so there's no other engine to keep: every shell gets rekcod.
+  cat >> $f <<EOF
+export DOCKER_HOST=unix://\$HOME/.rekcod/run/docker.sock
+export DOCKER_CONFIG=\${DOCKER_CONFIG:-\$HOME/.rekcod/docker}
+EOF
+else
+  cat >> $f <<EOF
 if [[ -n \$SSH_CONNECTION && ! -o interactive ]]; then
-  export PATH="${d:h}:\$PATH"
   export DOCKER_HOST=unix://\$HOME/.rekcod/run/docker.sock
 fi
-# <<< rekcod host
 EOF
+fi
+echo "# <<< rekcod host" >> $f
 echo "docker:$d"
-"#;
+"##;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Host {
@@ -107,7 +119,27 @@ fn ssh(dest: &str) -> Command {
     ssh_opts(dest, &[])
 }
 
+/// One SSH connection for every command `add` runs there: each new one costs a full
+/// handshake (a second or more on Wi-Fi), and `add` runs a dozen. The master lingers 60s.
+pub fn mux_opts() -> Vec<String> {
+    let dir = std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".rekcod/run");
+    let _ = std::fs::create_dir_all(&dir);
+    // %C is a hash of host, port and user; the socket path has to stay under 104 bytes.
+    let path = dir.join("ssh-%C");
+    ["-o", "ControlMaster=auto", "-o", &format!("ControlPath={}", path.display()), "-o", "ControlPersist=60"].map(String::from).into()
+}
+
 fn ssh_opts(dest: &str, extra: &[&str]) -> Command {
+    let mut cmd = Command::new("ssh");
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"])
+        .args(mux_opts())
+        .args(extra)
+        .args(ssh_dest(dest));
+    cmd
+}
+
+/// Without multiplexing: `forward` runs its own master on its own socket.
+fn plain_ssh(dest: &str, extra: &[&str]) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]).args(extra).args(ssh_dest(dest));
     cmd
@@ -158,6 +190,7 @@ fn check(paths: &Paths, name: &str, dest: &str) -> Result<()> {
     if name == "local" || name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("host name must be letters, digits, - or _ (and not `local`)");
     }
+    eprintln!("rekcod: connecting to {dest}");
     let out = ssh(dest).arg("true").stdin(Stdio::null()).output().context("run ssh")?;
     if out.status.success() {
         return Ok(());
@@ -187,9 +220,14 @@ pub fn add_server(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet
         return Ok(());
     }
     // The docker socket only exists while the server's VM runs.
+    eprintln!("rekcod: starting the docker VM on {dest}");
     if !ssh(dest).arg(format!("'{bin}' start")).stdin(Stdio::null()).status()?.success() {
         bail!("`rekcod start` failed on {dest}; the fleet is set up, docker isn't (re-run with --no-docker to skip it)");
     }
+    // Docker over SSH runs a docker CLI there; one that only goes through docker (any
+    // passthrough command) downloads rekcod's when there's none.
+    let _ =
+        ssh(dest).arg(format!("'{bin}' version --format '{{{{.Client.Version}}}}'")).stdin(Stdio::null()).stdout(Stdio::null()).status();
     let authority = crate::fleet::authority(&url)?;
     let lan = match (crate::bonjour::instance_of(&authority), fp) {
         (Some(i), Some(fp)) => Some(Lan { instance: i.into(), fp, host_key: host_key(dest)? }),
@@ -205,6 +243,7 @@ pub fn add(paths: &Paths, name: &str, dest: &str, switch: bool) -> Result<()> {
 fn add_described(paths: &Paths, name: &str, dest: &str, switch: bool, description: &str) -> Result<()> {
     let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
     check(paths, name, dest)?;
+    eprintln!("rekcod: setting up docker over SSH on {dest}");
     let mut child = ssh(dest).args(["/bin/zsh", "-l", "-s"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
     child.stdin.take().context("ssh stdin")?.write_all(SETUP.as_bytes())?;
     let out = child.wait_with_output()?;
@@ -218,7 +257,7 @@ fn add_described(paths: &Paths, name: &str, dest: &str, switch: bool, descriptio
             "{dest}'s login shell is {}, not zsh; add to the file it reads for non-interactive SSH:\n  export PATH=<dir of docker>:$PATH\n  export DOCKER_HOST=unix://$HOME/.rekcod/run/docker.sock",
             stdout.trim().trim_start_matches("shell:")
         ),
-        Some(4) => bail!("no docker CLI on {dest}; run `rekcod start` there once (it downloads one if needed)"),
+        Some(4) => bail!("no docker CLI on {dest}; run `rekcod version` there once (it downloads one)"),
         _ => bail!("setting up {dest} failed: {}", stdout.trim()),
     }
     let ctx = context(name);
@@ -235,6 +274,62 @@ fn add_described(paths: &Paths, name: &str, dest: &str, switch: bool, descriptio
         use_host(paths, name)?;
     }
     Ok(())
+}
+
+/// `rekcod host restart NAME`: runs `rekcod server restart` there (one password prompt),
+/// then waits for the Mac to go down and come back, and for its docker engine to answer.
+pub fn restart(paths: &Paths, name: &str) -> Result<()> {
+    if let Err(e) = refresh(paths, name) {
+        eprintln!("rekcod: {e:#}");
+    }
+    let (hosts, _) = list();
+    let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
+    let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?.to_string();
+    eprintln!("rekcod: connecting to {dest}");
+    let bin = crate::server::ensure_binary(&dest, || ssh(&dest), &ssh_dest(&dest))?;
+    // A Mac can be down and up again between two polls, so "it went down" proves nothing;
+    // a new boot time does.
+    let boot_time = || {
+        let o = Command::new("ssh")
+            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=3", "-o", "ServerAliveInterval=2", "-o", "ServerAliveCountMax=2"])
+            .args(ssh_dest(&dest))
+            .args(["sysctl", "-n", "kern.boottime"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let t = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        (o.status.success() && !t.is_empty()).then_some(t)
+    };
+    let before = boot_time().with_context(|| format!("can't read {name}'s boot time over SSH"))?;
+    // The reboot cuts the connection (ssh exits 255). rekcod refusing there (a wrong
+    // password) exits 1: nothing restarted.
+    let st = ssh_opts(&dest, &["-t"]).arg(format!("'{bin}' server restart")).status()?;
+    if st.code() == Some(1) {
+        bail!("{name} didn't restart");
+    }
+    eprintln!("rekcod: waiting for {name} to come back");
+    let t0 = std::time::Instant::now();
+    let ctx = context(name);
+    let mut booted = false;
+    while t0.elapsed() < Duration::from_secs(600) {
+        std::thread::sleep(Duration::from_secs(3));
+        if !booted {
+            match boot_time() {
+                Some(b) if b != before => {
+                    booted = true;
+                    eprintln!("rekcod: {name} is up again after {}s; waiting for its docker engine", t0.elapsed().as_secs());
+                }
+                Some(_) if t0.elapsed() > Duration::from_secs(90) => bail!("{name} is still on the same boot after 90s; it didn't restart"),
+                _ => continue,
+            }
+        }
+        if let Ok(v) = docker::run_ok(&["--context", &ctx, "version", "--format", "{{.Server.Version}}"]) {
+            println!("{name} is back after {}s: docker engine {v}", t0.elapsed().as_secs());
+            return Ok(());
+        }
+    }
+    bail!("{name} hasn't come back in 10 minutes; with FileVault on it may be waiting at its unlock screen")
 }
 
 /// `user@host[:port]` with the host swapped for `target`.
@@ -400,7 +495,7 @@ pub fn forward(paths: &Paths, name: &str, only: &[u16]) -> Result<()> {
     std::fs::create_dir_all(ctl.parent().unwrap())?;
     let _ = std::fs::remove_file(&ctl);
     let ctl_s = ctl.display().to_string();
-    let child = ssh(&dest).args(["-q", "-M", "-S", &ctl_s, "-N"]).stdin(Stdio::null()).spawn().context("run ssh")?;
+    let child = plain_ssh(&dest, &["-q", "-M", "-S", &ctl_s, "-N"]).stdin(Stdio::null()).spawn().context("run ssh")?;
     let mut master = Master { child, ctl };
     // Kill or a closed Terminal window would otherwise leave the master connection behind.
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {

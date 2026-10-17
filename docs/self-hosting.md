@@ -12,9 +12,9 @@ These need the server's screen or your Apple ID, so rekcod doesn't do them:
 2. Optional: Tailscale, logged in to the same tailnet as your Mac. Then the fleet uses the
    server's tailnet address and works from anywhere on the tailnet. Without it, see
    [On a LAN without Tailscale](#on-a-lan-without-tailscale).
-3. System Settings › Users & Groups › **Automatic login** on. The services are LaunchAgents,
-   which only run in a logged-in session, so without this nothing comes back after a reboot.
-   FileVault blocks automatic login.
+3. Nothing for reboots: step 3 below asks for the server's password once (sudo) and installs
+   the services as LaunchDaemons, which start at boot with nobody logged in. With FileVault
+   on, a cold boot still waits at the unlock screen ([server.md](server.md#starting-at-boot)).
 
 rekcod does **not** need to be installed on the server.
 
@@ -37,9 +37,9 @@ What happens:
 
 1. Copies your `rekcod` binary to `~/.rekcod/bin/rekcod` on the server if it has none. Use a
    release build: a dev build has no embedded guest, and the server's `rekcod start` fails.
-2. Runs `rekcod server setup` there, which installs four LaunchAgents: RustFS storage
-   (`:7710`), the controller (`:7700`), a node (`:7701`) and the edge (`:8080`, public apps on
-   `127.0.0.1:8081`). With Tailscale they listen on its address; without, see below.
+2. Runs `rekcod server setup` there, which installs five LaunchDaemons that run as you:
+   RustFS storage (`:7710`), the controller (`:7700`), a node (`:7701`), the edge (`:8080`,
+   public apps on `127.0.0.1:8081`) and the docker VM. With Tailscale they listen on its address; without, see below.
 3. Runs `sudo pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1` so the lid can shut and
    a power cut doesn't leave it off. sudo asks for the server's password. `--no-power` skips it.
 4. Adds the remote `mini` on your Mac with the admin token.

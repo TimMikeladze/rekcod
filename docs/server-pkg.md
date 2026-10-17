@@ -30,15 +30,16 @@ the log. CI runs it.
 
 ## What postinstall does
 
-Installer runs it as root. The services are LaunchAgents, so they need the user logged in on
-the server's screen; it finds them with `stat -f %Su /dev/console`.
+Installer runs it as root. Setup runs as the user logged in on the server's screen (it finds
+them with `stat -f %Su /dev/console`), then root moves the services to boot.
 
 1. `pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1` (root already, so `server setup`
    gets `--no-power`).
 2. As that user (`launchctl asuser UID sudo -u USER`): `rekcod server setup --domain D
    --no-power`. Tailscale if it's up, otherwise the LAN and Bonjour, as in
    [server.md](server.md).
-3. As that user: `rekcod start --install`, so the docker VM runs at login.
+3. As root: `rekcod server at-boot --user USER`. Setup had no sudo, so its jobs are
+   LaunchAgents; this makes them LaunchDaemons that start at boot, nobody logged in.
 4. Writes `~/Desktop/rekcod-pair.txt` (0600) with `rekcod remote add NAME ...` built from
    setup's last line. NAME is the Mac's LocalHostName in lower case: `Tims-Mac-mini` becomes
    `tims-mac-mini`. It copies that line to the clipboard (Universal Clipboard puts it on
@@ -68,6 +69,6 @@ up). It asks for the password there once to install its key.
 - Signing and notarizing the pkg needs a "Developer ID Installer" certificate, which there
   isn't yet. Unsigned, the server refuses it on the first double-click; System Settings ›
   Privacy & Security › Open Anyway lets it through.
-- Turning on Remote Login and automatic login. Both are system settings I'd rather an
-  installer didn't flip quietly. setup warns when automatic login is off.
+- Turning on Remote Login. It's a system setting I'd rather an installer didn't flip
+  quietly.
 - The server's own web dashboard needs Node, so the pkg doesn't install it.

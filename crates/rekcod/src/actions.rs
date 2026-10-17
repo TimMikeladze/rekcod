@@ -48,6 +48,7 @@ pub enum Kind {
     HostUse,
     HostForward,
     HostRefresh,
+    HostRestart,
     EdgeBan,
     EdgeUnban,
     StorageUp,
@@ -79,7 +80,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 60] = [
+    pub const ALL: [Kind; 61] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -114,6 +115,7 @@ impl Kind {
         Kind::HostUse,
         Kind::HostForward,
         Kind::HostRefresh,
+        Kind::HostRestart,
         Kind::EdgeBan,
         Kind::EdgeUnban,
         Kind::StorageUp,
@@ -1152,6 +1154,14 @@ pub fn host_actions(h: &Hosts) -> Vec<Action> {
     for host in h.all.iter().filter(|h| h.bonjour.is_some()) {
         out.push(Action::rekcod(Kind::HostRefresh, format!("Find {} again on the LAN", host.name), &["host", "refresh", &host.name]));
     }
+    // Interactive: it asks for the password on that Mac.
+    for host in &h.all {
+        out.push(
+            Action::rekcod(Kind::HostRestart, format!("Restart {}", host.name), &["host", "restart", &host.name])
+                .interactive()
+                .confirm(format!("Restart {}? Its apps and containers are down until it's back, about a minute.", host.name)),
+        );
+    }
     out
 }
 
@@ -1374,6 +1384,7 @@ pub mod tests {
                     | Kind::VmForceStop
                     | Kind::VmRepair
                     | Kind::Uninstall
+                    | Kind::HostRestart
             ) || (a.kind == Kind::EdgeBan && !a.interactive);
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }

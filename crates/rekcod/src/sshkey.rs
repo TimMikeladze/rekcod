@@ -138,8 +138,18 @@ fn ensure_key(paths: &Paths) -> Result<PathBuf> {
 /// Makes `dest` take rekcod's key: `ssh-copy-id` (the password prompt) and a config block,
 /// so plain `ssh dest` and docker's ssh use it. Needs a terminal for the prompt.
 pub fn install(paths: &Paths, name: &str, dest: &str) -> Result<()> {
+    let k = key(paths);
+    // Already in its authorized_keys (copied by hand, or the config was lost): only the
+    // config is missing, and no password is needed.
+    if k.exists() && accepts(dest, &k) {
+        return write_config(paths, name, host_of(dest), &k);
+    }
     if !std::io::stdin().is_terminal() {
-        bail!("{dest} wants a password, and there's no terminal to type it in; run this in one, or `ssh-copy-id {dest}`");
+        let k = ensure_key(paths)?;
+        bail!(
+            "{dest} wants a password, and there's no terminal to type it in; run this in one, or run\n  ssh-copy-id -i {} {dest}\nand then this again",
+            k.with_extension("pub").display()
+        );
     }
     let k = ensure_key(paths)?;
     let host = host_of(dest);
@@ -153,8 +163,24 @@ pub fn install(paths: &Paths, name: &str, dest: &str) -> Result<()> {
     if !copy.arg(target).status().context("run ssh-copy-id")?.success() {
         bail!("ssh-copy-id to {dest} failed");
     }
+    write_config(paths, name, host, &k)
+}
+
+/// Whether `dest` lets rekcod's key in, without asking for anything.
+fn accepts(dest: &str, k: &Path) -> bool {
+    let mut ssh = Command::new("ssh");
+    ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "IdentitiesOnly=yes", "-i"]).arg(k);
+    match dest.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()) {
+        Some((d, p)) => ssh.args(["-p", p, d]),
+        None => ssh.arg(dest),
+    };
+    ssh.arg("true").stdin(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+}
+
+/// Host NAME's block in rekcod's config, and the Include in the user's.
+fn write_config(paths: &Paths, name: &str, host: &str, k: &Path) -> Result<()> {
     let cfg = std::fs::read_to_string(config(paths)).unwrap_or_default();
-    write_private(&config(paths), &set_block(&cfg, name, host, &k))?;
+    write_private(&config(paths), &set_block(&cfg, name, host, k))?;
     let user = user_config()?;
     let current = std::fs::read_to_string(&user).unwrap_or_default();
     let next = with_include(&current, &config(paths));

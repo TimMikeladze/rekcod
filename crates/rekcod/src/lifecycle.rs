@@ -140,7 +140,7 @@ pub fn uninstall(paths: &Paths, keep_data: bool, yes: bool) -> Result<()> {
     step("stop the VM", crate::cli::stop(paths, true, false));
     for a in AGENTS {
         if crate::service::installed(a) {
-            step(&format!("remove LaunchAgent {}", crate::service::label(a)), crate::service::uninstall(a));
+            step(&format!("remove {}", crate::service::label(a)), crate::service::uninstall(a));
         }
     }
     if crate::syssock::installed(paths) {

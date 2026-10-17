@@ -16,8 +16,8 @@ Done once, by hand, because they need its screen or an Apple ID:
 - Tailscale logged in, on the same tailnet as your Mac. Without it the fleet goes on the LAN
   and your Mac finds it over Bonjour, whatever its IP or name ([lan-discovery.md](lan-discovery.md));
   `--lan` picks that even with Tailscale. `--addr IP` pins one address you manage instead.
-- Automatic login on (System Settings › Users & Groups). LaunchAgents only run in a logged-in
-  session, so without it nothing comes back after a reboot. FileVault blocks automatic login.
+- An admin account you can `sudo` with. With it the services start at boot, nobody logged
+  in (below); without, they wait for someone to log in.
 
 rekcod itself does **not** have to be installed there: `host add` copies this Mac's binary over.
 No SSH? [server-pkg.md](server-pkg.md) builds a pkg you double-click on the server instead.
@@ -28,12 +28,15 @@ No SSH? [server-pkg.md](server-pkg.md) builds a pkg you double-click on the serv
    `ssh-copy-id` first.
 2. Finds `rekcod` on the server (login shell `PATH`, then `~/.rekcod/bin/rekcod`). If there's
    none, copies this binary to `~/.rekcod/bin/rekcod` with scp (beside it, then renamed, so
-   agents running the old one survive). A dev build also copies the local guest to
+   agents running the old one survive). A copy in `~/.rekcod/bin` is replaced whenever its
+   sha256 differs, since dev builds share a version. A binary without the virtualization
+   entitlement (a plain `cargo build`) is sent as a signed copy. A dev build also copies the local guest to
    `~/.rekcod/guest` when its `VERSION` differs.
 3. Runs `rekcod server setup --domain D` there over `ssh -t`, so sudo can ask for a password.
 4. Reads the `remote URL TOKEN` line the setup prints and runs `rekcod remote add NAME URL`
    here. The server's tailnet name goes in the URL, so it survives an IP change.
-5. Without `--no-docker`: runs `rekcod start` on the server, then the plain `host add` steps
+5. Without `--no-docker`: runs `rekcod start` on the server and `rekcod version` (which
+   downloads a docker CLI when it has none), then the plain `host add` steps
    (docker context `rekcod-NAME`, switched to unless `--no-use`).
 
 Re-running it is safe: every step replaces what it made before.
@@ -42,7 +45,8 @@ Re-running it is safe: every step replaces what it made before.
 
 The Rust version of the old setup shell script, plus the headless bits.
 
-- Address: `--addr`, else `tailscale ip -4`, else (or with `--lan`) none: RustFS and the node
+- Address: `--addr`, else `tailscale ip -4` if that IP is on one of the Mac's interfaces
+  (a stopped Tailscale still prints its old one), else (or with `--lan`) none: RustFS and the node
   on 127.0.0.1, the controller and edge on 0.0.0.0, the controller on Bonjour (`--bonjour`).
   A node that joined on another address is removed (`node rm`) and joins again.
 - `storage serve --install` on `ADDR:7710` (RustFS, [`rustfs.md`](rustfs.md)), waits for its
@@ -54,16 +58,58 @@ The Rust version of the old setup shell script, plus the headless bits.
 - Power, unless `--no-power`: `sudo pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1`.
   `disablesleep` keeps a MacBook awake with the lid shut, `autorestart` boots it after a power
   cut. Skipped with a warning when sudo can't prompt (no terminal).
-- Warns when automatic login is off (`autoLoginUser` in `com.apple.loginwindow`).
+- Firewall: when the application firewall is on and rekcod isn't in its list,
+  `sudo socketfilterfw --add` and `--unblockapp` for the binary. Without them other Macs'
+  connections to the controller and edge are accepted and then get nothing back. Without a
+  terminal for sudo it prints the command instead.
+- `start --install`: the docker VM, as a job like the others.
+- Without sudo, after the agents: prints `sudo rekcod server at-boot`, and when automatic
+  login is off says what's in the way (FileVault, or opens Users & Groups on the screen).
+  rekcod doesn't switch automatic login on itself: that takes the user's password.
 - Last line on stdout: `remote https://NAME:7700 ADMIN_TOKEN CA-FINGERPRINT`, with NAME
   `rekcod-<fingerprint>.bonjour` on a LAN.
 
-`rekcod server uninstall` removes the four agents. It leaves pmset and `~/.rekcod` alone.
+`rekcod server uninstall` removes the five jobs (sudo for daemons). It leaves pmset and
+`~/.rekcod` alone.
+
+## Starting at boot
+
+LaunchAgents run in a login session, so a server built from them comes back after a reboot
+only once someone logs in, and macOS won't log in automatically while FileVault is on. The
+services don't need a login: they're network servers and VMs. So `server setup` installs
+them as LaunchDaemons whenever it can get root (`sudo -v`, which asks in a terminal):
+
+- `/Library/LaunchDaemons/dev.rekcod.{storage,controller,node,edge,vm}.plist`, root:wheel
+  0644, loaded into launchd's `system` domain.
+- `UserName` is you and `GroupName` staff, so they run as you, with your `~/.rekcod`, as the
+  agents did. launchd gives a daemon no login environment, so the plist sets `HOME`, `USER`
+  and a `PATH`.
+- A service that has a daemon stays one: a later `--install` of it rewrites the daemon (sudo
+  again), and its LaunchAgent, if any, is removed so the two never run side by side.
+  `REKCOD_LAUNCHD=system` makes new ones daemons, which is how `server setup` tells the
+  commands it runs.
+
+Without sudo (no terminal, as in the pkg's postinstall) setup falls back to LaunchAgents,
+which still need someone logged in on the screen. `rekcod server at-boot` turns them into
+daemons later: it re-runs itself under sudo, reads each agent's command line and log back
+with `plutil`, installs the daemon and removes the agent. As root it takes `--user NAME`,
+which is how the pkg uses it.
+
+FileVault still holds a cold boot at its unlock screen until someone types the password
+there; nothing on the disk runs before that. For a restart you plan, run
+`rekcod host restart NAME` on your Mac (or `rekcod server restart` on the server). It asks
+for the server account's password once, checks it with `sudo -v`, checks that the account
+is in `fdesetup list`, then runs `fdesetup authrestart -inputplist` with the account and
+password on stdin, so the disk unlocks for that one boot. Asked directly, fdesetup wants a
+password, a user name and a password again, unlabelled. Without FileVault it's
+`shutdown -r now`. `host restart` then waits for a new `kern.boottime` (a Mac can go down and
+come back between two polls, so "it stopped answering" proves nothing) and for its docker
+engine to answer, and says how long that took. I haven't found a way around an unplanned
+one that doesn't mean turning FileVault off.
 
 ## Not done
 
-- Turning on automatic login, Remote Login or Tailscale. They need the GUI, an Apple ID or the
-  user's password in a form I'd rather not pass around.
+- Turning on Remote Login or Tailscale. They need the GUI or an Apple ID.
 - cloudflared. The setup prints the commands; public traffic stays opt-in.
 - Menu bar: `host add` takes arguments the menu has no way to ask for, same as before.
 - Starting the docker VM at login. After a reboot apps come back (they're sandboxes the node

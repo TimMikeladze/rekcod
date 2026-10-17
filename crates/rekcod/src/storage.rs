@@ -55,6 +55,10 @@ pub fn read_credentials(file: &Path) -> Result<S3> {
 pub fn ensure_binary(paths: &Paths) -> Result<PathBuf> {
     let bin = paths.home.join("bin").join(format!("rustfs-{RUSTFS_VERSION}"));
     if bin.exists() {
+        // Downloaded before rekcod patched it, on a Mac without Homebrew's xz.
+        if !Path::new(BREW_LZMA).exists() {
+            use_system_lzma(&bin)?;
+        }
         return Ok(bin);
     }
     let tmp = paths.home.join("bin").join(format!(".rustfs-{}", std::process::id()));
@@ -76,11 +80,50 @@ pub fn ensure_binary(paths: &Paths) -> Result<PathBuf> {
         }
         // Unsigned: a quarantine flag would stop launchd from running it.
         let _ = Command::new("/usr/bin/xattr").args(["-d", "com.apple.quarantine"]).arg(tmp.join("rustfs")).stderr(Stdio::null()).status();
+        use_system_lzma(&tmp.join("rustfs"))?;
         std::fs::rename(tmp.join("rustfs"), &bin)?;
         Ok(())
     })();
     let _ = std::fs::remove_dir_all(&tmp);
     r.map(|()| bin)
+}
+
+/// RustFS's macOS release loads liblzma from Homebrew's xz, so it fails to start on a Mac
+/// without `brew install xz`. macOS ships the same library (compatibility version 14).
+const BREW_LZMA: &str = "/opt/homebrew/opt/xz/lib/liblzma.5.dylib";
+const SYSTEM_LZMA: &str = "/usr/lib/liblzma.5.dylib";
+
+/// The load command's path, swapped in place: the new one is shorter, so the rest of the
+/// field is zeroed and nothing moves. `None` when the path isn't there exactly once.
+fn swap_lzma(bin: &[u8]) -> Option<Vec<u8>> {
+    let needle = BREW_LZMA.as_bytes();
+    let mut hits = bin.windows(needle.len()).enumerate().filter(|(_, w)| *w == needle).map(|(i, _)| i);
+    let at = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    let mut out = bin.to_vec();
+    out[at..at + needle.len()].fill(0);
+    out[at..at + SYSTEM_LZMA.len()].copy_from_slice(SYSTEM_LZMA.as_bytes());
+    Some(out)
+}
+
+/// Points `bin` at the system liblzma and signs it again (ad hoc: editing it broke the
+/// signature, and arm64 won't run an unsigned binary). `/usr/bin/codesign` is on every Mac;
+/// `install_name_tool` needs the Xcode tools.
+fn use_system_lzma(bin: &Path) -> Result<()> {
+    let bytes = std::fs::read(bin)?;
+    let Some(patched) = swap_lzma(&bytes) else { return Ok(()) };
+    let tmp = bin.with_extension("lzma-tmp");
+    std::fs::write(&tmp, patched)?;
+    std::fs::set_permissions(&tmp, std::os::unix::fs::PermissionsExt::from_mode(0o755))?;
+    if !Command::new("/usr/bin/codesign").args(["-f", "-s", "-"]).arg(&tmp).stderr(Stdio::null()).status()?.success() {
+        let _ = std::fs::remove_file(&tmp);
+        bail!("could not sign {} after pointing it at {SYSTEM_LZMA}", bin.display());
+    }
+    std::fs::rename(&tmp, bin)?;
+    eprintln!("rekcod: RustFS now loads {SYSTEM_LZMA} instead of Homebrew's");
+    Ok(())
 }
 
 /// Runs RustFS in the foreground (it replaces this process) on `listen`, data in `data`.
@@ -233,4 +276,22 @@ pub fn snap_target(paths: &Paths) -> Result<(S3, String)> {
     let s = local(paths)?;
     s.create_bucket("rekcod-snaps")?;
     Ok((s, "rekcod-snaps".into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lzma_path_swapped_in_place() {
+        let bin = [b"\x0c\0\0\0head".as_slice(), BREW_LZMA.as_bytes(), b"\0\0tail"].concat();
+        let out = swap_lzma(&bin).unwrap();
+        assert_eq!(out.len(), bin.len());
+        assert_eq!(&out[8..8 + SYSTEM_LZMA.len()], SYSTEM_LZMA.as_bytes());
+        assert!(out[8 + SYSTEM_LZMA.len()..8 + BREW_LZMA.len()].iter().all(|&b| b == 0));
+        assert!(out.ends_with(b"\0\0tail"));
+        // Already patched, or the path twice: leave it alone.
+        assert_eq!(swap_lzma(&out), None);
+        assert_eq!(swap_lzma(&[bin.clone(), bin].concat()), None);
+    }
 }

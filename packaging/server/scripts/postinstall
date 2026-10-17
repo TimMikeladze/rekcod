@@ -17,6 +17,12 @@ say() { echo "rekcod: $*" | tee -a "$log"; }
 
 if [[ $EUID == 0 || -n ${REKCOD_PKG_TEST_ROOT:-} ]]; then
   say "$(pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1 2>&1 && echo 'never sleeps, lid shut or not; boots again after a power cut')"
+  # With the firewall on, other Macs connect to the controller and edge but get no data back.
+  fw=/usr/libexec/ApplicationFirewall/socketfilterfw
+  if "$fw" --getglobalstate 2>/dev/null | grep -q enabled; then
+    "$fw" --add "$rekcod" >/dev/null 2>&1 && "$fw" --unblockapp "$rekcod" >/dev/null 2>&1 &&
+      say "the firewall lets $rekcod accept connections"
+  fi
   user=$(stat -f %Su /dev/console)
   # loginwindow and _mbsetupuser (Setup Assistant) own the console when nobody is logged in.
   if [[ -z $user || $user == root || $user == loginwindow || $user == _* ]]; then
@@ -45,7 +51,11 @@ if [[ -z $remote ]]; then
   as_user open -e "$log" 2>/dev/null
   exit 1
 fi
-as_user "$rekcod" start --install >>"$log" 2>&1 || say "rekcod start --install failed; the docker VM won't start at login (see $log)"
+# Setup ran as the user without sudo, so its jobs are LaunchAgents, which wait for a login.
+# As root, make them LaunchDaemons that start at boot with nobody logged in.
+if [[ $EUID == 0 || -n ${REKCOD_PKG_TEST_ROOT:-} ]]; then
+  "$rekcod" server at-boot --user "$user" >>"$log" 2>&1 || say "rekcod server at-boot failed; the services wait for a login after a reboot (see $log)"
+fi
 
 # The remote is named after this Mac: LocalHostName Tims-Mac-mini becomes tims-mac-mini.
 host=$(scutil --get LocalHostName 2>/dev/null || hostname -s)

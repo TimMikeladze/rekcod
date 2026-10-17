@@ -444,7 +444,8 @@ pub fn start(
         }
     }
     default_socket_on_start(paths, no_switch)?;
-    if std::env::var_os("DOCKER_HOST").is_some() {
+    // Pointing at rekcod's own socket (as `host add` sets it on a server) is fine.
+    if std::env::var("DOCKER_HOST").is_ok_and(|h| h != paths.docker_host()) {
         println!("warning: DOCKER_HOST is set and overrides docker contexts; `unset DOCKER_HOST` to use rekcod");
     }
     Ok(())

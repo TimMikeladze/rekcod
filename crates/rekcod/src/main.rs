@@ -1183,11 +1183,14 @@ enum HostCmd {
     /// Point a LAN server's docker context at its current address, found over Bonjour
     /// (default: every such host). `use` and `forward` do this first.
     Refresh { name: Option<String> },
+    /// Restart a server so it comes back on its own (FileVault unlocked for that one boot),
+    /// then wait until it's back. Asks for the password there once.
+    Restart { name: String },
 }
 
 #[derive(Subcommand)]
 enum ServerCmd {
-    /// Controller, node, edge and RustFS as LaunchAgents on the Tailscale address; no sleep with the lid shut.
+    /// Controller, node, edge, RustFS and the VM as LaunchDaemons (LaunchAgents without sudo); no sleep with the lid shut.
     Setup {
         /// Apps are served at <app>.<domain>.
         #[arg(long)]
@@ -1203,8 +1206,18 @@ enum ServerCmd {
         #[arg(long)]
         no_power: bool,
     },
-    /// Remove the controller, node, edge and RustFS LaunchAgents (data stays).
+    /// Remove the controller, node, edge, RustFS and VM jobs (data stays).
     Uninstall,
+    /// Restart this Mac so it comes back on its own: with FileVault on, unlocks the disk for
+    /// that one boot (`fdesetup authrestart`). Asks for your password once.
+    Restart,
+    /// Make a server set up without sudo start at boot, nobody logged in: its LaunchAgents
+    /// become LaunchDaemons that run as the same user (asks for sudo).
+    AtBoot {
+        /// Whose server (default: you; required as root).
+        #[arg(long)]
+        user: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1422,6 +1435,8 @@ fn main() {
         }
         Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power }) => server::setup(&paths, &domain, addr.as_deref(), lan, no_power),
         Cmd::Server(ServerCmd::Uninstall) => server::uninstall(),
+        Cmd::Server(ServerCmd::AtBoot { user }) => server::at_boot(user.as_deref()),
+        Cmd::Server(ServerCmd::Restart) => server::restart(),
         Cmd::Host(HostCmd::Ls { json }) => {
             host::print_list(json);
             Ok(())
@@ -1430,6 +1445,7 @@ fn main() {
         Cmd::Host(HostCmd::Rm { name }) => host::rm(&paths, &name),
         Cmd::Host(HostCmd::Forward { name, ports }) => host::forward(&paths, &name, &ports),
         Cmd::Host(HostCmd::Refresh { name: Some(name) }) => host::refresh(&paths, &name),
+        Cmd::Host(HostCmd::Restart { name }) => host::restart(&paths, &name),
         Cmd::Host(HostCmd::Refresh { name: None }) => {
             for h in host::list().0.iter().filter(|h| h.bonjour.is_some()) {
                 host::refresh(&paths, &h.name)?;

@@ -16,6 +16,12 @@ strips the quarantine flag, and `exec`s it with root keys from
 start). Data defaults to `~/.rekcod/storage/data`. The unsigned binary runs fine from a
 LaunchAgent; curl doesn't set the quarantine flag anyway.
 
+The 1.0.1 release loads `liblzma` from Homebrew's xz (`/opt/homebrew/opt/xz/lib`), so on a Mac
+without `brew install xz` it dies at launch. rekcod rewrites that load path to macOS's own
+`/usr/lib/liblzma.5.dylib` (same compatibility version, the new path is shorter so it fits in
+place) and signs the binary again ad hoc with `/usr/bin/codesign`. A copy downloaded before
+this is patched on its next start when Homebrew's xz isn't there.
+
 `rekcod controller serve --storage http://...:7710` reads those keys (or
 `--storage-credentials FILE`) and stores URL and keys in fleet.db's `config`, the secret
 sealed with the `default` namespace key. Later starts without `--storage` use what's stored.

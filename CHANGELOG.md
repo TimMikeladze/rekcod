@@ -48,6 +48,13 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Added
 
+- `rekcod host restart NAME` (menu bar and dashboard: Restart NAME) and `rekcod server restart`:
+  reboot a server so it comes back on its own, FileVault unlocked for that one boot. One
+  password prompt, checked before anything restarts; `host restart` waits until it's back.
+- `server setup` installs the services and the docker VM as LaunchDaemons that run as you and
+  start at boot with nobody logged in, whenever it can sudo; `rekcod server at-boot` moves a
+  setup done without sudo (LaunchAgents) over, and the pkg does that as root
+  (docs/server.md#starting-at-boot).
 - `host add` on a Mac that only takes an SSH password creates `~/.rekcod/ssh/id_ed25519`, installs
   it with `ssh-copy-id` (one prompt) and includes `~/.rekcod/ssh/config` from `~/.ssh/config`, so
   docker's ssh gets in too. `host rm` and `host refresh` keep the config in step; `uninstall`
@@ -116,6 +123,19 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Fixed
 
+- `host add` reuses one SSH connection (a dozen handshakes took most of a minute over Wi-Fi) and
+  prints each step, including that sudo on the server is about to ask for a password.
+- `server setup` on a Mac without Homebrew's xz: RustFS 1.0.1 loads macOS's own `liblzma`
+  instead (docs/rustfs.md).
+- `server setup` used a stopped Tailscale's old IP; it now checks the IP is on an interface.
+- `server setup` with the application firewall on lets rekcod accept connections (sudo), or
+  prints the command.
+- `server setup` re-runs: waits for launchd to drop the old agent before `bootstrap`, waits for
+  the restarted controller to listen, and trusts the controller's CA before asking it for the
+  edge token.
+- `host add --server` found no rekcod and no `$HOME` on the server (arguments split over SSH),
+  never replaced an older dev build, could send a binary without the virtualization
+  entitlement, and left the server without a docker CLI.
 - `host add --server` copies rekcod to the server beside the old binary and renames it over,
   instead of overwriting the file a running agent was started from.
 - Readings nobody could take are `null` and show as `–`, not 0: node CPUs, load and disk,

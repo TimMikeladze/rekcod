@@ -59,7 +59,7 @@ rekcod has three front ends: the CLI (`rekcod ...`), the menu bar item
 | Switch the default remote's namespace | `ns use <name>` | Namespace: current › Switch to … (only when the token is in more than one) | sidebar remote menu |
 | Switch docker between this Mac's rekcod and a remote host | `host use <name>\|local` | Docker host: current › Use … (only with a host added; shown while the VM is stopped too) | sidebar docker host menu, `/fleet` |
 | Forward a remote host's published ports here | `host forward <name>` | Docker host › Forward ports from … (opens Terminal) | sidebar docker host menu, `/fleet` |
-| Point a LAN spare's docker context at its current address | `host refresh <name>` | Docker host › Find … again on the LAN | sidebar docker host menu, `/fleet` |
+| Point a LAN server's docker context at its current address | `host refresh <name>` | Docker host › Find … again on the LAN | sidebar docker host menu, `/fleet` |
 | Ban an IP or range on every edge, lift a ban | `edge ban [<net>]` / `edge unban <net>` | Edge bans › Ban an IP or range (opens Terminal to ask), Unban … (only with an admin-token remote) | `/fleet` › Edge bans |
 | Compose project: restart, stop, down | `compose -p NAME restart/stop/down` | Projects & snapshots › project | `/containers` (group header), `/projects` |
 | Images: remove; remove dangling | `image rm ID` / `image prune -f` | Images, Free up disk space | `/images` |
@@ -74,7 +74,7 @@ rekcod has three front ends: the CLI (`rekcod ...`), the menu bar item
 Creating, exec, fork, `cp` and golden disks are for agents and scripts, so they're CLI,
 HTTP and MCP only. So are deploys, scaling and env changes (they take arguments; the dashboard's app page has
 "Copy command" with the line filled in), `node pool` (takes namespaces; the node page shows the command), the
-other fleet admin commands (`node join/serve/pool`, `controller serve/token/restore`, `edge serve`, `remote add/rm`, `spare`), `host add/rm`, `--remote` sandboxes,
+other fleet admin commands (`node join/serve/pool`, `controller serve/token/restore`, `edge serve`, `remote add/rm`, `server`), `host add/rm`, `--remote` sandboxes,
 `sandbox input` (agents), and `macos` image setup (one-time, interactive). The menu bar lists what exists and offers what a person does to it.
 
 ## Changing things

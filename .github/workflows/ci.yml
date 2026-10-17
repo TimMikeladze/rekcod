@@ -31,6 +31,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
       - run: cargo test --workspace --locked
+      - run: packaging/server/test.sh
       - run: cargo clippy --locked -p rekcod -p rekcod-proto -- -D warnings
       - run: cargo clippy --locked -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings
       - run: cargo build --locked --release -p rekcod-agent --target aarch64-unknown-linux-musl

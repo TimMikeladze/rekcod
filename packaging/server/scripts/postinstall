@@ -1,0 +1,81 @@
+#!/bin/bash
+# Installer runs this as root after copying rekcod into /usr/local (docs/server-pkg.md).
+# Sets this Mac up as a server for whoever is logged in on its screen, then leaves the
+# `rekcod remote add` line for the user's other Mac in ~/Desktop/rekcod-pair.txt.
+#
+# $3 is the target volume. Run as a normal user, it sets up that user and skips pmset.
+# REKCOD_PKG_TEST_ROOT=1 takes the root branch anyway (packaging/server/test.sh stubs the
+# commands it runs).
+set -uo pipefail
+umask 077
+vol=${3:-/}
+vol=${vol%/}
+rekcod=$vol/usr/local/bin/rekcod
+log=${REKCOD_PKG_LOG:-/var/log/rekcod-server-install.log}
+domain=$(cat "$vol/usr/local/share/rekcod/server-domain" 2>/dev/null || echo apps.localhost)
+say() { echo "rekcod: $*" | tee -a "$log"; }
+
+if [[ $EUID == 0 || -n ${REKCOD_PKG_TEST_ROOT:-} ]]; then
+  say "$(pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1 2>&1 && echo 'never sleeps, lid shut or not; boots again after a power cut')"
+  user=$(stat -f %Su /dev/console)
+  # loginwindow and _mbsetupuser (Setup Assistant) own the console when nobody is logged in.
+  if [[ -z $user || $user == root || $user == loginwindow || $user == _* ]]; then
+    say "installed $rekcod; nobody is logged in on the screen, so log in and run: rekcod server setup --domain $domain"
+    exit 0
+  fi
+  uid=$(id -u "$user")
+  home=$(dscl . -read "/Users/$user" NFSHomeDirectory | sed -n 's/^NFSHomeDirectory: //p')
+  if [[ -z $home ]]; then
+    say "no home folder for $user; log in and run: rekcod server setup --domain $domain"
+    exit 0
+  fi
+  as_user() { launchctl asuser "$uid" sudo -u "$user" -H env HOME="$home" PATH="$vol/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
+  # The user's, so TextEdit can open it on a failure, and nobody else's.
+  chown "$user" "$log"
+else
+  user=$(id -un) home=$HOME
+  as_user() { "$@"; }
+fi
+
+say "rekcod server setup --domain $domain as $user"
+# setup's progress goes to stderr; its last stdout line is `remote URL TOKEN FINGERPRINT`.
+remote=$(as_user "$rekcod" server setup --domain "$domain" --no-power 2>>"$log" | grep '^remote ' | tail -1)
+if [[ -z $remote ]]; then
+  say "server setup failed; see $log"
+  as_user open -e "$log" 2>/dev/null
+  exit 1
+fi
+as_user "$rekcod" start --install >>"$log" 2>&1 || say "rekcod start --install failed; the docker VM won't start at login (see $log)"
+
+# The remote is named after this Mac: LocalHostName Tims-Mac-mini becomes tims-mac-mini.
+host=$(scutil --get LocalHostName 2>/dev/null || hostname -s)
+name=$(printf %s "$host" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-' | sed 's/--*/-/g; s/^-//; s/-$//')
+name=${name:-server}
+read -r _ url token fp <<<"$remote"
+cmd="rekcod remote add $name $url --token $token --ca-fingerprint $fp"
+text="This Mac is a rekcod server. Run this on your other Mac, then \`rekcod dashboard\`:
+
+$cmd
+
+Delete this file afterwards: the token is the controller's admin token.
+Docker on this Mac goes over SSH: turn on Remote Login here, then on your Mac run
+  rekcod host add $name $user@$host.local
+Undo: rekcod server uninstall. Logs: ~/.rekcod/logs/"
+# Written as the user, 0600: it holds the admin token. rm first, because a file left by an
+# earlier install keeps its old mode. Privacy settings can keep the installer out of
+# ~/Desktop, so the home folder is the fallback.
+pair=
+for p in "$home/Desktop/rekcod-pair.txt" "$home/rekcod-pair.txt"; do
+  if printf '%s\n' "$text" | as_user /bin/sh -c 'umask 077; rm -f "$1"; cat > "$1"' sh "$p" 2>/dev/null; then
+    pair=$p
+    break
+  fi
+done
+printf %s "$cmd" | as_user pbcopy 2>/dev/null
+if [[ -n $pair ]]; then
+  as_user open -e "$pair" 2>/dev/null
+  say "wrote $pair (the pairing line is on the clipboard too)"
+else
+  say "couldn't write rekcod-pair.txt; the pairing line is on the clipboard"
+fi
+exit 0

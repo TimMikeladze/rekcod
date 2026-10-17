@@ -1273,7 +1273,7 @@ struct Controller {
     storage: Option<crate::s3::S3>,
     /// Edge client reports by minute: (minute, ip) -> (requests, rate-limited). Ten minutes kept.
     clients: Mutex<HashMap<(i64, String), (i64, i64)>>,
-    /// New nodes start `ready` instead of `pending` (one-Mac fleets, `spare setup`).
+    /// New nodes start `ready` instead of `pending` (one-Mac fleets, `server setup`).
     auto_approve: bool,
     /// `~/.rekcod/controller`: join-token and the other files `serve` writes.
     dir: PathBuf,
@@ -4108,7 +4108,7 @@ fn backup(c: &Controller) -> Result<Value> {
         // Its own connection: WAL lets it read while requests keep using the main one.
         rusqlite::Connection::open(&c.db_path)?.execute("vacuum into ?1", [&path])?;
         let key = format!("fleet-{}.db", crate::s3::amz_date(now() as u64));
-        // A copy off the RustFS disk (which on a spare is the controller's own disk).
+        // A copy off the RustFS disk (which on a server is the controller's own disk).
         if let Some(dir) = &c.backup_dir {
             std::fs::create_dir_all(dir)?;
             std::fs::copy(&tmp, dir.join(&key))?;
@@ -4744,7 +4744,7 @@ mod tests {
         assert!(authority("ftp://x").is_err());
         assert_eq!(percent_encode("/a b"), "%2Fa%20b");
         // Plain HTTP only where it can't be read in transit.
-        for ok in ["127.0.0.1:7700", "[::1]:7700", "100.101.102.103:7700", "spare.tail1.ts.net:7700", "localhost:1"] {
+        for ok in ["127.0.0.1:7700", "[::1]:7700", "100.101.102.103:7700", "mini.tail1.ts.net:7700", "localhost:1"] {
             assert!(check_plain_http(ok, "x").is_ok(), "{ok}");
         }
         if std::env::var_os("REKCOD_INSECURE").is_none() {

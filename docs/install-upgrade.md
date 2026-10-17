@@ -25,8 +25,8 @@ daemon keeps the old file). The dashboard bundle in the tarball replaces
 Every fleet request carries `X-Rekcod-Version`. The controller answers 400 when the client's
 `major.minor` differs from its own (0.x versions treat minor as major), naming both, so an
 old CLI or node gets told to upgrade instead of failing on a changed API. Requests without
-the header (curl, older clients) pass. `spare setup` copies its binary to the spare when the
-spare's `rekcod --version` differs, not only when it has none.
+the header (curl, older clients) pass. `server setup` copies its binary to the server when the
+server's `rekcod --version` differs, not only when it has none.
 
 ## LaunchAgents and Homebrew
 

@@ -190,8 +190,8 @@ test("charts: overview sparklines, app traffic, the jobs timeline, node history"
   await expect(page.getByRole("columnheader", { name: "5xx" })).toBeVisible()
   await page.goto("/jobs")
   await expect(page.getByRole("img", { name: /Job runs in the last 24 hours/ })).toBeVisible()
-  await page.goto("/nodes/spare")
-  await expect(page.getByRole("img", { name: "load of node spare over the last hour" })).toBeVisible()
+  await page.goto("/nodes/studio")
+  await expect(page.getByRole("img", { name: "load of node studio over the last hour" })).toBeVisible()
 })
 
 test("fleet views are tabs in the URL", async ({ page }) => {

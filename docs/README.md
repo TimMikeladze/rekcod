@@ -7,8 +7,8 @@ Start with the [README](../README.md): install, what works, commands, build and 
 How a feature behaves today and how to drive it.
 
 - [getting-started.md](getting-started.md): install to a running compose project, then snapshots, `rekcod x`, menu bar.
-- [self-hosting.md](self-hosting.md): a spare Mac as your app host and docker engine, step by step.
-- [lan-discovery.md](lan-discovery.md): a spare on a LAN found over Bonjour, whatever its IP or name.
+- [self-hosting.md](self-hosting.md): another Mac as your app host and docker engine, step by step.
+- [lan-discovery.md](lan-discovery.md): a server on a LAN found over Bonjour, whatever its IP or name.
 - [troubleshooting.md](troubleshooting.md): what to do when something's wrong; start with `rekcod doctor`.
 - [install-upgrade.md](install-upgrade.md): `rekcod upgrade`, `uninstall`, `doctor`, logs.
 - [cli-passthrough.md](cli-passthrough.md): `rekcod <docker command>` without a docker CLI.
@@ -20,7 +20,8 @@ How a feature behaves today and how to drive it.
 - [frontends.md](frontends.md): the CLI, menu bar and dashboard share one action list.
 - [dashboard.md](dashboard.md): the web dashboard and `rekcod dashboard`.
 - [remote-docker.md](remote-docker.md): another Mac's rekcod as your docker engine.
-- [spare.md](spare.md): provisioning a spare Mac with `rekcod host add`.
+- [server.md](server.md): turning another Mac into a server with `rekcod host add`.
+- [server-pkg.md](server-pkg.md): a double-click installer that makes a Mac a server, no SSH needed.
 - [fleet-compute.md](fleet-compute.md): scale to zero, recycle, jobs.
 - [namespaces.md](namespaces.md): multi-tenancy in a fleet.
 - [edge-http.md](edge-http.md): the edge proxy, rate limits, bans, per-app HTTP settings.

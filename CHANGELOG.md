@@ -19,7 +19,7 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
   loopback and tailnet addresses. Controllers, nodes and CLIs must be on the same minor
   version; older ones get an error naming both versions.
 - **New nodes need `rekcod node approve ID`** unless the controller runs with
-  `--auto-approve` (`spare setup` passes it). Existing nodes stay ready.
+  `--auto-approve` (`server setup` passes it). Existing nodes stay ready.
 - **Tokens are hashed** on the controller's first start. They keep working; the plaintext
   is no longer in fleet.db, so keep `controller/admin-token`.
 - **Edges should use an edge token** (`controller token edge --edge`) instead of an admin
@@ -48,6 +48,9 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Added
 
+- `scripts/package-server.sh` builds `rekcod-server-X.Y.Z.pkg`: AirDrop it to a Mac and
+  double-click. It installs rekcod and the guest, runs `server setup` for the logged-in user and
+  leaves the `rekcod remote add` line in `~/Desktop/rekcod-pair.txt` (docs/server-pkg.md).
 - `rekcod snap save|restore|ls|rm`: compose volume snapshots, named after the git branch by
   default.
 - `rekcod x`: run a command in a container picked from the project's runtime, with VM-local
@@ -66,7 +69,7 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
   zero, recycle and scheduled jobs. `--install` runs each part as a LaunchAgent. The
   controller keeps its state in SQLite (`~/.rekcod/controller/fleet.db`).
 - `rekcod macos`: macOS sandboxes from Apple's restore image.
-- `rekcod host add ... --fleet`: provisions a spare Mac as a one-machine fleet over SSH.
+- `rekcod host add ... --server`: provisions another Mac as a one-machine fleet over SSH.
 - `rekcod storage`: RustFS for per-app buckets, stored images, fleet database backups and
   `snap save --push`. Edge rate limits, bans and per-app HTTP settings.
 - `rekcod state` and `rekcod dashboard`: a web dashboard (Next.js) over the menu bar's

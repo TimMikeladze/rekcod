@@ -30,10 +30,10 @@ export function NoRemote({ what }: { what: string }) {
       title="No fleet remote"
       commands={[
         ["remote", "add", "team", "http://controller:7700", "--token", "ADMIN_TOKEN"],
-        ["host", "add", "spare", "me@spare-mac", "--fleet"],
+        ["host", "add", "mini", "me@mac-mini", "--server", "--domain", "apps.example.com"],
       ]}
     >
-      {what} live on a fleet controller. Point rekcod at one, or turn a spare Mac into a one-node fleet.
+      {what} live on a fleet controller. Point rekcod at one, or turn another Mac into a one-node server.
     </GetStarted>
   )
 }

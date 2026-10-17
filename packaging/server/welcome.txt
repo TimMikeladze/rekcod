@@ -1,0 +1,7 @@
+This makes this Mac a rekcod server: a one-machine fleet (controller, node, edge, RustFS) and a docker VM, all started at login.
+
+It also stops the Mac sleeping, lid shut or not, and boots it again after a power cut.
+
+Stay logged in, and turn on automatic login (System Settings > Users & Groups), so everything comes back after a reboot.
+
+When it's done, ~/Desktop/rekcod-pair.txt has the one line to run on your other Mac.

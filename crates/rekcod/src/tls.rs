@@ -343,8 +343,8 @@ mod tests {
         assert!(out.ends_with("hello"), "{out}");
         // A CA we don't hold for that host: no connection. (Any socket will do; it's refused
         // before a byte is sent.)
-        let spare = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let tcp = TcpStream::connect(spare.local_addr().unwrap()).unwrap();
+        let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let tcp = TcpStream::connect(unused.local_addr().unwrap()).unwrap();
         if DEFAULT_TRUST.get().is_none() {
             assert!(connect("https://10.9.9.9:1", "10.9.9.9:1", tcp).is_err());
         }

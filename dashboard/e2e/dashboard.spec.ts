@@ -45,7 +45,7 @@ test("the overview renders with no serious axe violations", async ({ page }) => 
   await noSeriousA11yIssues(page)
 })
 
-for (const path of ["/containers/shop-web-1", "/apps/dash", "/jobs/j-8f2k1m", "/nodes/spare", "/sandboxes/m4c0s9zz", "/disk", "/vm", "/activity"]) {
+for (const path of ["/containers/shop-web-1", "/apps/dash", "/jobs/j-8f2k1m", "/nodes/studio", "/sandboxes/m4c0s9zz", "/disk", "/vm", "/activity"]) {
   test(`${path} renders with no serious axe violations`, async ({ page }) => {
     await page.goto(path)
     await expect(page.getByRole("heading", { level: 1 })).toBeVisible()

@@ -1,17 +1,17 @@
-# Provisioning a spare Mac
+# A Mac as a server
 
-One command on your Mac turns a spare Mac into a deploy target and a docker host. After that
-the spare runs with its lid shut and nobody touches it.
+One command on your Mac turns another Mac into a server: a deploy target and a docker host.
+After that it runs with its lid shut and nobody touches it.
 
 ```sh
-rekcod host add spare me@spare-mac --fleet --domain apps.example.com
+rekcod host add mini me@mac-mini --server --domain apps.example.com
 ```
 
-## What the spare needs first
+## What the server needs first
 
 Done once, by hand, because they need its screen or an Apple ID:
 
-- Remote Login on, and your key on it (`ssh-copy-id me@spare-mac`).
+- Remote Login on, and your key on it (`ssh-copy-id me@mac-mini`).
 - Tailscale logged in, on the same tailnet as your Mac. Without it the fleet goes on the LAN
   and your Mac finds it over Bonjour, whatever its IP or name ([lan-discovery.md](lan-discovery.md));
   `--lan` picks that even with Tailscale. `--addr IP` pins one address you manage instead.
@@ -19,23 +19,24 @@ Done once, by hand, because they need its screen or an Apple ID:
   session, so without it nothing comes back after a reboot. FileVault blocks automatic login.
 
 rekcod itself does **not** have to be installed there: `host add` copies this Mac's binary over.
+No SSH? [server-pkg.md](server-pkg.md) builds a pkg you double-click on the server instead.
 
-## What `host add --fleet` does
+## What `host add --server` does
 
 1. Checks SSH works without a password.
-2. Finds `rekcod` on the spare (login shell `PATH`, then `~/.rekcod/bin/rekcod`). If there's
+2. Finds `rekcod` on the server (login shell `PATH`, then `~/.rekcod/bin/rekcod`). If there's
    none, copies this binary to `~/.rekcod/bin/rekcod` with scp.
-3. Runs `rekcod spare setup --domain D` there over `ssh -t`, so sudo can ask for a password.
+3. Runs `rekcod server setup --domain D` there over `ssh -t`, so sudo can ask for a password.
 4. Reads the `remote URL TOKEN` line the setup prints and runs `rekcod remote add NAME URL`
-   here. The spare's tailnet name goes in the URL, so it survives an IP change.
-5. Without `--no-docker`: runs `rekcod start` on the spare, then the plain `host add` steps
+   here. The server's tailnet name goes in the URL, so it survives an IP change.
+5. Without `--no-docker`: runs `rekcod start` on the server, then the plain `host add` steps
    (docker context `rekcod-NAME`, switched to unless `--no-use`).
 
 Re-running it is safe: every step replaces what it made before.
 
-## `rekcod spare setup` (on the spare)
+## `rekcod server setup` (on the server)
 
-The Rust version of the old `scripts/spare-setup.sh`, plus the headless bits.
+The Rust version of the old setup shell script, plus the headless bits.
 
 - Address: `--addr`, else `tailscale ip -4`, else (or with `--lan`) none: RustFS and the node
   on 127.0.0.1, the controller and edge on 0.0.0.0, the controller on Bonjour (`--bonjour`).
@@ -53,7 +54,7 @@ The Rust version of the old `scripts/spare-setup.sh`, plus the headless bits.
 - Last line on stdout: `remote https://NAME:7700 ADMIN_TOKEN CA-FINGERPRINT`, with NAME
   `rekcod-<fingerprint>.bonjour` on a LAN.
 
-`rekcod spare uninstall` removes the four agents. It leaves pmset and `~/.rekcod` alone.
+`rekcod server uninstall` removes the four agents. It leaves pmset and `~/.rekcod` alone.
 
 ## Not done
 
@@ -62,6 +63,7 @@ The Rust version of the old `scripts/spare-setup.sh`, plus the headless bits.
 - cloudflared. The setup prints the commands; public traffic stays opt-in.
 - Menu bar: `host add` takes arguments the menu has no way to ask for, same as before.
 - Starting the docker VM at login. After a reboot apps come back (they're sandboxes the node
-  starts), but docker over SSH needs `rekcod start` on the spare first.
-- A dev build copied over has no embedded guest, so the spare's first `rekcod start` fails.
-  Copy a release build, or install rekcod there from the release.
+  starts), but docker over SSH needs `rekcod start` on the server first.
+- A dev build copied over has no embedded guest, so the server's first `rekcod start` fails.
+  Copy a release build, install rekcod there from the release, or use the pkg
+  ([server-pkg.md](server-pkg.md)), which carries the guest.

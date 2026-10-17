@@ -20,7 +20,7 @@ const OWN: &[&str] = &[
     "doctor",
     "remote",
     "host",
-    "spare",
+    "server",
     "node",
     "controller",
     "edge",

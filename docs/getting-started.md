@@ -148,7 +148,7 @@ rekcod uninstall [--keep-data]     # removes agents, socket route, context, and 
 
 - Agent sandboxes with an HTTP API and MCP server: [agent-sandboxes.md](agent-sandboxes.md)
 - Another Mac as your docker engine: [remote-docker.md](remote-docker.md)
-- Self-host apps on a spare Mac: [self-hosting.md](self-hosting.md)
+- Self-host apps on a server Mac: [self-hosting.md](self-hosting.md)
 - App hosting across several Macs: [fleet-compute.md](fleet-compute.md), [namespaces.md](namespaces.md)
 - Local S3 with RustFS: [rustfs.md](rustfs.md)
 - Every command: [README, Commands](../README.md#commands)

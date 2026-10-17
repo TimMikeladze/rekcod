@@ -71,8 +71,8 @@ export function fakeRelease(app: string, n: number, s: State) {
   const failed = r?.state === "failed"
   const log = [
     `release ${n} of ${app} at ${r?.commit ?? "0000000"}, by ${r?.who ?? "tim"}`,
-    "placing 2 instance(s) on spare, mini",
-    "spare: started sb-1a2b at 100.64.0.2:40101 (built, image stored)",
+    "placing 2 instance(s) on studio, mini",
+    "studio: started sb-1a2b at 100.64.0.2:40101 (built, image stored)",
     "mini: started sb-3c4d at 100.64.0.3:40102",
     ...(failed
       ? ["sb-3c4d: health check / failed within 30s; last log lines:\nError: Cannot find module './VERSION'", "failed; the previous release keeps serving"]
@@ -95,7 +95,7 @@ export function fakeJobHistory(name: string, s: State): { jobs: Job[]; schedules
       created,
       finished: created + took,
       cmd: ["python", "etl.py"],
-      node: i % 2 ? "mini" : "spare",
+      node: i % 2 ? "mini" : "studio",
       owner: "tim",
       schedule: name,
       actions: [],

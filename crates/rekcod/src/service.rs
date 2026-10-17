@@ -1,5 +1,5 @@
 //! LaunchAgents for the fleet's long-running commands (`controller serve`, `node serve`,
-//! `edge serve`, `storage serve` with `--install`), so a spare Mac brings them back after a reboot or crash.
+//! `edge serve`, `storage serve` with `--install`), so a server Mac brings them back after a reboot or crash.
 //! They're per-user agents: they start at login, so the Mac needs automatic login.
 
 use std::path::{Path, PathBuf};

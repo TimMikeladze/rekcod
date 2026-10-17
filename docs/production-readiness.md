@@ -231,7 +231,7 @@ it and fsck at boot (D4). Refuse to create a key when the DB has sealed values (
 - No `rekcod doctor`/diagnose bundle, no crash reporting, one debug env var for log level.
 - Fleet: no metrics, no alerts on lost node or failed deploy, app logs are the last 200 lines of
   live instances and vanish on redeploy, no SIGTERM handling.
-- Backups go to the same RustFS, which on a spare is the same disk. Restore brings back stale
+- Backups go to the same RustFS, which on a server is the same disk. Restore brings back stale
   `live` instances with no reconcile.
 - Unbounded growth: node `remote-ws` clones and `jobs/`, every release image and build cache in
   RustFS (destroyed previews included), the `audit` and `jobs` tables.

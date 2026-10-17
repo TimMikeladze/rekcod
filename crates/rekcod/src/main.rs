@@ -51,11 +51,11 @@ mod sandbox;
 #[cfg(target_os = "macos")]
 mod sandbox_api;
 #[cfg(target_os = "macos")]
+mod server;
+#[cfg(target_os = "macos")]
 mod service;
 #[cfg(target_os = "macos")]
 mod snap;
-#[cfg(target_os = "macos")]
-mod spare;
 #[cfg(target_os = "macos")]
 mod state;
 #[cfg(target_os = "macos")]
@@ -213,9 +213,9 @@ enum Cmd {
     /// Another Mac's rekcod as your docker engine, over SSH (docs/remote-docker.md).
     #[command(subcommand)]
     Host(HostCmd),
-    /// This Mac as a headless one-machine fleet (docs/spare.md); `host add --fleet` runs it over SSH.
+    /// This Mac as a headless one-machine fleet (docs/server.md); `host add --server` runs it over SSH.
     #[command(subcommand)]
-    Spare(SpareCmd),
+    Server(ServerCmd),
     /// Run this Mac as a fleet node.
     #[command(subcommand)]
     Node(NodeCmd),
@@ -1147,24 +1147,24 @@ enum HostCmd {
         /// Create the context without switching to it.
         #[arg(long)]
         no_use: bool,
-        /// Also make DEST a fleet you deploy apps to, running headless (docs/spare.md).
+        /// Also make DEST a server: a fleet you deploy apps to, running headless (docs/server.md).
         #[arg(long, requires = "domain")]
-        fleet: bool,
-        /// Apps are served at <app>.<domain> (with --fleet).
+        server: bool,
+        /// Apps are served at <app>.<domain> (with --server).
         #[arg(long)]
         domain: Option<String>,
-        /// The spare's address for the fleet (default: its Tailscale IP).
-        #[arg(long, requires = "fleet", conflicts_with = "lan")]
+        /// The server's address for the fleet (default: its Tailscale IP).
+        #[arg(long, requires = "server", conflicts_with = "lan")]
         addr: Option<String>,
         /// Put the fleet on the LAN, found over Bonjour whatever its IP or name (the default
-        /// when the spare has no Tailscale address).
-        #[arg(long, requires = "fleet")]
+        /// when the server has no Tailscale address).
+        #[arg(long, requires = "server")]
         lan: bool,
-        /// Leave the spare's sleep settings alone.
-        #[arg(long, requires = "fleet")]
+        /// Leave the server's sleep settings alone.
+        #[arg(long, requires = "server")]
         no_power: bool,
-        /// Only the fleet; no docker context.
-        #[arg(long, requires = "fleet")]
+        /// Only the server; no docker context.
+        #[arg(long, requires = "server")]
         no_docker: bool,
     },
     /// Hosts (docker contexts rekcod-*); * marks the one in use.
@@ -1178,13 +1178,13 @@ enum HostCmd {
     Rm { name: String },
     /// Forward the host's published ports to 127.0.0.1 here until Ctrl-C (default: all, followed live).
     Forward { name: String, ports: Vec<u16> },
-    /// Point a LAN spare's docker context at its current address, found over Bonjour
+    /// Point a LAN server's docker context at its current address, found over Bonjour
     /// (default: every such host). `use` and `forward` do this first.
     Refresh { name: Option<String> },
 }
 
 #[derive(Subcommand)]
-enum SpareCmd {
+enum ServerCmd {
     /// Controller, node, edge and RustFS as LaunchAgents on the Tailscale address; no sleep with the lid shut.
     Setup {
         /// Apps are served at <app>.<domain>.
@@ -1413,13 +1413,13 @@ fn main() {
         }
         Cmd::Shell => cli::shell(&paths),
         Cmd::Compact => cli::compact(&paths),
-        Cmd::Host(HostCmd::Add { name, dest, no_use, fleet: false, .. }) => host::add(&name, &dest, !no_use),
+        Cmd::Host(HostCmd::Add { name, dest, no_use, server: false, .. }) => host::add(&name, &dest, !no_use),
         Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, lan, no_power, no_docker, .. }) => {
             let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker };
-            host::add_fleet(&paths, &name, &dest, !no_use, &f)
+            host::add_server(&paths, &name, &dest, !no_use, &f)
         }
-        Cmd::Spare(SpareCmd::Setup { domain, addr, lan, no_power }) => spare::setup(&paths, &domain, addr.as_deref(), lan, no_power),
-        Cmd::Spare(SpareCmd::Uninstall) => spare::uninstall(),
+        Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power }) => server::setup(&paths, &domain, addr.as_deref(), lan, no_power),
+        Cmd::Server(ServerCmd::Uninstall) => server::uninstall(),
         Cmd::Host(HostCmd::Ls { json }) => {
             host::print_list(json);
             Ok(())

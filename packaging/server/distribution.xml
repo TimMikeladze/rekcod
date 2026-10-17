@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- productbuild template; package-server.sh fills in @VERSION@. -->
+<installer-gui-script minSpecVersion="2">
+    <title>rekcod server</title>
+    <options customize="never" require-scripts="true" hostArchitectures="arm64"/>
+    <domains enable_localSystem="true"/>
+    <welcome file="welcome.txt" mime-type="text/plain"/>
+    <choices-outline>
+        <line choice="default"/>
+    </choices-outline>
+    <choice id="default" title="rekcod">
+        <pkg-ref id="dev.rekcod.server"/>
+    </choice>
+    <pkg-ref id="dev.rekcod.server" version="@VERSION@" onConclusion="none">rekcod-server-component.pkg</pkg-ref>
+</installer-gui-script>

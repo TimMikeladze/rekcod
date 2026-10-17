@@ -14,7 +14,7 @@ use crate::paths::Paths;
 
 const PREFIX: &str = "rekcod-";
 
-/// Runs on the spare in a login shell (so Homebrew's PATH is there) and writes the
+/// Runs on the server in a login shell (so Homebrew's PATH is there) and writes the
 /// `~/.zshenv` block that docker's non-interactive `ssh ... docker system dial-stdio` reads.
 const SETUP: &str = r#"
 case $SHELL in */zsh) ;; *) echo "shell:$SHELL"; exit 3;; esac
@@ -40,11 +40,11 @@ pub struct Host {
     pub name: String,
     pub endpoint: String,
     pub current: bool,
-    /// A LAN spare, kept in the context's description.
+    /// A LAN server, kept in the context's description.
     pub bonjour: Option<Lan>,
 }
 
-/// How a LAN spare is found again (Bonjour) and recognised (its SSH host key, pinned when
+/// How a LAN server is found again (Bonjour) and recognised (its SSH host key, pinned when
 /// it was added; the CA fingerprint is public, so it can't be the proof).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Lan {
@@ -80,7 +80,7 @@ fn known_hosts_name(dest: &str) -> String {
     }
 }
 
-/// The spare's ed25519 host key, read over the SSH session `add` just authenticated.
+/// The server's ed25519 host key, read over the SSH session `add` just authenticated.
 fn host_key(dest: &str) -> Result<String> {
     let out = ssh(dest).arg("cat /etc/ssh/ssh_host_ed25519_key.pub").stdin(Stdio::null()).output().context("run ssh")?;
     let line = String::from_utf8_lossy(&out.stdout);
@@ -143,7 +143,7 @@ pub fn list() -> (Vec<Host>, bool) {
     }
 }
 
-/// `host add --fleet`: what to set up on the spare besides docker.
+/// `host add --server`: what to set up on the server besides docker.
 pub struct Fleet {
     pub domain: String,
     pub addr: Option<String>,
@@ -163,19 +163,19 @@ fn check(name: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Provisions the spare as a fleet (docs/spare.md), adds it as remote NAME, then as a docker host.
-pub fn add_fleet(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet) -> Result<()> {
+/// Provisions the server as a fleet (docs/server.md), adds it as remote NAME, then as a docker host.
+pub fn add_server(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet) -> Result<()> {
     let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
     check(name, dest)?;
-    let bin = crate::spare::ensure_binary(dest, || ssh(dest), &ssh_dest(dest))?;
+    let bin = crate::server::ensure_binary(dest, || ssh(dest), &ssh_dest(dest))?;
     let tty: &[&str] = if std::io::IsTerminal::is_terminal(&std::io::stdin()) { &["-t"] } else { &[] };
-    let (url, token, fp) = crate::spare::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.lan, f.no_power)?;
+    let (url, token, fp) = crate::server::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.lan, f.no_power)?;
     crate::fleet::remote_add(paths, name, &url, &token, None, fp.as_deref())?;
     println!("remote {name}: {url}  (rekcod app deploy --remote {name})");
     if !f.docker {
         return Ok(());
     }
-    // The docker socket only exists while the spare's VM runs.
+    // The docker socket only exists while the server's VM runs.
     if !ssh(dest).arg(format!("'{bin}' start")).stdin(Stdio::null()).status()?.success() {
         bail!("`rekcod start` failed on {dest}; the fleet is set up, docker isn't (re-run with --no-docker to skip it)");
     }
@@ -237,7 +237,7 @@ fn retarget(dest: &str, target: &str) -> String {
     out
 }
 
-/// A LAN spare's docker context pointed at wherever its Bonjour instance is now, after
+/// A LAN server's docker context pointed at wherever its Bonjour instance is now, after
 /// proving with the SSH host key pinned at `add` that the Mac there is the same one.
 /// Hosts without one are left alone.
 pub fn refresh(name: &str) -> Result<()> {
@@ -320,7 +320,7 @@ pub fn rm(name: &str) -> Result<()> {
         println!("docker context: {to}");
     }
     docker::run_ok(&["context", "rm", &ctx])?;
-    println!("removed {ctx} (the spare's ~/.zshenv block stays)");
+    println!("removed {ctx} (the server's ~/.zshenv block stays)");
     Ok(())
 }
 
@@ -470,22 +470,22 @@ mod tests {
 
     #[test]
     fn dest_with_port() {
-        assert_eq!(ssh_dest("me@spare:2222"), ["-p", "2222", "me@spare"]);
-        assert_eq!(ssh_dest("me@spare"), ["me@spare"]);
+        assert_eq!(ssh_dest("me@mac-mini:2222"), ["-p", "2222", "me@mac-mini"]);
+        assert_eq!(ssh_dest("me@mac-mini"), ["me@mac-mini"]);
     }
 
     #[test]
     fn hosts_from_contexts() {
         let raw = r#"{"Name":"default","Current":false,"DockerEndpoint":"unix:///var/run/docker.sock"}
 {"Name":"rekcod","Current":false,"DockerEndpoint":"unix:///x"}
-{"Name":"rekcod-spare","Current":true,"DockerEndpoint":"ssh://me@spare"}"#;
+{"Name":"rekcod-mac-mini","Current":true,"DockerEndpoint":"ssh://me@mac-mini"}"#;
         let (hosts, local) = parse_hosts(raw);
         assert!(!local);
-        assert_eq!(hosts, [Host { name: "spare".into(), endpoint: "ssh://me@spare".into(), current: true, bonjour: None }]);
+        assert_eq!(hosts, [Host { name: "mac-mini".into(), endpoint: "ssh://me@mac-mini".into(), current: true, bonjour: None }]);
     }
 
     #[test]
-    fn lan_spare_description() {
+    fn lan_server_description() {
         let lan = Lan { instance: "rekcod-3f9a1c2b7d4e".into(), fp: "sha256:3f9a".into(), host_key: "ssh-ed25519 AAAAC3Nza+/=".into() };
         let d = description(Some(&lan));
         assert_eq!(parse_description(&d), Some(lan));
@@ -498,15 +498,15 @@ mod tests {
 
     #[test]
     fn known_hosts_names() {
-        assert_eq!(known_hosts_name("me@Spare.local"), "Spare.local");
-        assert_eq!(known_hosts_name("me@Spare.local:2222"), "[Spare.local]:2222");
-        assert_eq!(known_hosts_name("Spare.local:22"), "Spare.local");
+        assert_eq!(known_hosts_name("me@Mac-Mini.local"), "Mac-Mini.local");
+        assert_eq!(known_hosts_name("me@Mac-Mini.local:2222"), "[Mac-Mini.local]:2222");
+        assert_eq!(known_hosts_name("Mac-Mini.local:22"), "Mac-Mini.local");
     }
 
     #[test]
     fn retarget_keeps_user_and_port() {
-        assert_eq!(retarget("me@spare-mac", "Spare-2.local"), "me@Spare-2.local");
-        assert_eq!(retarget("me@10.0.0.4:2222", "Spare-2.local"), "me@Spare-2.local:2222");
-        assert_eq!(retarget("spare", "Spare-2.local"), "Spare-2.local");
+        assert_eq!(retarget("me@mac-mini", "Mac-Mini-2.local"), "me@Mac-Mini-2.local");
+        assert_eq!(retarget("me@10.0.0.4:2222", "Mac-Mini-2.local"), "me@Mac-Mini-2.local:2222");
+        assert_eq!(retarget("mac-mini", "Mac-Mini-2.local"), "Mac-Mini-2.local");
     }
 }

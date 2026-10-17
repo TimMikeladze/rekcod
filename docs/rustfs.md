@@ -22,7 +22,7 @@ sealed with the `default` namespace key. Later starts without `--storage` use wh
 On start it creates `rekcod-releases`, `rekcod-cache` and `rekcod-backups`; a RustFS that
 isn't up yet only logs, and deploys create the buckets they need.
 
-`rekcod spare setup` runs `storage serve --install` on `ADDR:7710` before the controller and
+`rekcod server setup` runs `storage serve --install` on `ADDR:7710` before the controller and
 passes `--storage`. One RustFS on one Mac: that disk is a single point of failure, which
 `platform.md` says not to rely on. RustFS's distributed mode is the upgrade path; I haven't
 measured it on Macs.
@@ -119,7 +119,7 @@ rekcod snap save|restore ... [--push|--pull]
   until someone deletes them.
 - Big images go through a temp file on the node's disk on the way up and down.
 - `storage serve` binds one address. Instances use that address, so it has to be one their
-  node can route to (the Tailscale IP on a spare); `127.0.0.1` only works for the Mac's own
+  node can route to (the Tailscale IP on a server); `127.0.0.1` only works for the Mac's own
   processes.
 
 ## Verification

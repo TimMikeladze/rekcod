@@ -80,18 +80,18 @@ describe("issues", () => {
     const s = state({
       ports: [{ port: 80, udp: false, container: "x", error: "port in use", sandbox: false, actions: [] }],
       status: { running: true, disk: { used_in_vm: 90, size: 100, on_mac: 1 } },
-      nodes: [{ id: "spare", url: "", mem_total_mib: 100, mem_free_mib: 50, last_seen: 1_000_000 - 600, state: "ready", pool: [], actions: [] }],
+      nodes: [{ id: "studio", url: "", mem_total_mib: 100, mem_free_mib: 50, last_seen: 1_000_000 - 600, state: "ready", pool: [], actions: [] }],
       jobs: [{ id: "j1", name: null, state: "failed", exit: 1, created: 1_000_000 - 60, actions: [] }],
     })
     const list = issues(s)
     expect(list.map((i) => i.tone)).toEqual(["bad", "bad", "bad", "warn"])
     expect(list.at(-1)!.text).toBe("VM disk is 90% full")
-    expect(list.some((i) => i.text.startsWith("Node spare last checked in 10m ago"))).toBe(true)
+    expect(list.some((i) => i.text.startsWith("Node studio last checked in 10m ago"))).toBe(true)
   })
   it("reports failed docker calls and doesn't call unknown free memory low", () => {
     const s = state({
       local_errors: { containers: "connection refused" },
-      nodes: [{ id: "spare", url: "", mem_total_mib: 100, mem_free_mib: null, last_seen: 1_000_000, state: "ready", pool: [], actions: [] }],
+      nodes: [{ id: "studio", url: "", mem_total_mib: 100, mem_free_mib: null, last_seen: 1_000_000, state: "ready", pool: [], actions: [] }],
     })
     expect(issues(s).map((i) => i.text)).toEqual(["Couldn't list containers: connection refused"])
   })
@@ -108,7 +108,7 @@ describe("duration", () => {
 
 describe("remote errors", () => {
   it("are issues, not empty lists", () => {
-    const s = state({ remote: { name: "spare", url: "http://x", ns: "default", all: [], error: "connection refused", errors: { apps: "connection refused" } } })
+    const s = state({ remote: { name: "studio", url: "http://x", ns: "default", all: [], error: "connection refused", errors: { apps: "connection refused" } } })
     const list = issues(s)
     expect(list[0]).toMatchObject({ tone: "bad", tab: "apps" })
     expect(list[0].text).toContain("connection refused")

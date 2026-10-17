@@ -308,55 +308,67 @@ into the guest's `~/ws` and back with tar). Their network is plain NAT with no f
 the Mac and the LAN are reachable, so `--offline` and `--allow-host` are refused for them. The MCP server adds `sandbox_screenshot` and `sandbox_input` for
 computer-use agents. Details: [`docs/platform.md`](docs/platform.md#track-4-as-built).
 
-### A spare Mac
+### Another Mac as a server
 
-One command on your Mac makes a spare Mac a deploy target and a docker host that runs with its
-lid shut:
+One command on your Mac makes another Mac a server: a deploy target and a docker host that
+runs with its lid shut:
 
 ```sh
-ssh-copy-id me@spare-mac
-rekcod host add spare me@spare-mac --fleet --domain apps.example.com
-rekcod app deploy --remote spare          # http://<spare's tailnet name>:8080, Host: <app>.apps.example.com
-docker ps                                 # runs on the spare too
+ssh-copy-id me@mac-mini
+rekcod host add mini me@mac-mini --server --domain apps.example.com
+rekcod app deploy --remote mini           # http://<server's tailnet name>:8080, Host: <app>.apps.example.com
+docker ps                                 # runs on the server too
 ```
 
-The spare needs Remote Login, Tailscale on your tailnet and automatic login. Without
+The server needs Remote Login, Tailscale on your tailnet and automatic login. Without
 Tailscale (or with `--lan`) it goes on the LAN and your Mac finds it over Bonjour as
 `https://rekcod-<CA fingerprint>.bonjour`, so a new IP or a renamed Mac doesn't break it
 ([`docs/lan-discovery.md`](docs/lan-discovery.md)); `--addr IP` pins one address instead. It needs automatic login
 because the services are LaunchAgents and those only run in a logged-in session. rekcod doesn't
 have to be installed there: `host add` copies this binary to `~/.rekcod/bin/rekcod` if it's
-missing. Then it runs `rekcod spare setup` over SSH, which installs RustFS, the controller, node and
+missing. Then it runs `rekcod server setup` over SSH, which installs RustFS, the controller, node and
 edge as LaunchAgents on the Tailscale address and runs `sudo pmset -a sleep 0 disablesleep 1
 autorestart 1` so the lid can shut and a power cut doesn't leave it off (sudo asks for the
-spare's password; `--no-power` skips it). It adds the remote `spare` here, then starts the
-spare's VM and adds the docker host (`--no-docker` skips that). Re-running it is safe.
-`rekcod spare uninstall` on the spare removes the agents. Details: [`docs/spare.md`](docs/spare.md). Step-by-step guide: [`docs/self-hosting.md`](docs/self-hosting.md).
+server's password; `--no-power` skips it). It adds the remote `mini` here, then starts the
+server's VM and adds the docker host (`--no-docker` skips that). Re-running it is safe.
+`rekcod server uninstall` on the server removes the agents. Details: [`docs/server.md`](docs/server.md). Step-by-step guide: [`docs/self-hosting.md`](docs/self-hosting.md).
+
+No SSH yet? Build an installer, AirDrop it to the server and double-click it there:
+
+```sh
+SERVER_DOMAIN=apps.example.com scripts/package-server.sh   # out/server/rekcod-server-0.3.0.pkg
+```
+
+It installs rekcod and the guest image, runs `server setup` for whoever is logged in on the
+server, and leaves the `rekcod remote add <its name> ...` line for your Mac in
+`~/Desktop/rekcod-pair.txt` and on the clipboard. The pkg isn't signed, so the first
+double-click is refused: System Settings › Privacy & Security › Open Anyway. Details:
+[`docs/server-pkg.md`](docs/server-pkg.md).
 
 The setup prints the `cloudflared` commands for public apps (`rekcod app public`).
 
 ### Docker on another Mac
 
-`rekcod host` makes a spare Mac's rekcod VM your docker engine, over plain docker-over-SSH.
-On the spare, run `rekcod start` and turn on Remote Login (System Settings › General ›
+`rekcod host` makes another Mac's rekcod VM your docker engine, over plain docker-over-SSH.
+On that Mac, run `rekcod start` and turn on Remote Login (System Settings › General ›
 Sharing). Then on your Mac:
 
 ```sh
-ssh-copy-id you@spare-mac              # docker's SSH helper can't answer a password prompt
-rekcod host add spare you@spare-mac    # sets up the spare, creates docker context rekcod-spare, switches to it
-docker ps                              # runs on the spare
-rekcod host forward spare              # the spare's published ports on 127.0.0.1 here, until Ctrl-C
+ssh-copy-id you@mac-mini               # docker's SSH helper can't answer a password prompt
+rekcod host add mini you@mac-mini      # sets up that Mac, creates docker context rekcod-mini, switches to it
+docker ps                              # runs on that Mac
+rekcod host forward mini               # its published ports on 127.0.0.1 here, until Ctrl-C
 rekcod host use local                  # back to this Mac's rekcod
 ```
 
-`host add` writes a marked block to the spare's `~/.zshenv`. For non-interactive SSH only, it
+`host add` writes a marked block to that Mac's `~/.zshenv`. For non-interactive SSH only, it
 puts the docker CLI on `PATH` (non-login SSH has no `/opt/homebrew/bin`) and points
-`DOCKER_HOST` at `~/.rekcod/run/docker.sock`, so it doesn't matter which context the spare
-has active. The spare's login shell has to be zsh; otherwise `add` prints the two lines to
+`DOCKER_HOST` at `~/.rekcod/run/docker.sock`, so it doesn't matter which context that Mac
+has active. Its login shell has to be zsh; otherwise `add` prints the two lines to
 add by hand. `forward` follows containers as they start and stop, and reports a port that's
 already taken here once instead of retrying it.
 
-Bind mounts (`-v ./src:/app`) are paths on the spare, and `docker build` sends its context
+Bind mounts (`-v ./src:/app`) are paths on the other Mac, and `docker build` sends its context
 over SSH. The menu bar shows a Docker host submenu for switching and forwarding, but the rest
 of the menu is still this Mac's VM. Details: [`docs/remote-docker.md`](docs/remote-docker.md).
 
@@ -398,7 +410,7 @@ HTTP, and only on loopback or tailnet addresses (100.64.0.0/10, `*.ts.net`) unle
 a tailnet or LAN you trust.
 
 New nodes wait as `pending` until `rekcod node approve ID` (`controller serve --auto-approve`
-skips that, as `spare setup` does). `node rm ID` forgets one and its instances move.
+skips that, as `server setup` does). `node rm ID` forgets one and its instances move.
 `controller rotate-join` replaces the join token. Tokens are stored hashed. An `--edge`
 token reads routes and bans, reports traffic and wakes sleeping apps; a token made with
 `--ns` has no access to `default`.
@@ -444,7 +456,7 @@ closed after 90 s without a request, and `--access-log` prints a line per reques
 
 `--install` on `controller serve`, `node join`/`node serve`, `edge serve` and `storage serve`
 runs each as a LaunchAgent; `rekcod controller|node|edge|storage uninstall` removes it.
-[A spare Mac](#a-spare-mac) sets up all four with one command. With storage the controller
+[Another Mac as a server](#another-mac-as-a-server) sets up all four with one command. With storage the controller
 backs `fleet.db` up every hour (below); `--backup-dir DIR` also keeps those copies on another
 disk or a synced folder. Without either, copy `fleet.db` (and its `-wal` file) while it's
 stopped. Either way keep a copy of `controller/secret-key` somewhere else: app secrets in
@@ -622,8 +634,8 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod edge serve\|ban\|unban\|bans\|uninstall` | HTTP ingress for apps; ban IPs and ranges on every edge |
 | `rekcod app deploy\|ls\|status\|release\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet; `release NAME N` prints one release with its deploy log, `logs --instance ID` one instance's logs (also after a redeploy removed it: the last lines of the 20 newest gone instances are kept) |
 | `rekcod job run\|ls\|logs\|rerun\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every`; `ls --name N` is one job's last 50 runs, `logs -f` follows a running one, `rerun ID` runs a finished one again |
-| `rekcod host add\|ls\|use\|rm\|forward\|refresh` | Another Mac's rekcod as the docker engine, over SSH; `add --fleet` also provisions it as a fleet (`--lan`: found over Bonjour, `refresh` follows it to a new address) |
-| `rekcod spare setup\|uninstall` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, no sleep) |
+| `rekcod host add\|ls\|use\|rm\|forward\|refresh` | Another Mac's rekcod as the docker engine, over SSH; `add --server` also provisions it as a fleet (`--lan`: found over Bonjour, `refresh` follows it to a new address) |
+| `rekcod server setup\|uninstall` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, no sleep) |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
 | `rekcod shell` | Root shell in the VM |

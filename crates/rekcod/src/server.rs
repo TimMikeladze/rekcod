@@ -1,6 +1,6 @@
-//! A spare Mac as a one-machine fleet that runs headless (docs/spare.md).
+//! This Mac as a server: a one-machine fleet that runs headless (docs/server.md).
 //!
-//! `rekcod spare setup` runs on the spare; `rekcod host add --fleet` runs it over SSH from
+//! `rekcod server setup` runs on the server; `rekcod host add --server` runs it over SSH from
 //! your Mac and adds the remote it prints.
 
 use std::io::{IsTerminal, Read, Write};
@@ -33,11 +33,22 @@ pub fn dns_name(status_json: &str) -> Option<String> {
 }
 
 fn run(exe: &Path, args: &[&str]) -> Result<()> {
-    let st = Command::new(exe).args(args).status().with_context(|| format!("run rekcod {}", args.join(" ")))?;
+    let st = Command::new(exe).args(args).status().with_context(|| format!("run rekcod {}", redacted(args)))?;
     if !st.success() {
-        bail!("`rekcod {}` failed", args.join(" "));
+        bail!("`rekcod {}` failed", redacted(args));
     }
     Ok(())
+}
+
+/// `args` for an error message, with tokens hidden (the value after `--token`, and
+/// `node join`'s join token): errors end up in install logs other accounts can read.
+fn redacted(args: &[&str]) -> String {
+    let join = args.starts_with(&["node", "join"]);
+    let mut out = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        out.push(if (i > 0 && args[i - 1] == "--token") || (join && i == 3) { "***" } else { a });
+    }
+    out.join(" ")
 }
 
 fn gui_session() -> bool {
@@ -70,7 +81,7 @@ fn power() {
     }
 }
 
-/// How the spare is addressed: a fixed IP, its tailnet, or nothing fixed (Bonjour).
+/// How the server is addressed: a fixed IP, its tailnet, or nothing fixed (Bonjour).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Net {
     Fixed(String),
@@ -202,7 +213,11 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    let fp = std::fs::read_to_string(&fp_file).map(|f| f.trim().to_string()).unwrap_or_else(|_| "sha256:dry-run".into());
+    let fp = match std::fs::read_to_string(&fp_file) {
+        Ok(f) => f.trim().to_string(),
+        Err(_) if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() => "sha256:dry-run".into(),
+        Err(_) => bail!("the controller wrote no CA fingerprint; see {}", paths.home.join("logs/controller.log").display()),
+    };
     let url = &l.controller_url;
     run(&exe, &["remote", "add", "local", url, "--token", &admin, "--ca-fingerprint", &fp])?;
     // A node that joined on another address (the LAN IP it had, a switch to or from --lan)
@@ -257,7 +272,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
          \x20 cloudflared tunnel login && cloudflared tunnel create rekcod && cloudflared tunnel route dns rekcod '*.{domain}'\n\
          \x20 # ~/.cloudflared/config.yml: tunnel: rekcod, ingress: *.{domain} -> http://127.0.0.1:8081\n\
          \x20 sudo cloudflared service install\n\
-         Logs: {}/logs/{{controller,node,edge,storage}}.log   Undo: rekcod spare uninstall\n",
+         Logs: {}/logs/{{controller,node,edge,storage}}.log   Undo: rekcod server uninstall\n",
         paths.home.display()
     );
     println!("remote {remote} {admin} {fp}");
@@ -271,8 +286,7 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
-/// The `remote URL TOKEN` line `spare setup` ends with.
-/// `remote URL TOKEN [CA-FINGERPRINT]`, the last line `spare setup` prints.
+/// `remote URL TOKEN [CA-FINGERPRINT]`, the last line `server setup` prints.
 pub fn parse_remote(line: &str) -> Option<(String, String, Option<String>)> {
     let mut it = line.trim().strip_prefix("remote ")?.split_whitespace();
     let (url, token) = (it.next()?, it.next()?);
@@ -282,7 +296,7 @@ pub fn parse_remote(line: &str) -> Option<(String, String, Option<String>)> {
 
 const FIND: &str = "command -v rekcod || { [ -x ~/.rekcod/bin/rekcod ] && echo ~/.rekcod/bin/rekcod; }";
 
-/// The spare's rekcod, copying this one over when it has none.
+/// The server's rekcod, copying this one over when it has none.
 pub fn ensure_binary(dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String]) -> Result<String> {
     let o = ssh().args(["/bin/zsh", "-lc", FIND]).stdin(Stdio::null()).output()?;
     let found = String::from_utf8_lossy(&o.stdout).lines().map(str::trim).find(|l| l.starts_with('/')).map(String::from);
@@ -360,7 +374,7 @@ fn pass_through(src: impl Read, mut out: impl Write) -> Result<Option<(String, S
     Ok(remote)
 }
 
-/// Runs `spare setup` over SSH, streaming its output, and returns the remote it printed.
+/// Runs `server setup` over SSH, streaming its output, and returns the remote it printed.
 /// `ssh` should have `-t` when this terminal is one, so sudo can prompt.
 pub fn remote_setup(
     dest: &str,
@@ -374,7 +388,7 @@ pub fn remote_setup(
     if !shell_safe(domain) || addr.is_some_and(|a| !shell_safe(a)) || bin.contains('\'') {
         bail!("--domain and --addr take letters, digits and - . : only");
     }
-    let mut cmd = format!("'{bin}' spare setup --domain {domain}");
+    let mut cmd = format!("'{bin}' server setup --domain {domain}");
     if let Some(a) = addr {
         cmd += &format!(" --addr {a}");
     }
@@ -387,9 +401,9 @@ pub fn remote_setup(
     let mut child = ssh.arg(cmd).stdout(Stdio::piped()).spawn().context("run ssh")?;
     let remote = pass_through(child.stdout.take().context("ssh stdout")?, std::io::stdout())?;
     if !child.wait()?.success() {
-        bail!("`rekcod spare setup` failed on {dest}");
+        bail!("`rekcod server setup` failed on {dest}");
     }
-    remote.context("spare setup didn't print its remote")
+    remote.context("server setup didn't print its remote")
 }
 
 #[cfg(test)]
@@ -406,17 +420,26 @@ mod tests {
         for a in [&l.storage_listen, &l.storage_url, &l.controller_url, &l.node_listen] {
             assert!(a.contains("127.0.0.1"), "{a}");
         }
-        let t = layout(&Net::Tailnet { ip: "100.64.0.9".into(), name: Some("spare.tail1.ts.net".into()) });
-        assert_eq!(t.tls_name.as_deref(), Some("spare.tail1.ts.net"));
+        let t = layout(&Net::Tailnet { ip: "100.64.0.9".into(), name: Some("mini.tail1.ts.net".into()) });
+        assert_eq!(t.tls_name.as_deref(), Some("mini.tail1.ts.net"));
         assert_eq!((t.node_listen.as_str(), t.bonjour), ("100.64.0.9:7701", false));
         assert_eq!(layout(&Net::Fixed("10.0.0.4".into())).tls_name.as_deref(), Some("10.0.0.4"));
     }
 
     #[test]
+    fn errors_hide_tokens() {
+        assert_eq!(
+            redacted(&["remote", "add", "local", "https://x", "--token", "secret", "--ca-fingerprint", "sha256:ab"]),
+            "remote add local https://x --token *** --ca-fingerprint sha256:ab"
+        );
+        assert_eq!(redacted(&["node", "join", "https://x", "jtok", "--listen", "a"]), "node join https://x *** --listen a");
+    }
+
+    #[test]
     fn remote_line() {
         assert_eq!(
-            parse_remote("remote http://spare.tail1.ts.net:7700 abc\r"),
-            Some(("http://spare.tail1.ts.net:7700".into(), "abc".into(), None))
+            parse_remote("remote http://mini.tail1.ts.net:7700 abc\r"),
+            Some(("http://mini.tail1.ts.net:7700".into(), "abc".into(), None))
         );
         assert_eq!(parse_remote("remote add local"), None);
         assert_eq!(
@@ -430,13 +453,13 @@ mod tests {
     #[test]
     fn remote_setup_returns_remote() {
         let bin = std::env::temp_dir().join(format!("rekcod-fake-{}", std::process::id()));
-        std::fs::write(&bin, "#!/bin/sh\necho \"args: $*\"\necho 'remote http://spare:7700 tok'\n").unwrap();
+        std::fs::write(&bin, "#!/bin/sh\necho \"args: $*\"\necho 'remote http://mini:7700 tok'\n").unwrap();
         std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let mut sh = Command::new("sh");
         sh.arg("-c");
-        let r = remote_setup("spare", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), false, true);
+        let r = remote_setup("mini", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), false, true);
         std::fs::remove_file(&bin).unwrap();
-        assert_eq!(r.unwrap(), ("http://spare:7700".into(), "tok".into(), None));
+        assert_eq!(r.unwrap(), ("http://mini:7700".into(), "tok".into(), None));
     }
 
     #[test]
@@ -450,7 +473,7 @@ mod tests {
 
     #[test]
     fn tailnet_name() {
-        assert_eq!(dns_name(r#"{"Self":{"DNSName":"spare.tail1.ts.net."}}"#).as_deref(), Some("spare.tail1.ts.net"));
+        assert_eq!(dns_name(r#"{"Self":{"DNSName":"mini.tail1.ts.net."}}"#).as_deref(), Some("mini.tail1.ts.net"));
         assert_eq!(dns_name(r#"{"Self":{"DNSName":""}}"#), None);
     }
 }

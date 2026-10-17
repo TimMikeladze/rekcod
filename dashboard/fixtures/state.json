@@ -749,8 +749,8 @@
         "instances": [
           {
             "release": 7,
-            "sandbox": "sb-spare-7",
-            "node": "spare",
+            "sandbox": "sb-studio-7",
+            "node": "studio",
             "endpoint": "100.64.0.7:3000",
             "state": "live",
             "created": 1792121224
@@ -1545,8 +1545,8 @@
         "instances": [
           {
             "release": 4,
-            "sandbox": "sb-spare-4",
-            "node": "spare",
+            "sandbox": "sb-studio-4",
+            "node": "studio",
             "endpoint": "100.64.0.4:3000",
             "state": "sleeping",
             "created": 1792121224
@@ -1568,7 +1568,7 @@
         "python",
         "etl.py"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": "nightly",
       "ns": "default",
@@ -1610,7 +1610,7 @@
         "run",
         "migrate"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": null,
       "ns": "default",
@@ -1680,7 +1680,7 @@
         "-c",
         "pytest -q"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": null,
       "ns": "default",
@@ -1720,7 +1720,7 @@
         "node",
         "sync.js"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": "sync",
       "ns": "default",
@@ -1778,7 +1778,7 @@
         "node",
         "sync.js"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": "sync",
       "ns": "default",
@@ -1808,7 +1808,7 @@
         "-c",
         "pg_dump shop | gzip > /out/shop.gz"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": null,
       "ns": "default",
@@ -1866,7 +1866,7 @@
         "node",
         "sync.js"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": "sync",
       "ns": "default",
@@ -1924,7 +1924,7 @@
         "node",
         "sync.js"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": "sync",
       "ns": "default",
@@ -1982,7 +1982,7 @@
         "node",
         "sync.js"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": "sync",
       "ns": "default",
@@ -2040,7 +2040,7 @@
         "node",
         "sync.js"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": "sync",
       "ns": "default",
@@ -2070,7 +2070,7 @@
         "-c",
         "pg_dump shop | gzip > /out/shop.gz"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": null,
       "ns": "default",
@@ -2128,7 +2128,7 @@
         "node",
         "sync.js"
       ],
-      "node": "spare",
+      "node": "studio",
       "owner": "tim",
       "schedule": "sync",
       "ns": "default",
@@ -2215,8 +2215,8 @@
   "hosts": {
     "all": [
       {
-        "name": "spare",
-        "endpoint": "ssh://me@spare-mac",
+        "name": "studio",
+        "endpoint": "ssh://me@mac-studio",
         "current": false
       }
     ],
@@ -2224,22 +2224,22 @@
     "actions": [
       {
         "kind": "HostUse",
-        "label": "Use spare",
+        "label": "Use studio",
         "argv": [
           "host",
           "use",
-          "spare"
+          "studio"
         ],
         "interactive": false,
         "confirm": null
       },
       {
         "kind": "HostForward",
-        "label": "Forward ports from spare",
+        "label": "Forward ports from studio",
         "argv": [
           "host",
           "forward",
-          "spare"
+          "studio"
         ],
         "interactive": true,
         "confirm": null
@@ -2323,11 +2323,11 @@
     ]
   },
   "remote": {
-    "name": "spare",
-    "url": "http://spare.tail1234.ts.net:7700",
+    "name": "studio",
+    "url": "http://studio.tail1234.ts.net:7700",
     "ns": "default",
     "all": [
-      "spare",
+      "studio",
       "work"
     ],
     "admin": true,
@@ -2336,7 +2336,7 @@
   },
   "nodes": [
     {
-      "id": "spare",
+      "id": "studio",
       "url": "http://100.64.0.2:7701",
       "mem_total_mib": 32768,
       "mem_free_mib": 12000,
@@ -2356,10 +2356,10 @@
           "argv": [
             "node",
             "drain",
-            "spare"
+            "studio"
           ],
           "interactive": false,
-          "confirm": "Drain spare? Nothing new is placed there; what runs keeps running."
+          "confirm": "Drain studio? Nothing new is placed there; what runs keeps running."
         }
       ]
     },
@@ -2696,9 +2696,9 @@
     }
   ],
   "remotes": {
-    "default": "spare",
+    "default": "studio",
     "all": [
-      "spare",
+      "studio",
       "work"
     ],
     "actions": [

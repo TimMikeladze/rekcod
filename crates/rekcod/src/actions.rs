@@ -1228,7 +1228,7 @@ pub mod tests {
         let lan =
             crate::host::Lan { instance: "rekcod-3f9a1c2b7d4e".into(), fp: "sha256:3f9a".into(), host_key: "ssh-ed25519 AAAA".into() };
         let lan = crate::host::Host { bonjour: Some(lan), ..h("mini", false) };
-        Hosts { all: vec![h("spare", true), lan], local_current: false }
+        Hosts { all: vec![h("studio", true), lan], local_current: false }
     }
 
     pub fn sample_bans() -> Vec<String> {

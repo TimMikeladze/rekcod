@@ -1,4 +1,4 @@
-//! A spare on a LAN found by identity instead of address (docs/lan-discovery.md).
+//! A server on a LAN found by identity instead of address (docs/lan-discovery.md).
 //!
 //! The controller registers `rekcod-<fingerprint>` as `_rekcod._tcp`; a remote URL
 //! `https://rekcod-<fingerprint>.bonjour` is resolved through mDNSResponder on every call.
@@ -136,7 +136,7 @@ pub fn resolve(instance: &str, timeout: Duration) -> Result<(String, u16)> {
     }
     unsafe { DNSServiceRefDeallocate(sd) };
     found.host.map(|h| (h, found.port)).ok_or_else(|| {
-        anyhow!("{instance} isn't answering on Bonjour; is the spare on, and on the same network (mDNS doesn't cross subnets)?")
+        anyhow!("{instance} isn't answering on Bonjour; is the server on, and on the same network (mDNS doesn't cross subnets)?")
     })
 }
 
@@ -162,7 +162,7 @@ mod tests {
         assert_eq!(instance("sha256:3F9A1C2B7D4E55aa"), "rekcod-3f9a1c2b7d4e");
         assert_eq!(instance_of("rekcod-3f9a1c2b7d4e.bonjour"), Some("rekcod-3f9a1c2b7d4e"));
         assert_eq!(instance_of("rekcod-3f9a1c2b7d4e.bonjour:7700"), Some("rekcod-3f9a1c2b7d4e"));
-        assert_eq!(instance_of("spare.local:7700"), None);
+        assert_eq!(instance_of("mini.local:7700"), None);
         assert_eq!(instance_of(".bonjour"), None);
     }
 

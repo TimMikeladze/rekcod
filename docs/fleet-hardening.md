@@ -15,7 +15,7 @@ comes from `docs/production-readiness.md` sections 4, 5 and 8. Section 1 (git in
   keeps today's behaviour (`member`). A token made with `--ns team` gets `none`, so a
   viewer in `team` can't deploy into `default`.
 - A new `edge` kind of token (`controller token edge-1 --edge`) may only read `/routes`
-  and `/bans` and post `/routes/activity`. `spare setup` makes one for its edge instead
+  and `/bans` and post `/routes/activity`. `server setup` makes one for its edge instead
   of handing it the admin token.
 - Viewers no longer see env values in app status, only the keys.
 
@@ -23,7 +23,7 @@ comes from `docs/production-readiness.md` sections 4, 5 and 8. Section 1 (git in
 
 - A node registers as `pending`. `rekcod node approve ID` (admin) makes it `ready`;
   `controller serve --auto-approve` keeps today's behaviour for one-Mac fleets and
-  `spare setup` passes it.
+  `server setup` passes it.
 - `rekcod node rm ID` deletes a node (its instances are rescheduled).
 - `rekcod controller rotate-join` makes a new join token; the old one stops working.
 - Placement trusts `mem_free` only up to the `mem_total` the node sent at join.

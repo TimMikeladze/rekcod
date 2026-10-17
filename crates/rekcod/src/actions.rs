@@ -49,6 +49,7 @@ pub enum Kind {
     HostForward,
     HostRefresh,
     HostRestart,
+    HostUninstall,
     EdgeBan,
     EdgeUnban,
     StorageUp,
@@ -80,7 +81,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 61] = [
+    pub const ALL: [Kind; 62] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -116,6 +117,7 @@ impl Kind {
         Kind::HostForward,
         Kind::HostRefresh,
         Kind::HostRestart,
+        Kind::HostUninstall,
         Kind::EdgeBan,
         Kind::EdgeUnban,
         Kind::StorageUp,
@@ -1162,6 +1164,16 @@ pub fn host_actions(h: &Hosts) -> Vec<Action> {
                 .confirm(format!("Restart {}? Its apps and containers are down until it's back, about a minute.", host.name)),
         );
     }
+    for host in &h.all {
+        out.push(
+            Action::rekcod(Kind::HostUninstall, format!("Remove rekcod from {}", host.name), &["host", "uninstall", &host.name, "--yes"])
+                .interactive()
+                .confirm(format!(
+                    "Remove rekcod from {}? Its VM, containers, apps and fleet data are deleted there, and it's forgotten here.",
+                    host.name
+                )),
+        );
+    }
     out
 }
 
@@ -1385,6 +1397,7 @@ pub mod tests {
                     | Kind::VmRepair
                     | Kind::Uninstall
                     | Kind::HostRestart
+                    | Kind::HostUninstall
             ) || (a.kind == Kind::EdgeBan && !a.interactive);
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }

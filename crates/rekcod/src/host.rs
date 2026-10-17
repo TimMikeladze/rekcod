@@ -332,6 +332,56 @@ pub fn restart(paths: &Paths, name: &str) -> Result<()> {
     bail!("{name} hasn't come back in 10 minutes; with FileVault on it may be waiting at its unlock screen")
 }
 
+/// `rekcod host uninstall NAME`: `rekcod uninstall` there (its VM, jobs, data, the
+/// `~/.zshenv` block, firewall exception and pmset), then rekcod's key out of its
+/// `authorized_keys`, then the docker context, SSH config block and remote NAME here.
+pub fn uninstall(paths: &Paths, name: &str, yes: bool) -> Result<()> {
+    if let Err(e) = refresh(paths, name) {
+        eprintln!("rekcod: {e:#}");
+    }
+    let (hosts, _) = list();
+    let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
+    let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?.to_string();
+    if !yes {
+        eprint!(
+            "This removes rekcod from {dest}: its VM, containers, apps, fleet data and ~/.rekcod, and the changes setup made there. Type `yes` to go on: "
+        );
+        std::io::stderr().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != "yes" {
+            bail!("nothing changed");
+        }
+    }
+    eprintln!("rekcod: connecting to {dest}");
+    // The same build there, so it knows everything this one would undo.
+    let bin = crate::server::ensure_binary(&dest, || ssh(&dest), &ssh_dest(&dest))?;
+    eprintln!("rekcod: running `rekcod uninstall` on {dest}; sudo there asks for the password of that Mac's account");
+    if !ssh_opts(&dest, &["-t"]).arg(format!("'{bin}' uninstall --yes && rm -f '{bin}'")).status()?.success() {
+        bail!("`rekcod uninstall` failed on {dest}; nothing removed here");
+    }
+    // Last thing over SSH: without its key rekcod can't get back in.
+    let key = std::fs::read_to_string(crate::sshkey::key(paths).with_extension("pub")).unwrap_or_default();
+    if !key.trim().is_empty() {
+        let mut child = ssh(&dest)
+            // Rewritten in place (cat >), so the file keeps its mode and owner.
+            .arg(r#"k=$(cat); f=~/.ssh/authorized_keys; if [ -f "$f" ]; then grep -vxF "$k" "$f" > "$f.rekcod"; cat "$f.rekcod" > "$f"; rm -f "$f.rekcod"; fi"#)
+            .stdin(Stdio::piped())
+            .spawn()?;
+        child.stdin.take().context("ssh stdin")?.write_all(key.trim().as_bytes())?;
+        if child.wait()?.success() {
+            eprintln!("rekcod: removed rekcod's key from {dest}'s ~/.ssh/authorized_keys");
+        }
+    }
+    forget(paths, name)?;
+    println!("removed docker context {} and its SSH config here", context(name));
+    if crate::fleet::remotes(paths).remotes.contains_key(name) {
+        crate::fleet::remote_rm(paths, name)?;
+    }
+    println!("rekcod is gone from {dest}");
+    Ok(())
+}
+
 /// `user@host[:port]` with the host swapped for `target`.
 fn retarget(dest: &str, target: &str) -> String {
     let (user, rest) = dest.split_once('@').map_or((None, dest), |(u, r)| (Some(u), r));
@@ -420,6 +470,16 @@ pub fn use_host(paths: &Paths, name: &str) -> Result<()> {
 }
 
 pub fn rm(paths: &Paths, name: &str) -> Result<()> {
+    forget(paths, name)?;
+    println!(
+        "removed {} (that Mac's ~/.zshenv block and rekcod's key in its authorized_keys stay; `rekcod host uninstall` removes them too)",
+        context(name)
+    );
+    Ok(())
+}
+
+/// The docker context and SSH config block for NAME, gone.
+fn forget(paths: &Paths, name: &str) -> Result<()> {
     let ctx = context(name);
     if !docker::context_exists(&ctx) {
         bail!("no host {name}");
@@ -430,9 +490,7 @@ pub fn rm(paths: &Paths, name: &str) -> Result<()> {
         println!("docker context: {to}");
     }
     docker::run_ok(&["context", "rm", &ctx])?;
-    crate::sshkey::forget(paths, name)?;
-    println!("removed {ctx} (the server's ~/.zshenv block and rekcod's key in its authorized_keys stay)");
-    Ok(())
+    crate::sshkey::forget(paths, name)
 }
 
 pub fn print_list(json: bool) {

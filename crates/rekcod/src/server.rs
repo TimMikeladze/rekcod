@@ -119,16 +119,145 @@ fn can_sudo() -> bool {
     std::io::stdin().is_terminal() || Command::new("sudo").args(["-n", "true"]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
-fn power() {
+fn power(paths: &Paths) {
     if !can_sudo() {
         eprintln!("rekcod: skipped `sudo {}` (sudo needs a terminal); run it once so the lid can stay shut", PMSET.join(" "));
         return;
+    }
+    // What `rekcod uninstall` puts back. Written once: a re-run would record rekcod's own values.
+    let before = pmset_file(paths);
+    if !before.exists() {
+        let custom = Command::new("pmset").args(["-g", "custom"]).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+        let g = Command::new("pmset").arg("-g").output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+        if let (Ok(c), Ok(g)) = (custom, g) {
+            let undo = pmset_undo(&c, &g);
+            let _ = std::fs::create_dir_all(before.parent().unwrap_or(&paths.home));
+            let _ = std::fs::write(&before, serde_json::to_vec(&undo).unwrap_or_default());
+        }
     }
     eprintln!("rekcod: sudo {}", PMSET.join(" "));
     match Command::new("sudo").args(PMSET).status() {
         Ok(s) if s.success() => eprintln!("rekcod: never sleeps, lid shut or not; boots again after a power cut"),
         _ => eprintln!("rekcod: pmset failed; the Mac sleeps when its lid shuts"),
     }
+}
+
+fn pmset_file(paths: &Paths) -> PathBuf {
+    paths.home.join("server/pmset-before.json")
+}
+
+/// The `pmset` commands that put back what `PMSET` changes, read from `pmset -g custom`
+/// (per power source: "Battery Power:", "AC Power:") and `pmset -g` (SleepDisabled is global).
+fn pmset_undo(custom: &str, global: &str) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let mut flag: Option<&str> = None;
+    let mut settings: Vec<String> = Vec::new();
+    let mut flush = |flag: Option<&str>, settings: &mut Vec<String>| {
+        if let Some(f) = flag
+            && !settings.is_empty()
+        {
+            let mut cmd = vec!["pmset".to_string(), f.to_string()];
+            cmd.append(settings);
+            out.push(cmd);
+        }
+        settings.clear();
+    };
+    for line in custom.lines() {
+        if !line.starts_with(' ') && line.ends_with(':') {
+            flush(flag, &mut settings);
+            flag = match line {
+                "Battery Power:" => Some("-b"),
+                "AC Power:" => Some("-c"),
+                "UPS Power:" => Some("-u"),
+                _ => None,
+            };
+            continue;
+        }
+        let mut it = line.split_whitespace();
+        if let (Some(k @ ("sleep" | "autorestart" | "womp")), Some(v)) = (it.next(), it.next()) {
+            settings.extend([k.to_string(), v.to_string()]);
+        }
+    }
+    flush(flag, &mut settings);
+    let disabled = global.lines().find_map(|l| l.trim().strip_prefix("SleepDisabled")).map(str::trim).unwrap_or("0");
+    out.push(["pmset", "-a", "disablesleep", disabled].map(String::from).into());
+    out
+}
+
+/// `sudo` that asks in a terminal and otherwise only works with cached credentials.
+fn sudo(args: &[&str]) -> Result<()> {
+    let mut cmd = Command::new("sudo");
+    if !std::io::stdin().is_terminal() {
+        cmd.arg("-n");
+    }
+    let out = cmd.args(args).stdout(Stdio::null()).output()?;
+    if !out.status.success() {
+        bail!("`sudo {}`: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
+/// The `~/.zshenv` block `host add` writes, removed (the rest of the file stays).
+pub fn without_zshenv_block(s: &str) -> String {
+    let mut out = String::new();
+    let mut skipping = false;
+    for line in s.lines() {
+        if line.starts_with("# >>> rekcod host") {
+            skipping = true;
+        } else if skipping && line.starts_with("# <<< rekcod host") {
+            skipping = false;
+        } else if !skipping {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// What `rekcod uninstall` undoes outside `~/.rekcod` on a Mac `server setup` or `host add`
+/// changed: the `~/.zshenv` block, firewall exceptions for rekcod, and pmset. Each is a
+/// step `uninstall` reports.
+pub fn undo_system(paths: &Paths) -> Vec<(String, Result<()>)> {
+    let mut steps = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        let f = PathBuf::from(home).join(".zshenv");
+        if let Ok(s) = std::fs::read_to_string(&f)
+            && s.contains("# >>> rekcod host")
+        {
+            steps.push((
+                "remove the rekcod block from ~/.zshenv".to_string(),
+                std::fs::write(&f, without_zshenv_block(&s)).map_err(Into::into),
+            ));
+        }
+    }
+    let list =
+        Command::new(SOCKETFILTERFW).arg("--listapps").output().map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let ours: Vec<String> = list
+        .lines()
+        .filter_map(|l| l.trim().split_once(" : ").map(|(_, p)| p.trim().to_string()))
+        .filter(|p| p.ends_with("/.rekcod/bin/rekcod") || p.ends_with("/bin/rekcod") || p.contains("/.rekcod/bin/rustfs"))
+        .collect();
+    for p in ours {
+        steps.push((format!("remove the firewall exception for {p}"), sudo(&[SOCKETFILTERFW, "--remove", &p])));
+    }
+    match std::fs::read(pmset_file(paths)).ok().and_then(|b| serde_json::from_slice::<Vec<Vec<String>>>(&b).ok()) {
+        Some(undo) => {
+            let r = undo.iter().try_for_each(|c| sudo(&c.iter().map(String::as_str).collect::<Vec<_>>()));
+            steps.push(("put pmset back as it was before `server setup`".to_string(), r));
+        }
+        None => {
+            let disabled = Command::new("pmset").arg("-g").output().is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim().strip_prefix("SleepDisabled").is_some_and(|v| v.trim() == "1"))
+            });
+            if disabled {
+                steps.push((
+                    "let the Mac sleep with the lid shut again (pmset disablesleep 0; sleep, womp and autorestart weren't recorded, so they stay)".to_string(),
+                    sudo(&["pmset", "-a", "disablesleep", "0"]),
+                ));
+            }
+        }
+    }
+    steps
 }
 
 const SOCKETFILTERFW: &str = "/usr/libexec/ApplicationFirewall/socketfilterfw";
@@ -285,7 +414,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
     }
     firewall(&exe);
     if !no_power {
-        power();
+        power(paths);
     }
 
     let ctl = paths.home.join("controller");
@@ -784,6 +913,28 @@ mod tests {
     }
 
     /// fdesetup reads the account from stdin; a password with XML in it stays one string.
+    /// What uninstall puts back, per power source, from `pmset -g custom` as a MacBook prints it.
+    #[test]
+    fn pmset_undo_per_source() {
+        let custom = "Battery Power:\n Sleep On Power Button 1\n womp                 0\n sleep                1\n displaysleep         2\nAC Power:\n womp                 1\n sleep                10\n autorestart          0\n";
+        let undo = pmset_undo(custom, " SleepDisabled\t\t0\n");
+        assert_eq!(
+            undo,
+            [
+                vec!["pmset", "-b", "womp", "0", "sleep", "1"],
+                vec!["pmset", "-c", "womp", "1", "sleep", "10", "autorestart", "0"],
+                vec!["pmset", "-a", "disablesleep", "0"],
+            ]
+        );
+    }
+
+    #[test]
+    fn zshenv_block_removed_rest_kept() {
+        let s = "export A=1\n# >>> rekcod host (written by rekcod host add)\nexport PATH=x\n# <<< rekcod host\nexport B=2\n";
+        assert_eq!(without_zshenv_block(s), "export A=1\nexport B=2\n");
+        assert_eq!(without_zshenv_block("export A=1\n"), "export A=1\n");
+    }
+
     #[test]
     fn unlock_plist_escapes() {
         let p = unlock_plist("tim", "a<b&c\"d");

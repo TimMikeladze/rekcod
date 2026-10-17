@@ -40,15 +40,35 @@ published yet.
 `rekcod uninstall` undoes everything rekcod set up, in order:
 
 1. stops the VM, the `--sandbox` VM and every agent sandbox;
-2. removes its LaunchAgents (`vm`, `menubar`, `dashboard`, `controller`, `node`, `edge`,
-   `storage`);
+2. removes its launchd jobs (`vm`, `menubar`, `dashboard`, `controller`, `node`, `edge`,
+   `storage`), LaunchDaemons too (sudo);
 3. hands `/var/run/docker.sock` back (`socket uninstall`, sudo asks once) when rekcod had it;
 4. switches the docker context back and removes the `rekcod` context;
-5. deletes `~/.rekcod` (VM disks, snapshots, sandboxes, macOS images, logs);
-6. prints the binary's path for you to delete (it may be root-owned or brew-managed).
+5. on a Mac that `server setup` or `host add` changed: removes the `~/.zshenv` block, the
+   application firewall's exceptions for rekcod and RustFS, and puts `pmset` back as setup
+   found it (recorded in `~/.rekcod/server/pmset-before.json`; a server set up before that
+   was recorded only gets `disablesleep 0`), sudo for the last two;
+6. deletes `~/.rekcod` (VM disks, snapshots, sandboxes, macOS images, logs) and the
+   `Include` rekcod added to `~/.ssh/config`;
+7. prints the binary's path for you to delete (it may be root-owned or brew-managed).
 
-`--keep-data` stops after step 4. It asks before deleting anything unless `--yes`. The menu
+`--keep-data` stops after step 5. It asks before deleting anything unless `--yes`. The menu
 bar and dashboard offer it with a confirmation; it runs in Terminal because of sudo.
+
+### Another Mac in your fleet
+
+`rekcod host uninstall NAME`, run on your Mac, asks first (`--yes` doesn't), then:
+
+1. copies this build there if it differs, so it knows everything there is to undo;
+2. runs `rekcod uninstall --yes` there over `ssh -t` (sudo asks for that Mac's password) and
+   deletes the binary in `~/.rekcod/bin`;
+3. removes rekcod's key from that Mac's `~/.ssh/authorized_keys`, last, since rekcod can't
+   SSH in after that;
+4. here: removes the `rekcod-NAME` docker context and its SSH config block, and
+   `remote rm NAME` if there's a remote by that name.
+
+If step 2 fails nothing is removed here. A pkg install's `/usr/local/bin/rekcod` is
+root-owned and stays; uninstall prints its path.
 
 ## Diagnostics
 

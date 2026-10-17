@@ -48,6 +48,10 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Added
 
+- `rekcod host uninstall NAME` (menu bar and dashboard: Remove rekcod from NAME): `rekcod uninstall`
+  on that Mac, rekcod's key out of its `authorized_keys`, then its docker context, SSH config and
+  remote here. `rekcod uninstall` also removes the `~/.zshenv` block, firewall exceptions and
+  puts `pmset` back as `server setup` found it.
 - `rekcod host restart NAME` (menu bar and dashboard: Restart NAME) and `rekcod server restart`:
   reboot a server so it comes back on its own, FileVault unlocked for that one boot. One
   password prompt, checked before anything restarts; `host restart` waits until it's back.

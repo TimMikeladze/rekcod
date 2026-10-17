@@ -156,12 +156,18 @@ pub fn uninstall(paths: &Paths, keep_data: bool, yes: bool) -> Result<()> {
             step("remove docker context rekcod", crate::docker::run_ok(&["context", "rm", "-f", crate::docker::CONTEXT]).map(|_| ()));
         }
     }
+    for (name, r) in crate::server::undo_system(paths) {
+        step(&name, r);
+    }
     if !keep_data {
         step("remove rekcod's Include from ~/.ssh/config", crate::sshkey::remove_include());
         step(&format!("delete {}", paths.home.display()), std::fs::remove_dir_all(&paths.home).map_err(Into::into));
     }
     let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "rekcod".into());
-    println!("\nThe binary is still at {exe}; delete it with `rm {exe}` (sudo if it's in /usr/local/bin), or `brew uninstall rekcod`.");
+    // One that `host add` copied lives in ~/.rekcod/bin and just went with it.
+    if keep_data || !std::path::Path::new(&exe).starts_with(&paths.home) {
+        println!("\nThe binary is still at {exe}; delete it with `rm {exe}` (sudo if it's in /usr/local/bin), or `brew uninstall rekcod`.");
+    }
     Ok(())
 }
 

@@ -70,7 +70,8 @@ The Rust version of the old setup shell script, plus the headless bits.
   `rekcod-<fingerprint>.bonjour` on a LAN.
 
 `rekcod server uninstall` removes the five jobs (sudo for daemons). It leaves pmset and
-`~/.rekcod` alone.
+`~/.rekcod` alone. To take rekcod off the server entirely, from your Mac:
+`rekcod host uninstall NAME` ([install-upgrade.md](install-upgrade.md#another-mac-in-your-fleet)).
 
 ## Starting at boot
 

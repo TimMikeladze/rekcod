@@ -190,8 +190,9 @@ enum Cmd {
         #[arg(long)]
         check: bool,
     },
-    /// Stop rekcod and remove everything it set up: login agents, the socket route, the
-    /// docker context, and ~/.rekcod.
+    /// Stop rekcod and remove everything it set up: launchd jobs, the socket route, the
+    /// docker context, the ~/.zshenv block, firewall exceptions, pmset (as `server setup`
+    /// found it), and ~/.rekcod.
     Uninstall {
         /// Keep ~/.rekcod (VM disks, volumes, snapshots).
         #[arg(long)]
@@ -1186,6 +1187,14 @@ enum HostCmd {
     /// Restart a server so it comes back on its own (FileVault unlocked for that one boot),
     /// then wait until it's back. Asks for the password there once.
     Restart { name: String },
+    /// Remove rekcod from that Mac entirely (`rekcod uninstall` there, rekcod's SSH key),
+    /// then its docker context, SSH config and remote NAME here.
+    Uninstall {
+        name: String,
+        /// Don't ask first.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1446,6 +1455,7 @@ fn main() {
         Cmd::Host(HostCmd::Forward { name, ports }) => host::forward(&paths, &name, &ports),
         Cmd::Host(HostCmd::Refresh { name: Some(name) }) => host::refresh(&paths, &name),
         Cmd::Host(HostCmd::Restart { name }) => host::restart(&paths, &name),
+        Cmd::Host(HostCmd::Uninstall { name, yes }) => host::uninstall(&paths, &name, yes),
         Cmd::Host(HostCmd::Refresh { name: None }) => {
             for h in host::list().0.iter().filter(|h| h.bonjour.is_some()) {
                 host::refresh(&paths, &h.name)?;

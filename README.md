@@ -95,8 +95,9 @@ checks its sha256 before unpacking. `REKCOD_RELEASE_URL` points the download els
 rekcod upgrade             # latest release over this binary, checksum-verified; --check only looks
 rekcod stop && rekcod start   # the VM keeps running the old version until it restarts
 rekcod doctor              # checks the VM, versions, disk, sockets, context, VM internet; --bundle tars the logs
-rekcod uninstall           # stops it, removes login agents, socket route, docker context and ~/.rekcod
+rekcod uninstall           # stops it, removes its launchd jobs, socket route, docker context and ~/.rekcod
 rekcod uninstall --keep-data   # the same, keeping ~/.rekcod
+rekcod host uninstall mini # all of that on another Mac in your fleet, then forgets it here
 ```
 
 `upgrade` refuses on a Homebrew install (`brew upgrade rekcod`; the formula is in
@@ -637,7 +638,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod edge serve\|ban\|unban\|bans\|uninstall` | HTTP ingress for apps; ban IPs and ranges on every edge |
 | `rekcod app deploy\|ls\|status\|release\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet; `release NAME N` prints one release with its deploy log, `logs --instance ID` one instance's logs (also after a redeploy removed it: the last lines of the 20 newest gone instances are kept) |
 | `rekcod job run\|ls\|logs\|rerun\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every`; `ls --name N` is one job's last 50 runs, `logs -f` follows a running one, `rerun ID` runs a finished one again |
-| `rekcod host add\|ls\|use\|rm\|forward\|refresh\|restart` | Another Mac's rekcod as the docker engine, over SSH; `add --server` also provisions it as a fleet (`--lan`: found over Bonjour, `refresh` follows it to a new address) |
+| `rekcod host add\|ls\|use\|rm\|forward\|refresh\|restart\|uninstall` | Another Mac's rekcod as the docker engine, over SSH; `add --server` also provisions it as a fleet (`--lan`: found over Bonjour, `refresh` follows it to a new address) |
 | `rekcod server setup\|uninstall\|at-boot\|restart` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, VM, no sleep), started at boot; `at-boot` moves a setup done without sudo from login to boot; `restart` reboots past FileVault once (one password prompt) |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |
@@ -647,7 +648,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod dashboard [--install\|--uninstall]` | Start the web dashboard (or find the running one) and open it; `--install` runs it at login (LaunchAgent `dev.rekcod.dashboard`) |
 | `rekcod upgrade [--check]` | Install the latest release over this binary |
 | `rekcod doctor [--bundle]` | Check what usually goes wrong, with a fix for each; `--bundle` writes a diagnostics tarball |
-| `rekcod uninstall [--keep-data] [--yes]` | Remove everything rekcod set up |
+| `rekcod uninstall [--keep-data] [--yes]` | Remove everything rekcod set up on this Mac |
 | `rekcod compact` | Give deleted image/volume space back to macOS now (also runs hourly) |
 | `rekcod <docker command>` | Runs `docker <command>` against rekcod (`ps`, `run`, `compose`, `build`, ...) |
 | `rekcod docker <args>` | Always docker, e.g. `rekcod docker status` |

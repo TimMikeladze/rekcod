@@ -61,6 +61,7 @@ rekcod has three front ends: the CLI (`rekcod ...`), the menu bar item
 | Forward a remote host's published ports here | `host forward <name>` | Docker host › Forward ports from … (opens Terminal) | sidebar docker host menu, `/fleet` |
 | Point a LAN server's docker context at its current address | `host refresh <name>` | Docker host › Find … again on the LAN | sidebar docker host menu, `/fleet` |
 | Restart a server so it comes back on its own (asks first; password in Terminal) | `host restart <name>` | Docker host › Restart … | sidebar docker host menu, `/fleet` |
+| Remove rekcod from another Mac and forget it here (asks first; password in Terminal) | `host uninstall <name>` | Docker host › Remove rekcod from … | sidebar docker host menu, `/fleet` |
 | Ban an IP or range on every edge, lift a ban | `edge ban [<net>]` / `edge unban <net>` | Edge bans › Ban an IP or range (opens Terminal to ask), Unban … (only with an admin-token remote) | `/fleet` › Edge bans |
 | Compose project: restart, stop, down | `compose -p NAME restart/stop/down` | Projects & snapshots › project | `/containers` (group header), `/projects` |
 | Images: remove; remove dangling | `image rm ID` / `image prune -f` | Images, Free up disk space | `/images` |

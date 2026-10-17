@@ -125,6 +125,19 @@ if mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null; then
     >/proc/sys/fs/binfmt_misc/register
 fi
 
+# Elastic memory (docs/elastic-memory.md): swap on memory the Mac gets back once the guest
+# frees it. /dev/rswap appears when the host has mapped the region in, just after boot.
+if grep -qx 0x003f /sys/bus/virtio/devices/*/device 2>/dev/null; then
+  (
+    for _ in $(seq 100); do [ -b /dev/rswap ] && break; sleep 0.1; done
+    if [ -b /dev/rswap ] && mkswap /dev/rswap >/dev/null && swapon -dpages /dev/rswap; then
+      log "elastic memory: $(($(cat /sys/block/rswap/size) / 2048)) MiB of swap"
+    else
+      log "elastic memory: /dev/rswap didn't come up"
+    fi
+  ) &
+fi
+
 # DNS: dnsmasq on eth0 answers host.docker.internal with the Mac (vmnet gateway) and
 # forwards everything else to rekcod-agent's stub, which resolves via the Mac.
 gw=$(ip route show default | awk '{print $3; exit}')

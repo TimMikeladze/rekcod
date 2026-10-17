@@ -27,7 +27,7 @@ export function issues(state: S): Issue[] {
   }
   for (const n of state.nodes ?? []) {
     if (n.last_seen == null || state.generated - n.last_seen > 60) out.push({ tone: "bad", text: n.last_seen == null ? `Node ${n.id} has never checked in` : `Node ${n.id} last checked in ${ago(n.last_seen, state.generated)}`, tab: "fleet" })
-    else if (n.mem_total_mib && n.mem_free_mib != null && n.mem_free_mib / n.mem_total_mib < 0.1) out.push({ tone: "warn", text: `Node ${n.id} is low on memory`, tab: "fleet" })
+    else if (n.mem_total_mib && n.mem_free_mib != null && n.mem_free_mib / n.mem_total_mib < 0.1) out.push({ tone: "warn", text: `Node ${n.id} has little memory left for VMs`, tab: "fleet" })
   }
   const failed = state.jobs.filter((j) => (j.state === "failed" || j.state === "lost") && j.created != null && state.generated - j.created < 86_400)
   if (failed.length) out.push({ tone: "bad", text: `${failed.length} job${failed.length > 1 ? "s" : ""} failed in the last day`, tab: "jobs" })

@@ -120,11 +120,12 @@ Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS
   Case-insensitive names behave like on the Mac (`Foo` is visible as `foo`). A bind-mounted
   tree is pre-warmed in the background from the moment its container is created, and the
   most recently used ones are warmed again right after `rekcod start`.
-- `linux/amd64` images through Rosetta.
+- `linux/amd64` images through Rosetta, when it's installed on the Mac ([docs/rosetta.md](docs/rosetta.md)).
 - `host.docker.internal` (including Mac services bound only to `127.0.0.1`) and `gateway.docker.internal`. Container DNS goes through the Mac's own resolvers (UDP and TCP), including per-domain ones from `scutil --dns` (`/etc/resolver/*`, VPN split DNS, Tailscale MagicDNS), so VPN and link-local DNS work.
 - `docker run -i`/`attach`/`exec` with stdin half-close, healthcheck-gated `depends_on`, and idempotent `compose up`.
 - `rekcod import`: images (`save | load`) and named volumes (data, labels; copied with `docker cp` and checked by file count and bytes), so compose reuses them. Volumes in use at the source are skipped unless you pass `--force`.
 - Idle VM memory is about 160 MiB RSS.
+- Memory a burst used comes back to macOS while the VM runs (macOS 27). `--memory` is split into base RAM and elastic memory, a swap device backed by memory rekcod hands back once the guest frees it: with `--memory 8 --base-memory 2`, a container that touched 5 GB left the VM at 2.8 GB resident 15 s after it exited, and the Mac 6.8 GB better off. Base RAM still stays with the VM once touched. Details: [docs/elastic-memory.md](docs/elastic-memory.md).
 - Database-style workloads run at native-Mac durability: guest `fsync` maps to macOS `fsync` (survives VM or app crashes, like any Mac app), not a full media flush on every commit. A power cut or kernel panic can lose the last writes, as for any Mac app; the guest runs `e2fsck -p` on the data disk at every boot. pgbench (8 clients, scale 20): about 15k TPS, versus 1k with Virtualization.framework's default. `REKCOD_DISK_SYNC=full` restores full flushes.
 - The data disk is sparse (256 GiB by default, grown in place by `--disk`), and the build cache is capped at 20 GB.
 
@@ -522,8 +523,8 @@ recycle = "24h"        # fresh VMs every day; off by default
 GREETING = "hi"
 ```
 
-A VM doesn't give memory back to macOS while it runs, so these two are how a fleet gets it
-back. `idle_stop` routes the app away and stops its VMs; the disks stay. The next request
+A VM doesn't give its base RAM back to macOS while it runs (elastic memory, which VMs given
+more than 4 GiB have, does), so these two are how a fleet gets it back. `idle_stop` routes the app away and stops its VMs; the disks stay. The next request
 through the edge is held while the controller boots them and waits for the health check,
 then it's forwarded. In `scripts/e2e-fleet.sh` that took 1 to 2 s for a small Python app. Only
 HTTP through the edge wakes an app, so background loops and open WebSockets stop with it.
@@ -618,7 +619,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 
 | Command | |
 |---|---|
-| `rekcod start [--cpus N] [--memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--disk` (default 256, sparse) grows the data disk, never shrinks it. The values are saved in `~/.rekcod/config.json` and reused when the menu bar or a docker command boots the VM |
+| `rekcod start [--cpus N] [--memory GiB] [--base-memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--base-memory` is how much of `--memory` is RAM, the rest being elastic memory macOS gets back (default half, at least 4 GiB; all RAM before macOS 27); `--disk` (default 256, sparse) grows the data disk, never shrinks it. The values are saved in `~/.rekcod/config.json` and reused when the menu bar or a docker command boots the VM |
 | `rekcod start --install\|--uninstall` | Start the VM at login and boot it again if it stops without `rekcod stop` (LaunchAgent `dev.rekcod.vm`) |
 | `rekcod start --network auto\|user\|nat` | How the VM reaches the network. `nat` is Virtualization.framework's NAT; `user` makes rekcod open the connections itself, which full-tunnel VPNs (Mullvad and others) don't drop; `auto`, the default, picks `user` while the Mac's default route goes through a VPN tunnel. Saved; `rekcod status --json` shows which is in use |
 | `rekcod start --repair` | When the VM won't start because its data disk has errors: `e2fsck -fy` on it and a fresh root disk, then boot. The data disk is never formatted unless it's blank |
@@ -746,7 +747,8 @@ Design and roadmap: [`docs/mvp.md`](docs/mvp.md), [`docs/plan.md`](docs/plan.md)
 - First access can be slower than OrbStack for a tree rekcod hasn't seen since boot, when a container touches it before background warming finishes (about 1 s per 20k files). Recently used trees are warmed at boot (a 19.5k-file walk 3 s after `rekcod start`: 34 ms warmed vs 286 ms not). Repeat work is 3–9× faster.
 - Mac→container change latency is about 14 ms p50 (`bench/inotify_rtt.py`; OrbStack measured 12 ms).
 - The VM's directories (`~/.rekcod/vm`, `sb`, `golden`, macOS images) are excluded from Time Machine; back up what's in your volumes with `rekcod snap save --push` or your own dumps.
-- Memory isn't returned to macOS. `REKCOD_BALLOON=1` drives the balloon, but on macOS 27 the VM's footprint doesn't drop, even under memory pressure (docs/phase2.md, docs/phase5.md).
+- Base RAM isn't returned to macOS while the VM runs: once the guest touches it, it stays until `rekcod stop`. Only elastic memory comes back, and memory above base RAM is swap, so a working set bigger than base RAM runs slower (2 GiB base, 3.5 GB touched: 1.3 s write and 1.7 s read pass against 0.8 s and 0.3 s in RAM). What was tried for RAM itself is in [docs/memory-return.md](docs/memory-return.md).
+- The guest's `MemTotal` is base RAM only, so tools that size themselves from it (DuckDB's default `memory_limit`) use less and spill to their own temp files.
 - `--sandbox` and `rekcod sandbox` haven't had an external security review (docs/sandbox.md); [`docs/security-review.md`](docs/security-review.md) is the scope for one.
 - A sandbox fork copies the disk, not memory: processes restart in the child (Virtualization.framework can't restore a VM with a virtio-fs share).
 - No brew formula. Releases are ad-hoc signed, not notarized.

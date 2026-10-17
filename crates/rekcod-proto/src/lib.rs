@@ -37,6 +37,25 @@ pub const MAC_SHARE_TAG: &str = "mac";
 /// virtio-fs tag for Rosetta.
 pub const ROSETTA_SHARE_TAG: &str = "rosetta";
 
+/// Virtio device ID of the elastic-memory device (docs/elastic-memory.md). Inside the
+/// modern virtio-pci range (0x1040 + id), unused by Linux.
+pub const ELASTIC_DEVICE_ID: u16 = 63;
+/// Unit the guest releases and reuses elastic memory in.
+pub const ELASTIC_CHUNK: u64 = 4 << 20;
+/// Request ops: `le32 op, le32 count, le32 chunk[count]`, answered with `le32 status`.
+pub const ELASTIC_OP_RELEASE: u32 = 1;
+pub const ELASTIC_OP_REUSE: u32 = 2;
+/// Elastic memory needs at least this much to be worth a device.
+pub const ELASTIC_MIN_MIB: u64 = 512;
+
+/// Splits the memory a VM may use into base RAM and elastic swap, in MiB. Base defaults
+/// to `max(min(memory, 4 GiB), memory / 2)`; `base` overrides it.
+pub fn split_memory(memory_mib: u64, base: Option<u64>) -> (u64, u64) {
+    let base = base.unwrap_or_else(|| memory_mib.min(4096).max(memory_mib / 2)).min(memory_mib);
+    let elastic = memory_mib - base;
+    if elastic < ELASTIC_MIN_MIB { (memory_mib, 0) } else { (base, elastic) }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Proto {
     Tcp,
@@ -170,6 +189,16 @@ pub fn host_allowed(allow: &[String], name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn splits_memory_into_base_and_elastic() {
+        assert_eq!(split_memory(8192, None), (4096, 4096));
+        assert_eq!(split_memory(16384, None), (8192, 8192));
+        assert_eq!(split_memory(4096, None), (4096, 0), "small VMs stay all RAM");
+        assert_eq!(split_memory(4400, None), (4400, 0), "elastic part too small to bother");
+        assert_eq!(split_memory(8192, Some(6144)), (6144, 2048));
+        assert_eq!(split_memory(8192, Some(10240)), (8192, 0), "base can't exceed memory");
+    }
+
     use super::*;
 
     #[test]

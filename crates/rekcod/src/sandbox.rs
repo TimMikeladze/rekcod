@@ -226,6 +226,7 @@ impl Sandbox {
         let opts = crate::cli::BootOptions {
             cpus: Some(m.cpus),
             memory_gib: Some(m.memory_gib),
+            base_memory_gib: None,
             disk_gib: DISK_GIB,
             project: Some(m.project.clone()),
             guest_dir: Some(main.guest_dir()?),

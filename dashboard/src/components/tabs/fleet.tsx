@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation"
 import { Actions } from "@/components/actions"
 import { Empty, Meter, Mono, State } from "@/components/bits"
 import { GetStarted, NoRemote } from "@/components/get-started"
-import { nodeHealth } from "@/components/node-sheet"
+import { nodeHealth, VM_MEMORY_HINT } from "@/components/node-sheet"
 import { TabRow, useTab, type TabItem } from "@/components/shell/tab-row"
 import { Head, match, NavRow, SectionTitle } from "@/components/table"
 import { Badge } from "@/components/ui/badge"
@@ -105,7 +105,7 @@ function Nodes({ q }: { q: string }) {
         ) : (
           <div className="overflow-x-auto">
             <Table>
-              <Head cols={["Node", ["Memory", "w-40 hidden sm:table-cell"], ["CPU", "w-32 hidden md:table-cell"], ["Disk", "w-32 hidden md:table-cell"], ["Runs", "hidden sm:table-cell"], ["Pool", "hidden lg:table-cell"], "Heartbeat", ""]} />
+              <Head cols={["Node", ["VM memory", "w-40 hidden sm:table-cell"], ["CPU", "w-32 hidden md:table-cell"], ["Disk", "w-32 hidden md:table-cell"], ["Runs", "hidden sm:table-cell"], ["Pool", "hidden lg:table-cell"], "Heartbeat", ""]} />
               <TableBody>
                 {nodes.map((n) => {
                   const h = nodeHealth(n, now)
@@ -120,10 +120,10 @@ function Nodes({ q }: { q: string }) {
                         </State>
                         <Mono className="block pl-3.5 text-[11px] text-muted-foreground">{n.url ?? ""}</Mono>
                       </TableCell>
-                      <TableCell className="hidden sm:table-cell">
+                      <TableCell className="hidden sm:table-cell" title={VM_MEMORY_HINT}>
                         <div className="space-y-1">
                           <Mono>
-                            {used != null ? fmtBytes(used * 1024 * 1024) : "–"} / {total != null ? fmtBytes(total * 1024 * 1024) : "–"}
+                            {n.mem_free_mib != null ? fmtBytes(n.mem_free_mib * 1024 * 1024) : "–"} free of {total != null ? fmtBytes(total * 1024 * 1024) : "–"}
                           </Mono>
                           <Meter value={total && used != null ? used / total : null} />
                         </div>

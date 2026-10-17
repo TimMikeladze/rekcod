@@ -8,6 +8,20 @@ Logs live in `~/.rekcod/logs`: `daemon.log` (the Mac side), `console.log` (the g
 kernel and boot), each with the previous boot's copy as `.1`. Inside the VM,
 `rekcod shell` and `/var/lib/docker/dockerd.log`.
 
+## The VM keeps memory after a big job
+
+`rekcod status` has a `memory` line when the VM has elastic memory; that part goes back to
+macOS 5 to 15 s after the guest frees it. Base RAM stays until `rekcod stop`. No `memory`
+line: the Mac is on macOS before 27, `--memory` is 4 GiB or less, or the guest image is
+older than elastic memory (`rekcod upgrade`). A smaller `--base-memory` moves more into
+elastic memory. See [elastic-memory.md](elastic-memory.md).
+
+## amd64 containers fail with `exec format error`
+
+Rosetta isn't installed on the Mac (`rosetta=false` in `daemon.log`). Run
+`softwareupdate --install-rosetta --agree-to-license`, then `rekcod stop && rekcod start`.
+See [rosetta.md](rosetta.md).
+
 ## The VM won't start
 
 - `the VM's data disk can't be used: ...`: the data disk isn't readable ext4, and rekcod

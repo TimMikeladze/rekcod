@@ -29,6 +29,8 @@ mod dashboard;
 #[cfg(target_os = "macos")]
 mod edge;
 #[cfg(target_os = "macos")]
+mod elastic;
+#[cfg(target_os = "macos")]
 mod fetch;
 #[cfg(target_os = "macos")]
 mod fleet;
@@ -97,6 +99,10 @@ enum Cmd {
         /// Memory in GiB (default: half of host RAM, at most 8). Unused memory is not reserved.
         #[arg(long)]
         memory: Option<u64>,
+        /// GiB of --memory that is RAM; the rest is swap macOS gets back once the guest frees it
+        /// (default: half, at least 4; macOS 27). Saved.
+        #[arg(long)]
+        base_memory: Option<u64>,
         /// Data disk size in GiB (sparse: only used space takes room on the Mac). Grows an existing disk; never shrinks.
         #[arg(long, default_value_t = paths::DEFAULT_DISK_GIB)]
         disk: u64,
@@ -318,6 +324,8 @@ enum Cmd {
         cpus: usize,
         #[arg(long)]
         memory_mib: u64,
+        #[arg(long)]
+        base_memory_mib: Option<u64>,
         #[arg(long)]
         project: Option<std::path::PathBuf>,
         #[arg(long)]
@@ -1269,8 +1277,8 @@ fn main() {
     let result = paths::Paths::new().and_then(|paths| match command {
         Cmd::Start { install: true, .. } => cli::autostart_install(&paths),
         Cmd::Start { uninstall: true, .. } => service::uninstall(cli::AUTOSTART),
-        Cmd::Start { cpus, memory, disk, no_switch, repair, foreground, network, .. } => {
-            let r = cli::start(&paths, cpus, memory, disk, no_switch, repair, network);
+        Cmd::Start { cpus, memory, base_memory, disk, no_switch, repair, foreground, network, .. } => {
+            let r = cli::start(&paths, cpus, (memory, base_memory), disk, no_switch, repair, network);
             if foreground { cli::supervise(&paths, r) } else { r }
         }
         Cmd::Stop { no_switch, force } => cli::stop(&paths, no_switch, force),
@@ -1474,9 +1482,10 @@ fn main() {
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user } => {
-            daemon::run(paths, daemon::Options { cpus, memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user })
-        }
+        Cmd::Daemon { cpus, memory_mib, base_memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user } => daemon::run(
+            paths,
+            daemon::Options { cpus, memory_mib, base_memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user },
+        ),
     });
     if let Err(e) = result {
         eprintln!("rekcod: {e:#}");

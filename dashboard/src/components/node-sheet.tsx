@@ -16,6 +16,10 @@ import { ago, fmtBytes } from "@/lib/format"
 import type { Node } from "@/lib/types"
 
 /** A node's state as one word and a tone: unreachable after a minute without a heartbeat. */
+/** What the node's memory figure is: capacity for VMs, not what macOS is using. */
+export const VM_MEMORY_HINT =
+  "Memory rekcod can still give VMs on this Mac: 75% of its RAM minus each running VM's maximum. Not what macOS is using right now."
+
 export function nodeHealth(n: Node, now: number): { tone: Tone; text: string; stale: boolean } {
   const stale = n.last_seen == null || now - n.last_seen > 60
   if (stale) return { tone: "bad", text: "unreachable", stale }
@@ -62,7 +66,7 @@ function History({ node }: { node: Node }) {
         {(
           [
             ["CPU load", "load", node.cpus],
-            ["Memory used", "mem", node.mem_total_mib == null ? undefined : node.mem_total_mib / 1024],
+            ["VM memory reserved", "mem", node.mem_total_mib == null ? undefined : node.mem_total_mib / 1024],
             ["Disk used", "disk", node.disk_total_gib],
           ] as const
         ).map(([label, metric, max]) => (
@@ -106,11 +110,13 @@ export function NodeDetail({ id }: { id: string }) {
                   value={node.cpus && node.load != null ? node.load / node.cpus : null}
                   text={node.cpus ? `load ${node.load?.toFixed(2) ?? "?"} of ${node.cpus}` : "not reported"}
                 />
-                <Gauge
-                  label="Memory"
-                  value={total && used != null ? used / total : null}
-                  text={total && used != null ? `${fmtBytes(used * 2 ** 20)} of ${fmtBytes(total * 2 ** 20)}` : total ? `? of ${fmtBytes(total * 2 ** 20)}` : "not reported"}
-                />
+                <div title={VM_MEMORY_HINT}>
+                  <Gauge
+                    label="VM memory"
+                    value={total && used != null ? used / total : null}
+                    text={total && node.mem_free_mib != null ? `${fmtBytes(node.mem_free_mib * 2 ** 20)} of ${fmtBytes(total * 2 ** 20)} free` : total ? `? of ${fmtBytes(total * 2 ** 20)} free` : "not reported"}
+                  />
+                </div>
                 <Gauge
                   label="Disk"
                   value={node.disk_total_gib && node.disk_free_gib != null ? 1 - node.disk_free_gib / node.disk_total_gib : null}

@@ -462,7 +462,16 @@ fn stats() -> String {
         used = total.saturating_sub(st.f_bfree as u64 * st.f_frsize as u64).to_string();
         size = total.to_string();
     }
-    format!("{{\"fs_requests\":{{{}}},\"warming\":[{}],\"disk_used\":{used},\"disk_size\":{size}}}", ops.join(","), warming.join(","))
+    // Elastic memory in use (docs/elastic-memory.md); null without swap.
+    let swap_used = match (meminfo_kib("SwapTotal"), meminfo_kib("SwapFree")) {
+        (Some(t), Some(f)) if t > 0 => ((t - f.min(t)) * 1024).to_string(),
+        _ => "null".to_string(),
+    };
+    format!(
+        "{{\"fs_requests\":{{{}}},\"warming\":[{}],\"disk_used\":{used},\"disk_size\":{size},\"swap_used\":{swap_used}}}",
+        ops.join(","),
+        warming.join(",")
+    )
 }
 
 // ------------------------------------------------------------- trimming
@@ -499,6 +508,12 @@ fn trim_log(path: &str) {
     if std::fs::metadata(path).is_ok_and(|m| m.len() > 20 << 20) && std::fs::copy(path, format!("{path}.1")).is_ok() {
         let _ = std::fs::OpenOptions::new().write(true).open(path).and_then(|f| f.set_len(0));
     }
+}
+
+/// One `/proc/meminfo` field, in KiB.
+fn meminfo_kib(name: &str) -> Option<u64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    text.lines().find_map(|l| l.strip_prefix(name)?.strip_prefix(':')).and_then(|v| v.split_whitespace().next()?.parse().ok())
 }
 
 /// `<total> <free> <available> <cached>` in KiB.

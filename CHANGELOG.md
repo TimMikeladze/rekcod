@@ -48,6 +48,12 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Added
 
+- Elastic memory (macOS 27): `--memory` is split into base RAM and swap backed by memory
+  rekcod hands back to macOS once the guest frees it, so a burst no longer leaves its memory
+  with the VM until `rekcod stop`. `rekcod start --base-memory N` sets the split (default:
+  half, at least 4 GiB); `rekcod status` shows how much elastic memory the Mac holds now.
+  Needs the new guest image. See `docs/elastic-memory.md`.
+
 - `rekcod host uninstall NAME` (menu bar and dashboard: Remove rekcod from NAME): `rekcod uninstall`
   on that Mac, rekcod's key out of its `authorized_keys`, then its docker context, SSH config and
   remote here. `rekcod uninstall` also removes the `~/.zshenv` block, firewall exceptions and

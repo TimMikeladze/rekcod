@@ -129,8 +129,9 @@ if [ -f "$KOUT/Image" ]; then
   log "kernel: cached ($key)"
 elif [ "$KERNEL" = custom ]; then
   log "kernel: custom ($key), compiling"
-  rm -rf "$T/src" "$T/patch" "$T/kout"
+  rm -rf "$T/src" "$T/patch" "$T/elastic" "$T/kout"
   copyroot "$G/fuse" "$T/patch"
+  copyroot "$G/kernel/elastic" "$T/elastic"
   inroot "$T" '
 apk add --no-cache ${KERNEL_REPO:+--repository "$KERNEL_REPO"} "linux-virt=$LINUX_VIRT_VERSION"
 '"$KERNEL_TARBALL"'
@@ -141,6 +142,8 @@ rm /tmp/linux.tar.xz && cp /boot/config-*-virt /src/alpine.config
   inroot "$T" '
 cd /src
 if [ "$FUSE_PATCH" = 1 ]; then (cd fs/fuse && patch -p1 < /patch/rekcod-fuse.patch && cp /patch/rekcod.c .); fi
+# Elastic memory driver (docs/elastic-memory.md), built in.
+cp /elastic/rekcod_elastic.c drivers/block/ && echo "obj-y += rekcod_elastic.o" >> drivers/block/Makefile
 printf "CONFIG_LOCALVERSION=\"-rekcod\"\n# CONFIG_LOCALVERSION_AUTO is not set\n" >>rekcod.config
 ARCH=arm64 scripts/kconfig/merge_config.sh -m alpine.config rekcod.config >/dev/null
 make ARCH=arm64 olddefconfig >/dev/null
@@ -158,7 +161,7 @@ rm -f /kout/lib/modules/*/build /kout/lib/modules/*/source
 cp arch/arm64/boot/Image /kout/Image && cp .config /kout/config
 '
   rm -rf "$KOUT.part" && mv "$T/kout" "$KOUT.part" && mv "$KOUT.part" "$KOUT"
-  rm -rf "$T/src" "$T/patch"
+  rm -rf "$T/src" "$T/patch" "$T/elastic"
 else
   log "kernel: alpine linux-virt ($key)"
   A=$WORK/alpine-kernel

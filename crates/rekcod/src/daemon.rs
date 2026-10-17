@@ -53,7 +53,10 @@ macro_rules! log {
 
 pub struct Options {
     pub cpus: usize,
+    /// Memory the guest may use: base RAM plus elastic swap (docs/elastic-memory.md).
     pub memory_mib: u64,
+    /// Base RAM; default from `rekcod_proto::split_memory`.
+    pub base_memory_mib: Option<u64>,
     /// Sandbox VM (docs/sandbox.md): share only this directory, and nothing
     /// on the Mac is reachable from the guest.
     pub project: Option<PathBuf>,
@@ -175,9 +178,15 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         (Some(_), _, true) => "filtered",
         (Some(_), _, false) => "none",
     };
+    let (base_mib, elastic_mib) = if crate::elastic::available() && crate::elastic::guest_supports(&guest.join("Image")) {
+        rekcod_proto::split_memory(opts.memory_mib, opts.base_memory_mib)
+    } else {
+        (opts.memory_mib, 0)
+    };
     let mut cfg = VmConfig {
         cpus: opts.cpus,
-        memory_mib: opts.memory_mib,
+        memory_mib: base_mib,
+        elastic_mib,
         kernel: guest.join("Image"),
         initrd: Some(guest.join("initramfs")).filter(|p| p.exists()),
         cmdline,
@@ -205,7 +214,8 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     };
     log!("kernel command line: {}", cfg.cmdline);
     vm.start().await?;
-    log!("VM started ({} CPUs, {} MiB, rosetta={})", cfg.cpus, cfg.memory_mib, vm.rosetta);
+    vm.map_elastic();
+    log!("VM started ({} CPUs, {} MiB + {} MiB elastic, rosetta={})", cfg.cpus, cfg.memory_mib, cfg.elastic_mib, vm.rosetta);
 
     // Docker socket first so `rekcod start` can poll it while the guest boots.
     let sock = paths.socket();
@@ -253,7 +263,15 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     for line in watch.set_roots(Default::default()) {
         log!("{line}");
     }
-    let status = Arc::new(Status::new(paths.clone(), cfg.cpus, cfg.memory_mib, fs_cache, watch, opts.project.clone(), network_name));
+    let status = Arc::new(Status::new(
+        paths.clone(),
+        cfg.cpus,
+        (cfg.memory_mib, cfg.elastic_mib),
+        fs_cache,
+        watch,
+        opts.project.clone(),
+        network_name,
+    ));
     status.write();
     let ctl = paths.control_socket();
     let _ = std::fs::remove_file(&ctl);
@@ -421,13 +439,26 @@ async fn control_server(vm: Vm, listener: UnixListener) {
                 return;
             }
             let reply = match Control::parse(&line) {
-                Some(cmd @ (Control::Trim | Control::BenchMeta(_) | Control::Stats)) => {
+                Some(Control::Stats) => {
+                    let reply =
+                        control_within(&vm, Control::Stats, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"));
+                    with_elastic_held(reply, vm.elastic_held())
+                }
+                Some(cmd @ (Control::Trim | Control::BenchMeta(_))) => {
                     control_within(&vm, cmd, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"))
                 }
                 _ => format!("error: unsupported command {:?}", line.trim_end()),
             };
             let _ = conn.get_mut().write_all(format!("{reply}\n").as_bytes()).await;
         });
+    }
+}
+
+/// The guest's stats JSON plus what elastic memory holds on the Mac, which only the host knows.
+fn with_elastic_held(reply: String, held: Option<u64>) -> String {
+    match (held, reply.strip_suffix('}')) {
+        (Some(h), Some(body)) if reply.starts_with('{') => format!("{body},\"elastic_held\":{h}}}"),
+        _ => reply,
     }
 }
 
@@ -776,7 +807,9 @@ struct StatusFile<'a> {
     guest_version: &'a str,
     started_at: u64,
     cpus: usize,
+    /// Base RAM plus elastic.
     memory_mib: u64,
+    elastic_mib: u64,
     fs_cache: bool,
     balloon_mib: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -797,6 +830,7 @@ struct Status {
     started_at: u64,
     cpus: usize,
     memory_mib: u64,
+    elastic_mib: u64,
     fs_cache: bool,
     /// Set for a sandbox VM: the only shared directory.
     project: Option<PathBuf>,
@@ -816,7 +850,7 @@ impl Status {
     fn new(
         paths: Paths,
         cpus: usize,
-        memory_mib: u64,
+        (base_mib, elastic_mib): (u64, u64),
         fs_cache: bool,
         watch: Arc<Watch>,
         project: Option<PathBuf>,
@@ -829,10 +863,11 @@ impl Status {
             watch,
             started_at,
             cpus,
-            memory_mib,
+            memory_mib: base_mib + elastic_mib,
+            elastic_mib,
             fs_cache,
             project,
-            balloon: Mutex::new(memory_mib),
+            balloon: Mutex::new(base_mib),
             forwards: Mutex::default(),
             binds: Mutex::default(),
             published: Mutex::default(),
@@ -867,6 +902,7 @@ impl Status {
             started_at: self.started_at,
             cpus: self.cpus,
             memory_mib: self.memory_mib,
+            elastic_mib: self.elastic_mib,
             fs_cache: self.fs_cache,
             balloon_mib: *self.balloon.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
             project: self.project.as_deref(),
@@ -1280,6 +1316,13 @@ fn meta_reply(req: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stats_carry_elastic_held_only_with_elastic_memory() {
+        assert_eq!(with_elastic_held(r#"{"disk_used":1}"#.into(), Some(5)), r#"{"disk_used":1,"elastic_held":5}"#);
+        assert_eq!(with_elastic_held(r#"{"disk_used":1}"#.into(), None), r#"{"disk_used":1}"#);
+        assert_eq!(with_elastic_held("error: agent gone".into(), Some(5)), "error: agent gone");
+    }
 
     #[test]
     fn failed_file_events_come_back_as_directories() {

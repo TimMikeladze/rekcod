@@ -11,6 +11,9 @@ How a feature behaves today and how to drive it.
 - [lan-discovery.md](lan-discovery.md): a server on a LAN found over Bonjour, whatever its IP or name.
 - [troubleshooting.md](troubleshooting.md): what to do when something's wrong; start with `rekcod doctor`.
 - [install-upgrade.md](install-upgrade.md): `rekcod upgrade`, `uninstall`, `doctor`, logs.
+- [elastic-memory.md](elastic-memory.md): memory above base RAM that macOS gets back while the VM runs (`--base-memory`).
+- [memory-return.md](memory-return.md): why the VM keeps memory it has used, what was tried, what to do instead.
+- [rosetta.md](rosetta.md): amd64 images, a Mac without Rosetta, why VZ, translation caching.
 - [cli-passthrough.md](cli-passthrough.md): `rekcod <docker command>` without a docker CLI.
 - [default-socket.md](default-socket.md): routing `/var/run/docker.sock` to rekcod.
 - [sandbox.md](sandbox.md): `rekcod x --sandbox` and its threat model.
@@ -28,6 +31,7 @@ How a feature behaves today and how to drive it.
 - [edge-http.md](edge-http.md): the edge proxy, rate limits, bans, per-app HTTP settings.
 - [rustfs.md](rustfs.md): app buckets, stored images and backups on RustFS.
 - [fleet-hardening.md](fleet-hardening.md): fleet TLS, tokens, node approval, the reconcile loop.
+- [fleet-ha.md](fleet-ha.md): plan for surviving a dead Mac: spread placement, two edges, a standby controller.
 - [sandbox-network.md](sandbox-network.md): sandbox egress filtered on the Mac.
 - [security-review.md](security-review.md): scope and setup for an external security review.
 

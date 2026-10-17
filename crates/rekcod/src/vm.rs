@@ -40,6 +40,9 @@ pub struct VmConfig {
     /// Name in the guest's `mac` virtio-fs share -> host directory.
     pub shares: Vec<(String, PathBuf)>,
     pub net: Net,
+    /// Swap backed by memory macOS gets back (docs/elastic-memory.md), on top of
+    /// `memory_mib` of RAM. 0 for none; ignored before macOS 27.
+    pub elastic_mib: u64,
 }
 
 pub enum Net {
@@ -70,6 +73,8 @@ pub struct Vm {
     queue: DispatchRetained<DispatchQueue>,
     vm: Arc<OnQueue<Retained<VZVirtualMachine>>>,
     pub rosetta: bool,
+    /// The elastic-memory device, kept for the VM's lifetime.
+    elastic: Option<Arc<crate::elastic::Elastic>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,7 +91,7 @@ pub fn max_cpus() -> usize {
 
 impl Vm {
     pub fn create(cfg: &VmConfig) -> Result<Vm> {
-        let (config, rosetta) = unsafe { build_config(cfg)? };
+        let (config, rosetta, elastic) = unsafe { build_config(cfg)? };
         let config = OnQueue(config);
         let queue = DispatchQueue::new("dev.rekcod.vm", None);
         let mut vm = None;
@@ -95,7 +100,7 @@ impl Vm {
             vm = Some(OnQueue(unsafe { VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config.get(), q.get()) }));
         });
         let vm = vm.expect("exec_sync ran the closure");
-        Ok(Vm { queue: queue.clone(), vm: Arc::new(vm), rosetta })
+        Ok(Vm { queue: queue.clone(), vm: Arc::new(vm), rosetta, elastic: elastic.map(Arc::new) })
     }
 
     /// A VM from a ready configuration (macOS guests, `macos.rs`).
@@ -107,7 +112,7 @@ impl Vm {
         queue.exec_sync(|| {
             vm = Some(OnQueue(unsafe { VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config.get(), q.get()) }));
         });
-        Vm { queue: queue.clone(), vm: Arc::new(vm.expect("exec_sync ran the closure")), rosetta: false }
+        Vm { queue: queue.clone(), vm: Arc::new(vm.expect("exec_sync ran the closure")), rosetta: false, elastic: None }
     }
 
     /// Runs `f` with the VM on its queue.
@@ -121,6 +126,18 @@ impl Vm {
     /// Asks the guest to shut down (the power button); false if it can't be asked.
     pub fn request_stop(&self) -> bool {
         self.with(|vm| unsafe { vm.canRequestStop() && vm.requestStopWithError().is_ok() })
+    }
+
+    /// Bytes of elastic memory macOS backs now; None without elastic memory.
+    pub fn elastic_held(&self) -> Option<u64> {
+        self.elastic.as_ref().map(|e| e.held())
+    }
+
+    /// Maps the elastic memory in (docs/elastic-memory.md); call once the VM runs.
+    pub fn map_elastic(&self) {
+        if let Some(e) = &self.elastic {
+            e.map();
+        }
     }
 
     pub async fn start(&self) -> Result<()> {
@@ -261,7 +278,7 @@ unsafe fn disk(path: &Path) -> Result<Retained<VZStorageDeviceConfiguration>> {
     Ok(Retained::into_super(dev))
 }
 
-unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfiguration>, bool)> {
+unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfiguration>, bool, Option<crate::elastic::Elastic>)> {
     unsafe {
         let boot = VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &url(&cfg.kernel));
         if let Some(initrd) = &cfg.initrd {
@@ -326,6 +343,15 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
             shares.push(Retained::into_super(fs));
         }
         c.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
+        // Elastic memory (docs/elastic-memory.md): swap the guest can hand back to macOS.
+        let elastic = if cfg.elastic_mib > 0 && crate::elastic::available() {
+            let (device, elastic) = crate::elastic::configuration(cfg.elastic_mib)?;
+            let devices = NSArray::from_retained_slice(&[device]);
+            let _: () = objc2::msg_send![&*c, setCustomVirtioDevices: &*devices];
+            Some(elastic)
+        } else {
+            None
+        };
 
         c.setSocketDevices(&NSArray::from_retained_slice(&[Retained::into_super(VZVirtioSocketDeviceConfiguration::new())]));
         c.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(VZVirtioEntropyDeviceConfiguration::new())]));
@@ -353,7 +379,7 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
         c.setSerialPorts(&NSArray::from_retained_slice(&[Retained::into_super(console)]));
 
         c.validateWithError().map_err(|e| anyhow!("invalid VM config: {}", e.localizedDescription()))?;
-        Ok((c, rosetta))
+        Ok((c, rosetta, elastic))
     }
 }
 

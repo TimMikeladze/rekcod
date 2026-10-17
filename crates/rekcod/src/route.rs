@@ -38,7 +38,7 @@ const OWN: &[&str] = &[
 ];
 
 /// `start`/`stop` flags; anything else means docker's container start/stop.
-const VM_FLAGS_WITH_VALUE: &[&str] = &["--cpus", "--memory", "--disk"];
+const VM_FLAGS_WITH_VALUE: &[&str] = &["--cpus", "--memory", "--base-memory", "--disk", "--network"];
 /// None of these are flags of docker's `start` or `stop`.
 const VM_FLAGS: &[&str] = &["--no-switch", "--repair", "--install", "--uninstall", "--foreground", "--force", "-h", "--help"];
 
@@ -86,6 +86,8 @@ mod tests {
             "start",
             "stop",
             "start --cpus 4 --memory=8",
+            "start --memory 8 --base-memory 2 --no-switch",
+            "start --network user",
             "stop --no-switch",
             "stop --force",
             "start --repair",

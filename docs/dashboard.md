@@ -209,7 +209,7 @@ Everything you open is its own page, not a drawer:
 | `/fleet` | tabs (`?view=`): Nodes, Namespaces, Edge routes, Backups, Bans, Remotes and hosts; a tab only shows when there's something in it |
 | `/apps/NAME` | requests, 5xx and p50/p95 per minute for the last hour, instances (uptime, node, logs), releases (commit link, who, build time, deploy log, the one a rollback goes to), "Copy command" for deploy, scale and env |
 | `/jobs/ID` | output (live while it runs), duration and exit status of a named job's last 50 runs |
-| `/nodes/ID` | CPU load, memory and disk now and over the last hour, its instances and jobs, drain/undrain, the `node pool` command |
+| `/nodes/ID` | CPU load, VM memory (what rekcod can still give VMs: 75% of the Mac's RAM minus each running VM's maximum, not what macOS uses) and disk now and over the last hour, its instances and jobs, drain/undrain, the `node pool` command |
 | `/sandboxes/ID` | age, CPU and memory, `diff --stat`, a macOS sandbox's screen (every 10 s) |
 | `/disk` | one bar split into images, containers, volumes and build cache, the data disk on the Mac, what the prunes would free, the five largest images and volumes; compact, clear build cache |
 | `/vm` | uptime, kernel, dockerd and API, file sharing and its request rates, sockets, the sandbox VM |

@@ -51,6 +51,9 @@ fn pid_is_rekcod(pid: i32) -> bool {
 pub struct Saved {
     pub cpus: Option<usize>,
     pub memory_gib: Option<u64>,
+    /// `rekcod start --base-memory` (docs/elastic-memory.md); None is the default split.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_memory_gib: Option<u64>,
     pub disk_gib: Option<u64>,
     /// `auto`, `user` or `nat` (`rekcod start --network`); None is auto.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,11 +90,18 @@ pub(crate) fn saved(paths: &Paths) -> Saved {
     std::fs::read(paths.config()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
 }
 
-fn save_settings(paths: &Paths, cpus: Option<usize>, memory_gib: Option<u64>, disk_gib: u64, network: Option<String>) -> Result<()> {
+fn save_settings(
+    paths: &Paths,
+    cpus: Option<usize>,
+    (memory_gib, base_memory_gib): (Option<u64>, Option<u64>),
+    disk_gib: u64,
+    network: Option<String>,
+) -> Result<()> {
     let old = saved(paths);
     let new = Saved {
         cpus: cpus.or(old.cpus),
         memory_gib: memory_gib.or(old.memory_gib),
+        base_memory_gib: base_memory_gib.or(old.base_memory_gib),
         disk_gib: Some(disk_gib.max(old.disk_gib.unwrap_or(0))),
         network: network.or(old.network.clone()),
     };
@@ -203,6 +213,8 @@ fn tail(path: &std::path::Path, lines: usize) -> String {
 pub struct BootOptions {
     pub cpus: Option<usize>,
     pub memory_gib: Option<u64>,
+    /// RAM part of `memory_gib`; None is the default split (docs/elastic-memory.md).
+    pub base_memory_gib: Option<u64>,
     pub disk_gib: u64,
     /// Sandbox VM: share only this directory (docs/sandbox.md).
     pub project: Option<PathBuf>,
@@ -225,6 +237,7 @@ impl Default for BootOptions {
         BootOptions {
             cpus: None,
             memory_gib: None,
+            base_memory_gib: None,
             disk_gib: crate::paths::DEFAULT_DISK_GIB,
             project: None,
             guest_dir: None,
@@ -275,6 +288,9 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
+        if let Some(base) = opts.base_memory_gib.or(saved.base_memory_gib) {
+            cmd.args(["--base-memory-mib", &(base << 10).to_string()]);
+        }
         if let Some(project) = &opts.project {
             cmd.arg("--project").arg(project);
         }
@@ -380,7 +396,7 @@ pub(crate) fn signal_daemon(paths: &Paths, sig: libc::c_int) -> Result<bool> {
 pub fn start(
     paths: &Paths,
     cpus: Option<usize>,
-    memory_gib: Option<u64>,
+    (memory_gib, base_memory_gib): (Option<u64>, Option<u64>),
     disk_gib: u64,
     no_switch: bool,
     repair: bool,
@@ -390,13 +406,13 @@ pub fn start(
     if repair && let Some(pid) = running_pid(paths) {
         bail!("rekcod is running (pid {pid}); `rekcod stop` first, then `rekcod start --repair`");
     }
-    save_settings(paths, cpus, memory_gib, disk_gib, network)?;
+    save_settings(paths, cpus, (memory_gib, base_memory_gib), disk_gib, network)?;
     if autostart_installed() && !repair {
         // Let the login agent own the VM, so a crash brings it back. Whoever boots first
         // wins the boot lock; the agent supervises either way.
         crate::service::kickstart(AUTOSTART);
     }
-    let opts = BootOptions { cpus, memory_gib, disk_gib, repair, ..Default::default() };
+    let opts = BootOptions { cpus, memory_gib, base_memory_gib, disk_gib, repair, ..Default::default() };
     if repair {
         println!("checking the data disk with e2fsck -fy and reinstalling the root disk; this can take a while");
     }
@@ -572,6 +588,7 @@ pub(crate) fn status_value(paths: &Paths) -> serde_json::Value {
         "kernel": version["KernelVersion"],
         "cpus": file["cpus"],
         "memory_mib": file["memory_mib"],
+        "elastic": {"size_mib": file["elastic_mib"], "used": stats["swap_used"], "held": stats["elastic_held"]},
         "fs_cache": file["fs_cache"],
         "socket": paths.docker_host(),
         "ports": file["ports"],
@@ -653,6 +670,11 @@ pub fn status(paths: &Paths, json: bool) -> Result<()> {
     println!("  kernel    {}", s("kernel"));
     if let Some(size) = vm_size(&v) {
         println!("  vm        {size}");
+    }
+    if let Some(e) = v["elastic"]["size_mib"].as_u64().filter(|e| *e > 0) {
+        let base = v["memory_mib"].as_u64().unwrap_or(e).saturating_sub(e);
+        let held = v["elastic"]["held"].as_u64().map(|h| format!(", {} of it on the Mac now", gib(h))).unwrap_or_default();
+        println!("  memory    {base} MiB RAM + {e} MiB elastic{held}; macOS gets elastic memory back when the VM frees it");
     }
     let sharing = if v["fs_cache"] == true { "cached, invalidated by FSEvents" } else { "uncached (stock virtio-fs)" };
     println!("  files     {sharing}");

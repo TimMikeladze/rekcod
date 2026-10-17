@@ -76,6 +76,7 @@ impl Ca {
         }
         p.distinguished_name.push(rcgen::DnType::CommonName, names.first().cloned().unwrap_or_default());
         p.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+        p.use_authority_key_identifier_extension = true;
         let now = std::time::SystemTime::now();
         p.not_before = now.checked_sub(std::time::Duration::from_secs(86400)).unwrap_or(now).into();
         p.not_after = (now + std::time::Duration::from_secs(2 * 365 * 86400)).into();

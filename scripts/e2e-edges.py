@@ -30,15 +30,16 @@ def port():
 
 def wait_for(check, timeout=15):
     end = time.monotonic() + timeout
+    last_error = None
     while time.monotonic() < end:
         try:
             result = check()
             if result:
                 return result
-        except (OSError, urllib.error.URLError, sqlite3.Error):
-            pass
+        except (OSError, urllib.error.URLError, sqlite3.Error) as error:
+            last_error = error
         time.sleep(0.1)
-    raise AssertionError("condition did not become true within its timeout")
+    raise AssertionError("condition did not become true within its timeout") from last_error
 
 
 class Backend(http.server.BaseHTTPRequestHandler):
@@ -88,6 +89,7 @@ def main():
         join = (controller / "controller/join-token").read_text().strip()
         fingerprint = (controller / "controller/ca-fingerprint").read_text().strip()
         context = ssl.create_default_context(cafile=str(ca_file))
+        context.verify_flags |= ssl.VERIFY_X509_STRICT
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
 
         def api(path, token=admin, data=None, raw=False):

@@ -110,6 +110,8 @@ control-plane hop (CLI, edge and nodes to the controller, the controller to node
 (`tls.rs`). Plain `http://` still works on loopback and tailnet addresses (100.64.0.0/10,
 fd7a:115c:a1e0::/48, `*.ts.net`), and elsewhere only with `REKCOD_INSECURE=1`. App traffic
 between the edge and instance relays stays plain TCP; nodes belong on a tailnet.
+Issued server certificates include the authority key identifier required by strict X.509
+clients, including newer Python/OpenSSL versions. Existing CA keys and fingerprints are reused.
 
 Two CAs: `ca.pem` signs only the controller's certificate and is what CLIs and edges pin;
 `node-ca.pem` signs node certificates and only the controller trusts it, so a node (which

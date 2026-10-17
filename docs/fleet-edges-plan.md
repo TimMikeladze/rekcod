@@ -54,3 +54,8 @@ processes and a loopback backend; edge routing does not require booting more gue
 
 The preceding placement changes were preserved and verified in the same branch.
 Controller standby remains the next HA implementation step.
+
+CI exposed stricter certificate verification in newer Python/OpenSSL: issued server
+certificates lacked their authority key identifier. Reproduced with Python 3.14, added
+the extension without changing CA keys or fingerprints, and made the process test
+request strict X.509 verification explicitly. Readiness failures now retain their cause.

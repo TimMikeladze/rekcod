@@ -40,7 +40,7 @@ export function Sandboxes({ q }: { q: string }) {
               <TableCell>
                 {s.cpu_pct != null ? (
                   <Mono>
-                    {s.cpu_pct.toFixed(0)}% · {fmtBytes((s.rss_mib ?? 0) * 1024 * 1024)}
+                    {s.cpu_pct.toFixed(0)}% · {s.rss_mib != null ? fmtBytes(s.rss_mib * 1024 * 1024) : "–"}
                   </Mono>
                 ) : (
                   <Mono className="text-muted-foreground">–</Mono>

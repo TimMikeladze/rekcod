@@ -608,6 +608,15 @@ fn port_lines(ports: &[serde_json::Value]) -> Vec<String> {
     lines
 }
 
+/// "4 CPUs, 8192 MiB" from a status value, leaving out what the status file lacks.
+pub(crate) fn vm_size(v: &serde_json::Value) -> Option<String> {
+    let parts: Vec<String> = [v["cpus"].as_u64().map(|c| format!("{c} CPUs")), v["memory_mib"].as_u64().map(|m| format!("{m} MiB"))]
+        .into_iter()
+        .flatten()
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
 fn gib(bytes: u64) -> String {
     format!("{:.1} GiB", bytes as f64 / (1u64 << 30) as f64)
 }
@@ -641,7 +650,9 @@ pub fn status(paths: &Paths, json: bool) -> Result<()> {
     println!("rekcod running (pid {})", v["pid"]);
     println!("  dockerd   {} (API {})", s("dockerd"), s("api"));
     println!("  kernel    {}", s("kernel"));
-    println!("  vm        {} CPUs, {} MiB", v["cpus"], v["memory_mib"]);
+    if let Some(size) = vm_size(&v) {
+        println!("  vm        {size}");
+    }
     let sharing = if v["fs_cache"] == true { "cached, invalidated by FSEvents" } else { "uncached (stock virtio-fs)" };
     println!("  files     {sharing}");
     if let Some(ops) = v["fs_requests"].as_object().filter(|o| !o.is_empty()) {
@@ -671,7 +682,8 @@ pub fn status(paths: &Paths, json: bool) -> Result<()> {
         println!("  port      {p}");
     }
     if let Some(sb) = sandbox {
-        println!("  sandbox   running for {} ({} MiB)", sb["project"].as_str().unwrap_or("?"), sb["memory_mib"]);
+        let mib = sb["memory_mib"].as_u64().map(|m| format!(" ({m} MiB)")).unwrap_or_default();
+        println!("  sandbox   running for {}{mib}", sb["project"].as_str().unwrap_or("?"));
         for p in port_lines(sb["ports"].as_array().map(Vec::as_slice).unwrap_or_default()) {
             println!("  port      {p} (sandbox)");
         }

@@ -20,12 +20,19 @@ export function sampleOf(n: Node, t: number): NodeSample {
   }
 }
 
-/** Keeps each node's load, memory and disk from a full `rekcod state`, the last hour. */
-export function recordNodes(s: State, t = Date.now()) {
+/**
+ * Keeps each node's load, memory and disk from a full `rekcod state`, the last hour. A sample
+ * is stamped with the node's heartbeat, so a node that stopped reporting adds nothing instead
+ * of repeating its last numbers.
+ */
+export function recordNodes(s: State, now = Date.now()) {
   for (const n of s.nodes ?? []) {
+    if (!n.last_seen) continue
+    const t = n.last_seen * 1000
     const list = h.by.get(n.id) ?? []
+    if (list.length && list[list.length - 1].t >= t) continue
     list.push(sampleOf(n, t))
-    while (list.length && list[0].t < t - KEEP_MS) list.shift()
+    while (list.length && list[0].t < now - KEEP_MS) list.shift()
     h.by.set(n.id, list)
   }
 }

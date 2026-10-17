@@ -35,10 +35,10 @@ export function useDashboard(): DashData {
     setError(null)
     setLoadedAt(Date.now())
     const ops = s.status?.fs_requests
-    if (ops) {
-      const t = Date.now()
-      setFsHistory((h) => [...h.filter((x) => x.t > t - FS_KEEP_MS), { t, ops }])
-    }
+    // Stamp with the server's read time: a cached answer repeats it and adds no sample (a fresh
+    // timestamp on old counters would chart a 0 req/s dip, then a spike).
+    const t = s.read_at
+    if (ops && t) setFsHistory((h) => (h.some((x) => x.t === t) ? h : [...h.filter((x) => x.t > t - FS_KEEP_MS), { t, ops }]))
   }, [])
 
   const refresh = useCallback(async () => {

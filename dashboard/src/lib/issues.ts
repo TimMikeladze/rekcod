@@ -13,6 +13,10 @@ export function issues(state: S): Issue[] {
     const tab: Tab = what === "jobs" ? "jobs" : what === "apps" ? "apps" : "fleet"
     out.push({ tone: "bad", text: `Remote ${state.remote?.name ?? ""} ${what}: ${err}`.replace("  ", " "), tab })
   }
+  for (const [what, err] of Object.entries(state.local_errors ?? {})) {
+    const tab: Tab = what === "images" ? "images" : what === "volumes" ? "volumes" : what === "snapshots" ? "projects" : "containers"
+    out.push({ tone: "bad", text: `Couldn't list ${what}: ${err}`, tab })
+  }
   for (const p of state.ports) if (p.error) out.push({ tone: "bad", text: `Port ${p.port} (${p.container}) isn't forwarded: ${p.error}`, tab: "ports" })
   for (const a of state.apps) {
     const latest = a.detail?.releases[0]
@@ -22,10 +26,10 @@ export function issues(state: S): Issue[] {
     if (a.live_release == null && !a.sleeping) out.push({ tone: "warn", text: `${a.name} has no live release`, tab: "apps" })
   }
   for (const n of state.nodes ?? []) {
-    if (state.generated - n.last_seen > 60) out.push({ tone: "bad", text: `Node ${n.id} last checked in ${ago(n.last_seen, state.generated)}`, tab: "fleet" })
-    else if (n.mem_total_mib && (n.mem_free_mib ?? 0) / n.mem_total_mib < 0.1) out.push({ tone: "warn", text: `Node ${n.id} is low on memory`, tab: "fleet" })
+    if (n.last_seen == null || state.generated - n.last_seen > 60) out.push({ tone: "bad", text: n.last_seen == null ? `Node ${n.id} has never checked in` : `Node ${n.id} last checked in ${ago(n.last_seen, state.generated)}`, tab: "fleet" })
+    else if (n.mem_total_mib && n.mem_free_mib != null && n.mem_free_mib / n.mem_total_mib < 0.1) out.push({ tone: "warn", text: `Node ${n.id} is low on memory`, tab: "fleet" })
   }
-  const failed = state.jobs.filter((j) => (j.state === "failed" || j.state === "lost") && state.generated - j.created < 86_400)
+  const failed = state.jobs.filter((j) => (j.state === "failed" || j.state === "lost") && j.created != null && state.generated - j.created < 86_400)
   if (failed.length) out.push({ tone: "bad", text: `${failed.length} job${failed.length > 1 ? "s" : ""} failed in the last day`, tab: "jobs" })
   for (const c of state.containers)
     if (c.state === "restarting" || c.state === "dead") out.push({ tone: c.state === "dead" ? "bad" : "warn", text: `${c.name} is ${c.state}`, tab: "containers" })

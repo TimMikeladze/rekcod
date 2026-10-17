@@ -77,7 +77,8 @@ function tick() {
   // Containers that stopped drop out of the stream; their last sample goes stale.
   const fresh = [...s.latest.values()].filter((x) => now - x.at < SAMPLE_SECS * 3000)
   for (const x of s.latest.values()) if (now - x.at >= SAMPLE_SECS * 3000) s.latest.delete(x.name)
-  const sample: Sample[] = fresh.map((x) => ({ t: now, name: x.name, cpu: x.cpu, mem: x.mem }))
+  // Only readings that arrived since the last tick go into history; repeating an old one would draw a reading nobody took.
+  const sample: Sample[] = fresh.filter((x) => now - x.at < SAMPLE_SECS * 1000).map((x) => ({ t: now, name: x.name, cpu: x.cpu, mem: x.mem }))
   s.colors.assign(sample.map((x) => x.name))
   if (sample.length) s.ring.push(sample)
   broadcast("stats", { latest: latest(), sample, colors: s.colors.map() })

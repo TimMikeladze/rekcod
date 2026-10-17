@@ -452,13 +452,15 @@ fn stats() -> String {
         .map(|(op, n)| format!("{}:{}", json_str(op), n.trim().parse::<u64>().unwrap_or(0)))
         .collect();
     let warming: Vec<String> = WARMING.lock().unwrap().iter().map(|p| json_str(p)).collect();
-    let (mut used, mut size) = (0u64, 0u64);
+    // null when statvfs fails: `rekcod status` then leaves the disk line out.
+    let (mut used, mut size) = ("null".to_string(), "null".to_string());
     let path = std::ffi::CString::new("/var/lib/docker").unwrap();
     let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
     // SAFETY: valid path and out-pointer.
     if unsafe { libc::statvfs(path.as_ptr(), &mut st) } == 0 {
-        size = st.f_blocks as u64 * st.f_frsize as u64;
-        used = size.saturating_sub(st.f_bfree as u64 * st.f_frsize as u64);
+        let total = st.f_blocks as u64 * st.f_frsize as u64;
+        used = total.saturating_sub(st.f_bfree as u64 * st.f_frsize as u64).to_string();
+        size = total.to_string();
     }
     format!("{{\"fs_requests\":{{{}}},\"warming\":[{}],\"disk_used\":{used},\"disk_size\":{size}}}", ops.join(","), warming.join(","))
 }

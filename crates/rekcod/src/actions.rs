@@ -308,7 +308,7 @@ pub struct Disk {
 pub struct FleetNode {
     pub id: String,
     pub state: String,
-    pub last_seen: u64,
+    pub last_seen: Option<u64>,
 }
 
 /// A client IP the edges saw in the last 10 minutes.
@@ -377,6 +377,9 @@ pub struct Model {
     pub admin: bool,
     /// What each controller call that failed said, by what it was for (`apps`, `jobs`, ...).
     pub remote_errors: std::collections::BTreeMap<String, String>,
+    /// Docker calls that failed while the VM runs (`containers`, `snapshots`, `images`,
+    /// `volumes`), so an unanswered list isn't shown as an empty one.
+    pub local_errors: std::collections::BTreeMap<String, String>,
 }
 
 /// Docker contexts `rekcod-*`, and whether the local `rekcod` context is in use.
@@ -402,7 +405,7 @@ pub struct RemoteJob {
     pub name: Option<String>,
     pub state: String,
     pub exit: Option<i64>,
-    pub created: u64,
+    pub created: Option<u64>,
 }
 
 /// Namespaces on the default remote: the current one and every one this token is in.
@@ -431,7 +434,7 @@ struct RemoteData {
 fn remote_data(paths: &Paths) -> RemoteData {
     let mut d = RemoteData::default();
     let Ok(r) = crate::fleet::remote(paths, None) else { return d };
-    let get = |path: &str| crate::fleet::call(&r.url, "GET", path, Some(&r.token), &Value::Null);
+    let get = |path: &str| crate::fleet::call_within(&r.url, "GET", path, Some(&r.token), &Value::Null, STATE_READ);
     let err = |errors: &mut std::collections::BTreeMap<String, String>, what: &str, e: anyhow::Error| {
         errors.insert(what.into(), format!("{e:#}"));
     };
@@ -466,7 +469,7 @@ fn remote_data(paths: &Paths) -> RemoteData {
                     .map(|n| FleetNode {
                         id: n["id"].as_str().unwrap_or_default().into(),
                         state: n["state"].as_str().unwrap_or_default().into(),
-                        last_seen: n["last_seen"].as_u64().unwrap_or(0),
+                        last_seen: n["last_seen"].as_u64(),
                     })
                     .collect(),
             )
@@ -501,10 +504,17 @@ pub fn admin_only(e: &anyhow::Error) -> bool {
     format!("{e:#}").contains("admin token required")
 }
 
-/// Connection-level failures (as opposed to the controller answering with an error).
+/// Connection-level failures (as opposed to the controller answering with an error). A read
+/// that hit `STATE_READ` says "temporarily unavailable" (EAGAIN).
 pub fn unreachable(e: &str) -> bool {
-    ["connect", "refused", "timed out", "resolve", "unreachable", "reset", "No route"].iter().any(|w| e.contains(w))
+    ["connect", "refused", "timed out", "resolve", "unreachable", "reset", "No route", "temporarily unavailable"]
+        .iter()
+        .any(|w| e.contains(w))
 }
+
+/// Read timeout for the controller calls behind the menu bar and `rekcod state`: a hung
+/// controller shows as an error instead of holding the menu for `fleet::SLOW`.
+pub const STATE_READ: std::time::Duration = std::time::Duration::from_secs(10);
 
 pub fn parse_jobs(v: &Value, max: usize) -> Vec<RemoteJob> {
     v["jobs"]
@@ -517,7 +527,7 @@ pub fn parse_jobs(v: &Value, max: usize) -> Vec<RemoteJob> {
             name: j["name"].as_str().map(String::from),
             state: j["state"].as_str().unwrap_or("").into(),
             exit: j["exit"].as_i64(),
-            created: j["created"].as_u64().unwrap_or(0),
+            created: j["created"].as_u64(),
         })
         .collect()
 }
@@ -611,15 +621,24 @@ impl Model {
         if !running {
             return m;
         }
-        let raw = crate::cli::api_get(paths, "/containers/json?all=1").unwrap_or_default();
-        m.containers = parse_containers(&raw);
+        let mut docker = |what: &str, path: &str| match crate::cli::api_get(paths, path) {
+            Ok(b) => Some(b),
+            Err(e) => {
+                m.local_errors.insert(what.into(), format!("{e:#}"));
+                None
+            }
+        };
+        let raw = docker("containers", "/containers/json?all=1");
         let filter = "%7B%22label%22%3A%5B%22dev.rekcod.snap%22%5D%7D"; // {"label":["dev.rekcod.snap"]}
-        let snapshots =
-            crate::cli::api_get(paths, &format!("/volumes?filters={filter}")).ok().map(|b| parse_snapshots(&b)).unwrap_or_default();
+        let snapshots = docker("snapshots", &format!("/volumes?filters={filter}")).map(|b| parse_snapshots(&b)).unwrap_or_default();
+        let images = docker("images", "/images/json");
+        let volumes = docker("volumes", "/volumes");
+        let raw = raw.unwrap_or_default();
+        m.containers = parse_containers(&raw);
         m.projects = projects(&m.containers, &raw, snapshots);
         let df = disk_usage(paths, remote);
-        m.images = crate::cli::api_get(paths, "/images/json").map(|b| parse_images(&b, &m.containers)).unwrap_or_default();
-        m.volumes = crate::cli::api_get(paths, "/volumes").map(|b| parse_volumes(&b, &m.containers, df.as_ref())).unwrap_or_default();
+        m.images = images.map(|b| parse_images(&b, &m.containers)).unwrap_or_default();
+        m.volumes = volumes.map(|b| parse_volumes(&b, &m.containers, df.as_ref())).unwrap_or_default();
         m.disk = df.as_ref().map(parse_disk);
         m
     }
@@ -1148,7 +1167,9 @@ pub fn ban_actions(nets: &[String], clients: &[EdgeClient]) -> Vec<Action> {
     out
 }
 
-pub fn age(created: u64) -> String {
+/// "5m ago"; "?" when the time isn't known.
+pub fn age(created: Option<u64>) -> String {
+    let Some(created) = created else { return "?".into() };
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
     match now.saturating_sub(created) {
         a if a < 120 => format!("{a}s ago"),
@@ -1195,7 +1216,7 @@ pub mod tests {
     }
 
     pub fn sample_job() -> RemoteJob {
-        RemoteJob { id: "j-abcdefgh".into(), name: Some("etl".into()), state: "running".into(), exit: None, created: 0 }
+        RemoteJob { id: "j-abcdefgh".into(), name: Some("etl".into()), state: "running".into(), exit: None, created: Some(0) }
     }
 
     pub fn sample_namespaces() -> Namespaces {
@@ -1249,8 +1270,8 @@ pub mod tests {
 
     pub fn sample_nodes() -> Vec<FleetNode> {
         vec![
-            FleetNode { id: "n-1".into(), state: "ready".into(), last_seen: 0 },
-            FleetNode { id: "n-2".into(), state: "drain".into(), last_seen: 0 },
+            FleetNode { id: "n-1".into(), state: "ready".into(), last_seen: Some(0) },
+            FleetNode { id: "n-2".into(), state: "drain".into(), last_seen: Some(0) },
         ]
     }
 
@@ -1381,5 +1402,13 @@ pub mod tests {
         assert!(done.iter().any(|a| a.kind == Kind::JobRerun) && !done.iter().any(|a| a.kind == Kind::JobCancel));
         let bans = ban_actions(&["198.51.100.7".into()], &sample_clients());
         assert!(!bans.iter().any(|a| a.kind == Kind::EdgeBan && !a.interactive), "an IP that's banned isn't offered again");
+    }
+
+    #[test]
+    fn age_of_unknown_time_is_unknown() {
+        assert_eq!(age(None), "?");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(age(Some(now - 300)), "5m ago");
+        assert_eq!(parse_jobs(&serde_json::json!({"jobs": [{"id": "j-1", "state": "done"}]}), 10)[0].created, None);
     }
 }

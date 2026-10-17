@@ -109,8 +109,8 @@ function Nodes({ q }: { q: string }) {
               <TableBody>
                 {nodes.map((n) => {
                   const h = nodeHealth(n, now)
-                  const total = n.mem_total_mib ?? 0
-                  const used = total - (n.mem_free_mib ?? 0)
+                  const total = n.mem_total_mib
+                  const used = total != null && n.mem_free_mib != null ? total - n.mem_free_mib : null
                   return (
                     <NavRow key={n.id} label={`Node ${n.id}, ${h.text}`} watch={h.text} onOpen={() => router.push(`/nodes/${encodeURIComponent(n.id)}`)}>
                       <TableCell>
@@ -123,9 +123,9 @@ function Nodes({ q }: { q: string }) {
                       <TableCell className="hidden sm:table-cell">
                         <div className="space-y-1">
                           <Mono>
-                            {fmtBytes(used * 1024 * 1024)} / {fmtBytes(total * 1024 * 1024)}
+                            {used != null ? fmtBytes(used * 1024 * 1024) : "–"} / {total != null ? fmtBytes(total * 1024 * 1024) : "–"}
                           </Mono>
-                          <Meter value={total ? used / total : 0} />
+                          <Meter value={total && used != null ? used / total : null} />
                         </div>
                       </TableCell>
                       <TableCell className="hidden md:table-cell">
@@ -134,7 +134,7 @@ function Nodes({ q }: { q: string }) {
                             <Mono>
                               load {n.load?.toFixed(1) ?? "?"} / {n.cpus}
                             </Mono>
-                            <Meter value={(n.load ?? 0) / n.cpus} />
+                            <Meter value={n.load != null ? n.load / n.cpus : null} />
                           </div>
                         ) : (
                           <Mono className="text-muted-foreground">–</Mono>
@@ -143,8 +143,8 @@ function Nodes({ q }: { q: string }) {
                       <TableCell className="hidden md:table-cell">
                         {n.disk_total_gib ? (
                           <div className="space-y-1">
-                            <Mono>{n.disk_free_gib} GiB free</Mono>
-                            <Meter value={1 - (n.disk_free_gib ?? 0) / n.disk_total_gib} />
+                            <Mono>{n.disk_free_gib != null ? `${n.disk_free_gib} GiB free` : "–"}</Mono>
+                            <Meter value={n.disk_free_gib != null ? 1 - n.disk_free_gib / n.disk_total_gib : null} />
                           </div>
                         ) : (
                           <Mono className="text-muted-foreground">–</Mono>
@@ -296,7 +296,7 @@ function Backups({ state }: { state: S }) {
                 <TableCell className="text-right">
                   <Mono>{fmtBytes(x.size)}</Mono>
                 </TableCell>
-                <TableCell className="text-xs text-muted-foreground">{ago(Date.parse(x.modified) / 1000, state.generated)}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">{Number.isNaN(Date.parse(x.modified)) ? "–" : ago(Date.parse(x.modified) / 1000, state.generated)}</TableCell>
               </TableRow>
             ))}
           </TableBody>

@@ -83,7 +83,7 @@ export function NotFound({ what }: { what: string }) {
 }
 
 const took = (j: Job, now: number) =>
-  j.finished ? duration(Math.max(1, j.finished - j.created)) : j.state === "running" ? duration(Math.max(1, now - j.created)) : "–"
+  j.created == null ? "–" : j.finished ? duration(Math.max(1, j.finished - j.created)) : j.state === "running" ? duration(Math.max(1, now - j.created)) : "–"
 
 /** `/jobs/[id]`: one job's command and output (followed while it runs), and the history of a named job. */
 export function JobDetail({ id }: { id: string }) {
@@ -133,7 +133,7 @@ export function JobDetail({ id }: { id: string }) {
         <dt className="text-muted-foreground">Owner</dt>
         <dd>{job.owner ?? "–"}</dd>
         <dt className="text-muted-foreground">Started</dt>
-        <dd>{ago(job.created, now)}</dd>
+        <dd>{job.created != null ? ago(job.created, now) : "?"}</dd>
         <dt className="text-muted-foreground">Took</dt>
         <dd className="font-mono">{took(job, now)}</dd>
       </dl>
@@ -166,7 +166,7 @@ export function JobDetail({ id }: { id: string }) {
                             {r.id}
                           </Link>
                         </TableCell>
-                        <TableCell className="text-xs text-muted-foreground">{ago(r.created, now)}</TableCell>
+                        <TableCell className="text-xs text-muted-foreground">{r.created != null ? ago(r.created, now) : "?"}</TableCell>
                         <TableCell>
                           <Mono>{took(r, now)}</Mono>
                         </TableCell>

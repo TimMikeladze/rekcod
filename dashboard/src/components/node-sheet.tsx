@@ -17,7 +17,7 @@ import type { Node } from "@/lib/types"
 
 /** A node's state as one word and a tone: unreachable after a minute without a heartbeat. */
 export function nodeHealth(n: Node, now: number): { tone: Tone; text: string; stale: boolean } {
-  const stale = now - n.last_seen > 60
+  const stale = n.last_seen == null || now - n.last_seen > 60
   if (stale) return { tone: "bad", text: "unreachable", stale }
   if (n.state === "drain") return { tone: "warn", text: "drained", stale }
   if (n.state === "lost") return { tone: "bad", text: "lost", stale }
@@ -68,7 +68,7 @@ function History({ node }: { node: Node }) {
         ).map(([label, metric, max]) => (
           <div key={metric} className="rounded-lg border bg-card p-3">
             <div className="cap mb-1">{label}</div>
-            <NodeHistoryChart rows={samples} metric={metric} max={max} node={id} />
+            <NodeHistoryChart rows={samples} metric={metric} max={max ?? undefined} node={id} />
           </div>
         ))}
       </div>
@@ -87,8 +87,8 @@ export function NodeDetail({ id }: { id: string }) {
   )
   const jobs = (state?.jobs ?? []).filter((j) => j.node === id && j.state === "running")
   if (!node) return <NotFound what={`Node ${id}`} />
-  const total = node.mem_total_mib ?? 0
-  const used = total - (node.mem_free_mib ?? 0)
+  const total = node.mem_total_mib
+  const used = total != null && node.mem_free_mib != null ? total - node.mem_free_mib : null
   const h = nodeHealth(node, now)
   return (
           <>
@@ -103,14 +103,18 @@ export function NodeDetail({ id }: { id: string }) {
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                 <Gauge
                   label="CPU"
-                  value={node.cpus ? (node.load ?? 0) / node.cpus : null}
+                  value={node.cpus && node.load != null ? node.load / node.cpus : null}
                   text={node.cpus ? `load ${node.load?.toFixed(2) ?? "?"} of ${node.cpus}` : "not reported"}
                 />
-                <Gauge label="Memory" value={total ? used / total : null} text={total ? `${fmtBytes(used * 2 ** 20)} of ${fmtBytes(total * 2 ** 20)}` : "not reported"} />
+                <Gauge
+                  label="Memory"
+                  value={total && used != null ? used / total : null}
+                  text={total && used != null ? `${fmtBytes(used * 2 ** 20)} of ${fmtBytes(total * 2 ** 20)}` : total ? `? of ${fmtBytes(total * 2 ** 20)}` : "not reported"}
+                />
                 <Gauge
                   label="Disk"
-                  value={node.disk_total_gib ? 1 - (node.disk_free_gib ?? 0) / node.disk_total_gib : null}
-                  text={node.disk_total_gib ? `${node.disk_free_gib} of ${node.disk_total_gib} GiB free` : "not reported"}
+                  value={node.disk_total_gib && node.disk_free_gib != null ? 1 - node.disk_free_gib / node.disk_total_gib : null}
+                  text={node.disk_total_gib ? `${node.disk_free_gib ?? "?"} of ${node.disk_total_gib} GiB free` : "not reported"}
                 />
               </div>
               <History node={node} />
@@ -166,7 +170,7 @@ export function NodeDetail({ id }: { id: string }) {
                           <TableCell className="max-w-48 truncate">
                             <Mono className="text-muted-foreground">{cmdLine(j.cmd) || "–"}</Mono>
                           </TableCell>
-                          <TableCell className="text-xs text-muted-foreground">{ago(j.created, now)}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground">{j.created != null ? ago(j.created, now) : "?"}</TableCell>
                         </TableRow>
                       ))}
                     </TableBody>

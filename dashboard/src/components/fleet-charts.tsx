@@ -12,11 +12,13 @@ import { scaleOrdinal } from "@tanstack/charts/scales/ordinal"
 import { tooltip } from "@tanstack/charts/tooltip"
 import { scaleUtc } from "d3-scale"
 import { duration } from "@/lib/format"
+import { breakGaps, fillMinutes, type Minute } from "@/lib/series"
 import type { Job, TrafficMinute } from "@/lib/types"
 
 const clock = (d: Date) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
 const day = (d: Date) => d.toLocaleDateString([], { month: "short", day: "numeric" })
-const at = (m: TrafficMinute) => new Date(m.minute * 60_000)
+const at = (m: Minute) => new Date(m.minute * 60_000)
+
 
 // Categorical slots 1 and 2 of the reference palette; run results use the status colours.
 const SERIES = ["#2a78d6", "#eb6834"]
@@ -26,7 +28,7 @@ const legend = () => colorLegend({ placement: "bottom", itemWidth: 120, items: c
  * One count per minute over the last hour (requests, or 5xx). Separate charts rather than one:
  * a few errors next to hundreds of requests would sit flat on the baseline.
  */
-export function PerMinuteChart({ rows, y, label, color, ariaLabel }: { rows: TrafficMinute[]; y: (d: TrafficMinute) => number; label: string; color: string; ariaLabel: string }) {
+export function PerMinuteChart({ rows, y, label, color, ariaLabel }: { rows: Minute[]; y: (d: Minute) => number; label: string; color: string; ariaLabel: string }) {
   const definition = useMemo(
     () =>
       defineChart({
@@ -38,7 +40,7 @@ export function PerMinuteChart({ rows, y, label, color, ariaLabel }: { rows: Tra
         color: { scale: () => scaleOrdinal<string, string>([label], [color]), domain: [label] },
         tooltip: {
           use: tooltip,
-          format: (p: ChartPoint<TrafficMinute>) => `${clock(at(p.datum))} · ${y(p.datum)} ${label}`,
+          format: (p: ChartPoint<Minute>) => `${clock(at(p.datum))} · ${y(p.datum)} ${label}`,
         },
       }),
     [rows, y, label, color],
@@ -50,11 +52,12 @@ export function PerMinuteChart({ rows, y, label, color, ariaLabel }: { rows: Tra
   )
 }
 
-const requests = (d: TrafficMinute) => d.requests
-const errors = (d: TrafficMinute) => d.errors
+const requests = (d: Minute) => d.requests
+const errors = (d: Minute) => d.errors
 
 /** Requests per minute, then 5xx per minute, over the last hour. */
-export function TrafficChart({ rows }: { rows: TrafficMinute[] }) {
+export function TrafficChart({ rows: raw }: { rows: TrafficMinute[] }) {
+  const rows = useMemo(() => fillMinutes(raw), [raw])
   return (
     <div className="space-y-2">
       <PerMinuteChart rows={rows} y={requests} label="requests" color={SERIES[0]} ariaLabel="Requests per minute over the last hour" />
@@ -64,13 +67,14 @@ export function TrafficChart({ rows }: { rows: TrafficMinute[] }) {
 }
 
 /** p50 and p95 latency per minute. */
-export function LatencyChart({ rows }: { rows: TrafficMinute[] }) {
+export function LatencyChart({ rows: raw }: { rows: TrafficMinute[] }) {
+  const rows = useMemo(() => fillMinutes(raw), [raw])
   const definition = useMemo(
     () =>
       defineChart({
         marks: [
-          lineY(rows, { x: at, y: (d: TrafficMinute) => d.p50_ms, color: () => "p50", strokeWidth: 2 }),
-          lineY(rows, { x: at, y: (d: TrafficMinute) => d.p95_ms, color: () => "p95", strokeWidth: 2 }),
+          lineY(rows, { x: at, y: (d: Minute) => d.p50_ms, color: () => "p50", strokeWidth: 2 }),
+          lineY(rows, { x: at, y: (d: Minute) => d.p95_ms, color: () => "p95", strokeWidth: 2 }),
         ],
         scales: {
           x: { scale: scaleUtc, axis: { ticks: { format: clock } } },
@@ -79,7 +83,7 @@ export function LatencyChart({ rows }: { rows: TrafficMinute[] }) {
         color: { scale: () => scaleOrdinal<string, string>(["p50", "p95"], SERIES), domain: ["p50", "p95"], legend: legend() },
         tooltip: {
           use: tooltip,
-          format: (p: ChartPoint<TrafficMinute>) => `${clock(at(p.datum))} · p50 ${p.datum.p50_ms} ms · p95 ${p.datum.p95_ms} ms`,
+          format: (p: ChartPoint<Minute>) => `${clock(at(p.datum))} · p50 ${p.datum.p50_ms} ms · p95 ${p.datum.p95_ms} ms`,
         },
       }),
     [rows],
@@ -98,17 +102,17 @@ export function runResult(j: Job): string {
   return j.state
 }
 
-const took = (j: Job) => (j.finished ? Math.max(1, j.finished - j.created) : null)
+const took = (j: Job) => (j.finished && j.created != null ? Math.max(1, j.finished - j.created) : null)
 
 /** Duration of each finished run, coloured by how it ended. */
 export function RunHistoryChart({ runs }: { runs: Job[] }) {
-  const finished = useMemo(() => runs.filter((j) => j.finished), [runs])
+  const finished = useMemo(() => runs.filter((j) => j.finished && j.created != null), [runs])
   const definition = useMemo(
     () =>
       defineChart({
         marks: [
           dot(finished, {
-            x: (d: Job) => new Date(d.created * 1000),
+            x: (d: Job) => new Date(d.created! * 1000),
             y: (d: Job) => took(d),
             color: (d: Job) => runResult(d),
             r: 4,
@@ -141,7 +145,8 @@ export function RunHistoryChart({ runs }: { runs: Job[] }) {
 }
 
 /** Requests per minute over the last hour as a 24 px line with no axes, for a table cell. */
-export function TrafficSpark({ rows, app }: { rows: TrafficMinute[]; app: string }) {
+export function TrafficSpark({ rows: raw, app }: { rows: TrafficMinute[]; app: string }) {
+  const rows = useMemo(() => fillMinutes(raw), [raw])
   const definition = useMemo(
     () =>
       defineChart({
@@ -151,7 +156,7 @@ export function TrafficSpark({ rows, app }: { rows: TrafficMinute[]; app: string
         scales: { x: { scale: scaleUtc }, y: { scale: scaleLinear } },
         guides: false,
         margin: 2,
-        tooltip: { use: tooltip, format: (p: ChartPoint<TrafficMinute>) => `${clock(at(p.datum))} · ${p.datum.requests} req · ${p.datum.errors} 5xx` },
+        tooltip: { use: tooltip, format: (p: ChartPoint<Minute>) => `${clock(at(p.datum))} · ${p.datum.requests} req · ${p.datum.errors} 5xx` },
       }),
     [rows],
   )
@@ -173,15 +178,16 @@ const RESULT_COLORS = ["var(--success)", "var(--alert)", "var(--ok)", "var(--str
  * it runs) and a dot at the start, so a 30 s run in a day-wide chart still shows.
  */
 export function JobsTimeline({ jobs, now }: { jobs: Job[]; now: number }) {
-  const rows = useMemo(() => jobs.filter((j) => j.created > now - 86_400), [jobs, now])
+  // A run without a start time has no place on a timeline.
+  const rows = useMemo(() => jobs.filter((j): j is Job & { created: number } => j.created != null && j.created > now - 86_400), [jobs, now])
   const lanes = useMemo(() => [...new Set(rows.map(lane))].sort(), [rows])
   const definition = useMemo(() => {
-    const end = (j: Job) => new Date(1000 * (j.finished ?? (j.state === "running" ? now : j.created)))
+    const end = (j: Job & { created: number }) => new Date(1000 * (j.finished ?? (j.state === "running" ? now : j.created)))
     const result = (j: Job) => (j.state === "running" ? "running" : runResult(j))
     return defineChart({
       marks: [
-        rect(rows, { x1: (d: Job) => new Date(d.created * 1000), x2: end, y: lane, color: result, inset: 3, radius: 2 }),
-        dot(rows, { x: (d: Job) => new Date(d.created * 1000), y: lane, color: result, r: 3.5 }),
+        rect(rows, { x1: (d: Job & { created: number }) => new Date(d.created * 1000), x2: end, y: lane, color: result, inset: 3, radius: 2 }),
+        dot(rows, { x: (d: Job & { created: number }) => new Date(d.created * 1000), y: lane, color: result, r: 3.5 }),
       ],
       scales: {
         // Instances keep their domains: the whole day, every lane.
@@ -191,7 +197,7 @@ export function JobsTimeline({ jobs, now }: { jobs: Job[]; now: number }) {
       color: { scale: () => scaleOrdinal<string, string>(RESULTS, RESULT_COLORS), domain: RESULTS, legend: legend() },
       tooltip: {
         use: tooltip,
-        format: (p: ChartPoint<Job>) =>
+        format: (p: ChartPoint<Job & { created: number }>) =>
           `${lane(p.datum)} · ${p.datum.id} · ${result(p.datum)} · ${p.datum.finished ? duration(Math.max(1, p.datum.finished - p.datum.created)) : "running"}`,
       },
     })
@@ -214,8 +220,10 @@ const NODE_METRIC = {
 } as const
 
 /** A node's load, memory or disk over the last hour. `max` (CPUs, total memory or disk) pins the top. */
-export function NodeHistoryChart({ rows, metric, max, node }: { rows: NodeSample[]; metric: keyof typeof NODE_METRIC; max?: number; node: string }) {
+export function NodeHistoryChart({ rows: raw, metric, max, node }: { rows: NodeSample[]; metric: keyof typeof NODE_METRIC; max?: number; node: string }) {
   const m = NODE_METRIC[metric]
+  // A node is unreachable after a minute without a heartbeat; don't draw across that.
+  const rows = useMemo(() => breakGaps(raw, 60_000, (p) => ({ t: p.t + 1, load: null, mem_used_mib: null, disk_used_gib: null })), [raw])
   const definition = useMemo(
     () =>
       defineChart({

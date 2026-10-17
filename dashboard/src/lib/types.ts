@@ -116,8 +116,8 @@ export type Instance = {
   node: string
   endpoint: string
   state: string
-  /** When its sandbox was created; 0 from older controllers. */
-  created?: number
+  /** When its sandbox was created; null when the sandbox row is gone. */
+  created?: number | null
 }
 
 /** One minute of edge traffic for an app. */
@@ -152,7 +152,7 @@ export type Job = {
   name: string | null
   state: string
   exit: number | null
-  created: number
+  created: number | null
   // Only with a remote (the controller's full row).
   cmd?: string[] | string | null
   node?: string
@@ -166,17 +166,17 @@ export type Job = {
 export type Node = {
   id: string
   state: string
-  last_seen: number
+  last_seen: number | null
   // The rest comes from the controller's `/nodes` (admin token).
   url?: string
-  mem_total_mib?: number
-  mem_free_mib?: number
+  mem_total_mib?: number | null
+  mem_free_mib?: number | null
   pool?: string[]
-  cpus?: number
+  cpus?: number | null
   /** 1-minute load average. */
-  load?: number
-  disk_total_gib?: number
-  disk_free_gib?: number
+  load?: number | null
+  disk_total_gib?: number | null
+  disk_free_gib?: number | null
   instances?: number
   jobs_running?: number
   actions: Action[]
@@ -212,8 +212,8 @@ export type VmStatus = {
   dockerd?: string
   api?: string
   kernel?: string
-  cpus?: number
-  memory_mib?: number
+  cpus?: number | null
+  memory_mib?: number | null
   fs_cache?: boolean
   socket?: string
   context?: string | null
@@ -228,8 +228,12 @@ export type VmStatus = {
 
 export type State = {
   generated: number
+  /** Set by the dashboard server: when it read this state (ms). Cached answers repeat it. */
+  read_at?: number
   /** `rekcod state --local`: the fleet keys below are missing or stale. */
   local?: boolean
+  /** Docker list calls that failed while the VM ran (containers, snapshots, images, volumes). */
+  local_errors?: Record<string, string>
   running: boolean
   status: VmStatus
   sandbox_vm: VmStatus | null

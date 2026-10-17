@@ -38,7 +38,7 @@ export function Images({ q }: { q: string }) {
   const list = state?.images ?? []
   const rows = sort.apply(list.filter((i) => match(q, i.id, ...i.tags, ...i.containers, i.dangling ? "dangling" : "", i.containers.length ? "" : "unused")))
   const total = list.reduce((a, i) => a + i.size, 0)
-  if (!list.length) return <Empty>{state?.running ? "No images." : "The VM is stopped."}</Empty>
+  if (!list.length) return <Empty>{state?.local_errors?.images ? `Couldn't list images: ${state.local_errors.images}` : state?.running ? "No images." : "The VM is stopped."}</Empty>
   const ids = rows.map((i) => i.id)
   const picked = rows.filter((i) => sel.has(i.id))
   return (

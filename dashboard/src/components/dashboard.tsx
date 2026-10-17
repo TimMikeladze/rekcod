@@ -207,7 +207,10 @@ function Tiles({ state, stats }: { state: S; stats: Record<string, Stat> }) {
   const running = state.containers.filter((c) => c.state === "running").length
   const cpu = Object.values(stats).reduce((a, s) => a + s.cpu, 0)
   const mem = Object.values(stats).reduce((a, s) => a + s.mem, 0)
-  const memTotal = (state.status.memory_mib ?? 0) * 1024 * 1024
+  // No running containers means 0 is a fact; running ones without a stats row yet are unknown.
+  const measured = running === 0 || Object.keys(stats).length > 0
+  const cpus = state.status.cpus
+  const memTotal = state.status.memory_mib != null ? state.status.memory_mib * 1024 * 1024 : null
   const disk = state.status.disk
   const live = state.apps.filter((a) => !a.sleeping && a.live_release != null).length
   const asleep = state.apps.filter((a) => a.sleeping).length
@@ -218,15 +221,15 @@ function Tiles({ state, stats }: { state: S; stats: Record<string, Stat> }) {
   return (
     <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-6">
       <Tile label="Containers" href="/containers" value={`${running}/${state.containers.length}`} sub={`${state.containers.length - running} stopped`} />
-      <Tile label="CPU" value={`${cpu.toFixed(1)}%`} sub={`of ${(state.status.cpus ?? 0) * 100}% (${state.status.cpus ?? "?"} vCPU)`}>
+      <Tile label="CPU" value={measured ? `${cpu.toFixed(1)}%` : "–"} sub={cpus != null ? `of ${cpus * 100}% (${cpus} vCPU)` : "vCPUs unknown"}>
         {state.running && <div className="mt-1.5"><UsageSpark metric="cpu" /></div>}
       </Tile>
-      <Tile label="Memory" value={fmtBytes(mem)} sub={`of ${fmtBytes(memTotal)} VM`}>
+      <Tile label="Memory" value={measured ? fmtBytes(mem) : "–"} sub={memTotal != null ? `of ${fmtBytes(memTotal)} VM` : "VM size unknown"}>
         {state.running && <div className="mt-1.5"><UsageSpark metric="mem" /></div>}
-        <Meter value={memTotal ? mem / memTotal : 0} className="mt-1" />
+        <Meter value={measured && memTotal ? mem / memTotal : null} className="mt-1" />
       </Tile>
       <Tile label="Disk" href="/disk" value={fmtBytes(disk?.used_in_vm)} sub={`${fmtBytes(disk?.on_mac)} on the Mac`}>
-        <Meter value={disk?.size ? (disk.used_in_vm ?? 0) / disk.size : 0} className="mt-2" />
+        <Meter value={disk?.size && disk.used_in_vm != null ? disk.used_in_vm / disk.size : null} className="mt-2" />
       </Tile>
       <Tile
         label="Apps"

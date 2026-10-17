@@ -20,7 +20,7 @@ export function Jobs({ q = "" }: { q?: string }) {
   const router = useRouter()
   const open = (id: string) => router.push(`/jobs/${encodeURIComponent(id)}`)
   const now = state?.generated ?? 0
-  const took = (j: Job) => (j.finished ? j.finished - j.created : j.state === "running" ? now - j.created : null)
+  const took = (j: Job) => (j.created == null ? null : j.finished ? j.finished - j.created : j.state === "running" ? now - j.created : null)
   const sort = useSort<Job>({ name: (j) => j.name ?? j.id, started: (j) => j.created, took, result: (j) => j.state })
   if (!state) return null
   if (!state.remote) return <NoRemote what="Jobs" />
@@ -80,9 +80,9 @@ export function Jobs({ q = "" }: { q?: string }) {
                   <TableCell className="hidden sm:table-cell">
                     <Mono>{j.node ?? "–"}</Mono>
                   </TableCell>
-                  <TableCell className="hidden text-xs text-muted-foreground sm:table-cell">{ago(j.created, now)}</TableCell>
+                  <TableCell className="hidden text-xs text-muted-foreground sm:table-cell">{j.created != null ? ago(j.created, now) : "?"}</TableCell>
                   <TableCell className="hidden sm:table-cell">
-                    <Mono>{j.finished ? duration(Math.max(1, j.finished - j.created)) : j.state === "running" ? duration(Math.max(1, now - j.created)) : "–"}</Mono>
+                    <Mono>{took(j) != null ? duration(Math.max(1, took(j)!)) : "–"}</Mono>
                   </TableCell>
                   <TableCell>
                     <State tone={jobTone(j.state, j.exit)} pulse={j.state === "running"}>

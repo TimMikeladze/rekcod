@@ -108,6 +108,13 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Fixed
 
+- Readings nobody could take are `null` and show as `–`, not 0: node CPUs, load and disk,
+  the guest's disk usage, VM CPUs/memory in `rekcod status`, `docker stats` rows that print
+  `--`. The controller's `nodes` table gets nullable columns (migration 5).
+- The menu bar shows "Loading…" until its first read, and a failed docker list shows its error
+  (`local_errors` in `rekcod state`) instead of "No containers".
+- Dashboard charts no longer draw lines across time with no samples, fill idle traffic minutes
+  with 0 requests, and the file-sharing rate no longer dips to 0 on cached polls.
 - A data disk that isn't readable ext4 is never formatted (it was, on any blkid miss); its
   backup superblock is tried and the error reported.
 - A reader that falls behind a vsock stream no longer gets a short stream with a clean EOF.

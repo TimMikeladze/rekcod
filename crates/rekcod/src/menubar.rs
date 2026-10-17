@@ -156,12 +156,18 @@ pub enum Entry {
     Separator,
 }
 
+/// Before the first model loads: nothing is known yet, so nothing is offered.
+pub fn loading() -> Vec<Entry> {
+    vec![Entry::Label("Loading…".into())]
+}
+
 /// The whole menu for `m`: everything comes from the `actions` lists.
 pub fn entries(m: &Model) -> Vec<Entry> {
     let mut out = Vec::new();
     let s = &m.status;
     if m.running {
-        out.push(Entry::Label(format!("rekcod running · {} CPUs · {} MiB", s["cpus"], s["memory_mib"])));
+        let size = crate::cli::vm_size(s).map(|z| format!(" · {}", z.replace(", ", " · "))).unwrap_or_default();
+        out.push(Entry::Label(format!("rekcod running{size}")));
     } else {
         out.push(Entry::Label("rekcod is stopped".into()));
     }
@@ -213,7 +219,10 @@ pub fn entries(m: &Model) -> Vec<Entry> {
             )
         })
         .collect();
-    out.push(if containers.is_empty() {
+    let failed = |what: &str| m.local_errors.get(what).map(|e| Entry::Label(format!("{what}: {e}")));
+    out.push(if let Some(e) = failed("containers") {
+        e
+    } else if containers.is_empty() {
         Entry::Label("No containers".into())
     } else {
         Entry::Submenu(format!("Containers ({})", m.containers.len()), containers)
@@ -227,17 +236,21 @@ pub fn entries(m: &Model) -> Vec<Entry> {
                 items.push(Entry::Separator);
             }
             for s in &p.snapshots {
-                let title = format!("{}  ({})", s.name, actions::age(s.created));
+                let title = format!("{}  ({})", s.name, actions::age(Some(s.created)));
                 items.push(Entry::Submenu(title, actions::snapshot_actions(s).into_iter().map(Entry::Action).collect()));
             }
             Entry::Submenu(p.name.clone(), items)
         })
         .collect();
-    out.push(if projects.is_empty() {
-        Entry::Label("No compose projects or snapshots".into())
-    } else {
-        Entry::Submenu("Projects & snapshots".into(), projects)
-    });
+    out.extend(failed("snapshots"));
+    // Projects come from the container list; without it there's nothing to say.
+    if !projects.is_empty() {
+        out.push(Entry::Submenu("Projects & snapshots".into(), projects));
+    } else if !m.local_errors.contains_key("containers") {
+        out.push(Entry::Label("No compose projects or snapshots".into()));
+    }
+    out.extend(failed("images"));
+    out.extend(failed("volumes"));
     if !m.images.is_empty() {
         let items = m
             .images
@@ -397,15 +410,10 @@ impl Target {
 
     /// Rebuilds the menu's items from a fresh model (called as it opens).
     fn fill(&self, menu: &NSMenu) {
-        let paths = &self.ivars().paths;
-        let model = self
-            .ivars()
-            .models
-            .fresh(std::time::Duration::from_millis(1500))
-            .unwrap_or_else(|| Arc::new(Model { running: crate::cli::running_pid(paths).is_some(), ..Default::default() }));
+        let model = self.ivars().models.fresh(std::time::Duration::from_millis(1500));
         menu.removeAllItems();
         self.ivars().actions.borrow_mut().clear();
-        self.add(menu, &entries(&model));
+        self.add(menu, &model.map(|m| entries(&m)).unwrap_or_else(loading));
         let mtm = self.mtm();
         menu.addItem(&NSMenuItem::separatorItem(mtm));
         menu.addItem(&self.item("Open logs folder", Some(sel!(openLogs:))));
@@ -681,6 +689,7 @@ mod tests {
             remotes: crate::actions::tests::sample_remotes(),
             admin: true,
             remote_errors: Default::default(),
+            local_errors: Default::default(),
         };
         let done = crate::actions::RemoteJob { state: "done".into(), ..crate::actions::tests::sample_job() };
         let model = Model { jobs: vec![crate::actions::tests::sample_job(), done], ..model };
@@ -705,5 +714,16 @@ mod tests {
         let top = entries(&model);
         assert_eq!(top[0], Entry::Label("rekcod running · 6 CPUs · 8192 MiB".into()));
         assert!(top.contains(&Entry::Label("Ports".into())));
+    }
+
+    #[test]
+    fn unread_values_are_not_shown_as_readings() {
+        let mut m = Model { running: true, ..Model::default() };
+        m.local_errors.insert("containers".into(), "connection refused".into());
+        let top = entries(&m);
+        assert_eq!(top[0], Entry::Label("rekcod running".into()));
+        assert!(top.contains(&Entry::Label("containers: connection refused".into())));
+        assert!(!top.iter().any(|e| matches!(e, Entry::Label(l) if l.starts_with("No containers") || l.starts_with("No compose"))));
+        assert_eq!(loading(), vec![Entry::Label("Loading…".into())]);
     }
 }

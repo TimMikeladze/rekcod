@@ -104,7 +104,16 @@ The server keeps the latest state and pushes it to every open page over `GET /ap
 
 A controller that doesn't answer isn't an empty fleet: each failed call is in
 `remote.errors` (`apps`, `jobs`, `nodes`, ...) and the first one in `remote.error`. The
-banner on every page, the sidebar badges and "Needs attention" show it.
+banner on every page, the sidebar badges and "Needs attention" show it. Each controller call
+gets 10 s to answer (`actions::STATE_READ`); a read that times out counts as unreachable, so
+the calls after it are skipped.
+
+The same goes for docker: a list call that fails while the VM runs leaves its error in
+`local_errors` (`{"containers": "...", "snapshots": "...", "images": "...", "volumes": "..."}`,
+`{}` when all answered) and that list empty. Readings nobody could take are `null`, never 0:
+a node's `cpus`, `load`, `disk_total_gib` and `disk_free_gib`, a job's `created`, an
+instance's `created`, a node's `last_seen`. The dashboard shows them as `–` (a dashed bar
+for a meter), and its charts break where there are no samples instead of drawing across the gap.
 
 `/system/df` takes seconds (it sizes every volume), so its result is cached in
 `~/.rekcod/run/df.json` for two minutes; only a full `rekcod state` measures again. Sizes on

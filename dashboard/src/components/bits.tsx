@@ -34,9 +34,11 @@ export function State({ tone, children, pulse }: { tone: Tone; children: ReactNo
   )
 }
 
-/** A thin usage bar; turns amber past 75%, red past 90%. */
-export function Meter({ value, className }: { value: number; className?: string }) {
-  const v = Math.max(0, Math.min(1, value || 0))
+/** A thin usage bar; turns amber past 75%, red past 90%. `null` (unknown) is a dashed empty bar. */
+export function Meter({ value, className }: { value: number | null | undefined; className?: string }) {
+  if (value == null || !Number.isFinite(value))
+    return <div title="no reading" className={cn("h-1.5 w-full rounded-full border border-dashed border-border", className)} />
+  const v = Math.max(0, Math.min(1, value))
   return (
     <div className={cn("h-1.5 w-full overflow-hidden rounded-full bg-accent", className)}>
       <div

@@ -14,6 +14,9 @@ describe("stats stream", () => {
     expect(parseStatLine("\x1b[H\x1b[K")).toBeNull()
     expect(parseStatLine("{not json")).toBeNull()
   })
+  it("treats a '--' row (no reading yet) as no sample, not 0%", () => {
+    expect(parseStatLine('{"CPUPerc":"--","MemUsage":"-- / --","Name":"web","NetIO":"-- / --"}')).toBeNull()
+  })
   it("keeps a partial line for the next chunk", () => {
     const [lines, rest] = splitLines(`${LINE}\n${LINE.slice(0, 20)}`)
     expect(lines).toHaveLength(1)

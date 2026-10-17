@@ -1012,9 +1012,11 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             } else {
                 0
             };
-            let (disk_total, disk_free) = disk_gib(&hb_paths.home);
+            // Readings that fail go as null; the controller keeps them unknown.
+            let disk = crate::cli::disk_gib(&hb_paths.home);
+            let (disk_total, disk_free) = (disk.map(|d| d.0), disk.map(|d| d.1));
             let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs,
-                              "cpus": crate::cli::sysctl_u64("hw.ncpu").unwrap_or(0), "load": load_average(),
+                              "cpus": crate::cli::sysctl_u64("hw.ncpu"), "load": load_average(),
                               "disk_total_gib": disk_total, "disk_free_gib": disk_free});
             match call_within(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body, QUICK) {
                 Ok(v) => {
@@ -1063,7 +1065,6 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// The 1-minute load average.
 /// Deletes clones in `remote-ws/` no sandbox uses and finished job directories, once older
 /// than `age`. Both otherwise grow with every deploy and job.
 fn node_cleanup(paths: &Paths, age: Duration) {
@@ -1084,13 +1085,10 @@ fn node_cleanup(paths: &Paths, age: Duration) {
     }
 }
 
-fn load_average() -> f64 {
+/// The 1-minute load average.
+fn load_average() -> Option<f64> {
     let mut l = [0f64; 3];
-    if unsafe { libc::getloadavg(l.as_mut_ptr(), 3) } < 1 { 0.0 } else { l[0] }
-}
-
-fn disk_gib(dir: &Path) -> (u64, u64) {
-    crate::cli::disk_gib(dir).unwrap_or((0, 0))
+    (unsafe { libc::getloadavg(l.as_mut_ptr(), 3) } >= 1).then_some(l[0])
 }
 
 // ------------------------------------------------------------- controller
@@ -1178,6 +1176,18 @@ const MIGRATIONS: &[&str] = &[
     // logs outlive them.
     "create table if not exists instance_logs (app text not null, release integer not null, sandbox text primary key,
        node text not null, ended integer not null, logs text not null);",
+    // Node cpus, load and disk become nullable: null is a reading the node couldn't take.
+    // Old rows stored those as 0; cpus or disk_total of 0 was never a real reading.
+    "create table nodes_new (id text primary key, url text not null, secret text not null,
+       mem_total integer not null default 0, mem_free integer not null default 0, last_seen integer not null default 0,
+       state text not null default 'ready', macos_free integer not null default 0,
+       cpus integer, load integer, disk_total integer, disk_free integer);
+     insert into nodes_new (id, url, secret, mem_total, mem_free, last_seen, state, macos_free, cpus, load, disk_total, disk_free)
+       select id, url, secret, mem_total, mem_free, last_seen, state, macos_free, nullif(cpus, 0),
+         case when cpus = 0 then null else load end, nullif(disk_total, 0), case when disk_total = 0 then null else disk_free end
+       from nodes;
+     drop table nodes;
+     alter table nodes_new rename to nodes;",
 ];
 
 pub struct Db(rusqlite::Connection);
@@ -2046,17 +2056,14 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .query_one("select mem_total from nodes where id = ?1", &[id])?
                         .get(0);
-                let free = body["mem_free_mib"].as_i64().unwrap_or(0).clamp(0, if total > 0 { total } else { i64::MAX });
+                // Missing (the node couldn't read its memory): the last value stands.
+                let free = body["mem_free_mib"].as_i64().map(|f| f.clamp(0, if total > 0 { total } else { i64::MAX }));
                 let macos_free = (body["macos_free"].as_i64().unwrap_or(0) as i32).clamp(0, crate::macos::MAX_RUNNING as i32);
                 let next = if state == "lost" { "ready".to_string() } else { state };
-                let load = (body["load"].as_f64().unwrap_or(0.0) * 100.0) as i64;
-                let (cpus, dt, df) = (
-                    body["cpus"].as_i64().unwrap_or(0),
-                    body["disk_total_gib"].as_i64().unwrap_or(0),
-                    body["disk_free_gib"].as_i64().unwrap_or(0),
-                );
+                let load = body["load"].as_f64().map(|l| (l * 100.0) as i64);
+                let (cpus, dt, df) = (body["cpus"].as_i64(), body["disk_total_gib"].as_i64(), body["disk_free_gib"].as_i64());
                 c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-                    "update nodes set mem_free = ?2, last_seen = ?3, state = ?4, macos_free = ?5, cpus = ?6, load = ?7,
+                    "update nodes set mem_free = coalesce(?2, mem_free), last_seen = ?3, state = ?4, macos_free = ?5, cpus = ?6, load = ?7,
                        disk_total = ?8, disk_free = ?9 where id = ?1",
                     &[id, &free, &now(), &next, &macos_free, &cpus, &load, &dt, &df],
                 )?;
@@ -2141,8 +2148,8 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                         json!({
                             "id": id, "url": r.get::<String>(1), "mem_total_mib": r.get::<i64>(2),
                             "mem_free_mib": r.get::<i64>(3), "last_seen": r.get::<i64>(4), "state": r.get::<String>(5), "pool": pool,
-                            "cpus": r.get::<i64>(6), "load": r.get::<i64>(7) as f64 / 100.0,
-                            "disk_total_gib": r.get::<i64>(8), "disk_free_gib": r.get::<i64>(9),
+                            "cpus": r.get::<Option<i64>>(6), "load": r.get::<Option<i64>>(7).map(|l| l as f64 / 100.0),
+                            "disk_total_gib": r.get::<Option<i64>>(8), "disk_free_gib": r.get::<Option<i64>>(9),
                             "instances": r.get::<i64>(10), "jobs_running": r.get::<i64>(11),
                         })
                     })
@@ -3225,7 +3232,7 @@ fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
     )?;
     let instances = db.query(
         &format!(
-            "select i.app, i.release, i.sandbox, i.node, i.endpoint, i.state, coalesce(s.created, 0) from instances i
+            "select i.app, i.release, i.sandbox, i.node, i.endpoint, i.state, s.created from instances i
              left join sandboxes s on s.id = i.sandbox where i.app in ({marks}) and i.state <> 'removed'"
         ),
         &params,
@@ -3260,7 +3267,7 @@ fn app_details(c: &Controller, keys: &[String]) -> Result<Vec<Value>> {
                 })).collect::<Vec<_>>(),
                 "instances": instances.iter().filter(|x| x.get::<String>(0) == name).map(|x| json!({
                     "release": x.get::<i32>(1), "sandbox": x.get::<String>(2), "node": x.get::<String>(3),
-                    "endpoint": x.get::<String>(4), "state": x.get::<String>(5), "created": x.get::<i64>(6),
+                    "endpoint": x.get::<String>(4), "state": x.get::<String>(5), "created": x.get::<Option<i64>>(6),
                 })).collect::<Vec<_>>(),
                 "traffic": traffic.iter().filter(|x| x.get::<String>(0) == name).map(|x| json!({
                     "minute": x.get::<i64>(1), "requests": x.get::<i64>(2), "errors": x.get::<i64>(3),
@@ -4634,6 +4641,37 @@ mod tests {
         // A freshly started controller never declares orphans.
         assert_eq!(v["delete"], json!([]));
         assert!(call(&url, "POST", "/nodes/n-1/heartbeat", Some("wrong"), &hb).is_err());
+        // Readings the node couldn't take stay unknown; memory keeps its last value.
+        let hb = json!({"mem_free_mib": null, "cpus": null, "load": null, "disk_total_gib": null, "disk_free_gib": null});
+        call(&url, "POST", "/nodes/n-1/heartbeat", Some("sec"), &hb).unwrap();
+        let r = c.db.lock().unwrap().query_one("select mem_free, cpus, load, disk_total from nodes where id = 'n-1'", &[]).unwrap();
+        assert_eq!((r.get::<i64>(0), r.get::<Option<i64>>(1), r.get::<Option<i64>>(2), r.get::<Option<i64>>(3)), (16384, None, None, None));
+    }
+
+    #[test]
+    fn node_readings_of_zero_from_old_heartbeats_become_unknown() {
+        let f = std::env::temp_dir().join(format!("rekcod-nodes-{}.db", std::process::id()));
+        let _ = std::fs::remove_file(&f);
+        {
+            let c = rusqlite::Connection::open(&f).unwrap();
+            c.execute_batch(SCHEMA).unwrap();
+            for m in LEGACY_MIGRATIONS {
+                let _ = c.execute(m, []);
+            }
+            c.execute_batch(&MIGRATIONS[..MIGRATIONS.len() - 1].join("\n")).unwrap();
+            c.execute_batch(&format!("pragma user_version = {}", MIGRATIONS.len())).unwrap();
+            c.execute_batch(
+                "insert into nodes (id, url, secret, cpus, load, disk_total, disk_free) values ('old', 'u', 's', 0, 0, 0, 0);
+                 insert into nodes (id, url, secret, cpus, load, disk_total, disk_free) values ('new', 'u', 's', 8, 0, 500, 100);",
+            )
+            .unwrap();
+        }
+        let mut db = Db::open(&f).unwrap();
+        let rows = db.query("select cpus, load, disk_total, disk_free from nodes order by id", &[]).unwrap();
+        let get = |r: &Row| (0..4).map(|i| r.get::<Option<i64>>(i)).collect::<Vec<_>>();
+        assert_eq!(get(&rows[0]), vec![Some(8), Some(0), Some(500), Some(100)]);
+        assert_eq!(get(&rows[1]), vec![None, None, None, None]);
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]

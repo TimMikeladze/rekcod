@@ -51,7 +51,7 @@ export function DiskDetail() {
                   <Mono>
                     {fmtBytes(vd.used_in_vm)} of {fmtBytes(vd.size)}
                   </Mono>
-                  <Meter value={vd.size ? (vd.used_in_vm ?? 0) / vd.size : 0} className="mt-1" />
+                  <Meter value={vd.size && vd.used_in_vm != null ? vd.used_in_vm / vd.size : null} className="mt-1" />
                 </dd>
                 <dt className="text-muted-foreground">On the Mac</dt>
                 <dd>

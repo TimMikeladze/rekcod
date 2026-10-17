@@ -116,7 +116,7 @@ pub enum Control {
     /// Reply: `ok <port> <port> ...` (`rekcod x` autoports).
     Listeners(String),
     /// Reply: one line of JSON: `{"fs_requests": {"<fuse opcode>": n}, "warming": [path],
-    /// "disk_used": bytes, "disk_size": bytes}`.
+    /// "disk_used": bytes, "disk_size": bytes}`; both null when statvfs fails.
     Stats,
 }
 

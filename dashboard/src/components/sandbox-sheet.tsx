@@ -5,7 +5,7 @@ import { Actions } from "@/components/actions"
 import { Empty, Mono, State } from "@/components/bits"
 import { DetailHead } from "@/components/shell/page-title"
 import { useDash } from "@/hooks/dash-context"
-import { ago } from "@/lib/format"
+import { ago, fmtBytes } from "@/lib/format"
 
 /** `/sandboxes/[id]`: changed files (`rekcod sandbox diff --stat`) and, for macOS, a screenshot every 10 s. */
 export function SandboxDetail({ id }: { id: string }) {
@@ -83,7 +83,7 @@ export function SandboxDetail({ id }: { id: string }) {
               </dd>
               <dt className="text-muted-foreground">Using</dt>
               <dd className="font-mono text-xs">
-                {s.cpu_pct != null ? `${s.cpu_pct.toFixed(1)}% CPU · ${s.rss_mib} MiB` : "–"}
+                {s.cpu_pct != null ? `${s.cpu_pct.toFixed(1)}% CPU · ${s.rss_mib != null ? fmtBytes(s.rss_mib * 1024 * 1024) : "? memory"}` : "–"}
               </dd>
             </dl>
             {s.macos && (

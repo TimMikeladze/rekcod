@@ -199,7 +199,9 @@ menu lists the VM, containers, forwarded ports and compose projects with their s
 with the same actions as the CLI: start/stop the VM,
 compact, root shell; start, stop, restart, logs or remove a container; open a port;
 save, restore or delete a snapshot; open a shell in an agent sandbox, diff, apply, stop or delete it. Every item runs the matching `rekcod` command, and
-anything destructive asks first. How it stays in sync with the CLI: [`docs/frontends.md`](docs/frontends.md).
+anything destructive asks first. Until its first read of docker and the fleet comes back it
+shows only "Loading…"; a docker list that fails shows its error instead of "No containers".
+How it stays in sync with the CLI: [`docs/frontends.md`](docs/frontends.md).
 
 ### Dashboard
 

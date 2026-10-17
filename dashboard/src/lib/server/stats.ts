@@ -22,13 +22,17 @@ export function parseStatLine(line: string): Stat | null {
     const s = JSON.parse(l)
     const [mem, limit] = String(s.MemUsage ?? "").split("/")
     const [netIn, netOut] = String(s.NetIO ?? "").split("/")
+    // A container with no reading yet prints "--" everywhere; that's no sample, not 0%.
+    const cpu = parseFloat(s.CPUPerc)
+    const used = parseBytes(mem ?? "")
+    if (!Number.isFinite(cpu) || used == null) return null
     return {
       name: String(s.Name),
-      cpu: parseFloat(s.CPUPerc) || 0,
-      mem: parseBytes(mem ?? ""),
-      memLimit: parseBytes(limit ?? ""),
-      netIn: parseBytes(netIn ?? ""),
-      netOut: parseBytes(netOut ?? ""),
+      cpu,
+      mem: used,
+      memLimit: parseBytes(limit ?? "") ?? 0,
+      netIn: parseBytes(netIn ?? "") ?? 0,
+      netOut: parseBytes(netOut ?? "") ?? 0,
     }
   } catch {
     return null

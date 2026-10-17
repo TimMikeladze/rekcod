@@ -53,6 +53,8 @@ export function Containers({ q }: { q: string }) {
     status: (c) => c.state,
   })
   const list = state?.containers ?? []
+  const err = state?.local_errors?.containers
+  if (!list.length && err) return <Empty>Couldn&apos;t list containers: {err}</Empty>
   if (!list.length)
     return (
       <GetStarted title="No containers yet" commands={[["run", "-d", "-p", "8080:80", "nginx"], ["compose", "up", "-d"]]}>
@@ -176,7 +178,7 @@ const Row = memo(function Row({ c, s, selected, onTick }: { c: Container; s?: St
         {s ? (
           <div className="space-y-1">
             <Mono>{fmtBytes(s.mem)}</Mono>
-            <Meter value={s.memLimit ? s.mem / s.memLimit : 0} />
+            <Meter value={s.memLimit ? s.mem / s.memLimit : null} />
           </div>
         ) : (
           <Mono className="text-muted-foreground">–</Mono>

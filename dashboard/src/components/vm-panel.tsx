@@ -83,10 +83,10 @@ function Facts() {
         {st.dockerd ?? "?"} · API {st.api ?? "?"}
       </Row>
       <Row k="Resources">
-        {st.cpus ?? "?"} CPU · {fmtBytes((st.memory_mib ?? 0) * 1024 * 1024)}
+        {st.cpus ?? "?"} CPU · {st.memory_mib != null ? fmtBytes(st.memory_mib * 1024 * 1024) : "?"}
       </Row>
-      <Row k="File cache">{st.fs_cache ? "on" : "off"}</Row>
-      <Row k="Warming">{warming.length ? warming.join(", ") : "idle"}</Row>
+      <Row k="File cache">{st.fs_cache == null ? "–" : st.fs_cache ? "on" : "off"}</Row>
+      <Row k="Warming">{st.warming == null ? "–" : warming.length ? warming.join(", ") : "idle"}</Row>
       <Row k="docker.sock">{st.default_socket ?? "–"}</Row>
       <Row k="Context">{st.context ?? "–"}</Row>
       <Row k="Socket">{st.socket ?? "–"}</Row>

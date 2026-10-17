@@ -268,7 +268,7 @@ function VmSwitcher({ state }: { state: S }) {
       <DropdownMenuContent align="start" sideOffset={6} className="w-64">
         <DropdownMenuGroup>
           <DropdownMenuLabel className="font-mono text-[11px]">
-            {state.running ? `dockerd ${st.dockerd ?? "?"} · ${st.cpus ?? "?"} CPU · ${fmtBytes((st.memory_mib ?? 0) * 1024 * 1024)}` : "The VM is stopped"}
+            {state.running ? `dockerd ${st.dockerd ?? "?"} · ${st.cpus ?? "?"} CPU · ${st.memory_mib != null ? fmtBytes(st.memory_mib * 1024 * 1024) : "? memory"}` : "The VM is stopped"}
           </DropdownMenuLabel>
         </DropdownMenuGroup>
         <DropdownMenuItem render={<Link href="/vm" />}>VM details</DropdownMenuItem>

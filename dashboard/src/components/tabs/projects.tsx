@@ -9,8 +9,11 @@ import { useDash } from "@/hooks/dash-context"
 import { ago, fmtBytes } from "@/lib/format"
 
 export function Projects({ q }: { q: string }) {
-  const list = useDash().state?.projects ?? []
+  const { state } = useDash()
+  const list = state?.projects ?? []
+  const err = state?.local_errors?.containers ?? state?.local_errors?.snapshots
   const rows = list.filter((p) => match(q, p.name, p.dir, ...p.snapshots.map((s) => s.name)))
+  if (!list.length && err) return <Empty>Couldn&apos;t list projects: {err}</Empty>
   if (!list.length) return <Empty>No compose projects or snapshots. `rekcod snap save` in a compose project saves its volumes.</Empty>
   if (!rows.length) return <Empty>Nothing matches “{q}”.</Empty>
   return (

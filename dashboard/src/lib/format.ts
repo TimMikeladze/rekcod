@@ -3,10 +3,10 @@ const UNITS: Record<string, number> = {
   KiB: 1024, MiB: 1024 ** 2, GiB: 1024 ** 3, TiB: 1024 ** 4,
 }
 
-/** "123.1MiB" → bytes, as `docker stats` prints them. */
-export function parseBytes(s: string): number {
+/** "123.1MiB" → bytes, as `docker stats` prints them; null for "--" (no reading yet). */
+export function parseBytes(s: string): number | null {
   const m = /^([\d.]+)\s*([A-Za-z]+)$/.exec(s.trim())
-  return m ? Number(m[1]) * (UNITS[m[2]] ?? 1) : 0
+  return m ? Number(m[1]) * (UNITS[m[2]] ?? 1) : null
 }
 
 export function fmtBytes(n: number | null | undefined): string {

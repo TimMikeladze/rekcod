@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest"
 import { findOffered } from "./allow"
 import { duration, parseBytes } from "./format"
+import { breakGaps, fillMinutes } from "./series"
 import { issues } from "./issues"
 import { DEFAULT_SETTINGS, fresh, notices } from "./notify"
 import { filterActivity } from "@/components/activity"
@@ -66,7 +67,8 @@ describe("parseBytes", () => {
     expect(parseBytes("7.753GiB ")).toBeCloseTo(7.753 * 1024 ** 3)
     expect(parseBytes("159MB")).toBe(159e6)
     expect(parseBytes("0B")).toBe(0)
-    expect(parseBytes("junk")).toBe(0)
+    expect(parseBytes("junk")).toBeNull()
+    expect(parseBytes("--")).toBeNull()
   })
 })
 
@@ -85,6 +87,13 @@ describe("issues", () => {
     expect(list.map((i) => i.tone)).toEqual(["bad", "bad", "bad", "warn"])
     expect(list.at(-1)!.text).toBe("VM disk is 90% full")
     expect(list.some((i) => i.text.startsWith("Node spare last checked in 10m ago"))).toBe(true)
+  })
+  it("reports failed docker calls and doesn't call unknown free memory low", () => {
+    const s = state({
+      local_errors: { containers: "connection refused" },
+      nodes: [{ id: "spare", url: "", mem_total_mib: 100, mem_free_mib: null, last_seen: 1_000_000, state: "ready", pool: [], actions: [] }],
+    })
+    expect(issues(s).map((i) => i.text)).toEqual(["Couldn't list containers: connection refused"])
   })
 })
 
@@ -227,5 +236,20 @@ describe("log windowing", () => {
     expect(tops[last - 1]).toBeGreaterThanOrEqual(10_000 + 500 - 20)
     expect(last - first).toBeLessThan(50)
     expect(windowOf(new Float64Array(0), 0, 0, 500)).toEqual([0, 0])
+  })
+})
+
+describe("series", () => {
+  it("fills unreported minutes with zero traffic and no latency", () => {
+    const r = (minute: number) => ({ minute, requests: 50, errors: 1, p50_ms: 4, p95_ms: 9 })
+    const out = fillMinutes([r(103), r(100)])
+    expect(out.map((m) => m.minute)).toEqual([100, 101, 102, 103])
+    expect(out[1]).toEqual({ minute: 101, requests: 0, errors: 0, p50_ms: null, p95_ms: null })
+  })
+  it("breaks a series where samples are further apart than the limit", () => {
+    const rows = [0, 5, 30, 35].map((t) => ({ t, name: "a", v: 1 }))
+    const out = breakGaps(rows, 10, (p) => ({ ...p, t: p.t + 1, v: NaN }), (r) => r.name)
+    expect(out.map((r) => r.t)).toEqual([0, 5, 6, 30, 35])
+    expect(out[2].v).toBeNaN()
   })
 })

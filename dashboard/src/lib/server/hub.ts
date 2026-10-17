@@ -56,8 +56,9 @@ function fakeFs(base: Record<string, number>, t: number) {
 }
 
 function publish(st: State) {
-  h.current = st
   h.at = Date.now()
+  st.read_at = h.at
+  h.current = st
   h.error = null
   const base = st.status?.fs_requests
   if (FIXTURE && base && !h.fs.length) for (let t = h.at - FS_KEEP_MS; t < h.at; t += FULL_MS) h.fs.push({ t, ops: fakeFs(base, t) })

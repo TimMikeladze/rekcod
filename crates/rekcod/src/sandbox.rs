@@ -310,12 +310,13 @@ impl std::fmt::Display for NoSandbox {
 }
 impl std::error::Error for NoSandbox {}
 
-/// MiB left for sandboxes before running VMs pass 75% of the Mac's memory.
-pub fn free_mib(paths: &Paths) -> u64 {
-    let host = crate::cli::sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
+/// MiB left for sandboxes before running VMs pass 75% of the Mac's memory; None when the
+/// Mac's memory can't be read.
+pub fn free_mib(paths: &Paths) -> Option<u64> {
+    let host = crate::cli::sysctl_u64("hw.memsize")? >> 20;
     let main = crate::cli::status_value(paths)["memory_mib"].as_u64().unwrap_or(0);
     let sandboxes: u64 = all(paths).iter().filter(|s| s.running()).map(|s| s.meta.memory_gib << 10).sum();
-    (host * 3 / 4).saturating_sub(main + sandboxes)
+    Some((host * 3 / 4).saturating_sub(main + sandboxes))
 }
 
 /// The sandbox's state directory.
@@ -336,9 +337,10 @@ fn check_disk(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// Refuses a sandbox that would push running VMs past 75% of the Mac's memory.
+/// Refuses a sandbox that would push running VMs past 75% of the Mac's memory. Allowed when
+/// the Mac's memory can't be read.
 fn check_capacity(paths: &Paths, gib: u64) -> Result<()> {
-    let host = crate::cli::sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
+    let Some(host) = crate::cli::sysctl_u64("hw.memsize").map(|b| b >> 20) else { return Ok(()) };
     let main = crate::cli::status_value(paths)["memory_mib"].as_u64().unwrap_or(0);
     let sandboxes: u64 = all(paths).iter().filter(|s| s.running()).map(|s| s.meta.memory_gib << 10).sum();
     let budget = host * 3 / 4;

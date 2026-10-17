@@ -31,7 +31,7 @@ export function notices(s: State): Notice[] {
     }
   }
   for (const n of s.nodes ?? []) {
-    if (s.generated - n.last_seen > STALE_SECS) out.push({ key: `node:${n.id}:${n.last_seen}`, kind: "node", title: `Node ${n.id} stopped checking in`, body: n.url ?? "" })
+    if (n.last_seen != null && s.generated - n.last_seen > STALE_SECS) out.push({ key: `node:${n.id}:${n.last_seen}`, kind: "node", title: `Node ${n.id} stopped checking in`, body: n.url ?? "" })
   }
   for (const j of s.jobs) {
     if (j.state === "failed" || j.state === "lost") {

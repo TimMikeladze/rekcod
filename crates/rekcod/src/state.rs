@@ -170,6 +170,7 @@ pub fn model_json(m: &Model) -> Value {
         "vm_actions": actions_json(&actions::vm_actions(m.running, m.socket_installed, m.autostart)),
         "storage_actions": actions_json(&actions::storage_actions(m.running, &m.containers)),
         "containers": containers,
+        "local_errors": m.local_errors,
         "ports": ports,
         "projects": projects,
         "sandboxes": sandboxes,
@@ -209,7 +210,7 @@ fn fleet_json(paths: &Paths, m: &Model, out: &mut Value) {
         if down {
             return None;
         }
-        match crate::fleet::call(&r.url, "GET", path, Some(&r.token), &Value::Null) {
+        match crate::fleet::call_within(&r.url, "GET", path, Some(&r.token), &Value::Null, actions::STATE_READ) {
             Ok(v) => Some(v),
             Err(e) if actions::admin_only(&e) => None,
             Err(e) => {
@@ -249,7 +250,7 @@ fn fleet_json(paths: &Paths, m: &Model, out: &mut Value) {
         }
         out["routes"] = get("routes", "/routes?peek=1").unwrap_or(Value::Null);
         // A controller without --storage has no backups; that's shown in the view, not as a remote error.
-        out["backups"] = match crate::fleet::call(&r.url, "GET", "/backups", Some(&r.token), &Value::Null) {
+        out["backups"] = match crate::fleet::call_within(&r.url, "GET", "/backups", Some(&r.token), &Value::Null, actions::STATE_READ) {
             Ok(v) => json!({"list": v}),
             Err(e) => json!({"error": format!("{e:#}")}),
         };

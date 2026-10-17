@@ -12,6 +12,7 @@ import { tooltip } from "@tanstack/charts/tooltip"
 import { scaleUtc } from "d3-scale"
 import { useDash, WINDOWS, type Window } from "@/hooks/dash-context"
 import { fmtBytes } from "@/lib/format"
+import { breakGaps } from "@/lib/series"
 import type { Sample } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -24,6 +25,10 @@ const FALLBACK = "#2a78d6"
 const WINDOW_LABEL: Record<Window, string> = { 300: "5m", 900: "15m", 3600: "1h" }
 const windowWords = (w: Window) => (w === 300 ? "five minutes" : w === 900 ? "fifteen minutes" : "hour")
 
+// Samples come every SAMPLE_SECS (5 s); a longer silence (VM stopped, container gone) breaks the line.
+const GAP_MS = 12_000
+const gapSample = (p: Sample): Sample => ({ t: p.t + 1, name: p.name, cpu: NaN, mem: NaN })
+
 const timeFormat = (d: Date) => d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false })
 
 /**
@@ -34,7 +39,7 @@ const timeFormat = (d: Date) => d.toLocaleTimeString([], { hour: "2-digit", minu
 export function ResourceChart({ metric, name, top = 5, height = 180 }: { metric: "cpu" | "mem"; name?: string; top?: number; height?: number }) {
   const { history, colors, window } = useDash()
   const rows = useMemo(() => {
-    if (name) return history.filter((s) => s.name === name)
+    if (name) return breakGaps(history.filter((s) => s.name === name), GAP_MS, gapSample)
     const latest = new Map<string, Sample>()
     for (const s of history) latest.set(s.name, s)
     const names = new Set([...latest.values()].sort((a, b) => b[metric] - a[metric]).slice(0, top).map((s) => s.name))
@@ -49,7 +54,7 @@ export function ResourceChart({ metric, name, top = 5, height = 180 }: { metric:
         other.set(s.t, o)
       }
     }
-    return [...out, ...other.values()].sort((a, b) => a.t - b.t)
+    return breakGaps([...out, ...other.values()].sort((a, b) => a.t - b.t), GAP_MS, gapSample, (s) => s.name)
   }, [history, metric, top, name])
 
   const definition = useMemo(() => {
@@ -91,7 +96,7 @@ export function ResourceChart({ metric, name, top = 5, height = 180 }: { metric:
     })
   }, [rows, metric, colors, name])
 
-  const points = new Set(rows.map((r) => r.t)).size
+  const points = new Set(rows.filter((r) => Number.isFinite(r[metric])).map((r) => r.t)).size
   if (points < 2) {
     return (
       <div className="flex items-center justify-center text-xs text-muted-foreground" style={{ height }}>
@@ -129,7 +134,7 @@ export function totals(history: Sample[]): Total[] {
 /** The overview tile's line: all containers' CPU or memory over the chart window, no axes. */
 export function UsageSpark({ metric, height = 28 }: { metric: "cpu" | "mem"; height?: number }) {
   const { history, window } = useDash()
-  const rows = useMemo(() => totals(history), [history])
+  const rows = useMemo(() => breakGaps(totals(history), GAP_MS, (p) => ({ t: p.t + 1, cpu: NaN, mem: NaN })), [history])
   const definition = useMemo(
     () =>
       defineChart({

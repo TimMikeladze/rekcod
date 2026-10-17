@@ -76,7 +76,7 @@ pub fn send_within(
     timeout: Option<Duration>,
 ) -> Result<(u16, BufReader<crate::tls::Stream>)> {
     let addr = authority(base)?;
-    let sock = addr.to_socket_addrs()?.next().ok_or_else(|| anyhow!("can't resolve {addr}"))?;
+    let sock = crate::bonjour::socket_addr(&addr)?;
     let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).with_context(|| format!("connect {base}"))?;
     tcp.set_read_timeout(timeout)?;
     tcp.set_write_timeout(Some(QUICK))?;
@@ -618,7 +618,20 @@ fn build_image(paths: &Paths, sb: &str, image: &str, dir: &Path, st: Option<&Rel
 pub fn storage_reach(endpoint: Option<&str>) -> Vec<String> {
     let Some(auth) = endpoint.and_then(|e| e.strip_prefix("http://")) else { return vec![] };
     let addrs = auth.trim_end_matches('/').to_socket_addrs().into_iter().flatten();
-    addrs.filter(|a| a.is_ipv4()).take(1).map(|a| a.to_string()).collect()
+    addrs.filter(|a| a.is_ipv4()).take(1).map(|a| as_seen_from_vm(a).to_string()).collect()
+}
+
+/// A VM can't address the Mac's loopback; it gets [`crate::netstack::MAC_LOOPBACK`] for it.
+fn as_seen_from_vm(a: std::net::SocketAddr) -> std::net::SocketAddr {
+    if a.ip().is_loopback() { std::net::SocketAddr::from((crate::netstack::MAC_LOOPBACK, a.port())) } else { a }
+}
+
+/// `S3_ENDPOINT` as the app inside its VM has to dial it.
+fn vm_endpoint(endpoint: &str) -> String {
+    match storage_reach(Some(endpoint)).first() {
+        Some(r) if r.starts_with(&crate::netstack::MAC_LOOPBACK.to_string()) => format!("http://{r}"),
+        _ => endpoint.to_string(),
+    }
 }
 
 /// Node op: builds `git` in a new sandbox and runs it; returns `{sandbox, endpoint}`. With a
@@ -655,6 +668,11 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         toml.iter().filter_map(|(k, v)| k.strip_prefix("env.").map(|k| (k.to_string(), json!(v)))).collect();
     for (k, v) in a["env"].as_object().into_iter().flatten() {
         env.insert(k.clone(), v.clone());
+    }
+    if let (Some(e), Some(Value::String(s3))) = (a["storage_endpoint"].as_str(), env.get("S3_ENDPOINT"))
+        && s3 == e
+    {
+        env.insert("S3_ENDPOINT".into(), json!(vm_endpoint(e)));
     }
     let o = sandbox::CreateOptions {
         dir: Some(dir.clone()),
@@ -4171,6 +4189,8 @@ pub struct ControllerOptions {
     pub http: bool,
     /// Extra names for the controller's certificate (a tailnet DNS name, say).
     pub tls_names: Vec<String>,
+    /// Advertise over Bonjour as `rekcod-<CA fingerprint>` (docs/lan-discovery.md).
+    pub bonjour: bool,
     /// SQLite file (default `~/.rekcod/controller/fleet.db`).
     pub db: Option<PathBuf>,
     pub listen: String,
@@ -4258,6 +4278,12 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     }
     names.extend(hostname());
     names.extend(o.tls_names.iter().cloned());
+    let bonjour = match (&ctl.ca, o.bonjour) {
+        (Some(ca), true) => Some(crate::bonjour::instance(&ca.fingerprint()?)),
+        (None, true) => bail!("--bonjour needs TLS (it's the CA fingerprint that identifies the controller)"),
+        _ => None,
+    };
+    names.extend(bonjour.iter().map(|i| format!("{i}{}", crate::bonjour::SUFFIX)));
     names.dedup();
     ctl.own_names = names.clone();
     ctl.alert_webhook = o.alert_webhook;
@@ -4270,6 +4296,10 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     graceful_exit(Some(c.clone()));
     c.seal_plain_secrets()?;
     let l = TcpListener::bind(&o.listen).with_context(|| format!("bind {}", o.listen))?;
+    if let Some(i) = &bonjour {
+        crate::bonjour::advertise(i, l.local_addr()?.port())?;
+        eprintln!("rekcod: on Bonjour as {i}: remote URL https://{i}{}", crate::bonjour::SUFFIX);
+    }
     let tls = c.ca.as_ref().map(|ca| -> Result<_> {
         let (cert, key) = ca.issue(&names)?;
         let fp = ca.fingerprint()?;
@@ -4641,7 +4671,11 @@ mod tests {
         assert_eq!(app_bucket("web--team"), "app-web--team");
         let long = app_bucket(&format!("{}--{}", "a".repeat(40), "b".repeat(20)));
         assert!(crate::s3::valid_bucket(&long) && long.len() == 36, "{long}");
-        assert_eq!(storage_reach(Some("http://127.0.0.1:7711")), ["127.0.0.1:7711"]);
+        // A VM can't dial the Mac's loopback itself: it gets the stand-in address.
+        assert_eq!(storage_reach(Some("http://127.0.0.1:7711")), ["198.18.0.1:7711"]);
+        assert_eq!(vm_endpoint("http://127.0.0.1:7710"), "http://198.18.0.1:7710");
+        assert_eq!(storage_reach(Some("http://100.64.0.9:7710")), ["100.64.0.9:7710"]);
+        assert_eq!(vm_endpoint("http://100.64.0.9:7710"), "http://100.64.0.9:7710");
         assert!(storage_reach(None).is_empty());
         assert_eq!(crate::daemon::reach_arg("100.64.0.1:7710, 10.0.0.2:9000").unwrap(), "100.64.0.1:7710,10.0.0.2:9000");
         // Nothing but addresses reaches the kernel command line.

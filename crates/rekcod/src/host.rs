@@ -40,6 +40,22 @@ pub struct Host {
     pub name: String,
     pub endpoint: String,
     pub current: bool,
+    /// A LAN spare's Bonjour instance and CA fingerprint, kept in the context's description.
+    pub bonjour: Option<(String, String)>,
+}
+
+const DESCRIPTION: &str = "rekcod host";
+
+fn description(bonjour: Option<(&str, &str)>) -> String {
+    match bonjour {
+        Some((i, fp)) => format!("{DESCRIPTION} bonjour={i} fp={fp}"),
+        None => DESCRIPTION.into(),
+    }
+}
+
+fn parse_description(d: &str) -> Option<(String, String)> {
+    let field = |k: &str| d.split_whitespace().find_map(|w| w.strip_prefix(k)).map(String::from);
+    Some((field("bonjour=")?, field("fp=")?))
 }
 
 fn context(name: &str) -> String {
@@ -75,7 +91,12 @@ pub fn parse_hosts(raw: &str) -> (Vec<Host>, bool) {
         if name == CONTEXT {
             local_current = current;
         } else if let Some(n) = name.strip_prefix(PREFIX) {
-            hosts.push(Host { name: n.into(), endpoint: v["DockerEndpoint"].as_str().unwrap_or_default().into(), current });
+            hosts.push(Host {
+                name: n.into(),
+                endpoint: v["DockerEndpoint"].as_str().unwrap_or_default().into(),
+                current,
+                bonjour: parse_description(v["Description"].as_str().unwrap_or_default()),
+            });
         }
     }
     (hosts, local_current)
@@ -93,6 +114,7 @@ pub fn list() -> (Vec<Host>, bool) {
 pub struct Fleet {
     pub domain: String,
     pub addr: Option<String>,
+    pub lan: bool,
     pub no_power: bool,
     pub docker: bool,
 }
@@ -114,7 +136,7 @@ pub fn add_fleet(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet)
     check(name, dest)?;
     let bin = crate::spare::ensure_binary(dest, || ssh(dest), &ssh_dest(dest))?;
     let tty: &[&str] = if std::io::IsTerminal::is_terminal(&std::io::stdin()) { &["-t"] } else { &[] };
-    let (url, token, fp) = crate::spare::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.no_power)?;
+    let (url, token, fp) = crate::spare::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.lan, f.no_power)?;
     crate::fleet::remote_add(paths, name, &url, &token, None, fp.as_deref())?;
     println!("remote {name}: {url}  (rekcod app deploy --remote {name})");
     if !f.docker {
@@ -124,10 +146,16 @@ pub fn add_fleet(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet)
     if !ssh(dest).arg(format!("'{bin}' start")).stdin(Stdio::null()).status()?.success() {
         bail!("`rekcod start` failed on {dest}; the fleet is set up, docker isn't (re-run with --no-docker to skip it)");
     }
-    add(name, dest, switch)
+    let authority = crate::fleet::authority(&url)?;
+    let bonjour = crate::bonjour::instance_of(&authority).zip(fp.as_deref());
+    add_described(name, dest, switch, &description(bonjour))
 }
 
 pub fn add(name: &str, dest: &str, switch: bool) -> Result<()> {
+    add_described(name, dest, switch, DESCRIPTION)
+}
+
+fn add_described(name: &str, dest: &str, switch: bool, description: &str) -> Result<()> {
     let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
     check(name, dest)?;
     let mut child = ssh(dest).args(["/bin/zsh", "-l", "-s"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
@@ -149,9 +177,9 @@ pub fn add(name: &str, dest: &str, switch: bool) -> Result<()> {
     let ctx = context(name);
     let endpoint = format!("host=ssh://{dest}");
     if docker::context_exists(&ctx) {
-        docker::run_ok(&["context", "update", &ctx, "--docker", &endpoint])?;
+        docker::run_ok(&["context", "update", &ctx, "--description", description, "--docker", &endpoint])?;
     } else {
-        docker::run_ok(&["context", "create", &ctx, "--description", "rekcod host", "--docker", &endpoint])?;
+        docker::run_ok(&["context", "create", &ctx, "--description", description, "--docker", &endpoint])?;
     }
     let version = docker::run_ok(&["--context", &ctx, "version", "--format", "{{.Server.Version}}"])
         .map_err(|e| anyhow::anyhow!("{e}\nis rekcod running on {dest}? run `rekcod start` there"))?;
@@ -162,7 +190,46 @@ pub fn add(name: &str, dest: &str, switch: bool) -> Result<()> {
     Ok(())
 }
 
+/// `user@host[:port]` with the host swapped for `target`.
+fn retarget(dest: &str, target: &str) -> String {
+    let (user, rest) = dest.split_once('@').map_or((None, dest), |(u, r)| (Some(u), r));
+    let port = rest.rsplit_once(':').map(|(_, p)| p).filter(|p| p.parse::<u16>().is_ok());
+    let mut out = user.map(|u| format!("{u}@")).unwrap_or_default() + target;
+    if let Some(p) = port {
+        out += &format!(":{p}");
+    }
+    out
+}
+
+/// A LAN spare's docker context pointed at wherever its Bonjour instance is now, after
+/// checking over SSH that the Mac there holds the same controller CA. Hosts without one
+/// are left alone.
+pub fn refresh(name: &str) -> Result<()> {
+    let (hosts, _) = list();
+    let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
+    let Some((instance, fp)) = &host.bonjour else { return Ok(()) };
+    let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?;
+    let (target, _) = crate::bonjour::resolve(instance, Duration::from_secs(3))?;
+    let new = retarget(dest, &target);
+    if new == dest {
+        return Ok(());
+    }
+    let out = ssh(&new).arg("cat ~/.rekcod/controller/ca-fingerprint").stdin(Stdio::null()).output().context("run ssh")?;
+    let got = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if !out.status.success() || !got.eq_ignore_ascii_case(fp) {
+        bail!("{new} doesn't hold {name}'s controller CA ({fp}, found {got:?}); leaving {name} on {dest}");
+    }
+    docker::run_ok(&["context", "update", &context(name), "--docker", &format!("host=ssh://{new}")])?;
+    println!("host {name}: now {new}");
+    Ok(())
+}
+
 pub fn use_host(name: &str) -> Result<()> {
+    if name != "local"
+        && let Err(e) = refresh(name)
+    {
+        eprintln!("rekcod: {e:#}");
+    }
     let ctx = if name == "local" { CONTEXT.to_string() } else { context(name) };
     if !docker::context_exists(&ctx) {
         bail!(if name == "local" {
@@ -241,6 +308,9 @@ impl Drop for Master {
 }
 
 pub fn forward(paths: &Paths, name: &str, only: &[u16]) -> Result<()> {
+    if let Err(e) = refresh(name) {
+        eprintln!("rekcod: {e:#}");
+    }
     let (hosts, _) = list();
     let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
     let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?.to_string();
@@ -345,6 +415,22 @@ mod tests {
 {"Name":"rekcod-spare","Current":true,"DockerEndpoint":"ssh://me@spare"}"#;
         let (hosts, local) = parse_hosts(raw);
         assert!(!local);
-        assert_eq!(hosts, [Host { name: "spare".into(), endpoint: "ssh://me@spare".into(), current: true }]);
+        assert_eq!(hosts, [Host { name: "spare".into(), endpoint: "ssh://me@spare".into(), current: true, bonjour: None }]);
+    }
+
+    #[test]
+    fn lan_spare_description() {
+        let d = description(Some(("rekcod-3f9a1c2b7d4e", "sha256:3f9a")));
+        assert_eq!(parse_description(&d), Some(("rekcod-3f9a1c2b7d4e".into(), "sha256:3f9a".into())));
+        assert_eq!(parse_description(DESCRIPTION), None);
+        let raw = format!(r#"{{"Name":"rekcod-mini","Current":false,"DockerEndpoint":"ssh://me@mini.local","Description":"{d}"}}"#);
+        assert!(parse_hosts(&raw).0[0].bonjour.is_some());
+    }
+
+    #[test]
+    fn retarget_keeps_user_and_port() {
+        assert_eq!(retarget("me@spare-mac", "Spare-2.local"), "me@Spare-2.local");
+        assert_eq!(retarget("me@10.0.0.4:2222", "Spare-2.local"), "me@Spare-2.local:2222");
+        assert_eq!(retarget("spare", "Spare-2.local"), "Spare-2.local");
     }
 }

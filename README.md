@@ -103,6 +103,9 @@ rekcod uninstall --keep-data   # the same, keeping ~/.rekcod
 `packaging/homebrew`). `uninstall` asks first and leaves the binary for you to delete.
 Details: [`docs/install-upgrade.md`](docs/install-upgrade.md).
 
+New to rekcod? [`docs/getting-started.md`](docs/getting-started.md) walks from install to a
+running compose project and the rekcod-only features.
+
 ## What works
 
 Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS 27:
@@ -315,7 +318,10 @@ rekcod app deploy --remote spare          # http://<spare's tailnet name>:8080, 
 docker ps                                 # runs on the spare too
 ```
 
-The spare needs Remote Login, Tailscale on your tailnet (or `--addr IP`) and automatic login,
+The spare needs Remote Login, Tailscale on your tailnet and automatic login. Without
+Tailscale (or with `--lan`) it goes on the LAN and your Mac finds it over Bonjour as
+`https://rekcod-<CA fingerprint>.bonjour`, so a new IP or a renamed Mac doesn't break it
+([`docs/lan-discovery.md`](docs/lan-discovery.md)); `--addr IP` pins one address instead. It needs automatic login
 because the services are LaunchAgents and those only run in a logged-in session. rekcod doesn't
 have to be installed there: `host add` copies this binary to `~/.rekcod/bin/rekcod` if it's
 missing. Then it runs `rekcod spare setup` over SSH, which installs RustFS, the controller, node and
@@ -323,7 +329,7 @@ edge as LaunchAgents on the Tailscale address and runs `sudo pmset -a sleep 0 di
 autorestart 1` so the lid can shut and a power cut doesn't leave it off (sudo asks for the
 spare's password; `--no-power` skips it). It adds the remote `spare` here, then starts the
 spare's VM and adds the docker host (`--no-docker` skips that). Re-running it is safe.
-`rekcod spare uninstall` on the spare removes the agents. Details: [`docs/spare.md`](docs/spare.md).
+`rekcod spare uninstall` on the spare removes the agents. Details: [`docs/spare.md`](docs/spare.md). Step-by-step guide: [`docs/self-hosting.md`](docs/self-hosting.md).
 
 The setup prints the `cloudflared` commands for public apps (`rekcod app public`).
 
@@ -614,7 +620,7 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod edge serve\|ban\|unban\|bans\|uninstall` | HTTP ingress for apps; ban IPs and ranges on every edge |
 | `rekcod app deploy\|ls\|status\|release\|public\|private\|rollback\|scale\|env\|secret\|logs\|open\|wake\|recycle\|storage\|destroy` | Apps on the fleet; `release NAME N` prints one release with its deploy log, `logs --instance ID` one instance's logs (also after a redeploy removed it: the last lines of the 20 newest gone instances are kept) |
 | `rekcod job run\|ls\|logs\|rerun\|cancel\|unschedule` | Commands that run to completion on the fleet, once or `--every`; `ls --name N` is one job's last 50 runs, `logs -f` follows a running one, `rerun ID` runs a finished one again |
-| `rekcod host add\|ls\|use\|rm\|forward` | Another Mac's rekcod as the docker engine, over SSH; `add --fleet` also provisions it as a fleet |
+| `rekcod host add\|ls\|use\|rm\|forward\|refresh` | Another Mac's rekcod as the docker engine, over SSH; `add --fleet` also provisions it as a fleet (`--lan`: found over Bonjour, `refresh` follows it to a new address) |
 | `rekcod spare setup\|uninstall` | This Mac as a headless one-machine fleet (RustFS, controller, node, edge, no sleep) |
 | `rekcod socket install\|uninstall` | Route `/var/run/docker.sock` to rekcod while it runs (sudo once) |
 | `rekcod import --from <context> [NAMES...] [--images-only\|--volumes-only] [--force]` | Copy images and named volumes from another engine |

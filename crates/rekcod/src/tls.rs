@@ -281,7 +281,7 @@ pub fn fetch_ca(base: &str, want: &str) -> Result<String> {
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(AnyCert(p)))
         .with_no_client_auth();
-    let addr = std::net::ToSocketAddrs::to_socket_addrs(authority)?.next().ok_or_else(|| anyhow!("can't resolve {authority}"))?;
+    let addr = crate::bonjour::socket_addr(authority)?;
     let tcp = TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(5))?;
     tcp.set_read_timeout(Some(std::time::Duration::from_secs(10)))?;
     let name = ServerName::try_from(host_of(authority).to_string()).map_err(|e| anyhow!("{authority}: {e}"))?;

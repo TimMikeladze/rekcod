@@ -47,6 +47,7 @@ pub enum Kind {
     NsUse,
     HostUse,
     HostForward,
+    HostRefresh,
     EdgeBan,
     EdgeUnban,
     StorageUp,
@@ -78,7 +79,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 59] = [
+    pub const ALL: [Kind; 60] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -112,6 +113,7 @@ impl Kind {
         Kind::NsUse,
         Kind::HostUse,
         Kind::HostForward,
+        Kind::HostRefresh,
         Kind::EdgeBan,
         Kind::EdgeUnban,
         Kind::StorageUp,
@@ -1128,6 +1130,9 @@ pub fn host_actions(h: &Hosts) -> Vec<Action> {
             Action::rekcod(Kind::HostForward, format!("Forward ports from {}", host.name), &["host", "forward", &host.name]).interactive(),
         );
     }
+    for host in h.all.iter().filter(|h| h.bonjour.is_some()) {
+        out.push(Action::rekcod(Kind::HostRefresh, format!("Find {} again on the LAN", host.name), &["host", "refresh", &host.name]));
+    }
     out
 }
 
@@ -1198,8 +1203,9 @@ pub mod tests {
     }
 
     pub fn sample_hosts() -> Hosts {
-        let h = |n: &str, current| crate::host::Host { name: n.into(), endpoint: format!("ssh://me@{n}"), current };
-        Hosts { all: vec![h("spare", true), h("mini", false)], local_current: false }
+        let h = |n: &str, current| crate::host::Host { name: n.into(), endpoint: format!("ssh://me@{n}"), current, bonjour: None };
+        let lan = crate::host::Host { bonjour: Some(("rekcod-3f9a1c2b7d4e".into(), "sha256:3f9a".into())), ..h("mini", false) };
+        Hosts { all: vec![h("spare", true), lan], local_current: false }
     }
 
     pub fn sample_bans() -> Vec<String> {

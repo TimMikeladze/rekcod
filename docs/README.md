@@ -6,6 +6,9 @@ Start with the [README](../README.md): install, what works, commands, build and 
 
 How a feature behaves today and how to drive it.
 
+- [getting-started.md](getting-started.md): install to a running compose project, then snapshots, `rekcod x`, menu bar.
+- [self-hosting.md](self-hosting.md): a spare Mac as your app host and docker engine, step by step.
+- [lan-discovery.md](lan-discovery.md): a spare on a LAN found over Bonjour, whatever its IP or name.
 - [troubleshooting.md](troubleshooting.md): what to do when something's wrong; start with `rekcod doctor`.
 - [install-upgrade.md](install-upgrade.md): `rekcod upgrade`, `uninstall`, `doctor`, logs.
 - [cli-passthrough.md](cli-passthrough.md): `rekcod <docker command>` without a docker CLI.

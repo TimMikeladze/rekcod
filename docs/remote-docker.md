@@ -41,7 +41,10 @@ rekcod host use local                 # back to this Mac's rekcod
 
 A "Docker host" submenu, shown even when the local VM is stopped: "Use <name>" / "Use local
 rekcod" (`Kind::HostUse`) for the contexts not in use, and "Forward ports from <name>"
-(`Kind::HostForward`, runs in Terminal).
+(`Kind::HostForward`, runs in Terminal). A spare set up with `host add --fleet --lan` also gets
+"Find <name> again on the LAN" (`Kind::HostRefresh`, `rekcod host refresh NAME`), which
+re-resolves its Bonjour name and updates the context; `host use` and `host forward` do that
+first anyway ([lan-discovery.md](lan-discovery.md)).
 
 ## Limitations
 

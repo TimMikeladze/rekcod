@@ -70,20 +70,92 @@ fn power() {
     }
 }
 
-pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) -> Result<()> {
-    let exe = std::env::current_exe()?.canonicalize()?;
-    let ts = tailscale();
-    let ip = match addr {
-        Some(a) => a.to_string(),
-        None => {
-            let o = Command::new(&ts).args(["ip", "-4"]).output();
-            let ip = o
-                .ok()
-                .filter(|o| o.status.success())
-                .map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string());
-            ip.filter(|i| !i.is_empty()).context("no Tailscale address; run `tailscale up`, or pass --addr IP")?
+/// How the spare is addressed: a fixed IP, its tailnet, or nothing fixed (Bonjour).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Net {
+    Fixed(String),
+    Tailnet { ip: String, name: Option<String> },
+    Lan,
+}
+
+/// Where each service listens and how the others reach it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Layout {
+    pub storage_listen: String,
+    pub storage_url: String,
+    pub controller_listen: String,
+    /// The certificate name remotes use (the Bonjour name is added by the controller).
+    pub tls_name: Option<String>,
+    pub bonjour: bool,
+    /// The controller as the node and edge on this Mac reach it.
+    pub controller_url: String,
+    pub node_listen: String,
+    pub edge_listen: String,
+}
+
+pub fn layout(net: &Net) -> Layout {
+    match net {
+        // Nothing on this Mac may depend on its LAN address: everything local goes over
+        // loopback, and only the controller and edge listen on every interface.
+        Net::Lan => Layout {
+            storage_listen: "127.0.0.1:7710".into(),
+            storage_url: "http://127.0.0.1:7710".into(),
+            controller_listen: "0.0.0.0:7700".into(),
+            tls_name: None,
+            bonjour: true,
+            controller_url: "https://127.0.0.1:7700".into(),
+            node_listen: "127.0.0.1:7701".into(),
+            edge_listen: "0.0.0.0:8080".into(),
+        },
+        Net::Fixed(ip) | Net::Tailnet { ip, .. } => {
+            let host = match net {
+                Net::Tailnet { name: Some(n), .. } => n.clone(),
+                _ => ip.clone(),
+            };
+            Layout {
+                storage_listen: format!("{ip}:7710"),
+                storage_url: format!("http://{ip}:7710"),
+                controller_listen: format!("{ip}:7700"),
+                tls_name: Some(host),
+                bonjour: false,
+                controller_url: format!("https://{ip}:7700"),
+                node_listen: format!("{ip}:7701"),
+                edge_listen: format!("{ip}:8080"),
+            }
         }
-    };
+    }
+}
+
+/// `--addr`, else the Tailscale address, else (or with `--lan`) Bonjour.
+fn pick_net(addr: Option<&str>, lan: bool) -> Net {
+    if let Some(a) = addr {
+        return Net::Fixed(a.to_string());
+    }
+    if lan {
+        return Net::Lan;
+    }
+    let ts = tailscale();
+    let o = Command::new(&ts).args(["ip", "-4"]).output();
+    let ip =
+        o.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).lines().next().unwrap_or("").trim().to_string());
+    match ip.filter(|i| !i.is_empty()) {
+        Some(ip) => {
+            // The tailnet DNS name goes into the controller's certificate, so remotes can use it.
+            let name =
+                Command::new(&ts).args(["status", "--json"]).output().ok().and_then(|o| dns_name(&String::from_utf8_lossy(&o.stdout)));
+            Net::Tailnet { ip, name }
+        }
+        None => {
+            eprintln!("rekcod: no Tailscale address; the fleet goes on the LAN and is found over Bonjour (docs/lan-discovery.md)");
+            Net::Lan
+        }
+    }
+}
+
+pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_power: bool) -> Result<()> {
+    let exe = std::env::current_exe()?.canonicalize()?;
+    let net = pick_net(addr, lan);
+    let l = layout(&net);
     if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_none() && !gui_session() {
         bail!(
             "nobody is logged in on this Mac's screen, and LaunchAgents need that; turn on automatic login, `sudo reboot`, then run this again"
@@ -95,7 +167,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
 
     let ctl = paths.home.join("controller");
     // RustFS first: the controller reads its keys on start.
-    run(&exe, &["storage", "serve", "--listen", &format!("{ip}:7710"), "--install"])?;
+    run(&exe, &["storage", "serve", "--listen", &l.storage_listen, "--install"])?;
     let creds = crate::storage::credentials_file(paths);
     for _ in 0..240 {
         if creds.exists() || std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
@@ -103,27 +175,16 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    let storage = format!("http://{ip}:7710");
-    // The tailnet DNS name goes into the controller's certificate, so remotes can use it.
-    let name = Command::new(&ts).args(["status", "--json"]).output().ok().and_then(|o| dns_name(&String::from_utf8_lossy(&o.stdout)));
-    let host = if addr.is_some() { ip.clone() } else { name.clone().unwrap_or(ip.clone()) };
-    run(
-        &exe,
-        &[
-            "controller",
-            "serve",
-            "--listen",
-            &format!("{ip}:7700"),
-            "--domain",
-            domain,
-            "--storage",
-            &storage,
-            "--auto-approve",
-            "--tls-name",
-            &host,
-            "--install",
-        ],
-    )?;
+    let mut args =
+        vec!["controller", "serve", "--listen", &l.controller_listen, "--domain", domain, "--storage", &l.storage_url, "--auto-approve"];
+    if let Some(n) = &l.tls_name {
+        args.extend(["--tls-name", n]);
+    }
+    if l.bonjour {
+        args.push("--bonjour");
+    }
+    args.push("--install");
+    run(&exe, &args)?;
     let admin_file = ctl.join("admin-token");
     for _ in 0..60 {
         if std::fs::metadata(&admin_file).is_ok_and(|m| m.len() > 0) {
@@ -142,32 +203,56 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
         std::thread::sleep(Duration::from_millis(500));
     }
     let fp = std::fs::read_to_string(&fp_file).map(|f| f.trim().to_string()).unwrap_or_else(|_| "sha256:dry-run".into());
-    let url = format!("https://{ip}:7700");
-    if paths.home.join("node.json").exists() {
+    let url = &l.controller_url;
+    run(&exe, &["remote", "add", "local", url, "--token", &admin, "--ca-fingerprint", &fp])?;
+    // A node that joined on another address (the LAN IP it had, a switch to or from --lan)
+    // would serve its old one forever: forget it and join again.
+    let node_file = paths.home.join("node.json");
+    let joined = std::fs::read(&node_file).ok().and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    if let Some(j) =
+        joined.as_ref().filter(|j| j["listen"].as_str() != Some(l.node_listen.as_str()) || j["controller"].as_str() != Some(url.as_str()))
+    {
+        eprintln!("rekcod: the node joined as {}; joining again on {}", j["listen"].as_str().unwrap_or("?"), l.node_listen);
+        crate::service::uninstall("node")?;
+        if let Some(id) = j["id"].as_str() {
+            let _ = run(&exe, &["node", "rm", id, "--remote", "local"]);
+        }
+        std::fs::remove_file(&node_file)?;
+    }
+    if node_file.exists() {
         run(&exe, &["node", "serve", "--install"])?;
     } else {
         let join = std::fs::read_to_string(ctl.join("join-token")).context("no join token")?;
-        run(&exe, &["node", "join", &url, join.trim(), "--listen", &format!("{ip}:7701"), "--ca-fingerprint", &fp, "--install"])?;
+        run(&exe, &["node", "join", url, join.trim(), "--listen", &l.node_listen, "--ca-fingerprint", &fp, "--install"])?;
     }
-    run(&exe, &["remote", "add", "local", &url, "--token", &admin, "--ca-fingerprint", &fp])?;
     // The edge gets a token that can only read routes and bans: taking over whatever runs
     // the edge shouldn't mean owning the fleet.
     let edge_token = if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
         "dry-run".to_string()
     } else {
-        let v = crate::fleet::call(&url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
+        let v = crate::fleet::call(url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
         v["token"].as_str().context("no edge token")?.to_string()
     };
-    run(&exe, &["remote", "add", "edge", &url, "--token", &edge_token, "--ca-fingerprint", &fp])?;
-    run(&exe, &["edge", "serve", "--remote", "edge", "--listen", &format!("{ip}:8080"), "--public-listen", "127.0.0.1:8081", "--install"])?;
+    run(&exe, &["remote", "add", "edge", url, "--token", &edge_token, "--ca-fingerprint", &fp])?;
+    run(&exe, &["edge", "serve", "--remote", "edge", "--listen", &l.edge_listen, "--public-listen", "127.0.0.1:8081", "--install"])?;
 
     if auto_login_user().is_none() {
         eprintln!(
             "rekcod: automatic login is off, so after a reboot nothing runs until someone logs in (System Settings › Users & Groups)"
         );
     }
+    let (on, remote) = match &net {
+        Net::Lan => {
+            let i = crate::bonjour::instance(&fp);
+            (format!("the LAN as {i} (Bonjour)"), format!("https://{i}{}", crate::bonjour::SUFFIX))
+        }
+        _ => (
+            l.controller_listen.trim_end_matches(":7700").to_string(),
+            format!("https://{}:7700", l.tls_name.as_deref().unwrap_or_default()),
+        ),
+    };
     eprintln!(
-        "\nrekcod: this Mac is a fleet on {ip}: controller :7700, node :7701, RustFS :7710, edge :8080 (all apps), 127.0.0.1:8081 (public apps)\n\
+        "\nrekcod: this Mac is a fleet on {on}: controller :7700, node :7701, RustFS :7710, edge :8080 (all apps), 127.0.0.1:8081 (public apps)\n\
          Public traffic, once {domain}'s DNS is on Cloudflare:\n\
          \x20 cloudflared tunnel login && cloudflared tunnel create rekcod && cloudflared tunnel route dns rekcod '*.{domain}'\n\
          \x20 # ~/.cloudflared/config.yml: tunnel: rekcod, ingress: *.{domain} -> http://127.0.0.1:8081\n\
@@ -175,7 +260,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, no_power: bool) ->
          Logs: {}/logs/{{controller,node,edge,storage}}.log   Undo: rekcod spare uninstall\n",
         paths.home.display()
     );
-    println!("remote https://{host}:7700 {admin} {fp}");
+    println!("remote {remote} {admin} {fp}");
     Ok(())
 }
 
@@ -283,6 +368,7 @@ pub fn remote_setup(
     bin: &str,
     domain: &str,
     addr: Option<&str>,
+    lan: bool,
     no_power: bool,
 ) -> Result<(String, String, Option<String>)> {
     if !shell_safe(domain) || addr.is_some_and(|a| !shell_safe(a)) || bin.contains('\'') {
@@ -291,6 +377,9 @@ pub fn remote_setup(
     let mut cmd = format!("'{bin}' spare setup --domain {domain}");
     if let Some(a) = addr {
         cmd += &format!(" --addr {a}");
+    }
+    if lan {
+        cmd += " --lan";
     }
     if no_power {
         cmd += " --no-power";
@@ -306,6 +395,22 @@ pub fn remote_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On a LAN nothing listens on, or points at, an address that can change.
+    #[test]
+    fn lan_layout_uses_no_lan_address() {
+        let l = layout(&Net::Lan);
+        assert!(l.bonjour && l.tls_name.is_none());
+        assert_eq!(l.controller_listen, "0.0.0.0:7700");
+        assert_eq!(l.edge_listen, "0.0.0.0:8080");
+        for a in [&l.storage_listen, &l.storage_url, &l.controller_url, &l.node_listen] {
+            assert!(a.contains("127.0.0.1"), "{a}");
+        }
+        let t = layout(&Net::Tailnet { ip: "100.64.0.9".into(), name: Some("spare.tail1.ts.net".into()) });
+        assert_eq!(t.tls_name.as_deref(), Some("spare.tail1.ts.net"));
+        assert_eq!((t.node_listen.as_str(), t.bonjour), ("100.64.0.9:7701", false));
+        assert_eq!(layout(&Net::Fixed("10.0.0.4".into())).tls_name.as_deref(), Some("10.0.0.4"));
+    }
 
     #[test]
     fn remote_line() {
@@ -329,7 +434,7 @@ mod tests {
         std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let mut sh = Command::new("sh");
         sh.arg("-c");
-        let r = remote_setup("spare", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), true);
+        let r = remote_setup("spare", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), false, true);
         std::fs::remove_file(&bin).unwrap();
         assert_eq!(r.unwrap(), ("http://spare:7700".into(), "tok".into(), None));
     }
@@ -340,7 +445,7 @@ mod tests {
         let r = pass_through(&b"Password:ok\r\nremote http://s:7700 t\r\nreminder\n"[..], &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "Password:ok\r\nreminder\n");
         assert_eq!(r, Some(("http://s:7700".into(), "t".into(), None)));
-        assert!(remote_setup("s", Command::new("true"), "/x", "a.com'; rm -rf ~", None, true).is_err());
+        assert!(remote_setup("s", Command::new("true"), "/x", "a.com'; rm -rf ~", None, false, true).is_err());
     }
 
     #[test]

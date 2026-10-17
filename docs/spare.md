@@ -12,8 +12,9 @@ rekcod host add spare me@spare-mac --fleet --domain apps.example.com
 Done once, by hand, because they need its screen or an Apple ID:
 
 - Remote Login on, and your key on it (`ssh-copy-id me@spare-mac`).
-- Tailscale logged in, on the same tailnet as your Mac. `--addr IP` skips Tailscale and uses
-  that address instead (a LAN IP, say).
+- Tailscale logged in, on the same tailnet as your Mac. Without it the fleet goes on the LAN
+  and your Mac finds it over Bonjour, whatever its IP or name ([lan-discovery.md](lan-discovery.md));
+  `--lan` picks that even with Tailscale. `--addr IP` pins one address you manage instead.
 - Automatic login on (System Settings › Users & Groups). LaunchAgents only run in a logged-in
   session, so without it nothing comes back after a reboot. FileVault blocks automatic login.
 
@@ -36,7 +37,9 @@ Re-running it is safe: every step replaces what it made before.
 
 The Rust version of the old `scripts/spare-setup.sh`, plus the headless bits.
 
-- Address: `--addr`, else `tailscale ip -4`.
+- Address: `--addr`, else `tailscale ip -4`, else (or with `--lan`) none: RustFS and the node
+  on 127.0.0.1, the controller and edge on 0.0.0.0, the controller on Bonjour (`--bonjour`).
+  A node that joined on another address is removed (`node rm`) and joins again.
 - `storage serve --install` on `ADDR:7710` (RustFS, [`rustfs.md`](rustfs.md)), waits for its
   keys in `storage/credentials.json`.
 - `controller serve --storage http://ADDR:7710 --install` on `ADDR:7700`, waits for the admin token.
@@ -47,7 +50,8 @@ The Rust version of the old `scripts/spare-setup.sh`, plus the headless bits.
   `disablesleep` keeps a MacBook awake with the lid shut, `autorestart` boots it after a power
   cut. Skipped with a warning when sudo can't prompt (no terminal).
 - Warns when automatic login is off (`autoLoginUser` in `com.apple.loginwindow`).
-- Last line on stdout: `remote http://NAME:7700 ADMIN_TOKEN`.
+- Last line on stdout: `remote https://NAME:7700 ADMIN_TOKEN CA-FINGERPRINT`, with NAME
+  `rekcod-<fingerprint>.bonjour` on a LAN.
 
 `rekcod spare uninstall` removes the four agents. It leaves pmset and `~/.rekcod` alone.
 

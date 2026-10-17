@@ -86,6 +86,10 @@ pub enum Verdict {
     Refuse(&'static str),
 }
 
+/// Stands for the Mac's loopback in a sandbox's `reach` list (a node's RustFS on
+/// 127.0.0.1, docs/lan-discovery.md). 198.18.0.0/15 is for benchmarks and never routed.
+pub const MAC_LOOPBACK: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
+
 pub struct Policy {
     /// Allowed names (`rekcod_proto::host_allowed` patterns); None is the open internet.
     pub allow: Option<Vec<String>>,
@@ -142,13 +146,17 @@ impl Policy {
             // host.docker.internal, which refuses the dashboard's port. A container with
             // NET_RAW could otherwise address 127.0.0.1 straight out of eth0.
             let ip = *dst.ip();
-            if ip.is_loopback() || ip.is_unspecified() {
+            if ip.is_loopback() || ip.is_unspecified() || ip == MAC_LOOPBACK {
                 return Verdict::Refuse("the Mac's loopback (use host.docker.internal)");
             }
             return Verdict::Allow;
         }
         if tcp && self.reach.contains(&dst) {
             return Verdict::Allow;
+        }
+        // Dialled as 127.0.0.1 (host_tcp), so only ever the exact ports in `reach`.
+        if *dst.ip() == MAC_LOOPBACK {
+            return Verdict::Refuse("the Mac's loopback");
         }
         // DNS goes over vsock to the daemon, which checks names; a direct resolver would not.
         if dst.port() == 53 {
@@ -811,7 +819,8 @@ fn recv(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
 /// Connects to `dst` and relays until both sides are done. A reset from either side
 /// resets the other (SO_LINGER 0 on the host socket).
 async fn host_tcp(dst: SocketAddrV4, mut rx: mpsc::Receiver<Msg>, tx: mpsc::Sender<Msg>, notify: Arc<Notify>) {
-    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(dst)).await {
+    let to = if *dst.ip() == MAC_LOOPBACK { SocketAddrV4::new(Ipv4Addr::LOCALHOST, dst.port()) } else { dst };
+    let stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(to)).await {
         Ok(Ok(s)) => s,
         _ => {
             let _ = tx.send(Msg::Reset).await;
@@ -1220,6 +1229,27 @@ mod tests {
         // Sandboxes keep refusing the LAN.
         let s = Policy::new(None, vec![], Arc::default());
         assert!(matches!(s.check(true, "192.168.1.10:445".parse().unwrap()), Verdict::Refuse(_)));
+        // The Mac's loopback stand-in is never plain internet, from either policy.
+        assert!(matches!(s.check(true, "198.18.0.1:7710".parse().unwrap()), Verdict::Refuse(_)));
+        assert!(matches!(p.check(true, "198.18.0.1:7710".parse().unwrap()), Verdict::Refuse(_)));
+    }
+
+    /// Only the exact port in `reach` gets through, and it's dialled on 127.0.0.1.
+    #[tokio::test]
+    async fn mac_loopback_stand_in_reaches_only_its_port() {
+        let p = Policy::new(None, vec![SocketAddrV4::new(MAC_LOOPBACK, 7710)], Arc::default());
+        assert!(matches!(p.check(true, "198.18.0.1:7710".parse().unwrap()), Verdict::Allow));
+        assert!(matches!(p.check(true, "198.18.0.1:4500".parse().unwrap()), Verdict::Refuse(_)));
+        assert!(matches!(p.check(false, "198.18.0.1:7710".parse().unwrap()), Verdict::Refuse(_)));
+
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (to_host, rx) = mpsc::channel(8);
+        let (tx, mut from_host) = mpsc::channel(8);
+        tokio::spawn(host_tcp(SocketAddrV4::new(MAC_LOOPBACK, port), rx, tx, Arc::new(Notify::new())));
+        let accepted = tokio::time::timeout(Duration::from_secs(5), l.accept()).await;
+        assert!(accepted.is_ok_and(|a| a.is_ok()), "host_tcp didn't dial 127.0.0.1:{port}");
+        drop((to_host, from_host.try_recv()));
     }
 
     #[test]

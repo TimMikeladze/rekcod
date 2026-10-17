@@ -17,6 +17,8 @@ mod route;
 #[cfg(target_os = "macos")]
 mod actions;
 #[cfg(target_os = "macos")]
+mod bonjour;
+#[cfg(target_os = "macos")]
 mod cli;
 #[cfg(target_os = "macos")]
 mod cli_fetch;
@@ -793,6 +795,10 @@ enum ControllerCmd {
         /// a tailnet DNS name, say). Its listen IP, host name and localhost are always in it.
         #[arg(long = "tls-name")]
         tls_names: Vec<String>,
+        /// Advertise over Bonjour, so a remote `https://rekcod-<fingerprint>.bonjour` finds it
+        /// whatever its LAN address or name (docs/lan-discovery.md).
+        #[arg(long)]
+        bonjour: bool,
     },
     /// Remove the controller's LaunchAgent.
     Uninstall,
@@ -1148,8 +1154,12 @@ enum HostCmd {
         #[arg(long)]
         domain: Option<String>,
         /// The spare's address for the fleet (default: its Tailscale IP).
-        #[arg(long, requires = "fleet")]
+        #[arg(long, requires = "fleet", conflicts_with = "lan")]
         addr: Option<String>,
+        /// Put the fleet on the LAN, found over Bonjour whatever its IP or name (the default
+        /// when the spare has no Tailscale address).
+        #[arg(long, requires = "fleet")]
+        lan: bool,
         /// Leave the spare's sleep settings alone.
         #[arg(long, requires = "fleet")]
         no_power: bool,
@@ -1168,6 +1178,9 @@ enum HostCmd {
     Rm { name: String },
     /// Forward the host's published ports to 127.0.0.1 here until Ctrl-C (default: all, followed live).
     Forward { name: String, ports: Vec<u16> },
+    /// Point a LAN spare's docker context at its current address, found over Bonjour
+    /// (default: every such host). `use` and `forward` do this first.
+    Refresh { name: Option<String> },
 }
 
 #[derive(Subcommand)]
@@ -1178,8 +1191,12 @@ enum SpareCmd {
         #[arg(long)]
         domain: String,
         /// Listen here instead of the Tailscale IP.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "lan")]
         addr: Option<String>,
+        /// No fixed address: loopback inside, found over Bonjour from other Macs (the
+        /// default without Tailscale; docs/lan-discovery.md).
+        #[arg(long)]
+        lan: bool,
         /// Skip `sudo pmset`.
         #[arg(long)]
         no_power: bool,
@@ -1304,6 +1321,7 @@ fn main() {
             backup_dir,
             http,
             tls_names,
+            bonjour,
             ..
         }) => fleet::controller_serve(
             &paths,
@@ -1319,6 +1337,7 @@ fn main() {
                 backup_dir,
                 http,
                 tls_names,
+                bonjour,
             },
         ),
         Cmd::Controller(ControllerCmd::Backup { remote }) => remote_call(&paths, &remote, "POST", "/backups", &serde_json::json!({})),
@@ -1395,11 +1414,11 @@ fn main() {
         Cmd::Shell => cli::shell(&paths),
         Cmd::Compact => cli::compact(&paths),
         Cmd::Host(HostCmd::Add { name, dest, no_use, fleet: false, .. }) => host::add(&name, &dest, !no_use),
-        Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, no_power, no_docker, .. }) => {
-            let f = host::Fleet { domain: domain.unwrap_or_default(), addr, no_power, docker: !no_docker };
+        Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, lan, no_power, no_docker, .. }) => {
+            let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker };
             host::add_fleet(&paths, &name, &dest, !no_use, &f)
         }
-        Cmd::Spare(SpareCmd::Setup { domain, addr, no_power }) => spare::setup(&paths, &domain, addr.as_deref(), no_power),
+        Cmd::Spare(SpareCmd::Setup { domain, addr, lan, no_power }) => spare::setup(&paths, &domain, addr.as_deref(), lan, no_power),
         Cmd::Spare(SpareCmd::Uninstall) => spare::uninstall(),
         Cmd::Host(HostCmd::Ls { json }) => {
             host::print_list(json);
@@ -1408,6 +1427,13 @@ fn main() {
         Cmd::Host(HostCmd::Use { name }) => host::use_host(&name),
         Cmd::Host(HostCmd::Rm { name }) => host::rm(&name),
         Cmd::Host(HostCmd::Forward { name, ports }) => host::forward(&paths, &name, &ports),
+        Cmd::Host(HostCmd::Refresh { name: Some(name) }) => host::refresh(&name),
+        Cmd::Host(HostCmd::Refresh { name: None }) => {
+            for h in host::list().0.iter().filter(|h| h.bonjour.is_some()) {
+                host::refresh(&h.name)?;
+            }
+            Ok(())
+        }
         Cmd::Socket(Socket::Install) => syssock::install(&paths, cli::status_value(&paths)["running"] == true),
         Cmd::Socket(Socket::Uninstall) => syssock::uninstall(&paths),
         Cmd::Menubar { install: true, .. } => menubar::install(),

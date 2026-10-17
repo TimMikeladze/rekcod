@@ -157,6 +157,7 @@ pub fn uninstall(paths: &Paths, keep_data: bool, yes: bool) -> Result<()> {
         }
     }
     if !keep_data {
+        step("remove rekcod's Include from ~/.ssh/config", crate::sshkey::remove_include());
         step(&format!("delete {}", paths.home.display()), std::fs::remove_dir_all(&paths.home).map_err(Into::into));
     }
     let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_else(|_| "rekcod".into());

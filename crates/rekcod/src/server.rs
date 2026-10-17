@@ -318,6 +318,22 @@ pub fn ensure_binary(dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String])
         eprintln!("rekcod: no rekcod on {dest}; copying {} to ~/.rekcod/bin/rekcod", exe.display());
     }
     let ok = ssh().args(["mkdir", "-p", ".rekcod/bin"]).stdin(Stdio::null()).status()?.success();
+    let (mut scp, host) = scp_target(dest, scp_dest)?;
+    // Copied beside it and renamed over: macOS kills a process whose binary changes under
+    // it, and the server's agents run this one.
+    if !ok
+        || !scp.arg(&exe).arg(format!("{host}:.rekcod/bin/.rekcod.tmp")).status()?.success()
+        || !ssh().args(["mv", "-f", ".rekcod/bin/.rekcod.tmp", ".rekcod/bin/rekcod"]).stdin(Stdio::null()).status()?.success()
+    {
+        bail!("copying rekcod to {dest} failed");
+    }
+    let o = ssh().args(["/bin/sh", "-c", "echo $HOME"]).stdin(Stdio::null()).output()?;
+    Ok(format!("{}/.rekcod/bin/rekcod", String::from_utf8_lossy(&o.stdout).trim()))
+}
+
+/// `scp` arguments for `scp_dest` (`[host]` or `["-p", port, host]`): the options and the
+/// `host:` prefix remote paths go after.
+fn scp_target(dest: &str, scp_dest: &[String]) -> Result<(Command, String)> {
     let (port, host) = match scp_dest {
         [p, port, host] if p == "-p" => (Some(port.clone()), host.clone()),
         [host] => (None, host.clone()),
@@ -328,11 +344,41 @@ pub fn ensure_binary(dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String])
     if let Some(p) = port {
         scp.args(["-P", &p]);
     }
-    if !ok || !scp.arg(&exe).arg(format!("{host}:.rekcod/bin/rekcod")).status()?.success() {
-        bail!("copying rekcod to {dest} failed");
+    Ok((scp, host))
+}
+
+/// A dev build pins no guest, so the server's `rekcod start` would find none: copy this
+/// Mac's to its `~/.rekcod/guest` unless the `VERSION` there matches. Release builds
+/// download theirs on first start.
+pub fn ensure_guest(paths: &Paths, dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String]) -> Result<()> {
+    if crate::fetch::GUEST_VERSION.is_some() {
+        return Ok(());
     }
-    let o = ssh().args(["/bin/sh", "-c", "echo $HOME"]).stdin(Stdio::null()).output()?;
-    Ok(format!("{}/.rekcod/bin/rekcod", String::from_utf8_lossy(&o.stdout).trim()))
+    let local = paths.guest_dir().context("this dev build has no guest to copy to the server; scripts/build.sh builds one")?;
+    let ours = std::fs::read_to_string(local.join("VERSION")).unwrap_or_default().trim().to_string();
+    let o = ssh().args(["cat", ".rekcod/guest/VERSION"]).stdin(Stdio::null()).stderr(Stdio::null()).output()?;
+    if !ours.is_empty() && String::from_utf8_lossy(&o.stdout).trim() == ours {
+        return Ok(());
+    }
+    let files: Vec<&str> = ["Image", "initramfs", "root.img", "VERSION"].into_iter().filter(|f| local.join(f).exists()).collect();
+    let size: u64 = files.iter().filter_map(|f| std::fs::metadata(local.join(f)).ok()).map(|m| m.len()).sum();
+    eprintln!("rekcod: copying this dev build's guest {ours} ({} MB) to {dest}:~/.rekcod/guest", size >> 20);
+    if !ssh().args(["mkdir", "-p", ".rekcod/guest"]).stdin(Stdio::null()).status()?.success() {
+        bail!("mkdir ~/.rekcod/guest on {dest} failed");
+    }
+    // Under temporary names, then renamed with VERSION last: an interrupted copy is copied
+    // again next time instead of booting half a guest.
+    for f in &files {
+        let (mut scp, host) = scp_target(dest, scp_dest)?;
+        if !scp.arg(local.join(f)).arg(format!("{host}:.rekcod/guest/.{f}.tmp")).status()?.success() {
+            bail!("copying the guest's {f} to {dest} failed");
+        }
+    }
+    let mv = files.iter().map(|f| format!("mv -f .{f}.tmp {f}")).collect::<Vec<_>>().join(" && ");
+    if !ssh().arg(format!("cd .rekcod/guest && {mv}")).stdin(Stdio::null()).status()?.success() {
+        bail!("installing the guest on {dest} failed");
+    }
+    Ok(())
 }
 
 /// Characters allowed in a value pasted into the remote shell command.

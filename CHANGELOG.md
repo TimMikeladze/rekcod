@@ -48,6 +48,11 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Added
 
+- `host add` on a Mac that only takes an SSH password creates `~/.rekcod/ssh/id_ed25519`, installs
+  it with `ssh-copy-id` (one prompt) and includes `~/.rekcod/ssh/config` from `~/.ssh/config`, so
+  docker's ssh gets in too. `host rm` and `host refresh` keep the config in step; `uninstall`
+  removes the Include (docs/ssh-keys.md).
+- `host add --server` from a dev build copies the local guest image to the server.
 - `scripts/package-server.sh` builds `rekcod-server-X.Y.Z.pkg`: AirDrop it to a Mac and
   double-click. It installs rekcod and the guest, runs `server setup` for the logged-in user and
   leaves the `rekcod remote add` line in `~/Desktop/rekcod-pair.txt` (docs/server-pkg.md).
@@ -111,6 +116,8 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Fixed
 
+- `host add --server` copies rekcod to the server beside the old binary and renames it over,
+  instead of overwriting the file a running agent was started from.
 - Readings nobody could take are `null` and show as `–`, not 0: node CPUs, load and disk,
   the guest's disk usage, VM CPUs/memory in `rekcod status`, `docker stats` rows that print
   `--`. The controller's `nodes` table gets nullable columns (migration 5).

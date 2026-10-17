@@ -57,6 +57,8 @@ mod service;
 #[cfg(target_os = "macos")]
 mod snap;
 #[cfg(target_os = "macos")]
+mod sshkey;
+#[cfg(target_os = "macos")]
 mod state;
 #[cfg(target_os = "macos")]
 mod storage;
@@ -1413,7 +1415,7 @@ fn main() {
         }
         Cmd::Shell => cli::shell(&paths),
         Cmd::Compact => cli::compact(&paths),
-        Cmd::Host(HostCmd::Add { name, dest, no_use, server: false, .. }) => host::add(&name, &dest, !no_use),
+        Cmd::Host(HostCmd::Add { name, dest, no_use, server: false, .. }) => host::add(&paths, &name, &dest, !no_use),
         Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, lan, no_power, no_docker, .. }) => {
             let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker };
             host::add_server(&paths, &name, &dest, !no_use, &f)
@@ -1424,13 +1426,13 @@ fn main() {
             host::print_list(json);
             Ok(())
         }
-        Cmd::Host(HostCmd::Use { name }) => host::use_host(&name),
-        Cmd::Host(HostCmd::Rm { name }) => host::rm(&name),
+        Cmd::Host(HostCmd::Use { name }) => host::use_host(&paths, &name),
+        Cmd::Host(HostCmd::Rm { name }) => host::rm(&paths, &name),
         Cmd::Host(HostCmd::Forward { name, ports }) => host::forward(&paths, &name, &ports),
-        Cmd::Host(HostCmd::Refresh { name: Some(name) }) => host::refresh(&name),
+        Cmd::Host(HostCmd::Refresh { name: Some(name) }) => host::refresh(&paths, &name),
         Cmd::Host(HostCmd::Refresh { name: None }) => {
             for h in host::list().0.iter().filter(|h| h.bonjour.is_some()) {
-                host::refresh(&h.name)?;
+                host::refresh(&paths, &h.name)?;
             }
             Ok(())
         }

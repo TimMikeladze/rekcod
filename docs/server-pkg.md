@@ -60,8 +60,8 @@ shows the server's apps, nodes and jobs from that remote. Delete `rekcod-pair.tx
 afterwards: it holds the controller's admin token.
 
 Docker on the server still goes over SSH. Turn on Remote Login there, then on your Mac:
-`ssh-copy-id me@tims-mac-mini.local && rekcod host add tims-mac-mini me@tims-mac-mini.local` (no `--server`, the
-fleet's already set up).
+`rekcod host add tims-mac-mini me@tims-mac-mini.local` (no `--server`, the fleet's already set
+up). It asks for the password there once to install its key.
 
 ## Not done
 

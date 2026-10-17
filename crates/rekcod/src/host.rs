@@ -152,13 +152,23 @@ pub struct Fleet {
     pub docker: bool,
 }
 
-fn check(name: &str, dest: &str) -> Result<()> {
+/// SSH to `dest` must work without a prompt (docker's ssh can't answer one). When it
+/// only takes a password, rekcod's own key goes on it first (docs/ssh-keys.md).
+fn check(paths: &Paths, name: &str, dest: &str) -> Result<()> {
     if name == "local" || name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("host name must be letters, digits, - or _ (and not `local`)");
     }
-    let ok = ssh(dest).arg("true").stdin(Stdio::null()).status().context("run ssh")?.success();
-    if !ok {
-        bail!("can't SSH to {dest} without a password; run `ssh-copy-id {dest}` and turn on Remote Login on that Mac");
+    let out = ssh(dest).arg("true").stdin(Stdio::null()).output().context("run ssh")?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if !err.contains("Permission denied") {
+        bail!("can't SSH to {dest}: {err}\nturn on Remote Login on that Mac (System Settings › General › Sharing)");
+    }
+    crate::sshkey::install(paths, name, dest)?;
+    if !ssh(dest).arg("true").stdin(Stdio::null()).status().context("run ssh")?.success() {
+        bail!("{dest} still wants a password after `ssh-copy-id`; check its ~/.ssh/authorized_keys");
     }
     Ok(())
 }
@@ -166,8 +176,9 @@ fn check(name: &str, dest: &str) -> Result<()> {
 /// Provisions the server as a fleet (docs/server.md), adds it as remote NAME, then as a docker host.
 pub fn add_server(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet) -> Result<()> {
     let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
-    check(name, dest)?;
+    check(paths, name, dest)?;
     let bin = crate::server::ensure_binary(dest, || ssh(dest), &ssh_dest(dest))?;
+    crate::server::ensure_guest(paths, dest, || ssh(dest), &ssh_dest(dest))?;
     let tty: &[&str] = if std::io::IsTerminal::is_terminal(&std::io::stdin()) { &["-t"] } else { &[] };
     let (url, token, fp) = crate::server::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.lan, f.no_power)?;
     crate::fleet::remote_add(paths, name, &url, &token, None, fp.as_deref())?;
@@ -184,16 +195,16 @@ pub fn add_server(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet
         (Some(i), Some(fp)) => Some(Lan { instance: i.into(), fp, host_key: host_key(dest)? }),
         _ => None,
     };
-    add_described(name, dest, switch, &description(lan.as_ref()))
+    add_described(paths, name, dest, switch, &description(lan.as_ref()))
 }
 
-pub fn add(name: &str, dest: &str, switch: bool) -> Result<()> {
-    add_described(name, dest, switch, DESCRIPTION)
+pub fn add(paths: &Paths, name: &str, dest: &str, switch: bool) -> Result<()> {
+    add_described(paths, name, dest, switch, DESCRIPTION)
 }
 
-fn add_described(name: &str, dest: &str, switch: bool, description: &str) -> Result<()> {
+fn add_described(paths: &Paths, name: &str, dest: &str, switch: bool, description: &str) -> Result<()> {
     let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
-    check(name, dest)?;
+    check(paths, name, dest)?;
     let mut child = ssh(dest).args(["/bin/zsh", "-l", "-s"]).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
     child.stdin.take().context("ssh stdin")?.write_all(SETUP.as_bytes())?;
     let out = child.wait_with_output()?;
@@ -221,7 +232,7 @@ fn add_described(name: &str, dest: &str, switch: bool, description: &str) -> Res
         .map_err(|e| anyhow::anyhow!("{e}\nis rekcod running on {dest}? run `rekcod start` there"))?;
     println!("docker context {ctx}: engine {version} on {dest}");
     if switch {
-        use_host(name)?;
+        use_host(paths, name)?;
     }
     Ok(())
 }
@@ -240,7 +251,7 @@ fn retarget(dest: &str, target: &str) -> String {
 /// A LAN server's docker context pointed at wherever its Bonjour instance is now, after
 /// proving with the SSH host key pinned at `add` that the Mac there is the same one.
 /// Hosts without one are left alone.
-pub fn refresh(name: &str) -> Result<()> {
+pub fn refresh(paths: &Paths, name: &str) -> Result<()> {
     let (hosts, _) = list();
     let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
     let Some(lan) = &host.bonjour else { return Ok(()) };
@@ -253,21 +264,25 @@ pub fn refresh(name: &str) -> Result<()> {
     // Anyone on the LAN can answer for a Bonjour name, so the answer only counts once the
     // SSH server there proves it holds the pinned key: a known_hosts with nothing else in it.
     let known = tempfile_known_hosts(&known_hosts_name(&new), &lan.host_key)?;
-    let ok = Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"])
-        .args(["-o", &format!("UserKnownHostsFile={}", known.display()), "-o", "GlobalKnownHostsFile=/dev/null"])
-        .args(ssh_dest(&new))
-        .arg("true")
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("run ssh")?
-        .success();
+    let mut verify = Command::new("ssh");
+    verify.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]).args([
+        "-o",
+        &format!("UserKnownHostsFile={}", known.display()),
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+    ]);
+    // The config block is still for the old name, so offer rekcod's key by hand.
+    let key = crate::sshkey::key(paths);
+    if key.exists() {
+        verify.arg("-i").arg(&key);
+    }
+    let ok = verify.args(ssh_dest(&new)).arg("true").stdin(Stdio::null()).stderr(Stdio::null()).status().context("run ssh")?.success();
     let _ = std::fs::remove_file(&known);
     if !ok {
         bail!("{new} answered for {name} on Bonjour but doesn't have its SSH host key; leaving {name} on {dest}");
     }
     trust_host_key(&known_hosts_name(&new), &lan.host_key)?;
+    crate::sshkey::retarget(paths, name, crate::sshkey::host_of(&new))?;
     docker::run_ok(&["context", "update", &context(name), "--docker", &format!("host=ssh://{new}")])?;
     println!("host {name}: now {new}");
     Ok(())
@@ -290,9 +305,9 @@ fn trust_host_key(host: &str, key: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn use_host(name: &str) -> Result<()> {
+pub fn use_host(paths: &Paths, name: &str) -> Result<()> {
     if name != "local"
-        && let Err(e) = refresh(name)
+        && let Err(e) = refresh(paths, name)
     {
         eprintln!("rekcod: {e:#}");
     }
@@ -309,7 +324,7 @@ pub fn use_host(name: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn rm(name: &str) -> Result<()> {
+pub fn rm(paths: &Paths, name: &str) -> Result<()> {
     let ctx = context(name);
     if !docker::context_exists(&ctx) {
         bail!("no host {name}");
@@ -320,7 +335,8 @@ pub fn rm(name: &str) -> Result<()> {
         println!("docker context: {to}");
     }
     docker::run_ok(&["context", "rm", &ctx])?;
-    println!("removed {ctx} (the server's ~/.zshenv block stays)");
+    crate::sshkey::forget(paths, name)?;
+    println!("removed {ctx} (the server's ~/.zshenv block and rekcod's key in its authorized_keys stay)");
     Ok(())
 }
 
@@ -374,7 +390,7 @@ impl Drop for Master {
 }
 
 pub fn forward(paths: &Paths, name: &str, only: &[u16]) -> Result<()> {
-    if let Err(e) = refresh(name) {
+    if let Err(e) = refresh(paths, name) {
         eprintln!("rekcod: {e:#}");
     }
     let (hosts, _) = list();

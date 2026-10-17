@@ -11,7 +11,8 @@ rekcod host add mini me@mac-mini --server --domain apps.example.com
 
 Done once, by hand, because they need its screen or an Apple ID:
 
-- Remote Login on, and your key on it (`ssh-copy-id me@mac-mini`).
+- Remote Login on (System Settings › General › Sharing). `host add` puts a key on it the first
+  time, asking for the password once ([ssh-keys.md](ssh-keys.md)).
 - Tailscale logged in, on the same tailnet as your Mac. Without it the fleet goes on the LAN
   and your Mac finds it over Bonjour, whatever its IP or name ([lan-discovery.md](lan-discovery.md));
   `--lan` picks that even with Tailscale. `--addr IP` pins one address you manage instead.
@@ -23,9 +24,12 @@ No SSH? [server-pkg.md](server-pkg.md) builds a pkg you double-click on the serv
 
 ## What `host add --server` does
 
-1. Checks SSH works without a password.
+1. Checks SSH works without a password; if it only takes one, installs rekcod's key with
+   `ssh-copy-id` first.
 2. Finds `rekcod` on the server (login shell `PATH`, then `~/.rekcod/bin/rekcod`). If there's
-   none, copies this binary to `~/.rekcod/bin/rekcod` with scp.
+   none, copies this binary to `~/.rekcod/bin/rekcod` with scp (beside it, then renamed, so
+   agents running the old one survive). A dev build also copies the local guest to
+   `~/.rekcod/guest` when its `VERSION` differs.
 3. Runs `rekcod server setup --domain D` there over `ssh -t`, so sudo can ask for a password.
 4. Reads the `remote URL TOKEN` line the setup prints and runs `rekcod remote add NAME URL`
    here. The server's tailnet name goes in the URL, so it survives an IP change.
@@ -64,6 +68,3 @@ The Rust version of the old setup shell script, plus the headless bits.
 - Menu bar: `host add` takes arguments the menu has no way to ask for, same as before.
 - Starting the docker VM at login. After a reboot apps come back (they're sandboxes the node
   starts), but docker over SSH needs `rekcod start` on the server first.
-- A dev build copied over has no embedded guest, so the server's first `rekcod start` fails.
-  Copy a release build, install rekcod there from the release, or use the pkg
-  ([server-pkg.md](server-pkg.md)), which carries the guest.

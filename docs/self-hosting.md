@@ -21,12 +21,11 @@ rekcod does **not** need to be installed on the server.
 To skip SSH altogether, AirDrop a pkg to the server and double-click it instead of steps 2
 and 3: [server-pkg.md](server-pkg.md).
 
-## 2. Set up SSH from your Mac
+## 2. SSH
 
-```sh
-ssh-copy-id me@mac-mini
-ssh me@mac-mini true     # must not ask for a password
-```
+Nothing to do. If `ssh me@mac-mini` already gets in without a password, step 3 uses that.
+Otherwise step 3 asks for the password on the server once and installs rekcod's own key
+(`~/.rekcod/ssh/id_ed25519`, [ssh-keys.md](ssh-keys.md)).
 
 ## 3. Provision it
 

@@ -21,6 +21,7 @@ How a feature behaves today and how to drive it.
 - [dashboard.md](dashboard.md): the web dashboard and `rekcod dashboard`.
 - [remote-docker.md](remote-docker.md): another Mac's rekcod as your docker engine.
 - [server.md](server.md): turning another Mac into a server with `rekcod host add`.
+- [ssh-keys.md](ssh-keys.md): `host add` installs its own SSH key when a Mac only takes a password.
 - [server-pkg.md](server-pkg.md): a double-click installer that makes a Mac a server, no SSH needed.
 - [fleet-compute.md](fleet-compute.md): scale to zero, recycle, jobs.
 - [namespaces.md](namespaces.md): multi-tenancy in a fleet.

@@ -314,7 +314,6 @@ One command on your Mac makes another Mac a server: a deploy target and a docker
 runs with its lid shut:
 
 ```sh
-ssh-copy-id me@mac-mini
 rekcod host add mini me@mac-mini --server --domain apps.example.com
 rekcod app deploy --remote mini           # http://<server's tailnet name>:8080, Host: <app>.apps.example.com
 docker ps                                 # runs on the server too
@@ -324,9 +323,12 @@ The server needs Remote Login, Tailscale on your tailnet and automatic login. Wi
 Tailscale (or with `--lan`) it goes on the LAN and your Mac finds it over Bonjour as
 `https://rekcod-<CA fingerprint>.bonjour`, so a new IP or a renamed Mac doesn't break it
 ([`docs/lan-discovery.md`](docs/lan-discovery.md)); `--addr IP` pins one address instead. It needs automatic login
-because the services are LaunchAgents and those only run in a logged-in session. rekcod doesn't
+because the services are LaunchAgents and those only run in a logged-in session. When SSH
+there only takes a password, `host add` creates `~/.rekcod/ssh/id_ed25519` and installs it with
+`ssh-copy-id` (one password prompt), so docker's ssh never has to ask
+([`docs/ssh-keys.md`](docs/ssh-keys.md)). rekcod doesn't
 have to be installed there: `host add` copies this binary to `~/.rekcod/bin/rekcod` if it's
-missing. Then it runs `rekcod server setup` over SSH, which installs RustFS, the controller, node and
+missing, and from a dev build it copies the local guest image too. Then it runs `rekcod server setup` over SSH, which installs RustFS, the controller, node and
 edge as LaunchAgents on the Tailscale address and runs `sudo pmset -a sleep 0 disablesleep 1
 autorestart 1` so the lid can shut and a power cut doesn't leave it off (sudo asks for the
 server's password; `--no-power` skips it). It adds the remote `mini` here, then starts the
@@ -354,8 +356,7 @@ On that Mac, run `rekcod start` and turn on Remote Login (System Settings › Ge
 Sharing). Then on your Mac:
 
 ```sh
-ssh-copy-id you@mac-mini               # docker's SSH helper can't answer a password prompt
-rekcod host add mini you@mac-mini      # sets up that Mac, creates docker context rekcod-mini, switches to it
+rekcod host add mini you@mac-mini      # sets up that Mac (and rekcod's SSH key on it, if it asks for a password), creates docker context rekcod-mini, switches to it
 docker ps                              # runs on that Mac
 rekcod host forward mini               # its published ports on 127.0.0.1 here, until Ctrl-C
 rekcod host use local                  # back to this Mac's rekcod

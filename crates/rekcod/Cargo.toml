@@ -37,4 +37,4 @@ governor = "0.10"
 ipnet = "2"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rcgen = "0.13"
+rcgen = "0.14"

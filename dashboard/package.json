@@ -32,7 +32,7 @@
     "@playwright/test": "^1.64.0",
     "@tailwindcss/turbopack": "^4",
     "@types/d3-scale": "^4.0.9",
-    "@types/node": "^24.19.1",
+    "@types/node": "^26.6.5",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",

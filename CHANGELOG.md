@@ -122,6 +122,8 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 
 ### Changed
 
+- Original rekcod code is now MIT licensed, including the guest drivers.
+- Guest kernel pin updated to 6.12.115-r0, matching the package available in Alpine 3.22.
 - `start --no-switch` with a non-default `REKCOD_HOME` leaves the shared docker context alone.
 - Snapshots are written as a new generation before the old one goes; restore saves the
   current volumes as `pre-restore` first.

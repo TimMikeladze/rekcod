@@ -1,4 +1,5 @@
-// SPDX-License-Identifier: GPL-2.0
+// SPDX-License-Identifier: MIT
+// Copyright (c) 2026 TimMikeladze
 /*
  * rekcod elastic memory (docs/elastic-memory.md): a swap device on a virtio shared
  * memory region that the host backs with its own memory. Chunks the guest stops using
@@ -390,4 +391,4 @@ static struct virtio_driver elastic_driver = {
 module_virtio_driver(elastic_driver);
 MODULE_DEVICE_TABLE(virtio, elastic_ids);
 MODULE_DESCRIPTION("rekcod elastic memory");
-MODULE_LICENSE("GPL");
+MODULE_LICENSE("Dual MIT/GPL");

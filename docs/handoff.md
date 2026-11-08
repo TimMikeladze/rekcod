@@ -8,7 +8,7 @@ You're continuing **rekcod**: Docker on macOS (Apple Silicon) that runs the real
 `dockerd` in a Virtualization.framework VM. Users switch to it in one command (`rekcod start`
 selects a `rekcod` docker context, `rekcod import --from <context>` copies images and volumes)
 and back in one (`rekcod stop`). The goal is that Docker Desktop and OrbStack users switch over
-without changing anything. Repo: github.com/TimMikeladze/rekcod (public, Apache-2.0),
+without changing anything. Repo: github.com/TimMikeladze/rekcod (public),
 branch `main`. Index of the docs: `docs/README.md`.
 
 ## Read first

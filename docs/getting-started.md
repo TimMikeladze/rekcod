@@ -10,8 +10,8 @@ curl -fsSL https://raw.githubusercontent.com/TimMikeladze/rekcod/main/scripts/in
 ```
 
 The script checks the release tarball's sha256 and installs nothing on a mismatch. It puts
-`rekcod` in `/usr/local/bin` and asks for sudo only if `/usr/local` isn't writable. Manual
-steps and Homebrew: [README, Install](../README.md#install).
+`rekcod` in `/usr/local/bin` and asks for sudo only if `/usr/local` isn't writable.
+Installer details: [scripts/install.sh](../scripts/install.sh).
 
 ## 2. Start the VM
 
@@ -151,4 +151,4 @@ rekcod uninstall [--keep-data]     # removes agents, socket route, context, and 
 - Self-host apps on a server Mac: [self-hosting.md](self-hosting.md)
 - App hosting across several Macs: [fleet-compute.md](fleet-compute.md), [namespaces.md](namespaces.md)
 - Local S3 with RustFS: [rustfs.md](rustfs.md)
-- Every command: [README, Commands](../README.md#commands)
+- Every command: `rekcod --help`; use `rekcod <command> --help` for its options.

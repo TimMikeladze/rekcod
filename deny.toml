@@ -11,7 +11,7 @@ yanked = "deny"
 ignore = []
 
 [licenses]
-# Licenses that can ship inside an Apache-2.0 binary.
+# Allowed licenses for third-party dependencies.
 allow = [
   "Apache-2.0",
   "MIT",

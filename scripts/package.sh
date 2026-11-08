@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Release artifacts in out/release (docs/phase3.md):
-#   rekcod-<version>-darwin-arm64.tar.gz   bin/rekcod, with the guest version + sha embedded
+#   rekcod-<version>-darwin-arm64.tar.gz   bin/rekcod, LICENSE, NOTICE, LICENSES/
 #   rekcod-darwin-arm64.tar.gz             the same, for releases/latest/download
-#   rekcod-guest-<guest version>.tar.gz    Image, [initramfs], root.img, VERSION
+#   rekcod-guest-<guest version>.tar.gz    Image, [initramfs], root.img, VERSION, license notices
 #   SHA256SUMS
 # Needs out/guest (scripts/build.sh, or GUEST_DIR=... from CI) and runs on macOS.
 #
@@ -21,10 +21,13 @@ version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 gv=$(cat "$guest/VERSION")
 rel=out/release
 rm -rf "$rel" && mkdir -p "$rel/stage/bin"
+cp LICENSE NOTICE "$rel/stage/"
+cp -R LICENSES "$rel/stage/LICENSES"
 
 guest_tar="rekcod-guest-$gv.tar.gz"
 # COPYFILE_DISABLE: no macOS ._ metadata files in the archive.
-COPYFILE_DISABLE=1 tar -C "$guest" -czf "$rel/$guest_tar" $(cd "$guest" && ls Image initramfs root.img VERSION 2>/dev/null)
+COPYFILE_DISABLE=1 tar -C "$guest" -czf "$rel/$guest_tar" $(cd "$guest" && ls Image initramfs root.img VERSION 2>/dev/null) \
+  -C "$PWD" LICENSE NOTICE LICENSES
 sha=$(shasum -a 256 "$rel/$guest_tar" | cut -d' ' -f1)
 
 # Signing rewrites the file, and macOS kills a process whose binary changes underneath it (a
@@ -41,7 +44,7 @@ signed_into() {
 }
 REKCOD_GUEST_VERSION=$gv REKCOD_GUEST_SHA256=$sha cargo build --locked --release -p rekcod
 signed_into "$rel/stage/bin/rekcod" "${CODESIGN_IDENTITY:--}"
-parts=(bin)
+parts=(bin LICENSE NOTICE LICENSES)
 if [[ $with_dashboard == 1 ]]; then
   (cd dashboard && npm ci && npm run bundle)
   mkdir -p "$rel/stage/share/rekcod"

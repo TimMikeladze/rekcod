@@ -7,7 +7,7 @@ class Rekcod < Formula
   version "0.3.0"
   url "https://github.com/TimMikeladze/rekcod/releases/download/v#{version}/rekcod-#{version}-darwin-arm64.tar.gz"
   sha256 "REPLACE_WITH_SHA256_FROM_SHA256SUMS"
-  license "Apache-2.0"
+  license "MIT"
 
   depends_on arch: :arm64
   depends_on :macos

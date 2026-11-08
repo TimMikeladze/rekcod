@@ -169,7 +169,7 @@ To turn it off again: `gh variable delete REKCOD_E2E_RUNNER`.
 ## Dependency checks
 
 - `ci.yml`'s `deny` job runs `cargo deny --locked check` against `deny.toml`:
-  RustSec advisories, licenses that can ship in an Apache-2.0 binary, duplicate crates
+  RustSec advisories, dependency licenses, duplicate crates
   (warnings only), crates.io as the only source.
 - The dashboard job runs `npm audit --omit=dev --audit-level=high`. Only production
   dependencies count, because only those ship in the standalone bundle.

@@ -1,0 +1,8 @@
+Original rekcod code is licensed under MIT.
+
+guest/fuse/rekcod-fuse.patch modifies Linux and is covered by GPL-2.0-only;
+the license text is in LICENSES/GPL-2.0-only.txt. The combined Linux kernel
+remains covered by its upstream terms.
+
+Dependencies and bundled third-party software retain their own copyright
+and license notices.

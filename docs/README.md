@@ -1,6 +1,6 @@
 # rekcod docs
 
-Start with the [README](../README.md): install, what works, commands, build and test.
+Start with the [README](../README.md): install, usage and how it works.
 
 ## Using rekcod
 

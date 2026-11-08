@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
 diff --color -ruN -x rekcod.c a/Makefile b/Makefile
 --- a/Makefile	2026-10-11 11:58:15
 +++ b/Makefile	2026-10-11 11:58:15

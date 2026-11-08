@@ -44,7 +44,7 @@ cargo deny check
 
 The agent's Linux-only tests run in CI on arm64 Linux. Locally: `rekcod x cargo test -p rekcod-agent`.
 
-The e2e scripts need a running VM and are listed in README's Test section. `scripts/e2e.sh`
+The VM e2e scripts live in `scripts/`. `scripts/e2e.sh`
 starts and finally stops the main VM, and stopping deletes running `--rm` containers.
 Check `docker ps` first; the script refuses the stop while containers it didn't start are
 running, unless `E2E_ALLOW_STOP=1`. `scripts/e2e-sandbox.sh`, `e2e-fleet.sh` and

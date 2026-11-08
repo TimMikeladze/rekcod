@@ -11,7 +11,7 @@ behavior is gated on the virtio-fs `rekcod` mount option. Design and measurement
 To change the patch:
 
 ```sh
-V=6.12.112   # guest kernel version (ls /lib/modules in the guest)
+V=6.12.115   # guest kernel version (ls /lib/modules in the guest)
 curl -sL https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$V.tar.xz | tar -xJ linux-$V/fs/fuse
 cp -R linux-$V/fs/fuse a && cp -R linux-$V/fs/fuse b
 (cd b && patch -p1 < ../rekcod-fuse.patch)

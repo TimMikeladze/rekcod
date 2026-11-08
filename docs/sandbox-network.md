@@ -12,7 +12,9 @@ likes to its own iptables; packets still only leave through the daemon.
 
 Scope: every sandbox VM (agent sandboxes, `rekcod x --sandbox`, fleet sandboxes, app
 instances and jobs). The main VM keeps NAT; it runs your own containers and needs full
-speed. macOS sandboxes are out of scope (they're plain NAT and documented as such).
+speed. macOS sandboxes are out of scope (they're plain NAT and documented as such), which
+is why `sandbox serve` and `mcp` neither create nor reach one unless started with
+`--allow-macos`.
 
 ## Pieces
 

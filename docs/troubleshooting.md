@@ -24,14 +24,37 @@ See [rosetta.md](rosetta.md).
 
 ## The VM won't start
 
-- `the VM's data disk can't be used: ...`: the data disk isn't readable ext4, and rekcod
-  refuses to format a disk that holds data. `rekcod stop`, then `rekcod start --repair`
-  runs `e2fsck -fy` on it (trying backup superblocks) and reinstalls the root disk. If that
-  fails too, `~/.rekcod/vm/data.img` is still there to copy off before you delete it.
+- `the VM's data disk can't be used: ...`: the data disk isn't readable ext4. rekcod formats
+  a data disk only on the boots after it created `vm/data.img` and before dockerd first
+  answered on it (`vm/data.fresh`), and only while its first 4 MiB are zeros. Any other
+  disk is left as it is, also one that is zeros at the start: damage there leaves the data
+  behind it. `rekcod stop`, then `rekcod start --repair` runs `e2fsck -fy` on it (trying
+  every backup superblock) and reinstalls the root disk. If that fails too, copy
+  `~/.rekcod/vm/data.img` off if anything on it matters, then move it out of `vm/`; the
+  next `rekcod start` creates an empty disk and formats that one.
 - `dockerd did not answer within 120s`: see the end of `console.log`. A guest that stops
   during boot usually says why there.
 - `another rekcod daemon is running`: one is, for that `REKCOD_HOME`. `rekcod status`
   shows its pid; `rekcod stop --force` powers off a hung one.
+
+## `rekcod doctor` says the state isn't private
+
+`~/.rekcod` and its `run/`, `logs/` and `vm/` are 0700, and the VM disks (`vm/root.img`,
+`vm/data.img`) 0600, since the data disk holds every volume and container. Every `rekcod`
+command sets those modes, whatever the umask, also on an install made before it did. A
+failed check means it couldn't, because the path belongs to another account (root, after a
+`sudo rekcod ...`): `sudo chown -R "$(whoami)" ~/.rekcod`, and the next `rekcod` command
+sets the modes.
+
+## A docker stream ends with an error
+
+`docker logs`, `export`, `cp` and `save` end with an error, never a short clean EOF, when
+the stream from the VM breaks: the vsock connection failed (its error is passed on), a
+stalled reader's spill to a temp file failed (`couldn't spill a stalled stream`), or the
+reader fell more than 16 GiB behind on top of the 64 MiB kept in memory (`reader fell too
+far behind`). Both limits count unread bytes, so a long stream whose reader keeps up is
+never cut. Spill files are unlinked files in `$TMPDIR`, closed (and their space freed) as
+they're read.
 
 ## Containers can't reach the internet
 

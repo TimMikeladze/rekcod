@@ -5,6 +5,7 @@ import { Actions } from "@/components/actions"
 import { Empty, Mono, State } from "@/components/bits"
 import { DetailHead } from "@/components/shell/page-title"
 import { useDash } from "@/hooks/dash-context"
+import { api } from "@/lib/api"
 import { ago, fmtBytes } from "@/lib/format"
 
 /** `/sandboxes/[id]`: changed files (`rekcod sandbox diff --stat`) and, for macOS, a screenshot every 10 s. */
@@ -17,7 +18,7 @@ export function SandboxDetail({ id }: { id: string }) {
   useEffect(() => {
     if (!s?.copy) return
     let stop = false
-    fetch(`/api/sandbox-stat?id=${encodeURIComponent(id)}`, { cache: "no-store" })
+    api(`/api/sandbox-stat?id=${encodeURIComponent(id)}`)
       .then((r) => r.text())
       .then((text) => !stop && setStat({ id, text }))
       .catch((e) => !stop && setStat({ id, text: String(e) }))
@@ -33,7 +34,7 @@ export function SandboxDetail({ id }: { id: string }) {
     let last: string | null = null
     const tick = async () => {
       try {
-        const r = await fetch(`/api/screenshot?id=${encodeURIComponent(id)}&t=${Date.now()}`, { cache: "no-store" })
+        const r = await api(`/api/screenshot?id=${encodeURIComponent(id)}&t=${Date.now()}`)
         if (!r.ok) throw new Error((await r.text()) || `HTTP ${r.status}`)
         const url = URL.createObjectURL(await r.blob())
         if (stop) return URL.revokeObjectURL(url)

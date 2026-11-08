@@ -123,7 +123,7 @@ Verified by `scripts/e2e.sh` (47 checks) and `tests/stress/` on an M5 Pro, macOS
 - `linux/amd64` images through Rosetta, when it's installed on the Mac ([docs/rosetta.md](docs/rosetta.md)).
 - `host.docker.internal` (including Mac services bound only to `127.0.0.1`) and `gateway.docker.internal`. Container DNS goes through the Mac's own resolvers (UDP and TCP), including per-domain ones from `scutil --dns` (`/etc/resolver/*`, VPN split DNS, Tailscale MagicDNS), so VPN and link-local DNS work.
 - `docker run -i`/`attach`/`exec` with stdin half-close, healthcheck-gated `depends_on`, and idempotent `compose up`.
-- `rekcod import`: images (`save | load`) and named volumes (data, labels; copied with `docker cp` and checked by file count and bytes), so compose reuses them. Volumes in use at the source are skipped unless you pass `--force`.
+- `rekcod import`: images (`save | load`) and named volumes (data, labels; copied with `docker cp` and checked by file count and bytes), so compose reuses them. Volumes in use at the source are skipped unless you pass `--force`. A `--from` context that reaches rekcod's own daemon (same `docker info` ID) is refused before anything is copied.
 - Idle VM memory is about 160 MiB RSS.
 - Memory a burst used comes back to macOS while the VM runs (macOS 27). `--memory` is split into base RAM and elastic memory, a swap device backed by memory rekcod hands back once the guest frees it: with `--memory 8 --base-memory 2`, a container that touched 5 GB left the VM at 2.8 GB resident 15 s after it exited, and the Mac 6.8 GB better off. Base RAM still stays with the VM once touched. Details: [docs/elastic-memory.md](docs/elastic-memory.md).
 - Database-style workloads run at native-Mac durability: guest `fsync` maps to macOS `fsync` (survives VM or app crashes, like any Mac app), not a full media flush on every commit. A power cut or kernel panic can lose the last writes, as for any Mac app; the guest runs `e2fsck -p` on the data disk at every boot. pgbench (8 clients, scale 20): about 15k TPS, versus 1k with Virtualization.framework's default. `REKCOD_DISK_SYNC=full` restores full flushes.
@@ -168,12 +168,20 @@ rekcod snap restore seeded --pull  # on another Mac: downloads it first, then re
 The project is the compose project started from the current directory (`-p` to pick one).
 Snapshots are copies on the VM's disk (a 360 MB Postgres data dir saves or restores in
 under a second). A restore after `compose down -v` recreates the volumes so compose adopts them.
-A save writes a new copy and only deletes the old one once every volume copied, so a save
-that fails or is interrupted leaves the previous snapshot as it was. A restore first saves
+A save writes a new copy and only deletes the old one once every volume copied and the new
+copy is checked to be the snapshot, so a save that fails or is interrupted leaves the previous
+snapshot as it was. If any container fails to pause, the ones already paused are unpaused
+and the save fails. Two commands that change the same snapshot (a menu bar save and a terminal
+restore, say) take turns. A restore first saves
 the current volumes as snapshot `pre-restore`, so `rekcod snap restore pre-restore` undoes it.
 `--push` and `--pull` use `$S3_ENDPOINT`/`$S3_BUCKET` with the `AWS_*` keys when they're set
 (an app's bucket, say), else `rekcod storage up`'s RustFS and bucket `rekcod-snaps`. Each
-volume goes up as `snaps/<project>/<name>/<volume>.tar.zst`.
+push uploads its volumes as `snaps/<project>/<name>/<generation>/<volume>.tar.zst`, then
+writes `snaps/<project>/<name>/manifest.json` with each archive's SHA-256, then deletes
+archives that neither this manifest nor the previous one uses. A push that fails partway
+leaves the previous push as the one `--pull` gets. `--pull` checks every archive against the
+manifest and fails on a mismatch; it also reads pushes from before generations. A pulled
+snapshot replaces the local one even when the local one is newer.
 
 ### Run anything without a Dockerfile
 
@@ -192,6 +200,9 @@ rekcod x --image alpine:3.22 sh                 # any image
 ```
 
 `-p PORT` publishes explicitly, `-e KEY=VALUE` sets variables, and `.env` is passed along.
+Version files are read from the directory itself and must be regular files of at most
+1 MiB. A symlink like `.nvmrc -> ../../.nvmrc` is followed in your own projects; in
+repositories rekcod cloned (fleet checkouts under `~/.rekcod`) links aren't followed.
 A warm `rekcod x node -v` adds about 65 ms over running node natively.
 
 ### Menu bar
@@ -220,8 +231,10 @@ cd dashboard && npm ci && npm run dev
 ```
 
 It runs commands as you, and every container can reach the Mac's 127.0.0.1, so each launch
-makes a new token. `rekcod dashboard` opens `/auth?token=...`, which swaps it for a cookie;
-without that cookie every page and API route answers 401. The token is in
+makes a new token. `rekcod dashboard` opens `/auth?token=...`, which keeps the token in that
+origin's `localStorage`; the page sends it to every API route as `Authorization: Bearer`, and
+without it the API answers 401. There's no cookie, because cookies reach every localhost port,
+including a container's web server. The token is in
 `~/.rekcod/run/dashboard.json` (0600), and running `rekcod dashboard` again opens the running
 one signed in.
 
@@ -275,9 +288,12 @@ after 30 minutes without an exec (`--ttl`) and boots again on the next one.
 
 For agents: `rekcod mcp` is an MCP server on stdio with tools for create, exec,
 read/write file, fork, diff, apply, stop and remove (`claude mcp add rekcod -- rekcod mcp`).
-Callers can only create sandboxes for the directory the server started in (`--root DIR`
-adds others), and can't open the network, mount the live directory or pass secrets unless
-the server was started with `--allow-host`, `--allow-mount` or `--secret`.
+Callers can only create and reach sandboxes for the directory the server started in
+(`--root DIR` adds others), and can't open the network, mount the live directory, pass
+secrets or start macOS guests unless the server was started with `--allow-host`,
+`--allow-mount`, `--secret` or `--allow-macos`. A sandbox made another way with more than
+that (another project's, a fleet's, one holding a secret the server wasn't given) isn't
+listed, and every call on it is refused.
 `rekcod sandbox serve` serves the same operations over HTTP on
 `~/.rekcod/run/sandbox.sock` (`--listen 127.0.0.1:PORT` adds TCP with a bearer token):
 
@@ -308,7 +324,8 @@ rekcod sandbox input $id type "hello"
 exec, diff, apply and fork work as for Linux sandboxes (over SSH; the workspace is copied
 into the guest's `~/ws` and back with tar). Their network is plain NAT with no filtering:
 the Mac and the LAN are reachable, so `--offline` and `--allow-host` are refused for them. The MCP server adds `sandbox_screenshot` and `sandbox_input` for
-computer-use agents. Details: [`docs/platform.md`](docs/platform.md#track-4-as-built).
+computer-use agents, and only creates or reaches macOS sandboxes when started with
+`--allow-macos`. Details: [`docs/platform.md`](docs/platform.md#track-4-as-built).
 
 ### Another Mac as a server
 
@@ -519,9 +536,11 @@ Viewers can list, read status and logs. Members deploy, set env and secrets, and
 sandboxes and jobs. Owners also manage members. Everyone with a token is in `default`, and
 there each person only sees their own things, as before namespaces. In any other namespace
 members share everything. A namespace you aren't in answers `no namespace`, the same as one
-that doesn't exist. Quotas count apps with a live release (sleeping ones too), running
-sandboxes and jobs. Nodes only accept connections to app instances from the controller and
-from edges that have fetched routes, so nobody on the tailnet can skip the edge. Design:
+that doesn't exist. Quotas count apps with a live release (sleeping ones too) or a deploy
+in progress, running sandboxes and jobs. A create, scale or deploy checks the quota and
+holds its share in one step, so two of them can't both take the last of it; a first deploy
+that fails gives its share back. Nodes only accept connections to app instances from the
+controller and from edges that have fetched routes, so nobody on the tailnet can skip the edge. Design:
 [`docs/namespaces.md`](docs/namespaces.md).
 
 A deploy starts new instances (on different nodes when it can), waits for the health check,
@@ -543,6 +562,17 @@ recycle = "24h"        # fresh VMs every day; off by default
 [env]
 GREETING = "hi"
 ```
+
+The controller refuses a spec outside these ranges before it stores anything: `instances` 1
+to 100, `cpus` 1 to 64, `memory` 1 to 512 GiB, `port` 1 to 65535 (left out, rekcod.toml's
+or 3000). The same `cpus` and `memory_gib` limits apply to remote sandboxes. App names of
+exactly 32 hex digits are refused, because that's how the hashed bucket name of a long
+`name--namespace` is spelled.
+
+`app destroy` takes the app out of the routes and app list at once, waits for a deploy of it
+that's in flight (which then stops before it registers anything), deletes the instances and
+then its storage. If storage cleanup fails it says so, the name stays taken, and the
+controller retries every minute; `app destroy` again retries at once.
 
 `app status NAME` reports placement, including shared Macs and zones. Soft spreading also
 records sharing in the release log. Strict spreading fails a deploy if it can't separate
@@ -572,12 +602,16 @@ rekcod job unschedule nightly
 The workspace is the repo's pushed HEAD (or `--git/--ref`). The image comes from the version
 files like `rekcod x` (`--image` overrides it, alpine otherwise), and there's no install
 step, so put it in the command. `--timeout` exits 124. The controller keeps the last 64 KiB
-of output. A schedule never runs two at once, and running jobs count toward the token's
-`--max-sandboxes`.
+of output. A schedule never runs two at once, and unfinished jobs (`pending`, `running`,
+`cancelling`, `lost`) count toward the token's `--max-sandboxes`. A job on a node that
+stops heartbeating is `lost` until the node answers again or `rekcod node rm` removes it,
+and its schedule waits for it. `job cancel` returns `cancelling`; the job is `cancelled`
+once its node confirms the command is gone.
 
 Point a GitHub webhook (pull_request events, the secret in `controller/webhook-secret`) at
 `/webhooks/github` and each PR gets `<app>-pr-<n>`, deleted when it closes or after 7 days.
-`rekcod node` replaces `docker node` here; use `rekcod docker node` for swarm.
+An existing app of that name that isn't a preview of `<app>` is left alone and the delivery
+fails. `rekcod node` replaces `docker node` here; use `rekcod docker node` for swarm.
 
 ### S3 storage
 
@@ -600,7 +634,9 @@ bucket = true
 Its instances get `S3_ENDPOINT`, `S3_BUCKET` (`app-<name>`), `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY` and `AWS_REGION=us-east-1`. The key only works on that bucket. The
 endpoint takes path-style requests, so set `forcePathStyle: true` in the AWS SDK. PR
-previews get their own empty bucket, deleted with the preview.
+previews get their own empty bucket, deleted with the preview. Destroying the app revokes
+its key and policy first, then deletes the bucket and its stored images; the app's name
+stays taken until all of that has worked.
 
 ```sh
 rekcod app storage dash              # endpoint, bucket, key, object count and bytes
@@ -621,6 +657,9 @@ rekcod controller backup             # one now
 rekcod controller backups
 rekcod controller restore            # stop the controller first; the latest unless you name one
 ```
+
+Restore checks the download first. An empty, damaged or non-fleet file is refused and
+`fleet.db` stays as it was; otherwise the old file is kept as `fleet.db.before-restore-<time>`.
 
 For local development, `rekcod storage up` runs RustFS in the VM on a free port from 9000
 (it never touches whatever has 9000) and prints the env block; `storage env` prints it again
@@ -648,13 +687,13 @@ after boot, or after the file changes on the Mac. How it works: [`docs/phase2.md
 | `rekcod start [--cpus N] [--memory GiB] [--base-memory GiB] [--disk GiB] [--no-switch]` | Boot the VM, create and select the `rekcod` docker context. `--cpus` defaults to the Mac's performance cores (at least 4); `--base-memory` is how much of `--memory` is RAM, the rest being elastic memory macOS gets back (default half, at least 4 GiB; all RAM before macOS 27); `--disk` (default 256, sparse) grows the data disk, never shrinks it. The values are saved in `~/.rekcod/config.json` and reused when the menu bar or a docker command boots the VM |
 | `rekcod start --install\|--uninstall` | Start the VM at login and boot it again if it stops without `rekcod stop` (LaunchAgent `dev.rekcod.vm`) |
 | `rekcod start --network auto\|user\|nat` | How the VM reaches the network. `nat` is Virtualization.framework's NAT; `user` makes rekcod open the connections itself, which full-tunnel VPNs (Mullvad and others) don't drop; `auto`, the default, picks `user` while the Mac's default route goes through a VPN tunnel. Saved; `rekcod status --json` shows which is in use |
-| `rekcod start --repair` | When the VM won't start because its data disk has errors: `e2fsck -fy` on it and a fresh root disk, then boot. The data disk is never formatted unless it's blank |
+| `rekcod start --repair` | When the VM won't start because its data disk has errors: `e2fsck -fy` on it and a fresh root disk, then boot. The data disk is never formatted; only one rekcod just created and dockerd never used is |
 | `rekcod stop [--no-switch] [--force]` | Graceful power-off, restore the previous context. `--force` powers off a hung VM right away |
 | `rekcod status [--json]` | Versions, VM size, forwarded ports (and any that couldn't be bound), data-disk use in the VM and on the Mac, file-cache trips to macOS, warming in progress, the sandbox VM. `--json` is the scriptable form |
 | `rekcod snap save\|restore\|ls\|rm [NAME] [-p PROJECT] [--push\|--pull]` | Volume snapshots of a compose project, optionally through S3 (above) |
 | `rekcod x [--sandbox] [--image IMG] [-p PORT] <command>` | Run a command in a container, no Dockerfile (above) |
 | `rekcod sandbox create\|exec\|shell\|cp\|fork\|diff\|apply\|ports\|log\|ls\|stop\|rm\|serve\|golden` | Agent sandboxes (above) |
-| `rekcod mcp [--root DIR] [--allow-host H] [--secret NAME] [--allow-mount]` | MCP server on stdio for the sandbox commands; the flags fix what callers may ask for |
+| `rekcod mcp [--root DIR] [--allow-host H] [--secret NAME] [--allow-mount] [--allow-macos]` | MCP server on stdio for the sandbox commands; the flags fix what callers may ask for and which sandboxes they reach |
 | `rekcod macos fetch\|install\|setup\|authorize\|ls\|rm` | macOS base images for `sandbox create --os macos` |
 | `rekcod sandbox screenshot\|input` | Screen and mouse/keyboard of a macOS sandbox |
 | `rekcod remote add NAME URL --token T [--ca-fingerprint FP]\|ls\|rm\|use` | Fleet controllers this CLI talks to (`--remote` on `sandbox` and `app`); `use` sets the default |

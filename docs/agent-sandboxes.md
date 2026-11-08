@@ -141,16 +141,37 @@ works when the guest is stopped. It skips VM-local paths (`node_modules`, `.venv
 - Both freeze `ws/` first (an APFS clone, taken with the workspace container paused), so a
   process still running in the sandbox can't change what's compared or written. `diff`
   keeps its frozen copy in `<sandbox>/reviewed`, and `apply --reviewed` writes exactly that
-  copy. Plain `apply` freezes the workspace as it is at that moment.
+  copy. Plain `apply` freezes the workspace as it is at that moment. The copy is cloned
+  under a temporary name and renamed into place, and nothing writes into it after that.
+- `diff`, `apply` and copying a macOS guest's workspace back hold the sandbox's lock
+  (`<sandbox>/review.lock`). A `diff` started while `apply --reviewed` runs waits for it
+  instead of rebuilding the copy being written.
 - Before writing, it refuses if any of those files changed in the real project since the
-  copy. Create records kind, size and mtime (ns) of every project file in
-  `manifest.json`; a path whose state differs now is a conflict, including a file moved in
-  with an old mtime. Each apply updates the manifest for what it wrote.
+  copy. Create records kind, size, mtime (ns) and mode of every project file, symlink and
+  directory in `manifest.json`; a path whose state differs now is a conflict, including a
+  file moved in with an old mtime and a `chmod` on the Mac. Each apply updates the
+  manifest for what it wrote. A mode change in the workspace is applied like a content
+  change.
 - Every write goes through a directory fd opened component by component with
-  `O_NOFOLLOW` (`safefs.rs`). A symlink on the way makes the write fail, a symlink at the
-  destination is replaced rather than written through, and a new symlink must point
-  inside the project. Setuid, setgid and sticky bits are dropped.
-- It never writes `.git/`. FIFOs, sockets and devices are left out of the comparison.
+  `O_NOFOLLOW` (`safefs.rs`), and so does every read from the frozen copy. A symlink on
+  the way makes the call fail, so a directory swapped for a link in the copy is never read
+  through, and a symlink at the destination is replaced rather than written through.
+  Setuid, setgid and sticky bits are dropped.
+- Symlinks are resolved link by link against the project as apply will leave it, links
+  under `node_modules` and the other skipped directories included. A link whose chain
+  leaves the project or reaches `.git` is refused: `b -> .` with `leak -> b/../outside`
+  fails although each looks fine alone, whether they arrive in one apply or two. A link
+  the project already had that already left it before the apply is the Mac user's own and
+  stays.
+- It never compares or writes `.git`, under any spelling the Mac may take for it: case is
+  ignored (`.GIT`, `.Git`), and so are the code points HFS+ drops from names, as git's own
+  check does. Writes that reach the project's real `.git` by device and inode are refused
+  too, whatever the name.
+- A directory the workspace replaced with a file or symlink is applied: deletions go first,
+  then the emptied directory is removed. That's a conflict only if something under it
+  changed on the Mac. A directory holding anything apply doesn't delete (`node_modules`, a
+  FIFO) is refused before anything is written.
+- FIFOs, sockets and devices are left out of the comparison.
 - `diff` replaces control characters with `^X` text, so escape sequences in the sandbox's
   files can't hide lines from you in a terminal.
 - `--check` prints what would change and exits 1 if anything would.
@@ -215,11 +236,27 @@ rekcod sandbox serve --root ~/src/app        # creates only for ~/src/app and be
 rekcod mcp --allow-host api.openai.com       # a host callers may add to the allowlist ('*' allows any)
 rekcod mcp --secret NPM_TOKEN                # a variable callers may pass in with "secrets"
 rekcod mcp --allow-mount                     # lets callers ask for a live read-write share
+rekcod mcp --allow-macos                     # lets callers create macOS guests, whose network isn't filtered
 ```
 
-A request outside those gets a 400 that names the flag. `git` sources (`{"git": {"url",
-"ref"}}`) are only for fleet nodes; `serve` and `mcp` refuse them, since the Mac would fetch
-from the URL before any sandbox exists. `exec` takes `env` only as
+A request outside those gets a 400 that names the flag. The same flags decide which
+existing sandboxes callers reach, so one made from the CLI or by another server is
+covered too. `list` shows only sandboxes this server could have created: a project under
+a `--root`, and no live mount, secret, allowed host, open network, `reach` or macOS guest
+beyond its flags. Every other operation checks the same before it acts, streamed `exec`
+included. A sandbox for another project, or one a fleet node made, answers 404 as if it
+didn't exist; one under a root with more than the flags allow answers 403 naming the flag:
+
+```
+$ curl --unix-socket ~/.rekcod/run/sandbox.sock -X POST localhost/sandboxes/aaaaaaaa/apply
+{"error":"sandbox aaaaaaaa isn't allowed here: it has secret TOKEN; start the server with --secret TOKEN"}
+```
+
+`git` sources (`{"git": {"url", "ref"}}`) are only for fleet nodes; `serve` and `mcp`
+refuse them, since the Mac would fetch from the URL before any sandbox exists. The node's
+own routes (`/instances`, `/jobs`, `/sandboxes/{id}/logs`) exist only on `rekcod node
+serve`, which reaches only the sandboxes the fleet made; `sandbox serve` answers 404 for
+them. `exec` takes `env` only as
 `KEY=VALUE`; a bare `KEY` would make docker copy the value from the server's own
 environment. The token is checked before the body is read. Request lines and headers are
 capped at 16 KiB and 100 headers, bodies at 64 MiB, a peer gets 30 s to send its request,
@@ -399,4 +436,5 @@ Where the code differs from the spec above:
 - **`diff` skips `.git`, `node_modules`, `.venv` and `target`**, and compares content, so
   a file touched without changes doesn't show up. `apply`'s conflict check compares each
   path's state with the manifest taken at create (sandboxes made before the manifest fall
-  back to mtime against creation).
+  back to mtime against creation; manifests from before modes and directories were
+  recorded are compared on what they have).

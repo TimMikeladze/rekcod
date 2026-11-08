@@ -78,3 +78,14 @@ export function spawnStream(a: Action) {
 export function spawnRekcod(argv: string[], cwd?: string) {
   return spawn(/*turbopackIgnore: true*/ BIN, argv, { cwd, stdio: ["ignore", "pipe", "pipe"] })
 }
+
+/**
+ * A background follower (`events`, `stats`). These are docker passthrough commands, which
+ * boot a stopped VM; with REKCOD_NO_BOOT they exit instead, so a follower restarted on a
+ * stale "running" state can't start a VM that was just stopped.
+ */
+export function spawnWatcher(argv: string[]) {
+  return spawn(/*turbopackIgnore: true*/ BIN, argv, { env: watcherEnv(), stdio: ["ignore", "pipe", "pipe"] })
+}
+
+export const watcherEnv = (): NodeJS.ProcessEnv => ({ ...process.env, REKCOD_NO_BOOT: "1" })

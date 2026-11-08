@@ -44,7 +44,7 @@ accept (one tokio task per connection, at most 10 000)
        Host -> Route (2 s refresh from GET /routes; the public listener only sees public apps)
        edge-wide and per-app buckets             limit.rs   -> 429 + Retry-After
        Content-Length over max_body              -> 413 (a chunked body: cut at the limit, then 413)
-       no endpoints? wake the app (POST /ns/NS/apps/APP/wake), as before
+       no endpoints? wake the app (POST /ns/NS/apps/APP/wake), one wake per host at a time
        lease a connection                        balance.rs -> 503 when none answers
        send, 60 s for the response headers       -> 504 / 502
        --access-log: one stderr line per request
@@ -56,6 +56,11 @@ stripped and `Host` is kept (from `:authority` for h2 clients). `X-Forwarded-For
 the client IP, or appended to when trusted, with `X-Forwarded-Proto: http` and an
 `X-Request-Id` if the client sent none. From an untrusted peer `CF-Connecting-IP` is removed,
 so an app can't be fooled by a header the client wrote.
+
+Requests for a sleeping app wait on one wake per host and use the endpoints it returns. A
+failed wake makes the edge answer 503 for that host for 30 s without asking the controller
+again, and the requests that were waiting on the failed wake get the 503 too instead of
+each starting another one.
 
 ## Load balancing
 

@@ -21,6 +21,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { useRouter } from "next/navigation";
+import { api } from "@/lib/api";
 import { DESTRUCTIVE, STREAMED } from "@/lib/kinds";
 import type { Action } from "@/lib/types";
 import { Loader2, MoreHorizontal } from "lucide-react";
@@ -40,7 +41,7 @@ type RunResult = { ok: boolean; out: string; activity?: number };
 /** POST /api/run; the server checks the argv against what `rekcod state` offers now. */
 async function post(a: Action, subject: string): Promise<RunResult> {
   try {
-    const r = await fetch("/api/run", {
+    const r = await api("/api/run", {
       method: "POST",
       headers: { "content-type": "application/json", "x-rekcod": "1" },
       body: JSON.stringify({ argv: a.argv, subject }),

@@ -564,6 +564,10 @@ struct ApiPolicyArgs {
     /// An environment variable callers may pass into a sandbox with `secrets` (repeatable).
     #[arg(long = "secret", value_name = "NAME")]
     secrets: Vec<String>,
+    /// Let callers create and use macOS sandboxes. Their network isn't filtered: they reach
+    /// the internet, the Mac and the LAN.
+    #[arg(long)]
+    allow_macos: bool,
 }
 
 impl ApiPolicyArgs {
@@ -578,7 +582,14 @@ impl ApiPolicyArgs {
         {
             eprintln!("rekcod: warning: a --root includes your whole home directory");
         }
-        Ok(sandbox_api::Policy { roots, mount: self.allow_mount, allow_hosts: self.allow_hosts, secrets: self.secrets })
+        Ok(sandbox_api::Policy {
+            roots,
+            mount: self.allow_mount,
+            allow_hosts: self.allow_hosts,
+            secrets: self.secrets,
+            macos: self.allow_macos,
+            node: false,
+        })
     }
 }
 
@@ -1679,7 +1690,7 @@ fn run_job(paths: &paths::Paths, remote: &Option<String>, c: JobCmd) -> anyhow::
                 let log = j["log"].as_str().unwrap_or("");
                 print!("{}", new_output(&shown, log));
                 shown = log.to_string();
-                if j["state"] != "running" {
+                if !fleet::job_active(j["state"].as_str().unwrap_or("")) {
                     let exit = j["exit"].as_i64().unwrap_or(1);
                     eprintln!("rekcod: job {id} {} (exit {exit})", j["state"].as_str().unwrap_or(""));
                     std::process::exit(exit as i32);
@@ -1700,7 +1711,7 @@ fn run_job(paths: &paths::Paths, remote: &Option<String>, c: JobCmd) -> anyhow::
                 print!("{}", new_output(&shown, log));
                 std::io::stdout().flush()?;
                 shown = log.to_string();
-                if !follow || j["state"] != "running" {
+                if !follow || !fleet::job_active(j["state"].as_str().unwrap_or("")) {
                     return Ok(());
                 }
                 std::thread::sleep(std::time::Duration::from_secs(2));

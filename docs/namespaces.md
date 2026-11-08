@@ -77,10 +77,14 @@ missing app, sandbox or job is `no app X` and so on.
 
 ## Quotas
 
-`check_quota` runs before a sandbox, job or fork starts, and in `upsert_app` before a
-deploy or scale. Usage counts:
-- apps with a live release, at `instances * cpus` and `instances * memory_gib`. Sleeping
-  apps count, so a wake never fails on quota. A redeploy replaces the app's own share.
+`check_quota` runs before a sandbox, job or fork starts. App creates and updates
+(`upsert_app`), scales and deploys of a ref (`admit`) check and record in one transaction
+under the namespace's quota lock, the `max_apps` count included, and add one to the app's
+`deploying` until that deploy ends. Usage counts:
+- apps with a live release or a deploy in progress (`deploying > 0`), at
+  `instances * cpus` and `instances * memory_gib`. Sleeping apps count, so a wake never
+  fails on quota. A redeploy replaces the app's own share. A first deploy that fails gives
+  the share back; a controller restart resets `deploying`. Apps being destroyed don't count.
 - running sandboxes (not app instances), at their `cpus`/`memory_gib`
 - running jobs, at their spec's `cpus`/`memory_gib`
 
@@ -107,8 +111,12 @@ capacity still applies: placement needs a node with the memory free.
   Guests were already kept off the LAN by their egress rules.
 - **Secrets.** AES-256-GCM, values stored as `sealed1:<hex nonce+ciphertext>`. The key is
   HMAC-SHA256 of `controller/secret-key` (32 bytes, a file next to `fleet.db`, not inside
-  it) and the namespace's salt. Deleting a namespace deletes the salt, so a backup row from
-  it can't be opened. Plain secrets from before this are sealed when the controller starts.
+  it) and the namespace's salt. Deleting a namespace deletes its salt from `fleet.db`, so
+  the controller can't open that namespace's sealed values any more. Backups taken before
+  the delete still hold the salt and the sealed values, and with `controller/secret-key`
+  they decrypt. To get rid of those secrets for good, change them where they're issued
+  and delete the older backups (`rekcod-backups`, `--backup-dir`). Plain secrets from
+  before this are sealed when the controller starts.
 - **Node pools.** A namespace with a pool is placed only on its pool, and other namespaces
   never land on pooled nodes.
 

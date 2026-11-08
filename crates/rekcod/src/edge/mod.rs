@@ -187,11 +187,14 @@ impl Edge {
         self.limits.prune();
     }
 
+    fn backing_off(&self, host: &str) -> bool {
+        self.wake_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).is_some_and(|t| t.elapsed() < WAKE_BACKOFF)
+    }
+
     /// Asks the controller to wake the app and waits (up to its health timeout, or a rebuild).
     async fn wake(&self, host: &str, route: &Route) -> Vec<String> {
         let Some(r) = self.remote.clone() else { return vec![] };
-        if self.wake_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).is_some_and(|t| t.elapsed() < WAKE_BACKOFF)
-        {
+        if self.backing_off(host) {
             return vec![];
         }
         let lock = self.waking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(host.to_string()).or_default().clone();
@@ -201,6 +204,10 @@ impl Edge {
             && !eps.is_empty()
         {
             return eps;
+        }
+        // Or their wake failed while we waited: the backoff covers us too.
+        if self.backing_off(host) {
+            return vec![];
         }
         let ns = if route.ns.is_empty() { "default".to_string() } else { route.ns.clone() };
         let app = route.app.clone();
@@ -775,6 +782,57 @@ mod tests {
         let mut status = String::new();
         s.read_line(&mut status).await.unwrap();
         assert!(status.starts_with("HTTP/1.1 413"), "{status}");
+    }
+
+    #[tokio::test]
+    async fn a_burst_during_a_failed_wake_asks_the_controller_once() {
+        let controller = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", controller.local_addr().unwrap());
+        let wakes = Arc::new(AtomicU64::new(0));
+        let w = wakes.clone();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = controller.accept().await.unwrap();
+                let w = w.clone();
+                tokio::spawn(async move {
+                    let mut r = BufReader::new(s);
+                    let mut first = String::new();
+                    r.read_line(&mut first).await.unwrap();
+                    let mut line = String::new();
+                    while line != "\r\n" {
+                        line.clear();
+                        r.read_line(&mut line).await.unwrap();
+                    }
+                    if first.contains("/wake") {
+                        w.fetch_add(1, Ordering::SeqCst);
+                    }
+                    // A slow failure, so the burst queues behind it.
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    let body = r#"{"error":"build failed"}"#;
+                    let resp =
+                        format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = r.get_mut().write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        let remote = Remote { url, token: "t".into(), ns: None, ca: None };
+        let edge = Edge::new(Some(remote), fast());
+        edge.table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("a.test".into(), Route { app: "a".into(), sleeping: true, ..route(&[], false) });
+        let addr = edge_on(&edge, Listener::default()).await;
+        let burst: Vec<_> = (0..8)
+            .map(|_| {
+                let addr = addr.clone();
+                tokio::spawn(async move { get(&mut dial(&addr).await, "a.test", "").await.0 })
+            })
+            .collect();
+        for r in burst {
+            assert_eq!(r.await.unwrap(), 503);
+        }
+        assert_eq!(get(&mut dial(&addr).await, "a.test", "").await.0, 503);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

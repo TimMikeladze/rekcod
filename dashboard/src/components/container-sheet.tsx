@@ -12,6 +12,7 @@ import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Check, Copy } from "lucide-react"
 import { useDash } from "@/hooks/dash-context"
+import { api } from "@/lib/api"
 import { ago } from "@/lib/format"
 
 /** The parts of `docker inspect` the sheet shows. */
@@ -126,7 +127,7 @@ export function ContainerDetail({ name }: { name: string }) {
 
   useEffect(() => {
     let stop = false
-    fetch(`/api/inspect?name=${encodeURIComponent(name)}`, { cache: "no-store" })
+    api(`/api/inspect?name=${encodeURIComponent(name)}`)
       .then(async (r) => {
         const body = await r.json().catch(() => ({ error: r.statusText }))
         if (stop) return

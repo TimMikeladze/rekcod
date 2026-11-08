@@ -76,6 +76,8 @@ positionals, `protocol.file.allow=never` (S1). Apply query params before the pat
 let them set `id` (S2). Whitelist create fields on the controller and validate `golden` as
 `[a-z0-9-]+` (S3, also locally). Per-launch dashboard token in a 0600 file, required on every
 `/api` route as a SameSite=Strict cookie, and `reverse_pool` refuses the dashboard's port (S4).
+The cookie was later replaced by a bearer header, since cookies reach other localhost ports
+([audit-2026-11-07.md](audit-2026-11-07.md) S1).
 Open destinations with `O_NOFOLLOW` under a project dir fd, refuse symlinks that leave the
 project, apply from a frozen snapshot of `ws/` (S5). Fix the policy at `serve`/`mcp` start
 (S6). `--cap-drop ALL`, no host network, long term enforce on the Mac side (S7). Require

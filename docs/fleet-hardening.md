@@ -29,6 +29,12 @@ comes from `docs/production-readiness.md` sections 4, 5 and 8. Section 1 (git in
 - Placement trusts `mem_free` only up to the `mem_total` the node sent at join.
 - Nodes build endpoints from the host in `--advertise`, never from the listen address, so
   `--listen 0.0.0.0:7701 --advertise http://mac2:7701` works.
+- A node reads the files of a cloned repo on the Mac (`rekcod.toml`, the version files
+  runtime detection looks at) only as regular files directly in the checkout, without
+  following a symlink and at most 1 MiB each. A `rekcod.toml` that's a link fails the
+  deploy; a version file that's a link is skipped. The generated Dockerfile is created
+  new (`O_EXCL`, `O_NOFOLLOW`), and a checkout with anything named `Dockerfile`, even a
+  dangling link, gets none: `docker build` keeps a linked Dockerfile inside the context.
 
 ## Secrets on the wire
 
@@ -43,6 +49,44 @@ comes from `docs/production-readiness.md` sections 4, 5 and 8. Section 1 (git in
 - `X-GitHub-Delivery` ids are kept for 24 h; a repeat is ignored.
 - `closed` only destroys apps whose `preview_of` matches, never a real app with that name.
 - Pull requests from forks don't deploy unless the PR has the `rekcod-preview` label.
+- `opened`, `synchronize`, `reopened` and `labeled` act with admin rights, so `upsert_app`
+  only takes `<app>-pr-<n>` when no app has that name or it's already `preview_of` that
+  base app; otherwise the delivery fails and the other app, its secrets included, is left
+  as it was. The check and the write are one transaction, under the preview's app lock
+  through to the deploy.
+
+## Apps
+
+- Each app row has a `generation`, a counter value from `config` (`app_generation`)
+  that's new when the row is made and again when its destroy begins. A deploy, top-up or
+  wake compares the generation it loaded with the row after it takes the app lock, again
+  in the transaction that registers each instance, and again in the one that makes the
+  release live. On a mismatch it stops: an instance the node just started is deleted on
+  the node without being recorded. A deploy that started for an app that was destroyed
+  and made again by someone else can't put its VM into the new app's routes.
+- Destroy sets `destroying` and a new generation first, which hides the app from routes,
+  lists, quota, reconcile, idle stop and recycling, and keeps the name from being deployed.
+  Then it takes the app lock, so it runs after a deploy in flight (which stops at its next
+  check), deletes the instances, then storage (docs/rustfs.md), then the rows, kept logs
+  and traffic. When storage cleanup fails the row stays `destroying`, the request fails
+  with the reason, and the reconcile loop retries once a minute. The row is removed only
+  for the generation that destroy marked, so a second destroy or a retry never removes an
+  app someone made of that name afterwards. A controller started without `--storage`
+  can't reach RustFS: it finishes the destroy and notes the app's key and bucket in
+  `leftover_storage`, which a controller with storage removes on its next retry; that
+  bucket name isn't handed out before then.
+- Jobs marked `lost` by a controller from before this change (they got `finished`) are
+  ended as `failed` by a migration, so they don't hold quota or a schedule's turn.
+- Schedules are checked like one-off jobs when they're made (`cmd`, `git.url`, `cpus`,
+  `memory_gib`), rather than failing at every run.
+- Spec fields are checked before anything is stored: `instances` 1 to 100, `cpus` 1 to
+  64, `memory_gib` 1 to 512, `port` 0 (rekcod.toml decides) or 1 to 65535,
+  `idle_stop_secs` and `recycle_secs` 0 or more, `rollback`'s release a 32-bit number.
+  Zero, negatives, fractions and strings are refused rather than narrowed. Quota sums
+  saturate instead of wrapping. Remote sandbox creates get the same `cpus` and
+  `memory_gib` ranges.
+- Admission (docs/namespaces.md, "Quotas") covers creates, updates, scales and deploys of
+  a ref; an admitted deploy holds its share until it ends.
 
 ## Convergence
 
@@ -57,13 +101,20 @@ actual state toward it. A `reconcile` pass runs every 10 s and on startup:
   node doesn't have are marked `lost`; sandboxes the node has that the controller doesn't
   know about (older than 10 minutes) are deleted.
 - Startup sweep: releases stuck in `building` become `failed`, `starting` instances are
-  deleted, `draining` ones are deleted after the drain time, jobs whose node doesn't know
-  them become `lost`.
+  deleted, `draining` ones are deleted after the drain time.
 - The first lost-node check waits one heartbeat interval after startup.
 - Nodes boot their instance VMs again when they start (`node serve` walks its sandboxes
   that hold an `instance.json` and starts them plus their relays).
-- Jobs a node lost (no `result.json`, no running thread) are reported failed on the next
-  `job_get`; the controller stops counting them against quota.
+- Jobs are stored as `pending` before a node hears of them, and starts are idempotent by
+  job ID, so a lost reply is sent again instead of leaving a job nobody tracks. A job whose
+  node goes quiet is `lost`, not over: it keeps its quota and its schedule's turn until the
+  node reports it finished or `node rm` removes the node. Cancel stays `cancelling` until
+  the node confirms. Details in [`fleet-compute.md`](fleet-compute.md#jobs).
+- `node serve` removes job sandboxes (marked `fleet-job`) that no job thread of its own
+  runs, at startup and hourly. Their jobs (no `result.json`, no running thread) are
+  reported failed on the next `job_get`.
+- A node that answers it doesn't have a job ends it: `failed`, or `cancelled` if a cancel
+  was waiting.
 - Deploys hold the app lock for their whole run. Release numbers are allocated inside one
   transaction.
 
@@ -89,7 +140,11 @@ actual state toward it. A `reconcile` pass runs every 10 s and on startup:
 
 - `PRAGMA user_version` numbers migrations; a migration that fails stops startup.
 - Backups run `VACUUM INTO` on a separate connection, outside the main lock.
-- `controller restore` marks every instance `lost` so the first reconcile checks them.
+- `controller restore` checks the download before it replaces anything: it opens it
+  read-only, without creating or migrating a schema, and refuses an empty file, one that
+  fails `PRAGMA integrity_check`, a schema newer than this rekcod, or one without the fleet
+  tables and a join token (a database no controller ran on). Then it marks every instance
+  `lost` so the first reconcile checks them.
 
 ## Operations
 
@@ -116,8 +171,17 @@ clients, including newer Python/OpenSSL versions. Existing CA keys and fingerpri
 Two CAs: `ca.pem` signs only the controller's certificate and is what CLIs and edges pin;
 `node-ca.pem` signs node certificates and only the controller trusts it, so a node (which
 gets its certificate at registration, before approval) can't pass for the controller. A
-node can't register the controller's own names or an address another node holds, and at
-most 20 nodes wait for approval at once. App instance sandboxes are reachable only through
+node's certificate names the node, `<node id>.node.rekcod.invalid`, not the host it
+advertised, and the controller expects that name from the node it dials. Several nodes
+can share a host (`scripts/e2e-fleet.sh` runs three on 127.0.0.1), and a join-token holder
+who registers another port on a node's host gets a certificate that only passes for its
+own node ID. Nodes that joined before this hold a certificate for their host; the
+controller accepts that only from the nodes it had the first time it started with node
+names (the `host_named_nodes` row in `config`), until they join again. A node can't
+register the controller's own names or an address another node holds, and at most 20
+nodes wait for approval at once. Registration checks the URL (`scheme://host:port`),
+zone and memory and issues the certificate before it stores the node, so a refused one
+leaves no row. App instance sandboxes are reachable only through
 their app, never through `/sandboxes/ID`. Edges report traffic and wake apps for every
 app, by design: an edge token is trusted for that.
 

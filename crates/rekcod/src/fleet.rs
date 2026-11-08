@@ -375,9 +375,27 @@ pub fn mark_fleet(paths: &Paths, id: &str) {
     }
 }
 
+/// In a job's sandbox home: the job's ID. Job sandboxes aren't fleet-marked (the controller
+/// tracks jobs, not their sandboxes); `node serve` removes the ones no job thread runs.
+pub const JOB_MARKER: &str = "fleet-job";
+
+/// A job this node process runs. `job_cancel` sets `cancelled`; the job thread checks it
+/// before each step and registers what a cancel has to stop.
+#[derive(Default)]
+struct JobRun {
+    cancelled: bool,
+    sandbox: Option<String>,
+    /// The command's process until it's reaped, so a kill never reaches a reused pid.
+    pid: Option<i32>,
+}
+
 /// Jobs this node process is running; one without a result and not in here died with an
 /// earlier node process.
-static RUNNING_JOBS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static JOBS: Mutex<std::collections::BTreeMap<String, JobRun>> = Mutex::new(std::collections::BTreeMap::new());
+
+fn jobs() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, JobRun>> {
+    JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn free_port() -> Result<u16> {
     Ok(TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
@@ -449,15 +467,41 @@ pub fn parse_toml(text: &str) -> HashMap<String, String> {
     out
 }
 
+/// A checkout's `rekcod.toml`, read on the Mac without following links.
+fn checkout_toml(dir: &Path) -> Result<HashMap<String, String>> {
+    Ok(parse_toml(&crate::xrun::read_project_file(dir, "rekcod.toml")?.unwrap_or_default()))
+}
+
+/// Writes a generated Dockerfile into a checkout that has nothing named `Dockerfile`. A
+/// link there, dangling or not, is left for `docker build`, which keeps it inside the
+/// build context; the file is created new and never through a link.
+fn ensure_dockerfile(dir: &Path, start: Option<&str>) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    if std::fs::symlink_metadata(dir.join("Dockerfile")).is_ok() {
+        return Ok(());
+    }
+    let start = start.ok_or_else(|| anyhow!("no Dockerfile and no start command in rekcod.toml"))?;
+    let text = generated_dockerfile(dir, start)?;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("Dockerfile"))
+        .context("create Dockerfile")?;
+    f.write_all(text.as_bytes())?;
+    Ok(())
+}
+
 /// A Dockerfile for a repo without one: the `rekcod x` image plus the start command.
 pub fn generated_dockerfile(dir: &Path, start: &str) -> Result<String> {
     let cmd: Vec<String> = start.split_whitespace().map(String::from).collect();
     let plan = crate::xrun::plan(dir, &cmd).ok_or_else(|| anyhow!("no Dockerfile, and can't tell which runtime `{start}` needs"))?;
-    let install = if dir.join("package-lock.json").exists() {
+    let has = |n: &str| crate::xrun::has_project_file(dir, n);
+    let install = if has("package-lock.json") {
         "RUN npm ci\n"
-    } else if dir.join("package.json").exists() {
+    } else if has("package.json") {
         "RUN npm install\n"
-    } else if dir.join("requirements.txt").exists() {
+    } else if has("requirements.txt") {
         "RUN pip install --no-cache-dir -r requirements.txt\n"
     } else {
         ""
@@ -654,15 +698,13 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
             eprintln!("rekcod: {app} r{release}: cloning {url}");
             let dir = clone(paths, url, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
             // The commit's own rekcod.toml fills in whatever the deploy didn't set.
-            let toml = parse_toml(&std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default());
+            let toml = checkout_toml(&dir)?;
             (dir, toml)
         }
     };
     let port = a["port"].as_u64().filter(|p| *p > 0).or_else(|| toml.get("app.port").and_then(|p| p.parse().ok())).unwrap_or(3000) as u16;
-    if stored.is_none() && !dir.join("Dockerfile").exists() {
-        let start = a["start"].as_str().or(toml.get("app.start").map(String::as_str));
-        let start = start.ok_or_else(|| anyhow!("no Dockerfile and no start command in rekcod.toml"))?;
-        std::fs::write(dir.join("Dockerfile"), generated_dockerfile(&dir, start)?)?;
+    if stored.is_none() {
+        ensure_dockerfile(&dir, a["start"].as_str().or(toml.get("app.start").map(String::as_str)))?;
     }
     let mut env: serde_json::Map<String, Value> =
         toml.iter().filter_map(|(k, v)| k.strip_prefix("env.").map(|k| (k.to_string(), json!(v)))).collect();
@@ -777,28 +819,80 @@ fn job_dir(paths: &Paths, id: &str) -> Result<PathBuf> {
     Ok(paths.home.join("jobs").join(id))
 }
 
+/// What a job does to the node: clone, make and run a sandbox, remove it. Tests swap in
+/// stubs to drive cancellation through every step without git or a VM.
+trait JobHost: Send + Sync {
+    fn clone(&self, url: &str, rev: &str) -> Result<PathBuf>;
+    /// Creates the job's sandbox and marks it with `job`; returns its ID.
+    fn create(&self, job: &str, o: sandbox::CreateOptions) -> Result<String>;
+    fn exec(&self, sb: &str, o: &sandbox::ExecOptions, cmd: &[String]) -> Result<Command>;
+    fn remove(&self, sb: &str);
+}
+
+struct NodeHost(Paths);
+
+impl JobHost for NodeHost {
+    fn clone(&self, url: &str, rev: &str) -> Result<PathBuf> {
+        clone(&self.0, url, rev)
+    }
+    fn create(&self, job: &str, o: sandbox::CreateOptions) -> Result<String> {
+        let meta = sandbox::create(&self.0, o)?;
+        if let Ok(h) = sandbox::home(&self.0, &meta.id) {
+            let _ = std::fs::write(h.join(JOB_MARKER), job);
+        }
+        Ok(meta.id)
+    }
+    fn exec(&self, sb: &str, o: &sandbox::ExecOptions, cmd: &[String]) -> Result<Command> {
+        sandbox::exec_cmd(&self.0, sb, o, cmd)
+    }
+    fn remove(&self, sb: &str) {
+        let _ = sandbox::rm(&self.0, &[sb.to_string()], false);
+    }
+}
+
+/// Written whole or not at all: the controller may read it at any moment.
+fn write_result(dir: &Path, v: &Value) -> Result<()> {
+    let tmp = dir.join("result.json.tmp");
+    std::fs::write(&tmp, v.to_string())?;
+    Ok(std::fs::rename(&tmp, dir.join("result.json"))?)
+}
+
 /// Node op: runs a job in a new sandbox in the background. Output goes to
 /// `jobs/ID/log`, the outcome to `jobs/ID/result.json`; the sandbox is removed after.
+/// Starting an ID this node already has (the controller's first request lost its reply,
+/// or a cancel got there first) starts nothing.
 pub fn run_job(paths: &Paths, a: &Value) -> Result<Value> {
+    run_job_on(Arc::new(NodeHost(paths.clone())), paths, a)
+}
+
+fn run_job_on(host: Arc<dyn JobHost>, paths: &Paths, a: &Value) -> Result<Value> {
     let id = a["id"].as_str().context("missing id")?.to_string();
     let dir = job_dir(paths, &id)?;
-    std::fs::create_dir_all(&dir)?;
+    std::fs::create_dir_all(dir.parent().context("no jobs directory")?)?;
+    {
+        let mut j = jobs();
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(json!({"started": id, "again": true})),
+            Err(e) => return Err(e.into()),
+        }
+        j.insert(id.clone(), JobRun::default());
+    }
     let started = id.clone();
-    let (paths, a) = (paths.clone(), a.clone());
-    RUNNING_JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(id.clone());
+    let a = a.clone();
     std::thread::spawn(move || {
         struct Done(String);
         impl Drop for Done {
             fn drop(&mut self) {
-                RUNNING_JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|j| *j != self.0);
+                jobs().remove(&self.0);
             }
         }
         let _done = Done(id.clone());
         let t0 = Instant::now();
         let log = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("log"));
-        let r = log.map_err(anyhow::Error::from).and_then(|log| job_body(&paths, &id, &a, &dir, log));
+        let r = log.map_err(anyhow::Error::from).and_then(|log| job_body(host.as_ref(), &id, &a, log));
         let timeout = a["timeout_secs"].as_u64();
-        let cancelled = dir.join("cancelled").exists();
+        let cancelled = jobs().get(&id).is_some_and(|j| j.cancelled);
         let result = match r {
             // `timeout -s KILL` in the container exits 137; report the conventional 124.
             Ok(code) if code != 0 && timeout.is_some_and(|t| t0.elapsed().as_secs() >= t) && !cancelled => {
@@ -813,21 +907,36 @@ pub fn run_job(paths: &Paths, a: &Value) -> Result<Value> {
         let mut result = result;
         result["cancelled"] = json!(cancelled);
         result["ms"] = json!(t0.elapsed().as_millis() as u64);
-        let _ = std::fs::write(dir.join("result.json"), result.to_string());
+        let _ = write_result(&dir, &result);
     });
     Ok(json!({"started": started}))
 }
 
-fn job_body(paths: &Paths, id: &str, a: &Value, dir: &Path, log: std::fs::File) -> Result<i32> {
+/// Fails once the job is cancelled.
+fn cancel_point(id: &str) -> Result<()> {
+    if jobs().get(id).is_some_and(|j| j.cancelled) {
+        bail!("cancelled before the command started");
+    }
+    Ok(())
+}
+
+fn job_body(host: &dyn JobHost, id: &str, a: &Value, log: std::fs::File) -> Result<i32> {
     let cmd: Vec<String> = a["cmd"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
-    let src = clone(paths, a["git"]["url"].as_str().context("missing git.url")?, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
+    let src = host.clone(a["git"]["url"].as_str().context("missing git.url")?, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
+    let r = job_in_checkout(host, id, a, &cmd, &src, log);
+    let _ = std::fs::remove_dir_all(&src);
+    r
+}
+
+fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src: &Path, log: std::fs::File) -> Result<i32> {
+    cancel_point(id)?;
     let image = a["image"]
         .as_str()
         .map(String::from)
-        .or_else(|| crate::xrun::plan(&src, &cmd).map(|p| p.image))
+        .or_else(|| crate::xrun::plan(src, cmd).map(|p| p.image))
         .unwrap_or_else(|| "alpine:3.22".into());
     let o = sandbox::CreateOptions {
-        dir: Some(src.clone()),
+        dir: Some(src.to_path_buf()),
         name: Some(id.to_string()),
         mount: true,
         image: Some(image),
@@ -837,20 +946,51 @@ fn job_body(paths: &Paths, id: &str, a: &Value, dir: &Path, log: std::fs::File) 
         ttl_secs: 0,
         ..Default::default()
     };
-    // Not fleet-marked: the controller tracks jobs, not their sandboxes, and the job thread
-    // removes this one itself.
-    let meta = sandbox::create(paths, o)?;
-    std::fs::write(dir.join("sandbox"), &meta.id)?;
+    let sb = host.create(id, o)?;
     let r = (|| -> Result<i32> {
+        {
+            // A cancel during creation found no sandbox to remove; this one goes now.
+            let mut j = jobs();
+            let run = j.entry(id.to_string()).or_default();
+            run.sandbox = Some(sb.clone());
+            if run.cancelled {
+                bail!("cancelled before the command started");
+            }
+        }
         let env = a["env"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
         let eo = sandbox::ExecOptions { workdir: None, env, timeout_secs: a["timeout_secs"].as_u64(), tty: false };
-        let mut c = sandbox::exec_cmd(paths, &meta.id, &eo, &cmd)?;
-        let status = c.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log).status()?;
-        Ok(status.code().unwrap_or(137))
+        let mut c = host.exec(&sb, &eo, cmd)?;
+        c.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+        let child = {
+            let mut j = jobs();
+            let run = j.entry(id.to_string()).or_default();
+            if run.cancelled {
+                bail!("cancelled before the command started");
+            }
+            let child = c.spawn()?;
+            run.pid = Some(child.id() as i32);
+            child
+        };
+        Ok(wait_job(id, child)?.code().unwrap_or(137))
     })();
-    let _ = sandbox::rm(paths, std::slice::from_ref(&meta.id), false);
-    let _ = std::fs::remove_dir_all(&src);
+    host.remove(&sb);
     r
+}
+
+/// Waits for the command without reaping it first, then clears its pid under the lock, so
+/// `job_cancel` can kill that pid any time before.
+fn wait_job(id: &str, mut child: std::process::Child) -> Result<std::process::ExitStatus> {
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let r = unsafe { libc::waitid(libc::P_PID, child.id() as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        if r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            break;
+        }
+    }
+    if let Some(j) = jobs().get_mut(id) {
+        j.pid = None;
+    }
+    Ok(child.wait()?)
 }
 
 /// Node op: `{running, exit, cancelled, error, log}` with the log's last 64 KiB.
@@ -861,14 +1001,15 @@ pub fn job_get(paths: &Paths, id: &str) -> Result<Value> {
     }
     let log = std::fs::read(dir.join("log")).unwrap_or_default();
     let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(JOB_LOG_BYTES)..]).to_string();
-    let running = RUNNING_JOBS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|j| j == id);
+    let running = jobs().contains_key(id);
     let mut v = match std::fs::read(dir.join("result.json")) {
         Ok(b) => serde_json::from_slice::<Value>(&b)?,
         Err(_) if running => json!({"running": true}),
-        // No result and no thread: the node restarted while it ran. Say so once, for good.
+        // No result and no thread: the node restarted while it ran, and `node serve`
+        // removed its sandbox. Say so once, for good.
         Err(_) => {
-            let r = json!({"exit": -1, "error": "the node restarted while the job ran", "cancelled": false});
-            let _ = std::fs::write(dir.join("result.json"), r.to_string());
+            let r = json!({"exit": -1, "error": "the node restarted while the job ran", "cancelled": dir.join("cancelled").exists()});
+            let _ = write_result(&dir, &r);
             r
         }
     };
@@ -877,18 +1018,66 @@ pub fn job_get(paths: &Paths, id: &str) -> Result<Value> {
     Ok(v)
 }
 
-/// Node op: removes the job's sandbox, which ends the command; the job thread then records
-/// it as cancelled.
+/// Node op: cancels a job at whatever step it's at. Before its sandbox exists the job
+/// thread stops at its next step; after, the sandbox is removed and the command killed.
+/// A job this node doesn't run gets a cancelled result, so a start that arrives later does
+/// nothing. `running` says whether the job thread still has to record the outcome.
 pub fn job_cancel(paths: &Paths, id: &str) -> Result<Value> {
+    job_cancel_on(Arc::new(NodeHost(paths.clone())), paths, id)
+}
+
+fn job_cancel_on(host: Arc<dyn JobHost>, paths: &Paths, id: &str) -> Result<Value> {
     let dir = job_dir(paths, id)?;
-    std::fs::write(dir.join("cancelled"), b"")?;
-    // The job thread removes it too once the command ends; whichever is second finds it gone.
-    if let Ok(sb) = std::fs::read_to_string(dir.join("sandbox"))
-        && let Err(e) = sandbox::rm(paths, &[sb.trim().to_string()], false)
-    {
-        eprintln!("rekcod: cancel {id}: {e:#}");
+    let sb = {
+        let mut j = jobs();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(dir.join("cancelled"), b"")?;
+        match j.get_mut(id) {
+            Some(run) => {
+                run.cancelled = true;
+                if let Some(pid) = run.pid {
+                    unsafe { libc::kill(pid, libc::SIGKILL) };
+                }
+                run.sandbox.clone()
+            }
+            None => {
+                if !dir.join("result.json").exists() {
+                    write_result(&dir, &json!({"exit": -1, "cancelled": true, "error": "cancelled before it ran"}))?;
+                }
+                None
+            }
+        }
+    };
+    // Removing a VM takes a while; the job thread removes it too once the command is gone,
+    // and whichever is second finds it gone.
+    if let Some(sb) = sb {
+        std::thread::spawn(move || host.remove(&sb));
     }
-    Ok(json!({"cancelled": id}))
+    Ok(json!({"cancelled": id, "running": jobs().contains_key(id)}))
+}
+
+/// Job sandboxes no job thread of this process runs: the node restarted while they ran, or
+/// the thread couldn't remove them. Known by the job marker, or for one whose creation a
+/// restart cut short, by its name being a job this node has.
+fn orphan_job_sandboxes(paths: &Paths) -> Vec<String> {
+    let listed: Vec<(String, String)> = sandbox::list(paths)
+        .into_iter()
+        .filter_map(|l| {
+            let marked = sandbox::home(paths, &l.meta.id).ok().and_then(|h| std::fs::read_to_string(h.join(JOB_MARKER)).ok());
+            let named = || l.meta.name.clone().filter(|n| job_dir(paths, n).is_ok_and(|d| d.exists()));
+            Some((l.meta.id.clone(), marked.map(|m| m.trim().to_string()).or_else(named)?))
+        })
+        .collect();
+    // Read after the listing: any job whose sandbox is listed was in here before it.
+    let live: Vec<String> = jobs().keys().cloned().collect();
+    listed.into_iter().filter(|(_, job)| !live.contains(job)).map(|(sb, _)| sb).collect()
+}
+
+fn remove_orphan_job_sandboxes(paths: &Paths) {
+    for sb in orphan_job_sandboxes(paths) {
+        eprintln!("rekcod: removing job sandbox {sb}: no job runs in it");
+        let _ = sandbox::rm(paths, std::slice::from_ref(&sb), false);
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -987,6 +1176,9 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     if let Ok(v) = std::fs::read(paths.home.join("node-allow.json")) {
         *RELAY_ALLOW.write().unwrap_or_else(std::sync::PoisonError::into_inner) = serde_json::from_slice(&v).unwrap_or_default();
     }
+    // Jobs from the last node process: their threads are gone, so their commands go too,
+    // before the API can report those jobs over.
+    remove_orphan_job_sandboxes(paths);
     for l in sandbox::list(paths) {
         let Ok(home) = sandbox::home(paths, &l.meta.id) else { continue };
         let Some(v) = std::fs::read(home.join("instance.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
@@ -1073,8 +1265,10 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
 }
 
 /// Deletes clones in `remote-ws/` no sandbox uses and finished job directories, once older
-/// than `age`. Both otherwise grow with every deploy and job.
+/// than `age`. Both otherwise grow with every deploy and job. Job sandboxes no job runs go
+/// at once.
 fn node_cleanup(paths: &Paths, age: Duration) {
+    remove_orphan_job_sandboxes(paths);
     let in_use: std::collections::HashSet<PathBuf> = sandbox::list(paths).into_iter().map(|l| l.meta.project).collect();
     let old = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|e| e > age));
     for e in std::fs::read_dir(paths.home.join("remote-ws")).into_iter().flatten().flatten() {
@@ -1197,6 +1391,21 @@ const MIGRATIONS: &[&str] = &[
      alter table nodes_new rename to nodes;",
     "alter table nodes add column zone text not null default '';
      alter table apps add column spread text not null default 'soft';",
+    // App lifecycle (docs/fleet-hardening.md, "Apps"). `generation` is new whenever a row is
+    // made or destroyed, so a deploy started for an earlier app of that name can't register
+    // into it. `destroying` is when cleanup was last tried, null for a live app. `deploying`
+    // counts admitted deploys still running; the quota holds their resources.
+    "alter table apps add column generation integer not null default 0;
+     alter table apps add column destroying integer;
+     alter table apps add column deploying integer not null default 0;",
+    // Older controllers ended a `lost` job (it got `finished`); now `lost` holds its quota and
+    // schedule until the node answers, so those rows would hold them for good.
+    // `leftover_storage`: a destroyed app's key and bucket that a controller without
+    // `--storage` couldn't remove; `retry_destroys` removes them once one with storage runs,
+    // and the bucket name isn't handed out before that.
+    "update jobs set state = 'failed', log = coalesce(log, '') || 'rekcod: lost before an upgrade' || char(10)
+       where state = 'lost' and finished is not null;
+     create table if not exists leftover_storage (bucket text, storage_key text, app text not null, since integer not null);",
 ];
 
 pub struct Db(rusqlite::Connection);
@@ -1541,43 +1750,56 @@ impl Controller {
         self.node(&node)
     }
 
-    /// CPUs, GiB and sandbox/job count in use in `ns`, leaving out app `skip_app`. Apps count
-    /// while they have a live release (sleeping ones too, so a wake never hits the quota).
     fn usage(&self, ns: &str, skip_app: &str) -> Result<(i64, i64, i64)> {
-        let r = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_one(
+        Self::usage_on(&self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0, ns, skip_app)
+    }
+
+    /// CPUs, GiB and sandbox/job count in use or held in `ns`, leaving out app `skip_app`. Apps
+    /// count while they have a live release (sleeping ones too, so a wake never hits the quota)
+    /// or an admitted deploy still running, and not once their destroy has begun. They're
+    /// charged at least one instance, CPU and GiB, which is what a deploy starts.
+    fn usage_on(db: &rusqlite::Connection, ns: &str, skip_app: &str) -> Result<(i64, i64, i64)> {
+        const APPS: &str = "from apps where ns = ?1 and name <> ?2 and destroying is null and (live_release is not null or deploying > 0)";
+        let sql = format!(
             "select
-               coalesce((select sum(instances * cpus) from apps where ns = ?1 and name <> ?2 and live_release is not null), 0)
+               coalesce((select sum(max(instances, 1) * max(cpus, 1)) {APPS}), 0)
              + coalesce((select sum(cpus) from sandboxes s where ns = ?1 and state = 'running'
                            and not exists(select 1 from instances i where i.sandbox = s.id)), 0)
-             + coalesce((select sum(coalesce(json_extract(spec, '$.cpus'), 2)) from jobs where ns = ?1 and state = 'running'), 0),
-               coalesce((select sum(instances * memory_gib) from apps where ns = ?1 and name <> ?2 and live_release is not null), 0)
+             + coalesce((select sum(coalesce(json_extract(spec, '$.cpus'), 2)) from jobs where ns = ?1
+                           and state in {JOB_ACTIVE_SQL}), 0),
+               coalesce((select sum(max(instances, 1) * max(memory_gib, 1)) {APPS}), 0)
              + coalesce((select sum(memory_gib) from sandboxes s where ns = ?1 and state = 'running'
                            and not exists(select 1 from instances i where i.sandbox = s.id)), 0)
-             + coalesce((select sum(coalesce(json_extract(spec, '$.memory_gib'), 2)) from jobs where ns = ?1 and state = 'running'), 0),
+             + coalesce((select sum(coalesce(json_extract(spec, '$.memory_gib'), 2)) from jobs where ns = ?1
+                           and state in {JOB_ACTIVE_SQL}), 0),
                (select count(*) from sandboxes s where ns = ?1 and state = 'running'
                   and not exists(select 1 from instances i where i.sandbox = s.id))
-             + (select count(*) from jobs where ns = ?1 and state = 'running')",
-            &[&ns, &skip_app],
-        )?;
-        Ok((r.get(0), r.get(1), r.get(2)))
+             + (select count(*) from jobs where ns = ?1 and state in {JOB_ACTIVE_SQL})"
+        );
+        Ok(db.query_row(&sql, rusqlite::params![ns, skip_app], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
+    }
+
+    fn check_quota(&self, ns: &str, skip_app: &str, cpus: i64, gib: i64, sandboxes: i64) -> Result<()> {
+        Self::quota_on(&self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0, ns, skip_app, cpus, gib, sandboxes)
     }
 
     /// Fails if adding `cpus`, `gib` and `sandboxes` to `ns` (with app `skip_app` replaced)
-    /// goes over its quota; the error names the limit.
-    fn check_quota(&self, ns: &str, skip_app: &str, cpus: i64, gib: i64, sandboxes: i64) -> Result<()> {
-        let (uc, um, us) = self.usage(ns, skip_app)?;
-        let q = self
-            .db
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query_one("select max_cpus, max_memory_gib, max_sandboxes from namespaces where name = ?1", &[&ns])?;
-        let (mc, mm, ms): (i64, i64, i64) = (q.get(0), q.get(1), q.get(2));
-        // A negative limit (`unlimited` on the CLI) is no limit.
-        if mc >= 0 && uc + cpus > mc {
-            bail!("quota: {ns} would use {} of {mc} CPUs", uc + cpus);
+    /// goes over its quota; the error names the limit. Callers that then record what they
+    /// were allowed hold the namespace's quota lock and do both on one connection hold.
+    fn quota_on(db: &rusqlite::Connection, ns: &str, skip_app: &str, cpus: i64, gib: i64, sandboxes: i64) -> Result<()> {
+        let (uc, um, us) = Self::usage_on(db, ns, skip_app)?;
+        let (mc, mm, ms): (i64, i64, i64) =
+            db.query_row("select max_cpus, max_memory_gib, max_sandboxes from namespaces where name = ?1", [ns], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })?;
+        // A negative limit (`unlimited` on the CLI) is no limit. A sum that would overflow
+        // saturates, so it's over any limit instead of wrapping under it.
+        let (cpus, gib) = (uc.saturating_add(cpus), um.saturating_add(gib));
+        if mc >= 0 && cpus > mc {
+            bail!("quota: {ns} would use {cpus} of {mc} CPUs");
         }
-        if mm >= 0 && um + gib > mm {
-            bail!("quota: {ns} would use {} of {mm} GiB", um + gib);
+        if mm >= 0 && gib > mm {
+            bail!("quota: {ns} would use {gib} of {mm} GiB");
         }
         if ms >= 0 && sandboxes > 0 && us + sandboxes > ms {
             bail!("quota: {us} of {ms} sandboxes and jobs in use in {ns}");
@@ -1585,8 +1807,9 @@ impl Controller {
         Ok(())
     }
 
-    /// The AES-256-GCM key for `ns`'s secrets: HMAC(controller key, namespace salt). Deleting
-    /// the namespace deletes the salt, so its secrets can't be read from an old backup.
+    /// The AES-256-GCM key for `ns`'s secrets: HMAC(controller key, namespace salt). Backups
+    /// hold the salt and the sealed values, so with the controller key a backup taken before
+    /// the namespace was deleted still opens them.
     fn ns_key(&self, ns: &str) -> Result<[u8; 32]> {
         use hmac::Mac;
         let salt: Vec<u8> = self
@@ -1744,7 +1967,8 @@ fn mark_lost_nodes(c: &Arc<Controller>) -> Result<()> {
         let id: String = r.get(0);
         db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[&id])?;
         db.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping')", &[&id])?;
-        db.execute("update jobs set state = 'lost', finished = ?2 where node = ?1 and state = 'running'", &[&id, &now()])?;
+        // Not over: the worker may still run them. `poll_jobs` keeps asking.
+        db.execute("update jobs set state = 'lost' where node = ?1 and state = 'running'", &[&id])?;
         eprintln!("rekcod: node {id} lost (no heartbeat for 15s)");
         c.alert(&format!("node {id} lost"));
     }
@@ -1761,7 +1985,7 @@ fn cleanup(c: &Arc<Controller>) -> Result<()> {
     {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         db.execute("delete from audit where ts < ?1", &[&cutoff])?;
-        db.execute("delete from jobs where state <> 'running' and coalesce(finished, created) < ?1", &[&cutoff])?;
+        db.execute(&format!("delete from jobs where state not in {JOB_ACTIVE_SQL} and coalesce(finished, created) < ?1"), &[&cutoff])?;
         db.execute("update releases set log = '' where state in ('old', 'failed') and created < ?1", &[&cutoff])?;
     }
     let Some(s) = &c.storage else { return Ok(()) };
@@ -1807,12 +2031,15 @@ fn expire_previews(c: &Arc<Controller>) -> Result<()> {
     let old: Vec<String> =
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query("select name from apps where preview_of is not null and created < ?1", &[&(now() - 7 * 86400)])?
+            .query("select name from apps where preview_of is not null and created < ?1 and destroying is null", &[&(now() - 7 * 86400)])?
             .iter()
             .map(|r| r.get(0))
             .collect();
     for name in old {
-        destroy_app(c, &name)?;
+        // A failed cleanup leaves it `destroying`; `retry_destroys` takes it from there.
+        if let Err(e) = destroy_app(c, &name) {
+            eprintln!("rekcod: expire preview {name}: {e:#}");
+        }
     }
     Ok(())
 }
@@ -1848,7 +2075,7 @@ fn reconcile(c: &Arc<Controller>) -> Result<()> {
                         .query_one("select app from instances where sandbox = ?1", &[&sb])?
                         .get(0);
                 let lock = c.app_lock(&name);
-                let Ok(_g) = lock.try_lock() else { continue };
+                let Some(_g) = try_app_lock(&lock) else { continue };
                 let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let restored = db.execute(
                     "update instances set state = 'live' where sandbox = ?1 and state = 'lost'
@@ -1884,7 +2111,7 @@ fn reconcile(c: &Arc<Controller>) -> Result<()> {
              and n.state = 'ready' and n.last_seen > ?1),
            (select count(*) from instances i where i.app = a.name and i.state = 'sleeping'),
            r.commit_sha
-         from apps a join releases r on r.app = a.name and r.n = a.live_release",
+         from apps a join releases r on r.app = a.name and r.n = a.live_release where a.destroying is null",
         &[&(now() - 15)],
     )?;
     for r in apps {
@@ -1920,7 +2147,49 @@ fn reconcile(c: &Arc<Controller>) -> Result<()> {
             }
         });
     }
+    // Off this thread: a RustFS that doesn't answer mustn't hold up the health checks.
+    let c = c.clone();
+    std::thread::spawn(move || {
+        if let Err(e) = retry_destroys(&c) {
+            eprintln!("rekcod: reconcile destroys: {e:#}");
+        }
+    });
     Ok(())
+}
+
+/// Apps whose destroy didn't finish (storage cleanup failed, or the controller stopped
+/// half way): tried again once a minute each until it succeeds.
+fn retry_destroys(c: &Arc<Controller>) -> Result<()> {
+    let due: Vec<(String, i64)> = c
+        .db
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .query("select name, generation from apps where destroying is not null and destroying < ?1 order by destroying", &[&(now() - 60)])?
+        .iter()
+        .map(|r| (r.get(0), r.get(1)))
+        .collect();
+    for (name, generation) in due {
+        let lock = c.app_lock(&name);
+        let Some(_g) = try_app_lock(&lock) else { continue };
+        match finish_destroy(c, &name, generation) {
+            Ok(_) => eprintln!("rekcod: {name}: destroyed after retrying its cleanup"),
+            Err(e) => eprintln!("rekcod: {e:#}"),
+        }
+    }
+    if let Some(s) = &c.storage {
+        drop_leftover_storage(c, s)?;
+    }
+    Ok(())
+}
+
+/// The app lock if it's free. A deploy that panicked while holding it leaves it poisoned,
+/// which says nothing about the app's rows; they're taken as they are.
+fn try_app_lock<T>(lock: &std::sync::Mutex<T>) -> Option<std::sync::MutexGuard<'_, T>> {
+    match lock.try_lock() {
+        Ok(g) => Some(g),
+        Err(std::sync::TryLockError::Poisoned(p)) => Some(p.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
 }
 
 /// What a controller restart left half done: deploys that never finished, instances that
@@ -1932,6 +2201,8 @@ fn sweep(c: &Arc<Controller>) -> Result<()> {
          where state = 'building'",
         &[&now()],
     )?;
+    // Those deploys ended, so the quota they were admitted with is free again.
+    db.execute("update apps set deploying = 0 where deploying <> 0", &[])?;
     let stale = db.query("select node, sandbox from instances where state in ('starting', 'draining')", &[])?;
     drop(db);
     if n > 0 || !stale.is_empty() {
@@ -2018,64 +2289,77 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
     match (req.method.as_str(), seg.as_slice()) {
         ("POST", ["nodes", "register"]) => {
             let r = (|| {
-                // Pending nodes cost a row each and anyone with the join token can add them.
-                let pending: i64 =
-                    c.db.lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .query_one("select count(*) from nodes where state = 'pending'", &[])?
-                        .get(0);
-                if pending >= 20 {
-                    bail!("20 nodes are already waiting for approval; approve or remove some first");
-                }
                 let want = c.config("join_token")?.unwrap_or_default();
                 if want.is_empty() || !crate::sandbox_api::ct_eq(body["join_token"].as_str().unwrap_or("").as_bytes(), want.as_bytes()) {
                     bail!("bad join token");
                 }
+                // Everything is checked and the certificate issued before the row exists, so a
+                // refused registration leaves nothing behind.
                 let (id, sec) = (format!("n-{}", sandbox::new_id()?), secret()?);
-                let url = body["url"].as_str().context("missing url")?;
+                let url = body["url"].as_str().context("missing url")?.trim_end_matches('/');
+                let a = authority(url)?;
+                let host = match a.rsplit_once(':') {
+                    Some((h, p)) if !h.is_empty() && p.parse::<u16>().is_ok_and(|p| p > 0) && !a.contains(['/', '@', '?', '#']) => {
+                        h.trim_matches(['[', ']']).to_ascii_lowercase()
+                    }
+                    _ => bail!("{url}: the node URL is scheme://host:port"),
+                };
                 let total = body["mem_total_mib"].as_i64().unwrap_or(0);
+                if total < 0 {
+                    bail!("mem_total_mib can't be negative");
+                }
                 let zone = body["zone"].as_str().unwrap_or("");
                 if !zone.is_empty() && !valid_label(zone) {
                     bail!("zone must be a lowercase label, at most 40 characters");
                 }
+                let https = url.starts_with("https://");
+                let mut reply = json!({"id": id, "secret": sec});
+                match (&c.node_ca, https) {
+                    (Some(ca), true) => {
+                        if c.own_names.iter().any(|n| n.eq_ignore_ascii_case(&host))
+                            && !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1")
+                        {
+                            bail!("{host} is one of the controller's own names");
+                        }
+                        // Named for the node, not the host it advertised (`tls::node_name`).
+                        let (cert, key) = ca.issue(&[crate::tls::node_name(&id)])?;
+                        reply["cert"] = json!(cert);
+                        reply["key"] = json!(key);
+                    }
+                    (None, true) => bail!("this controller serves plain http; join it with an http:// address"),
+                    (_, false) => check_plain_http(&a, "the node")?,
+                }
                 // Anyone with the join token can register; an admin approves before work lands there.
                 let state = if c.auto_approve { "ready" } else { "pending" };
-                c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-                    "insert into nodes (id, url, secret, mem_total, last_seen, state, zone) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    &[&id, &url, &sec, &total, &now(), &state, &zone],
-                )?;
+                {
+                    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    // Pending nodes cost a row each and anyone with the join token can add them.
+                    let pending: i64 = db.query_one("select count(*) from nodes where state = 'pending'", &[])?.get(0);
+                    if pending >= 20 {
+                        bail!("20 nodes are already waiting for approval; approve or remove some first");
+                    }
+                    // The controller finds a node's expected certificate by its address.
+                    if https
+                        && db
+                            .query("select url from nodes", &[])?
+                            .iter()
+                            .any(|r| authority(&r.get::<String>(0)).is_ok_and(|o| o.eq_ignore_ascii_case(&a)))
+                    {
+                        bail!("another node already registered {a}");
+                    }
+                    db.execute(
+                        "insert into nodes (id, url, secret, mem_total, last_seen, state, zone) values (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        &[&id, &url, &sec, &total, &now(), &state, &zone],
+                    )?;
+                }
+                if https {
+                    crate::tls::expect_node(&a, &id, false);
+                }
                 c.audit("-", "node", "register", &id, true);
                 if state == "pending" {
                     eprintln!("rekcod: node {id} ({url}) registered; `rekcod node approve {id}` to use it");
                 }
-                let mut reply = json!({"id": id, "secret": sec, "state": state});
-                // An https node gets a certificate for the host it advertised.
-                if let (Some(ca), Some(rest)) = (&c.node_ca, url.strip_prefix("https://")) {
-                    let a = rest.trim_end_matches('/');
-                    let host = a.rsplit_once(':').map_or(a, |(h, _)| h).trim_matches(['[', ']']).to_ascii_lowercase();
-                    // Not a name the controller answers to, nor another node's: the certificate
-                    // would let whoever registered first pass for it.
-                    if c.own_names.iter().any(|n| n.eq_ignore_ascii_case(&host))
-                        && !matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1")
-                    {
-                        bail!("{host} is one of the controller's own names");
-                    }
-                    let taken =
-                        c.db.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .query("select url from nodes where id <> ?1", &[&id])?;
-                    if taken
-                        .iter()
-                        .any(|r| authority(&r.get::<String>(0)).is_ok_and(|a| a.eq_ignore_ascii_case(rest.trim_end_matches('/'))))
-                    {
-                        bail!("another node already registered {rest}");
-                    }
-                    let (cert, key) = ca.issue(std::slice::from_ref(&host))?;
-                    reply["cert"] = json!(cert);
-                    reply["key"] = json!(key);
-                } else if !url.starts_with("https://") {
-                    check_plain_http(&authority(url)?, "the node")?;
-                }
+                reply["state"] = json!(state);
                 Ok(reply)
             })();
             return json_reply(&mut w, r);
@@ -2208,12 +2492,21 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         // Forget a node; its instances are rescheduled by the next reconcile.
         ("DELETE", ["nodes", id]) => admin_only().and_then(|_| {
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            if db.execute("delete from nodes where id = ?1", &[id])? == 0 {
-                bail!("no node {id}");
+            let Some(gone) = db.query_opt("delete from nodes where id = ?1 returning url", &[id])? else { bail!("no node {id}") };
+            if let Ok(a) = authority(&gone.get::<String>(0)) {
+                crate::tls::forget_node(&a);
             }
             db.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping', 'starting')", &[id])?;
             db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[id])?;
-            db.execute("update jobs set state = 'lost', finished = ?2 where node = ?1 and state = 'running'", &[id, &now()])?;
+            // Nobody can confirm these any more: they end here, and free their schedule's turn.
+            db.execute(
+                &format!(
+                    "update jobs set state = case when state = 'cancelling' then 'cancelled' else 'failed' end, finished = ?2,
+                       log = log || 'rekcod: node ' || ?1 || ' was removed; whether the job finished is unknown' || char(10)
+                     where node = ?1 and state in {JOB_ACTIVE_SQL}"
+                ),
+                &[id, &now()],
+            )?;
             db.execute("delete from node_pools where node = ?1", &[id])?;
             drop(db);
             c.audit("-", &who.name, "node rm", id, true);
@@ -2509,8 +2802,10 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
         return err(w, format!("quota: {count} of {} sandboxes in use", who.max));
     }
     let macos = body["os"].as_str() == Some("macos");
-    let gib = body["memory_gib"].as_i64().unwrap_or(2).max(if macos { 8 } else { 0 });
-    let cpus = body["cpus"].as_i64().unwrap_or(2);
+    let (cpus, gib) = match (spec_count(&body, "cpus", 2, MAX_CPUS), spec_count(&body, "memory_gib", 2, MAX_MEMORY_GIB)) {
+        (Ok(cpus), Ok(gib)) => (cpus, gib.max(if macos { 8 } else { 0 })),
+        (Err(e), _) | (_, Err(e)) => return err(w, format!("{e:#}")),
+    };
     if let Err(e) = c.check_quota(ns, "", cpus, gib, 1) {
         return err(w, format!("{e:#}"));
     }
@@ -2664,11 +2959,19 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
                     .iter()
                     .map(|r| (r.get(0), r.get(1)))
                     .collect(),
-                    db.query("select id, node from jobs where ns = ?1 and state = 'running'", &[n])?.iter().map(|r| (r.get(0), r.get(1))).collect(),
+                    db.query(&format!("select id, node from jobs where ns = ?1 and state in {JOB_ACTIVE_SQL}"), &[n])?
+                        .iter()
+                        .map(|r| (r.get(0), r.get(1)))
+                        .collect(),
                 )
             };
             if !force && (!apps.is_empty() || !sbs.is_empty() || !jobs.is_empty()) {
-                bail!("{n} still has {} apps, {} sandboxes and {} running jobs; --force removes them", apps.len(), sbs.len(), jobs.len());
+                bail!(
+                    "{n} still has {} apps, {} sandboxes and {} unfinished jobs; --force removes them",
+                    apps.len(),
+                    sbs.len(),
+                    jobs.len()
+                );
             }
             for a in &apps {
                 destroy_app(c, a)?;
@@ -2676,19 +2979,18 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
             for (id, node) in sbs {
                 delete_instance(c, &node, &id);
             }
+            // Cancelled once their nodes confirm, like `job cancel`.
             for (id, node) in jobs {
-                if let Ok((url, sec, _)) = c.node(&node) {
-                    let _ = call(&url, "DELETE", &format!("/jobs/{id}"), Some(&sec), &Value::Null);
-                }
                 c.db.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .execute("update jobs set state = 'cancelled', finished = ?2 where id = ?1", &[&id, &now()])?;
+                    .execute(&format!("update jobs set state = 'cancelling' where id = ?1 and state in {JOB_ACTIVE_SQL}"), &[&id])?;
+                let _ = refresh_job(c, &id, &node, "cancelling");
             }
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             for t in ["members", "node_pools", "schedules"] {
                 db.execute(&format!("delete from {t} where ns = ?1"), &[n])?;
             }
-            // The salt goes with the row, so any copy of its sealed secrets can't be opened.
+            // The salt goes with the row; earlier backups keep a copy (docs/namespaces.md).
             db.execute("delete from namespaces where name = ?1", &[n])?;
             drop(db);
             c.audit(n, &who.name, "delete namespace", n, true);
@@ -2705,7 +3007,7 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
 fn routes(c: &Controller) -> Result<Value> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select i.app, i.endpoint, a.public, i.state, a.ns, a.http from instances i join apps a on a.name = i.app
-         where i.state in ('live', 'sleeping') order by i.app",
+         where i.state in ('live', 'sleeping') and a.destroying is null order by i.app",
         &[],
     )?;
     let mut out: std::collections::BTreeMap<String, Route> = Default::default();
@@ -2794,6 +3096,33 @@ struct App {
     secrets: Value,
     idle_stop: i64,
     strict_spread: bool,
+    /// The row's generation when it was loaded; see [`is_current`].
+    generation: i64,
+}
+
+/// Whether `app` is still the row it was loaded from: not being destroyed, and not destroyed
+/// and made again under the same name. Deploys check it before each step that records
+/// anything, so one that started for an earlier app of that name can't join the new one.
+fn is_current(db: &rusqlite::Connection, app: &App) -> Result<bool> {
+    Ok(db.query_row(
+        "select exists(select 1 from apps where name = ?1 and generation = ?2 and destroying is null)",
+        rusqlite::params![app.name, app.generation],
+        |r| r.get(0),
+    )?)
+}
+
+fn current(c: &Controller, app: &App) -> Result<bool> {
+    is_current(&c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0, app)
+}
+
+/// A generation no app row has had yet: a counter in `config` that only goes up.
+fn next_generation(db: &rusqlite::Connection) -> Result<i64> {
+    Ok(db.query_row(
+        "insert into config values ('app_generation', '1') on conflict (key) do update set value = cast(value as integer) + 1
+         returning cast(value as integer)",
+        [],
+        |r| r.get(0),
+    )?)
 }
 
 struct PlacementNode {
@@ -2881,10 +3210,11 @@ fn load_app(c: &Controller, ns: &str, name: &str, who: &Caller, need: Role) -> R
     Ok(app)
 }
 
-/// App by row key, no access check; secrets come back opened.
+/// App by row key, no access check; secrets come back opened. One being destroyed is gone.
 fn load_app_key(c: &Controller, key: &str) -> Result<Option<App>> {
     let r = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
-        "select name, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, secrets, ns, idle_stop, spread from apps where name = ?1",
+        "select name, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, secrets, ns, idle_stop, spread, generation
+         from apps where name = ?1 and destroying is null",
         &[&key],
     )?;
     let Some(r) = r else { return Ok(None) };
@@ -2912,6 +3242,7 @@ fn load_app_key(c: &Controller, key: &str) -> Result<Option<App>> {
         secrets,
         idle_stop: r.get(12),
         strict_spread: r.get::<String>(13) == "strict",
+        generation: r.get(14),
     }))
 }
 
@@ -2963,6 +3294,10 @@ fn register_instance(c: &Controller, app: &App, release: i32, node: &PlacementNo
         let ep = reply["endpoint"].as_str().filter(|s| !s.is_empty()).context("node returned no endpoint")?;
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tx = db.0.transaction()?;
+        // Destroyed while the node started it: not recorded, so it's deleted below.
+        if !is_current(&tx, app)? {
+            bail!("{} was destroyed during this deploy", app.short);
+        }
         tx.execute(
             "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
             rusqlite::params![sb, node.id, who, now(), app.ns, app.cpus, app.memory_gib],
@@ -3013,6 +3348,10 @@ fn launch_instances(
     });
     let mut result = Launched { started: Vec::new(), errors: Vec::new(), health: app.health.clone() };
     while result.started.len() < count {
+        // Destroyed meanwhile: no more VMs for it. Ones it already recorded go with the destroy.
+        if !current(c, app)? {
+            bail!("{} was destroyed during this deploy", app.short);
+        }
         let mut handles = Vec::new();
         // Build and store once before launching the other replicas in parallel.
         let batch = if spec["store"]["cached"] == json!(false) { 1 } else { count - result.started.len() };
@@ -3123,8 +3462,9 @@ fn top_up_locked(c: &Arc<Controller>, app: &App) -> Result<usize> {
                (select count(*) from instances i join nodes n on n.id = i.node where i.app = a.name and i.release = r.n
                  and i.state = 'live' and n.state = 'ready' and n.last_seen > ?2),
                (select count(*) from instances i where i.app = a.name and i.state = 'sleeping')
-             from apps a join releases r on r.app = a.name and r.n = a.live_release where a.name = ?1",
-            &[&app.name, &(now() - 15)],
+             from apps a join releases r on r.app = a.name and r.n = a.live_release
+             where a.name = ?1 and a.generation = ?3 and a.destroying is null",
+            &[&app.name, &(now() - 15), &app.generation],
         )?
         else {
             return Ok(0);
@@ -3255,19 +3595,28 @@ fn drain_node(c: &Arc<Controller>, id: &str) -> Result<Value> {
 /// Start instances on distinct nodes where possible, wait for health, switch routes, drain
 /// the old ones. The caller holds the app's lock.
 fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> Result<Value> {
+    // `app` may have been loaded before the lock was free, and destroyed in between.
+    if !current(c, app)? {
+        bail!("no app {}", app.short);
+    }
     let commit = match commit {
         Some(c) => c,
         None => resolve(&app.git_url, &app.git_ref)?,
     };
-    let n: i32 =
-        c.db.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query_one("select coalesce(max(n), 0) + 1 from releases where app = ?1", &[&app.name])?
-            .get(0);
-    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-        "insert into releases (app, n, commit_sha, state, created, who) values (?1, ?2, ?3, 'building', ?4, ?5)",
-        &[&app.name, &n, &commit, &now(), &who],
-    )?;
+    let n: i32 = {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db.0.transaction()?;
+        if !is_current(&tx, app)? {
+            bail!("no app {}", app.short);
+        }
+        let n = tx.query_row("select coalesce(max(n), 0) + 1 from releases where app = ?1", [&app.name], |r| r.get(0))?;
+        tx.execute(
+            "insert into releases (app, n, commit_sha, state, created, who) values (?1, ?2, ?3, 'building', ?4, ?5)",
+            rusqlite::params![app.name, n, commit, now(), who],
+        )?;
+        tx.commit()?;
+        n
+    };
     // The deploy log kept with the release (`app release NAME N`).
     let mut log = vec![format!("release {n} of {} at {commit}, by {who}", app.short)];
     let finish = |state: &str, log: &[String]| {
@@ -3298,6 +3647,16 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
     }
     let old: Vec<(String, String)> = {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Checked in the same hold as the switch, so a destroy can't slip in between.
+        if !is_current(&db.0, app)? {
+            drop(db);
+            for (node, sb, _) in &started {
+                delete_instance(c, node, sb);
+            }
+            log.push("the app was destroyed during this deploy".into());
+            finish("failed", &log);
+            bail!("{} was destroyed during this deploy", app.short);
+        }
         let old = db.query(
             "update instances set state = 'draining' where app = ?1 and release <> ?2 and state = 'live' returning node, sandbox",
             &[&app.name, &n],
@@ -3332,17 +3691,39 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
               "instances": started.iter().map(|(n, s, e)| json!({"node": n, "sandbox": s, "endpoint": e})).collect::<Vec<_>>()}))
 }
 
+/// Marks app `name` (a row key) `destroying` with a new generation, which takes it out of the
+/// routes, lists and quota and keeps the name taken, and stops a deploy in flight before it
+/// records anything more. Then, under the app's lock (after that deploy), removes it.
 fn destroy_app(c: &Arc<Controller>, name: &str) -> Result<Value> {
-    if let Err(e) = drop_bucket(c, name) {
-        eprintln!("rekcod: {name}: bucket: {e:#}");
-    }
-    // Its stored images and build cache go with it.
-    if let Some(s) = &c.storage {
-        let objs = s.list(RELEASES, &format!("{name}/")).unwrap_or_default();
-        for o in objs {
-            let _ = s.delete(RELEASES, &o.key);
+    let generation = {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db.0.transaction()?;
+        let generation = next_generation(&tx)?;
+        let marked =
+            tx.execute("update apps set destroying = ?2, generation = ?3 where name = ?1", rusqlite::params![name, now(), generation])?;
+        if marked == 0 {
+            bail!("no app {}", short_name(name));
         }
-        let _ = s.delete(CACHE, &format!("{name}.tar.zst"));
+        tx.commit()?;
+        generation
+    };
+    let lock = c.app_lock(name);
+    let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    finish_destroy(c, name, generation).inspect_err(|e| c.alert(&format!("{e:#}")))
+}
+
+/// Deletes a `destroying` app's instances, then its storage: bucket access revoked before the
+/// bucket goes, stored images and build cache. The row goes last, only once all of that
+/// worked; until then the name stays taken and `retry_destroys` tries again. The caller holds
+/// the app's lock. Only the row `generation` marked: another destroy may have finished it, and
+/// someone may have made a new app of that name since.
+fn finish_destroy(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Value> {
+    let marked =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select 1 from apps where name = ?1 and generation = ?2 and destroying is not null", &[&name, &generation])?;
+    if marked.is_none() {
+        return Ok(json!({"destroyed": name}));
     }
     let rows =
         c.db.lock()
@@ -3351,11 +3732,78 @@ fn destroy_app(c: &Arc<Controller>, name: &str) -> Result<Value> {
     for r in rows {
         delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
     }
+    // Without --storage nothing can reach RustFS; the key and bucket are left for later.
+    let leftover = if c.storage.is_none() { leftover_storage(c, name)? } else { None };
+    let storage = if c.storage.is_none() { Ok(()) } else { drop_bucket(c, name).and_then(|_| drop_release_store(c, name)) };
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    db.execute("delete from releases where app = ?1", &[&name])?;
-    db.execute("delete from instances where app = ?1", &[&name])?;
-    db.execute("delete from apps where name = ?1", &[&name])?;
+    if let Err(e) = storage {
+        db.execute("update apps set destroying = ?2 where name = ?1", &[&name, &now()])?;
+        bail!(
+            "{}: its instances are gone, but storage cleanup failed: {e:#}. The controller retries every minute; the name stays taken until that works",
+            short_name(name)
+        );
+    }
+    // Kept logs and traffic too: someone else may make an app of this name next.
+    let tx = db.0.transaction()?;
+    for t in ["releases", "instances", "instance_logs", "traffic"] {
+        tx.execute(&format!("delete from {t} where app = ?1"), [name])?;
+    }
+    if let Some((bucket, key)) = &leftover {
+        tx.execute(
+            "insert into leftover_storage (bucket, storage_key, app, since) values (?1, ?2, ?3, ?4)",
+            rusqlite::params![bucket, key, name, now()],
+        )?;
+        eprintln!("rekcod: {}: the controller has no --storage, so its bucket and key stay until one with storage runs", short_name(name));
+    }
+    tx.execute("delete from apps where name = ?1 and generation = ?2", rusqlite::params![name, generation])?;
+    tx.commit()?;
     Ok(json!({"destroyed": name}))
+}
+
+/// The bucket (unless another app owns that name) and key a destroyed app may have left in
+/// RustFS; None when it never had storage.
+fn leftover_storage(c: &Controller, app: &str) -> Result<Option<(Option<String>, Option<String>)>> {
+    let r =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select bucket, storage_key from apps where name = ?1", &[&app])?;
+    let Some(r) = r else { return Ok(None) };
+    let (on, key): (bool, Option<String>) = (r.get(0), r.get(1));
+    if !on && key.is_none() {
+        return Ok(None);
+    }
+    let bucket = bucket_owner(c, app)?.is_none().then(|| app_bucket(app));
+    Ok(Some((bucket, key)))
+}
+
+/// Removes what `leftover_storage` noted, now that the controller has storage.
+fn drop_leftover_storage(c: &Controller, s: &crate::s3::S3) -> Result<()> {
+    let rows =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select rowid, bucket, storage_key, app from leftover_storage order by since", &[])?;
+    for r in rows {
+        let (id, bucket, key, app): (i64, Option<String>, Option<String>, String) = (r.get(0), r.get(1), r.get(2), r.get(3));
+        let removed = (|| -> Result<()> {
+            if let Some(k) = &key {
+                gone(s.remove_user(k)).context("revoke its storage key")?;
+            }
+            if let Some(b) = &bucket {
+                gone(s.remove_policy(b)).context("remove the bucket's policy")?;
+                s.delete_bucket(b, true)?;
+            }
+            Ok(())
+        })();
+        match removed {
+            Ok(()) => {
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .execute("delete from leftover_storage where rowid = ?1", &[&id])?;
+            }
+            Err(e) => eprintln!("rekcod: {}: storage left by its destroy: {e:#}", short_name(&app)),
+        }
+    }
+    Ok(())
 }
 
 // ------------------------------------------------------------- scale to zero, recycling
@@ -3381,6 +3829,9 @@ fn live_endpoints(c: &Controller, app: &str) -> Result<Vec<String>> {
 fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
     let lock = c.app_lock(&app.name);
     let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !current(c, app)? {
+        bail!("no app {}", app.short);
+    }
     let eps = live_endpoints(c, &app.name)?;
     if !eps.is_empty() {
         return Ok(eps);
@@ -3445,7 +3896,7 @@ fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
 fn sleep_idle(c: &Arc<Controller>) -> Result<()> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select a.name from apps a join releases r on r.app = a.name and r.n = a.live_release
-         where a.idle_stop > 0 and max(a.last_request, r.created) < ?1 - a.idle_stop
+         where a.idle_stop > 0 and a.destroying is null and max(a.last_request, r.created) < ?1 - a.idle_stop
            and exists(select 1 from instances i where i.app = a.name and i.state = 'live')",
         &[&now()],
     )?;
@@ -3483,7 +3934,7 @@ fn sleep_idle(c: &Arc<Controller>) -> Result<()> {
 fn recycle_due(c: &Arc<Controller>) -> Result<()> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select a.name, r.commit_sha from apps a join releases r on r.app = a.name and r.n = a.live_release
-         where a.recycle > 0 and r.created < ?1 - a.recycle
+         where a.recycle > 0 and a.destroying is null and r.created < ?1 - a.recycle
            and exists(select 1 from instances i where i.app = a.name and i.state = 'live')
            and not exists(select 1 from releases b where b.app = a.name and b.state = 'building')",
         &[&now()],
@@ -3632,9 +4083,85 @@ fn edge_clients(c: &Controller) -> Value {
     json!(v.iter().take(20).map(|(ip, (n, l))| json!({"ip": ip, "requests": n, "limited": l})).collect::<Vec<_>>())
 }
 
-/// Creates or updates app `b.name` in `ns`; returns its short name. The caller has checked
-/// `who` may deploy in `ns`.
-fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Option<&str>) -> Result<String> {
+/// Most instances, CPUs and GiB one app, sandbox or job may ask for. Counts are checked
+/// against these before anything is stored, so quota sums can't wrap or go negative.
+const MAX_INSTANCES: i64 = 100;
+const MAX_CPUS: i64 = 64;
+const MAX_MEMORY_GIB: i64 = 512;
+
+/// `b[key]` as a count from 1 to `max`, or `default` when it's absent or null. Zero,
+/// negatives, fractions, strings and anything over `max` are refused.
+fn spec_count(b: &Value, key: &str, default: i64, max: i64) -> Result<i64> {
+    let Some(v) = b.get(key).filter(|v| !v.is_null()) else { return Ok(default) };
+    v.as_i64().filter(|n| (1..=max).contains(n)).ok_or_else(|| anyhow!("{key} must be a whole number from 1 to {max}, not {v}"))
+}
+
+/// `port` from 1 to 65535. Absent, null or 0 leave it to the commit's rekcod.toml (3000 if
+/// it doesn't say), which is what a stored 0 means.
+fn spec_port(b: &Value) -> Result<i64> {
+    let Some(v) = b.get("port").filter(|v| !v.is_null()) else { return Ok(0) };
+    v.as_i64().filter(|n| (0..=65535).contains(n)).ok_or_else(|| anyhow!("port must be from 1 to 65535, not {v}"))
+}
+
+/// `idle_stop_secs` and `recycle_secs`: None keeps the current setting, 0 is off.
+fn spec_secs(b: &Value, key: &str) -> Result<Option<i64>> {
+    let Some(v) = b.get(key).filter(|v| !v.is_null()) else { return Ok(None) };
+    v.as_i64().filter(|n| *n >= 0).map(Some).ok_or_else(|| anyhow!("{key} must be a whole number of seconds, not {v}"))
+}
+
+/// 32 hex digits: how a hashed bucket name ends (`app_bucket`). A new app with such a key
+/// would get the bucket of some app with a long key.
+fn looks_hashed(key: &str) -> bool {
+    key.len() == 32 && key.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// A deploy's hold on its namespace's quota: `apps.deploying` counts it until this drops,
+/// once the deploy it was admitted for has finished, either way.
+struct Admitted<'a> {
+    c: &'a Controller,
+    key: String,
+    generation: i64,
+    /// What the app's owners call it.
+    short: String,
+}
+
+impl Drop for Admitted<'_> {
+    fn drop(&mut self) {
+        let _ = self.c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+            "update apps set deploying = max(deploying - 1, 0) where name = ?1 and generation = ?2",
+            &[&self.key, &self.generation],
+        );
+    }
+}
+
+/// Admits a deploy of an existing app that changes at most its instance count (scale, deploy
+/// of a ref). Under the namespace's quota lock and in one transaction: the quota check for
+/// the app's whole share, then `instances` and the pending deploy are recorded.
+fn admit<'a>(c: &'a Controller, app: &App, instances: Option<i64>) -> Result<Admitted<'a>> {
+    let ql = c.quota_lock(&app.ns);
+    let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let tx = db.0.transaction()?;
+    if !is_current(&tx, app)? {
+        bail!("no app {}", app.short);
+    }
+    let (have, cpus, gib): (i64, i64, i64) =
+        tx.query_row("select instances, cpus, memory_gib from apps where name = ?1", [&app.name], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })?;
+    let n = instances.unwrap_or(have).max(1);
+    Controller::quota_on(&tx, &app.ns, &app.name, n.saturating_mul(cpus.max(1)), n.saturating_mul(gib.max(1)), 0)?;
+    tx.execute("update apps set instances = ?2, deploying = deploying + 1 where name = ?1", rusqlite::params![app.name, n])?;
+    tx.commit()?;
+    Ok(Admitted { c, key: app.name.clone(), generation: app.generation, short: app.short.clone() })
+}
+
+/// Creates or updates app `b.name` in `ns` and admits its deploy. The caller has checked
+/// `who` may deploy in `ns`. The app-count and resource checks and the write happen under
+/// the namespace's quota lock in one transaction, so creates and scales running at once
+/// can't all take the last of a quota. With `preview_of` (the PR webhook, which acts with
+/// admin rights) the row must be absent or already a preview of exactly that app.
+fn upsert_app<'a>(c: &'a Controller, ns: &str, who: &Caller, b: &Value, preview_of: Option<&str>) -> Result<Admitted<'a>> {
     let short = b["name"].as_str().context("missing name")?.to_string();
     if !valid_label(&short) {
         bail!("app names are lowercase letters, digits and single dashes, at most 40");
@@ -3645,29 +4172,25 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
     }
     let git_url = b["git"]["url"].as_str().context("missing git.url")?;
     let git_ref = b["git"]["ref"].as_str().unwrap_or("main");
-    // 0: the commit's rekcod.toml decides (3000 if it doesn't say).
-    let port = b["port"].as_i64().unwrap_or(0) as i32;
+    let port = spec_port(b)?;
     // Left out (a deploy without --instances) keeps an existing app's count.
-    let existing: Option<i32> =
-        c.db.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query_opt("select instances from apps where name = ?1", &[&name])?
-            .map(|r| r.get(0));
-    let instances = b["instances"].as_i64().map(|n| n as i32).or(existing).unwrap_or(1);
+    let instances = match b.get("instances").filter(|v| !v.is_null()) {
+        Some(_) => Some(spec_count(b, "instances", 1, MAX_INSTANCES)?),
+        None => None,
+    };
     let spread = b["spread"].as_str();
     if spread.is_some_and(|s| !matches!(s, "soft" | "strict")) {
         bail!("spread must be soft or strict");
     }
-    let cpus = b["cpus"].as_i64().unwrap_or(1) as i32;
-    let mem = b["memory_gib"].as_i64().unwrap_or(1) as i32;
+    let cpus = spec_count(b, "cpus", 1, MAX_CPUS)?;
+    let mem = spec_count(b, "memory_gib", 1, MAX_MEMORY_GIB)?;
     let health = b["health"].as_str().unwrap_or("/");
     let start = b["start"].as_str();
     let env = b.get("env").filter(|e| e.is_object()).map(|e| e.to_string());
     // None keeps an existing app's visibility; new apps are private.
     let public = b["public"].as_bool();
-    // None keeps the current setting; 0 is off.
-    let idle_stop = b["idle_stop_secs"].as_i64();
-    let recycle = b["recycle_secs"].as_i64();
+    let idle_stop = spec_secs(b, "idle_stop_secs")?;
+    let recycle = spec_secs(b, "recycle_secs")?;
     let http = match b.get("http").filter(|h| h.is_object()) {
         Some(h) => {
             let s: HttpSettings = serde_json::from_value(h.clone()).context("http")?;
@@ -3678,54 +4201,77 @@ fn upsert_app(c: &Controller, ns: &str, who: &Caller, b: &Value, preview_of: Opt
         }
         None => None,
     };
-    let exists =
-        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt("select owner, ns from apps where name = ?1", &[&name])?;
-    if exists.is_none() {
-        let (n, max): (i64, i64) = {
-            let r =
-                c.db.lock()
-                    .unwrap()
-                    .query_one("select (select count(*) from apps where ns = ?1), max_apps from namespaces where name = ?1", &[&ns])?;
-            (r.get(0), r.get(1))
-        };
-        if max >= 0 && n >= max {
-            bail!("quota: {ns} has {n} of {max} apps");
-        }
-    }
     let ql = c.quota_lock(ns);
     let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    c.check_quota(ns, &name, (instances * cpus) as i64, (instances * mem) as i64, 0)?;
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(r) = exists {
-        let (owner, row_ns): (String, String) = (r.get(0), r.get(1));
-        if row_ns != ns || !can_touch(who, ns, &owner) {
-            bail!("app {short} belongs to someone else");
+    let tx = db.0.transaction()?;
+    use rusqlite::OptionalExtension;
+    let row: Option<(String, String, Option<String>, bool, i64, i64)> = tx
+        .query_row("select owner, ns, preview_of, destroying is not null, generation, instances from apps where name = ?1", [&name], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })
+        .optional()?;
+    let generation = match &row {
+        Some((owner, row_ns, row_preview, destroying, generation, _)) => {
+            if *destroying {
+                bail!("{short} is being destroyed; deploy it again once that has finished");
+            }
+            if row_ns != ns || !can_touch(who, ns, owner) {
+                bail!("app {short} belongs to someone else");
+            }
+            if let Some(base) = preview_of
+                && row_preview.as_deref() != Some(base)
+            {
+                bail!("{short} already exists and isn't a preview of {}; leaving it alone", short_name(base));
+            }
+            *generation
         }
-        db.execute(
+        None => {
+            if looks_hashed(&name) {
+                bail!("app names of 32 hex digits are reserved for hashed bucket names; pick another");
+            }
+            let (n, max): (i64, i64) =
+                tx.query_row("select (select count(*) from apps where ns = ?1), max_apps from namespaces where name = ?1", [ns], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })?;
+            if max >= 0 && n >= max {
+                bail!("quota: {ns} has {n} of {max} apps");
+            }
+            next_generation(&tx)?
+        }
+    };
+    let instances = instances.or(row.as_ref().map(|r| r.5)).unwrap_or(1).max(1);
+    Controller::quota_on(&tx, ns, &name, instances.saturating_mul(cpus), instances.saturating_mul(mem), 0)?;
+    if row.is_some() {
+        tx.execute(
             "update apps set git_url = ?2, git_ref = ?3, port = ?4, instances = ?5, cpus = ?6, memory_gib = ?7, health = ?8,
              start = ?9, env = coalesce(?10, env), public = coalesce(?11, public), idle_stop = coalesce(?12, idle_stop),
              recycle = coalesce(?13, recycle), http = coalesce(?14, http), spread = coalesce(?15, spread) where name = ?1",
-            &[
-                &name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &public, &idle_stop, &recycle, &http,
-                &spread,
+            rusqlite::params![
+                name, git_url, git_ref, port, instances, cpus, mem, health, start, env, public, idle_stop, recycle, http, spread
             ],
         )?;
     } else {
-        db.execute(
+        tx.execute(
             "insert into apps (name, owner, git_url, git_ref, port, instances, cpus, memory_gib, health, start, env, preview_of, created, public,
-               idle_stop, recycle, ns, http)
+               idle_stop, recycle, ns, http, generation)
              values (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, coalesce(?11, '{}'), ?12, ?13, coalesce(?14, false), coalesce(?15, 0), coalesce(?16, 0), ?17,
-               coalesce(?18, '{}'))",
-            &[&name, &who.name, &git_url, &git_ref, &port, &instances, &cpus, &mem, &health, &start, &env, &preview_of, &now(), &public, &idle_stop, &recycle, &ns, &http],
+               coalesce(?18, '{}'), ?19)",
+            rusqlite::params![
+                name, who.name, git_url, git_ref, port, instances, cpus, mem, health, start, env, preview_of, now(), public, idle_stop, recycle,
+                ns, http, generation
+            ],
         )?;
     }
     if let Some(on) = b["bucket"].as_bool() {
-        db.execute("update apps set bucket = ?2 where name = ?1", &[&name, &on])?;
+        tx.execute("update apps set bucket = ?2 where name = ?1", rusqlite::params![name, on])?;
     }
     if let Some(spread) = spread {
-        db.execute("update apps set spread = ?2 where name = ?1", &[&name, &spread])?;
+        tx.execute("update apps set spread = ?2 where name = ?1", rusqlite::params![name, spread])?;
     }
-    Ok(short)
+    tx.execute("update apps set deploying = deploying + 1 where name = ?1", [&name])?;
+    tx.commit()?;
+    Ok(Admitted { c, key: name, generation, short })
 }
 
 fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[&str], b: &Value, q: &[(String, String)]) -> Result<Value> {
@@ -3737,7 +4283,7 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 "select name, git_url, live_release, instances, preview_of, public,
                    exists(select 1 from instances where app = name and state = 'sleeping')
                    and not exists(select 1 from instances where app = name and state = 'live')
-                 from apps where ns = ?1 and (?1 <> 'default' or owner = ?2 or ?3) order by name",
+                 from apps where ns = ?1 and (?1 <> 'default' or owner = ?2 or ?3) and destroying is null order by name",
                 &[&ns, &who.name, &who.admin],
             )?;
             let mut list: Vec<Value> = rows
@@ -3764,8 +4310,8 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         // Create or update the app's config, then deploy it.
         ("POST", ["apps"]) => {
             c.allow(who, ns, Role::Member)?;
-            let name = upsert_app(c, ns, who, b, None)?;
-            deploy(c, &load(&name, Role::Member)?, None, &who.name)
+            let admitted = upsert_app(c, ns, who, b, None)?;
+            deploy(c, &load(&admitted.short, Role::Member)?, None, &who.name)
         }
         ("GET", ["apps", name]) => {
             let mut v = app_status(c, &load(name, Role::Viewer)?)?;
@@ -3783,10 +4329,15 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             c.audit(ns, &who.name, if public { "make public" } else { "make private" }, name, true);
             Ok(json!({"app": name, "ns": ns, "public": public}))
         }
-        ("POST", ["apps", name, "deploy"]) => deploy(c, &load(name, Role::Member)?, b["ref"].as_str().map(String::from), &who.name),
+        ("POST", ["apps", name, "deploy"]) => {
+            let app = load(name, Role::Member)?;
+            let _admitted = admit(c, &app, None)?;
+            deploy(c, &app, b["ref"].as_str().map(String::from), &who.name)
+        }
         ("POST", ["apps", name, "rollback"]) => {
             let app = load(name, Role::Member)?;
-            let target: Option<i32> = b["release"].as_i64().map(|n| n as i32);
+            let target: Option<i32> =
+                b["release"].as_i64().map(|n| i32::try_from(n).map_err(|_| anyhow!("{name} has no release {n}"))).transpose()?;
             let row = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
                 "select commit_sha from releases where app = ?1 and state in ('live', 'old') and n = coalesce(?2,
                    (select max(n) from releases where app = ?1 and n < (select live_release from apps where name = ?1) and state in ('live', 'old')))",
@@ -3799,12 +4350,12 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             deploy(c, &app, Some(commit), &who.name)
         }
         ("POST", ["apps", name, "scale"]) => {
-            let n = b["instances"].as_i64().context("missing instances")? as i32;
+            if b.get("instances").is_none_or(Value::is_null) {
+                bail!("missing instances");
+            }
+            let n = spec_count(b, "instances", 1, MAX_INSTANCES)?;
             let app = load(name, Role::Member)?;
-            c.check_quota(ns, &app.name, (n * app.cpus) as i64, (n * app.memory_gib) as i64, 0)?;
-            c.db.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execute("update apps set instances = ?2 where name = ?1", &[&app.name, &n])?;
+            let _admitted = admit(c, &app, Some(n))?;
             let commit = live_commit(c, &app.name)?;
             deploy(c, &load(name, Role::Member)?, commit, &who.name)
         }
@@ -3920,6 +4471,20 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             deploy(c, &app, Some(commit), &who.name)
         }
         ("DELETE", ["apps", name]) => {
+            // Already being destroyed (its storage cleanup failed): try again now.
+            let key = app_key(ns, name);
+            let row =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .query_opt("select owner from apps where name = ?1 and destroying is not null", &[&key])?;
+            if let Some(r) = row
+                && c.allow(who, ns, Role::Member).is_ok()
+                && can_touch(who, ns, &r.get::<String>(0))
+            {
+                c.audit(ns, &who.name, "destroy", name, true);
+                destroy_app(c, &key)?;
+                return Ok(json!({"destroyed": name, "ns": ns}));
+            }
             let app = load(name, Role::Member)?;
             if !b["force"].as_bool().unwrap_or(false)
                 && let Some(n) = bucket_objects(c, &app.name)?.filter(|n| *n > 0)
@@ -3939,7 +4504,104 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
 /// How much of a job's output the controller keeps once it's finished.
 const JOB_LOG_BYTES: usize = 64 << 10;
 
-/// Places a job and starts it on a node; returns `{id, node}`.
+/// States in which the worker may still run a job: it keeps its quota and its schedule's
+/// turn. `pending` hasn't been acknowledged by its node, `lost` is on a node that stopped
+/// heartbeating, `cancelling` waits for the node to confirm.
+const JOB_ACTIVE: [&str; 4] = ["pending", "running", "cancelling", "lost"];
+const JOB_ACTIVE_SQL: &str = "('pending', 'running', 'cancelling', 'lost')";
+
+/// The job may still be running (see [`JOB_ACTIVE`]); the CLI follows those.
+pub fn job_active(state: &str) -> bool {
+    JOB_ACTIVE.contains(&state)
+}
+
+/// A node's answer to a job call. `Refused` is an error status from the node itself, so it
+/// didn't do what was asked; `Unreachable` is no answer, so it may have.
+enum NodeReply {
+    Ok(Value),
+    Refused(String),
+    Unreachable(anyhow::Error),
+}
+
+fn node_call(url: &str, sec: &str, method: &str, path: &str, body: &Value) -> NodeReply {
+    let data = if body.is_null() { vec![] } else { body.to_string().into_bytes() };
+    let (code, mut r) = match send_within(url, method, path, Some(sec), &data, Some(QUICK)) {
+        Ok(x) => x,
+        Err(e) => return NodeReply::Unreachable(e),
+    };
+    let mut buf = Vec::new();
+    if let Err(e) = r.read_to_end(&mut buf) {
+        return NodeReply::Unreachable(e.into());
+    }
+    let v: Value = serde_json::from_slice(&buf).unwrap_or_else(|_| json!({"error": String::from_utf8_lossy(&buf)}));
+    if code >= 400 { NodeReply::Refused(v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string())) } else { NodeReply::Ok(v) }
+}
+
+/// Jobs whose start is on its way to a node: one sender at a time, so a refusal can't be
+/// overtaken by a repeat that starts it.
+static DISPATCHING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+enum Dispatch {
+    Started,
+    /// No answer, or another sender has it: `poll_jobs` sends it again.
+    Pending,
+    Refused(String),
+    /// It was no longer `pending` (cancelled meanwhile, say): its state.
+    Moved(String),
+}
+
+/// Sends a `pending` job to its node, which starts it once whatever the number of times
+/// it's sent. The row becomes `running` when the node says so and `failed` if it refuses.
+fn dispatch_job(c: &Controller, id: &str) -> Result<Dispatch> {
+    {
+        let mut d = DISPATCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if d.iter().any(|j| j == id) {
+            return Ok(Dispatch::Pending);
+        }
+        d.push(id.to_string());
+    }
+    struct Release(String);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            DISPATCHING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|j| *j != self.0);
+        }
+    }
+    let _release = Release(id.to_string());
+    let r =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select node, spec, state from jobs where id = ?1", &[&id])?;
+    let r = r.ok_or_else(|| anyhow!("no job {id}"))?;
+    let (node, spec, state): (String, String, String) = (r.get(0), r.get(1), r.get(2));
+    if state != "pending" {
+        return Ok(Dispatch::Moved(state));
+    }
+    let Some((url, sec)) = job_node(c, id, &node)? else { return Ok(Dispatch::Refused(format!("node {node} was removed"))) };
+    let mut body: Value = serde_json::from_str(&spec)?;
+    body["id"] = json!(id);
+    let (state, log, d) = match node_call(&url, &sec, "POST", "/jobs", &body) {
+        NodeReply::Ok(_) => ("running", String::new(), Dispatch::Started),
+        NodeReply::Refused(e) => ("failed", format!("rekcod: node {node} refused the job: {e}\n"), Dispatch::Refused(e)),
+        NodeReply::Unreachable(e) => {
+            eprintln!("rekcod: job {id}: no answer from node {node} ({e:#}); sending it again");
+            return Ok(Dispatch::Pending);
+        }
+    };
+    let finished = (state == "failed").then(now);
+    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+        "update jobs set state = ?2, finished = ?3, log = log || ?4 where id = ?1 and state = 'pending'",
+        &[&id, &state, &finished, &log],
+    )?;
+    Ok(d)
+}
+
+/// A job's CPUs and GiB, checked like an app's.
+fn job_resources(spec: &Value) -> Result<(i64, i64)> {
+    Ok((spec_count(spec, "cpus", 2, MAX_CPUS)?, spec_count(spec, "memory_gib", 2, MAX_MEMORY_GIB)?))
+}
+
+/// Places a job, stores it as `pending` with its quota, and starts it on a node; returns
+/// `{id, node, state}`. A start whose reply got lost stays `pending` and is sent again.
 fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, schedule: Option<&str>) -> Result<Value> {
     if spec["cmd"].as_array().is_none_or(|a| a.is_empty()) {
         bail!("missing cmd");
@@ -3947,71 +4609,146 @@ fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, sche
     if spec["git"]["url"].as_str().is_none() {
         bail!("jobs need git.url (and git.ref)");
     }
-    let used: i64 =
-        c.db.lock()
-            .unwrap()
-            .query_one(
-                "select (select count(*) from sandboxes where owner = ?1 and state = 'running')
-                  + (select count(*) from jobs where owner = ?1 and state = 'running')",
-                &[&owner],
-            )?
-            .get(0);
-    if max >= 0 && used >= max as i64 {
-        bail!("quota: {used} of {max} sandboxes and jobs in use");
-    }
-    let gib = spec["memory_gib"].as_i64().unwrap_or(2);
-    let ql = c.quota_lock(ns);
-    let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    c.check_quota(ns, "", spec["cpus"].as_i64().unwrap_or(2), gib, 1)?;
-    let mib = gib * 1024;
-    let (node, url, sec) = c.place(mib, false, ns)?.into_iter().next().ok_or_else(|| anyhow!("no node has {mib} MiB free"))?;
+    let (cpus, gib) = job_resources(spec)?;
     let id = format!("j-{}", sandbox::new_id()?);
-    let mut body = spec.clone();
-    body["id"] = json!(id);
-    call(&url, "POST", "/jobs", Some(&sec), &body).with_context(|| format!("node {node}"))?;
-    let name = spec["name"].as_str();
-    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-        "insert into jobs (id, owner, node, name, spec, state, created, schedule, ns) values (?1, ?2, ?3, ?4, ?5, 'running', ?6, ?7, ?8)",
-        &[&id, &owner, &node, &name, &spec.to_string(), &now(), &schedule, &ns],
-    )?;
+    let node = {
+        let ql = c.quota_lock(ns);
+        let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let used: i64 =
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_one(
+                    &format!(
+                        "select (select count(*) from sandboxes where owner = ?1 and state = 'running')
+                          + (select count(*) from jobs where owner = ?1 and state in {JOB_ACTIVE_SQL})"
+                    ),
+                    &[&owner],
+                )?
+                .get(0);
+        if max >= 0 && used >= max as i64 {
+            bail!("quota: {used} of {max} sandboxes and jobs in use");
+        }
+        c.check_quota(ns, "", cpus, gib, 1)?;
+        let mib = gib * 1024;
+        let (node, _, _) = c.place(mib, false, ns)?.into_iter().next().ok_or_else(|| anyhow!("no node has {mib} MiB free"))?;
+        let name = spec["name"].as_str();
+        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+            "insert into jobs (id, owner, node, name, spec, state, created, schedule, ns) values (?1, ?2, ?3, ?4, ?5, 'pending', ?6, ?7, ?8)",
+            &[&id, &owner, &node, &name, &spec.to_string(), &now(), &schedule, &ns],
+        )?;
+        node
+    };
     c.audit(ns, owner, "job", &id, true);
-    Ok(json!({"id": id, "node": node}))
+    let state = match dispatch_job(c, &id)? {
+        Dispatch::Started => "running".to_string(),
+        Dispatch::Pending => "pending".to_string(),
+        Dispatch::Moved(s) => s,
+        Dispatch::Refused(e) => bail!("node {node}: {e}"),
+    };
+    Ok(json!({"id": id, "node": node, "state": state}))
 }
 
-/// Asks each running job's node how it's doing; stores the result once it's finished.
+fn finish_job(c: &Controller, id: &str, state: &str, exit: Option<i64>, log: &str) -> Result<()> {
+    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+        &format!("update jobs set state = ?2, exit = ?3, finished = ?4, log = ?5 where id = ?1 and state in {JOB_ACTIVE_SQL}"),
+        &[&id, &state, &exit, &now(), &log],
+    )?;
+    Ok(())
+}
+
+/// Ends a job nothing of which runs anywhere: `cancelled` if that was asked for.
+fn job_not_running(c: &Controller, id: &str, why: &str) -> Result<()> {
+    let r =
+        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_one("select log, state from jobs where id = ?1", &[&id])?;
+    let (log, state): (String, String) = (r.get(0), r.get(1));
+    finish_job(c, id, if state == "cancelling" { "cancelled" } else { "failed" }, None, &format!("{log}rekcod: {why}\n"))
+}
+
+/// The job's node, or None once its row is gone (removed while the job was placed).
+fn job_node(c: &Controller, id: &str, node: &str) -> Result<Option<(String, String)>> {
+    match c.node(node) {
+        Ok((url, sec, _)) => Ok(Some((url, sec))),
+        Err(e) if e.to_string().starts_with("no node") => {
+            job_not_running(c, id, &format!("node {node} was removed"))?;
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Brings one job's row up to date with its node: repeats a cancel, then stores the
+/// outcome if the node says the job is over. False when the node didn't answer.
+fn refresh_job(c: &Controller, id: &str, node: &str, state: &str) -> Result<bool> {
+    let Some((url, sec)) = job_node(c, id, node)? else { return Ok(true) };
+    if state == "cancelling" && matches!(node_call(&url, &sec, "DELETE", &format!("/jobs/{id}"), &Value::Null), NodeReply::Unreachable(_)) {
+        return Ok(false);
+    }
+    let v = match node_call(&url, &sec, "GET", &format!("/jobs/{id}"), &Value::Null) {
+        NodeReply::Unreachable(_) => return Ok(false),
+        // It answered and has no such job, so nothing of it runs there.
+        NodeReply::Refused(e) if e.starts_with("no job") => {
+            job_not_running(c, id, &format!("node {node} doesn't have this job"))?;
+            return Ok(true);
+        }
+        NodeReply::Refused(_) => return Ok(true),
+        NodeReply::Ok(v) => v,
+    };
+    if v["running"].as_bool() != Some(false) {
+        // The node is back, or never stopped running it.
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update jobs set state = 'running' where id = ?1 and state = 'lost'", &[&id])?;
+        return Ok(true);
+    }
+    let done = if v["cancelled"].as_bool() == Some(true) {
+        "cancelled"
+    } else if v["exit"].as_i64() == Some(0) {
+        "done"
+    } else {
+        "failed"
+    };
+    finish_job(c, id, done, v["exit"].as_i64(), v["log"].as_str().unwrap_or(""))?;
+    Ok(true)
+}
+
+/// Every 5 s, for each job that may still run: a `pending` start is sent again, a
+/// `cancelling` job's cancel repeated, and the outcome stored once the node says it's
+/// over. Polling means a controller restart doesn't lose jobs; a node that doesn't answer
+/// is skipped for the rest of the pass.
 fn poll_jobs(c: &Controller) -> Result<()> {
     let rows =
-        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query("select id, node from jobs where state = 'running'", &[])?;
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query(&format!("select id, node, state from jobs where state in {JOB_ACTIVE_SQL} order by created"), &[])?;
+    let mut silent: Vec<String> = Vec::new();
     for r in rows {
-        let (id, node): (String, String) = (r.get(0), r.get(1));
-        let Ok((url, sec, _)) = c.node(&node) else { continue };
-        let Ok(v) = call(&url, "GET", &format!("/jobs/{id}"), Some(&sec), &Value::Null) else { continue };
-        if v["running"].as_bool() != Some(false) {
+        let (id, node, state): (String, String, String) = (r.get(0), r.get(1), r.get(2));
+        if silent.contains(&node) {
             continue;
         }
-        let state = if v["cancelled"].as_bool() == Some(true) {
-            "cancelled"
-        } else if v["exit"].as_i64() == Some(0) {
-            "done"
+        let answered = if state == "pending" {
+            !matches!(dispatch_job(c, &id), Ok(Dispatch::Pending))
         } else {
-            "failed"
+            refresh_job(c, &id, &node, &state).unwrap_or(true)
         };
-        let (exit, log) = (v["exit"].as_i64(), v["log"].as_str().unwrap_or("").to_string());
-        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-            "update jobs set state = ?2, exit = ?3, finished = ?4, log = ?5 where id = ?1 and state = 'running'",
-            &[&id, &state, &exit, &now(), &log],
-        )?;
+        if !answered {
+            silent.push(node);
+        }
     }
     Ok(())
 }
 
-/// Starts a schedule's next run once its last one has finished and `every` has passed.
+/// Starts a schedule's next run once no run of it may still be going and `every` has
+/// passed. A run on a node that went quiet keeps the turn until its node answers or is
+/// removed, so two never overlap.
 fn run_schedules(c: &Controller) -> Result<()> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
-        "select s.name, s.owner, s.spec, coalesce(t.max_sandboxes, 10), s.ns from schedules s
-           left join (select name, max(max_sandboxes) as max_sandboxes from tokens group by name) t on t.name = s.owner
-         where s.last_run <= ?1 - s.every
-           and not exists(select 1 from jobs j where j.id = s.last_job and j.state = 'running')",
+        &format!(
+            "select s.name, s.owner, s.spec, coalesce(t.max_sandboxes, 10), s.ns from schedules s
+               left join (select name, max(max_sandboxes) as max_sandboxes from tokens group by name) t on t.name = s.owner
+             where s.last_run <= ?1 - s.every
+               and not exists(select 1 from jobs j where (j.id = s.last_job or j.schedule = s.name) and j.state in {JOB_ACTIVE_SQL})"
+        ),
         &[&now()],
     )?;
     for r in rows {
@@ -4067,6 +4804,14 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             if !valid_label(name) {
                 bail!("schedule names are lowercase letters, digits and single dashes");
             }
+            // What start_job would refuse at every run, refused now.
+            if b["cmd"].as_array().is_none_or(|a| a.is_empty()) {
+                bail!("missing cmd");
+            }
+            if b["git"]["url"].as_str().is_none() {
+                bail!("jobs need git.url (and git.ref)");
+            }
+            job_resources(b)?;
             let key = app_key(ns, name);
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(r) = db.query_opt("select owner from schedules where name = ?1", &[&key])?
@@ -4110,10 +4855,11 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         ("GET", ["jobs", id]) => {
             let (mut v, log) = load_job(c, ns, id, who, Role::Viewer)?;
             v["log"] = json!(log);
-            if v["state"] == "running" {
+            if job_active(v["state"].as_str().unwrap_or("")) {
                 let node = v["node"].as_str().unwrap_or("").to_string();
-                if let Ok(live) =
-                    c.node(&node).and_then(|(url, sec, _)| call(&url, "GET", &format!("/jobs/{id}"), Some(&sec), &Value::Null))
+                if let Ok(live) = c
+                    .node(&node)
+                    .and_then(|(url, sec, _)| call_within(&url, "GET", &format!("/jobs/{id}"), Some(&sec), &Value::Null, QUICK))
                 {
                     v["log"] = live["log"].clone();
                 }
@@ -4123,8 +4869,8 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         // The same spec again as a one-off job (a schedule's run doesn't renew the schedule).
         ("POST", ["jobs", id, "rerun"]) => {
             let (v, _) = load_job(c, ns, id, who, Role::Member)?;
-            if v["state"] == "running" {
-                bail!("job {id} is still running");
+            if job_active(v["state"].as_str().unwrap_or("")) {
+                bail!("job {id} is still {}", v["state"].as_str().unwrap_or(""));
             }
             let spec: String =
                 c.db.lock()
@@ -4137,16 +4883,23 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         }
         ("POST", ["jobs", id, "cancel"]) => {
             let (v, _) = load_job(c, ns, id, who, Role::Member)?;
-            if v["state"] != "running" {
-                bail!("job {id} is {}", v["state"].as_str().unwrap_or(""));
+            let state = v["state"].as_str().unwrap_or("");
+            if !job_active(state) {
+                bail!("job {id} is {state}");
             }
-            let (url, sec, _) = c.node(v["node"].as_str().unwrap_or(""))?;
-            call(&url, "DELETE", &format!("/jobs/{id}"), Some(&sec), &Value::Null)?;
             c.db.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execute("update jobs set state = 'cancelled', finished = ?2 where id = ?1", &[id, &now()])?;
+                .execute(&format!("update jobs set state = 'cancelling' where id = ?1 and state in {JOB_ACTIVE_SQL}"), &[id])?;
             c.audit(ns, &who.name, "cancel", id, true);
-            Ok(json!({"cancelled": id}))
+            // `cancelled` once the node confirms, now or from `poll_jobs`; until then the job
+            // keeps its quota and its schedule's turn.
+            refresh_job(c, id, v["node"].as_str().unwrap_or(""), "cancelling")?;
+            let state: String =
+                c.db.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .query_one("select state from jobs where id = ?1", &[id])?
+                    .get(0);
+            Ok(json!({"cancelled": id, "state": state}))
         }
         ("DELETE", ["schedules", name]) => {
             c.allow(who, ns, Role::Member).map_err(|_| anyhow!("no schedule {name}"))?;
@@ -4160,6 +4913,444 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             Ok(json!({"unscheduled": name}))
         }
         _ => Err(anyhow!("no such endpoint")),
+    }
+}
+
+// Jobs, node registration, checkout files and restore (docs/fleet-hardening.md). Workers and
+// VMs are stubbed; controller SQL, HTTP and the job threads are real.
+#[cfg(test)]
+mod job_and_node_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    fn serve(c: Controller) -> (String, Arc<Controller>) {
+        let c = Arc::new(c);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        let cc = c.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let c = cc.clone();
+                std::thread::spawn(move || controller_handle(&c, s.peer_addr().ok().map(|a| a.ip()), s));
+            }
+        });
+        (url, c)
+    }
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rekcod-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// Clone and sandbox stubs; `block` names the step that waits for `release`.
+    struct FakeHost {
+        block: &'static str,
+        reached: AtomicBool,
+        release: AtomicBool,
+        created: AtomicUsize,
+        removed: Mutex<Vec<String>>,
+        work: PathBuf,
+    }
+
+    impl FakeHost {
+        fn new(block: &'static str, work: &Path) -> Arc<FakeHost> {
+            Arc::new(FakeHost {
+                block,
+                reached: AtomicBool::new(false),
+                release: AtomicBool::new(false),
+                created: AtomicUsize::new(0),
+                removed: Mutex::new(vec![]),
+                work: work.to_path_buf(),
+            })
+        }
+        fn step(&self, stage: &str) {
+            if self.block == stage {
+                self.reached.store(true, Ordering::SeqCst);
+                while !self.release.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+    }
+
+    impl JobHost for FakeHost {
+        fn clone(&self, _: &str, _: &str) -> Result<PathBuf> {
+            self.step("clone");
+            let d = self.work.join(sandbox::new_id()?);
+            std::fs::create_dir_all(&d)?;
+            Ok(d)
+        }
+        fn create(&self, _: &str, _: sandbox::CreateOptions) -> Result<String> {
+            self.created.fetch_add(1, Ordering::SeqCst);
+            self.step("create");
+            Ok("fake-sb".into())
+        }
+        fn exec(&self, _: &str, _: &sandbox::ExecOptions, _: &[String]) -> Result<Command> {
+            let mut c = Command::new("/bin/sh");
+            c.args(["-c", if self.block == "exec" { "printf executed; exec sleep 30" } else { "printf executed" }]);
+            Ok(c)
+        }
+        fn remove(&self, sb: &str) {
+            self.removed.lock().unwrap().push(sb.into());
+        }
+    }
+
+    fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
+        let t0 = Instant::now();
+        while !f() {
+            assert!(t0.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn finished(paths: &Paths, id: &str) -> Value {
+        let mut v = Value::Null;
+        wait_for("the job's result", || {
+            v = job_get(paths, id).unwrap();
+            v["running"] == false
+        });
+        v
+    }
+
+    #[test]
+    fn cancel_stops_a_job_at_whatever_step_it_is_at() {
+        let home = temp("job-cancel");
+        let paths = Paths { home: home.clone() };
+        for stage in ["clone", "create", "exec"] {
+            let host = FakeHost::new(stage, &home.join("work"));
+            let id = format!("j-cancel{stage}");
+            let t0 = Instant::now();
+            run_job_on(host.clone(), &paths, &json!({"id": id, "git": {"url": "u"}, "cmd": ["x"]})).unwrap();
+            if stage == "exec" {
+                wait_for("the command", || {
+                    std::fs::read_to_string(home.join("jobs").join(&id).join("log")).is_ok_and(|l| l.contains("executed"))
+                });
+            } else {
+                wait_for(stage, || host.reached.load(Ordering::SeqCst));
+            }
+            assert_eq!(job_cancel_on(host.clone(), &paths, &id).unwrap()["running"], true, "{stage}: the worker hasn't confirmed yet");
+            host.release.store(true, Ordering::SeqCst);
+            let v = finished(&paths, &id);
+            assert_eq!(v["cancelled"], true, "{stage}: {v}");
+            let log = v["log"].as_str().unwrap();
+            match stage {
+                "clone" => assert!(host.created.load(Ordering::SeqCst) == 0 && !log.contains("executed"), "{log}"),
+                "create" => {
+                    assert!(!log.contains("executed"), "{log}");
+                    assert!(host.removed.lock().unwrap().contains(&"fake-sb".to_string()));
+                }
+                _ => {
+                    assert!(t0.elapsed() < Duration::from_secs(10), "the command was killed, not waited for");
+                    assert!(host.removed.lock().unwrap().contains(&"fake-sb".to_string()));
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_repeated_start_runs_once_and_a_cancel_that_comes_first_wins() {
+        let home = temp("job-idem");
+        let paths = Paths { home: home.clone() };
+        let host = FakeHost::new("", &home.join("work"));
+        let spec = json!({"id": "j-idem", "git": {"url": "u"}, "cmd": ["x"]});
+        assert!(run_job_on(host.clone(), &paths, &spec).unwrap()["again"].is_null());
+        assert_eq!(run_job_on(host.clone(), &paths, &spec).unwrap()["again"], true);
+        let v = finished(&paths, "j-idem");
+        assert_eq!((v["exit"].as_i64(), v["log"].as_str()), (Some(0), Some("executed")));
+        assert_eq!(run_job_on(host.clone(), &paths, &spec).unwrap()["again"], true, "a finished job isn't run again either");
+        assert_eq!(host.created.load(Ordering::SeqCst), 1);
+        // The controller's cancel got there before its start.
+        assert_eq!(job_cancel_on(host.clone(), &paths, "j-early").unwrap()["running"], false);
+        run_job_on(host.clone(), &paths, &json!({"id": "j-early", "git": {"url": "u"}, "cmd": ["x"]})).unwrap();
+        let v = job_get(&paths, "j-early").unwrap();
+        assert_eq!((v["running"].as_bool(), v["cancelled"].as_bool()), (Some(false), Some(true)));
+        assert_eq!(host.created.load(Ordering::SeqCst), 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    fn fake_sandbox(home: &Path, id: &str, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let d = home.join("sb").join(id);
+        std::fs::create_dir_all(&d).unwrap();
+        let meta = json!({"id": id, "name": name, "project": "/tmp/x", "mode": "mount", "image": "alpine", "golden": null,
+                          "allow": null, "offline": false, "cpus": 1, "memory_gib": 1, "ttl_secs": 0, "secrets": [], "created": 0});
+        std::fs::write(d.join("meta.json"), meta.to_string()).unwrap();
+        for (f, body) in files {
+            std::fs::write(d.join(f), body).unwrap();
+        }
+        d
+    }
+
+    #[test]
+    fn a_node_restart_removes_job_sandboxes_nothing_runs() {
+        let home = temp("job-orphans");
+        let paths = Paths { home: home.clone() };
+        std::fs::create_dir_all(home.join("jobs/j-half")).unwrap();
+        let orphan = fake_sandbox(&home, "sborphan", "j-orphan", &[(JOB_MARKER, "j-orphan")]);
+        // Its creation was cut short before the marker: known by its name and job directory.
+        let half = fake_sandbox(&home, "sbhalf", "j-half", &[]);
+        let live = fake_sandbox(&home, "sblive", "j-live", &[(JOB_MARKER, "j-live")]);
+        let mine = fake_sandbox(&home, "sbmine", "j-mine", &[]);
+        let instance = fake_sandbox(&home, "sbinst", "web-r1-abcd", &[(FLEET_MARKER, ""), ("instance.json", "{}")]);
+        jobs().insert("j-live".into(), JobRun::default());
+        let mut found = orphan_job_sandboxes(&paths);
+        found.sort();
+        assert_eq!(found, ["sbhalf", "sborphan"]);
+        remove_orphan_job_sandboxes(&paths);
+        jobs().remove("j-live");
+        assert!(!orphan.exists() && !half.exists());
+        assert!(live.exists() && mine.exists() && instance.exists());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn checkout_files_are_read_and_written_without_following_links() {
+        let dir = temp("checkout-links");
+        let outside = temp("checkout-outside");
+        std::fs::write(outside.join("settings.toml"), "[app]\nport = 9999\n").unwrap();
+        let link = |target: &Path, name: &str| std::os::unix::fs::symlink(target, dir.join(name)).unwrap();
+        link(Path::new("/dev/zero"), "rekcod.toml");
+        assert!(checkout_toml(&dir).unwrap_err().to_string().contains("symlink"));
+        std::fs::remove_file(dir.join("rekcod.toml")).unwrap();
+        link(&outside.join("settings.toml"), "rekcod.toml");
+        assert!(checkout_toml(&dir).is_err(), "a file outside the checkout isn't read");
+        std::fs::remove_file(dir.join("rekcod.toml")).unwrap();
+        assert!(checkout_toml(&dir).unwrap().is_empty());
+        // A dangling Dockerfile link: nothing appears where it points.
+        link(&outside.join("planted"), "Dockerfile");
+        ensure_dockerfile(&dir, Some("python3 app.py")).unwrap();
+        assert!(!outside.join("planted").exists());
+        assert!(std::fs::symlink_metadata(dir.join("Dockerfile")).unwrap().file_type().is_symlink());
+        std::fs::remove_file(dir.join("Dockerfile")).unwrap();
+        // A lockfile that's a link doesn't decide the install step.
+        std::fs::write(dir.join("package.json"), "{}").unwrap();
+        link(&outside.join("settings.toml"), "package-lock.json");
+        ensure_dockerfile(&dir, Some("python3 app.py")).unwrap();
+        let d = std::fs::read_to_string(dir.join("Dockerfile")).unwrap();
+        assert!(d.starts_with("FROM python:") && d.contains("RUN npm install\n"), "{d}");
+        std::fs::write(dir.join("Dockerfile"), "FROM custom\n").unwrap();
+        ensure_dockerfile(&dir, Some("python3 app.py")).unwrap();
+        assert_eq!(std::fs::read_to_string(dir.join("Dockerfile")).unwrap(), "FROM custom\n");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    type Seen = Arc<Mutex<Vec<(String, String, String)>>>;
+
+    /// A worker at `id` answering with `reply` (None: close without a reply).
+    fn worker(c: &Controller, id: &str, reply: impl Fn(&str, &str) -> Option<(u16, Value)> + Send + 'static) -> Seen {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into nodes (id, url, secret, mem_free, mem_total, last_seen) values (?1, ?2, 's', 65536, 65536, ?3)",
+                &[&id, &url, &now()],
+            )
+            .unwrap();
+        let seen: Seen = Arc::new(Mutex::new(vec![]));
+        let s = seen.clone();
+        std::thread::spawn(move || {
+            for conn in l.incoming().flatten() {
+                let mut r = BufReader::new(conn);
+                let Ok(req) = crate::sandbox_api::read_request(&mut r) else { continue };
+                s.lock().unwrap().push((req.method.clone(), req.path.clone(), String::from_utf8_lossy(&req.body).to_string()));
+                if let Some((code, v)) = reply(&req.method, &req.path) {
+                    let _ = respond(r.get_mut(), code, "application/json", v.to_string().as_bytes());
+                }
+            }
+        });
+        seen
+    }
+
+    fn job_state(c: &Controller, id: &str) -> String {
+        c.db.lock().unwrap().query_one("select state from jobs where id = ?1", &[&id]).unwrap().get(0)
+    }
+
+    fn spec() -> Value {
+        json!({"cmd": ["sleep", "1000"], "git": {"url": "https://example.invalid/repo"}})
+    }
+
+    #[test]
+    fn a_start_whose_reply_is_lost_stays_tracked_and_is_sent_again_with_its_id() {
+        let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        let posts = Arc::new(AtomicUsize::new(0));
+        let p = posts.clone();
+        let seen = worker(&c, "n1", move |m, _| match m {
+            // The first start is accepted and the connection dropped, as in the audit.
+            "POST" => (p.fetch_add(1, Ordering::SeqCst) > 0).then(|| (200, json!({"started": "x"}))),
+            _ => Some((200, json!({"running": true, "log": ""}))),
+        });
+        let v = start_job(&c, "default", "alice", 1, &spec(), None).unwrap();
+        let id = v["id"].as_str().unwrap().to_string();
+        assert_eq!((v["state"].as_str(), job_state(&c, &id).as_str()), (Some("pending"), "pending"));
+        // Its quota is held while it's pending.
+        assert!(start_job(&c, "default", "alice", 1, &spec(), None).unwrap_err().to_string().contains("quota"));
+        poll_jobs(&c).unwrap();
+        assert_eq!(job_state(&c, &id), "running");
+        let starts: Vec<String> = seen.lock().unwrap().iter().filter(|s| s.0 == "POST").map(|s| s.2.clone()).collect();
+        assert_eq!(starts.len(), 2);
+        assert!(starts.iter().all(|b| serde_json::from_str::<Value>(b).unwrap()["id"] == json!(id)), "a repeat carries the same ID");
+        // A node that refuses: the row is failed, not left to run untracked.
+        worker(&c, "n2", |_, _| Some((400, json!({"error": "disk full"}))));
+        c.db.lock().unwrap().execute("update nodes set mem_free = 0 where id = 'n1'", &[]).unwrap();
+        assert!(start_job(&c, "default", "bob", 5, &spec(), None).unwrap_err().to_string().contains("disk full"));
+        let failed: String = c.db.lock().unwrap().query_one("select state from jobs where owner = 'bob'", &[]).unwrap().get(0);
+        assert_eq!(failed, "failed");
+        // Placed on a node removed before the row was stored: it ends instead of holding quota.
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into jobs (id, owner, node, spec, state, created) values ('j-orphan', 'carol', 'n-gone', '{}', 'pending', 0)",
+                &[],
+            )
+            .unwrap();
+        poll_jobs(&c).unwrap();
+        assert_eq!(job_state(&c, "j-orphan"), "failed");
+    }
+
+    #[test]
+    fn a_job_on_a_silent_node_keeps_its_schedule_turn_until_the_worker_confirms() {
+        let (url, c) = serve(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        c.db.lock()
+            .unwrap()
+            .execute("insert into tokens (token, name, admin, hashed) values (?1, 'admin', 1, 1)", &[&hash_token("admin-t")])
+            .unwrap();
+        let answer = Arc::new(Mutex::new(json!({"running": true, "log": "busy"})));
+        let a = answer.clone();
+        let seen = worker(&c, "n1", move |m, _| match m {
+            "POST" => Some((200, json!({"started": "x"}))),
+            "DELETE" => Some((200, json!({"cancelled": "x", "running": true}))),
+            _ => Some((200, a.lock().unwrap().clone())),
+        });
+        // A second, healthy worker where a second copy could start.
+        let other = worker(&c, "n2", |_, _| Some((200, json!({"started": "x", "running": true}))));
+        c.db.lock().unwrap().execute("update nodes set mem_free = 32768 where id = 'n2'", &[]).unwrap();
+        let starts = || [&seen, &other].iter().map(|s| s.lock().unwrap().iter().filter(|s| s.0 == "POST").count()).sum::<usize>();
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into schedules (name, owner, spec, every, ns) values ('nightly', 'alice', ?1, 1, 'default')",
+                &[&spec().to_string()],
+            )
+            .unwrap();
+        run_schedules(&c).unwrap();
+        let id: String = c.db.lock().unwrap().query_one("select last_job from schedules", &[]).unwrap().get(0);
+        assert_eq!((starts(), job_state(&c, &id).as_str()), (1, "running"));
+        let due = || c.db.lock().unwrap().execute("update schedules set last_run = 0", &[]).unwrap();
+        // The node misses its heartbeats: the job is lost, not over.
+        c.db.lock().unwrap().execute("update nodes set last_seen = 0 where id = 'n1'", &[]).unwrap();
+        mark_lost_nodes(&c).unwrap();
+        assert_eq!(job_state(&c, &id), "lost");
+        due();
+        run_schedules(&c).unwrap();
+        assert_eq!(starts(), 1, "no second copy while the first may still run");
+        // Lost jobs are still polled; the worker says it's running.
+        poll_jobs(&c).unwrap();
+        assert_eq!(job_state(&c, &id), "running");
+        c.db.lock().unwrap().execute("update jobs set state = 'lost' where id = ?1", &[&id]).unwrap();
+        // Cancel reaches the worker, and the job holds its turn until the worker confirms.
+        let r = call(&url, "POST", &format!("/jobs/{id}/cancel"), Some("admin-t"), &json!({})).unwrap();
+        assert_eq!(r["state"], "cancelling");
+        assert!(seen.lock().unwrap().iter().any(|s| s.0 == "DELETE" && s.1 == format!("/jobs/{id}")));
+        due();
+        run_schedules(&c).unwrap();
+        assert_eq!(starts(), 1);
+        *answer.lock().unwrap() = json!({"running": false, "exit": 137, "cancelled": true, "log": "busy"});
+        poll_jobs(&c).unwrap();
+        assert_eq!(job_state(&c, &id), "cancelled");
+        c.db.lock().unwrap().execute("update nodes set last_seen = ?1, state = 'ready'", &[&now()]).unwrap();
+        due();
+        run_schedules(&c).unwrap();
+        assert_eq!(starts(), 2, "the next run starts once the first is confirmed over");
+        // Removing a node ends what it ran, unconfirmed.
+        let next: String = c.db.lock().unwrap().query_one("select last_job from schedules", &[]).unwrap().get(0);
+        call(&url, "DELETE", "/nodes/n1", Some("admin-t"), &Value::Null).unwrap();
+        assert_eq!(job_state(&c, &next), "failed");
+    }
+
+    #[test]
+    fn https_nodes_can_share_a_host_and_failed_registrations_leave_no_row() {
+        let dir = temp("node-register");
+        let (url, c) = serve({
+            let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+            ctl.node_ca = Some(crate::tls::ensure_node_ca(&dir).unwrap());
+            ctl.own_names = vec!["127.0.0.1".into(), "ctl.example".into()];
+            ctl
+        });
+        c.db.lock().unwrap().execute("insert or replace into config values ('join_token', 'jt')", &[]).unwrap();
+        let reg = |u: &str| call(&url, "POST", "/nodes/register", None, &json!({"join_token": "jt", "url": u, "mem_total_mib": 1024}));
+        let rows = || c.db.lock().unwrap().query_one("select count(*) from nodes", &[]).unwrap().get::<i64>(0);
+        let a = reg("https://127.0.0.1:17991").unwrap();
+        let b = reg("https://127.0.0.1:17992").unwrap();
+        // Each certificate names its node, and not the host both advertised.
+        for n in [&a, &b] {
+            use rustls::pki_types::pem::PemObject;
+            let der = rustls::pki_types::CertificateDer::from_pem_slice(n["cert"].as_str().unwrap().as_bytes()).unwrap();
+            let text = String::from_utf8_lossy(der.as_ref()).to_string();
+            assert!(text.contains(&crate::tls::node_name(n["id"].as_str().unwrap())), "{text}");
+            assert!(!der.as_ref().windows(4).any(|w| w == [127, 0, 0, 1]), "no IP address in a node certificate");
+        }
+        assert_eq!(rows(), 2);
+        for (u, why) in [
+            ("https://127.0.0.1:17991", "already registered"),
+            ("https://ctl.example:7701", "controller's own"),
+            ("https://127.0.0.1", "scheme://host:port"),
+            ("https://127.0.0.1:0", "scheme://host:port"),
+            ("https://127.0.0.1:7701/x", "scheme://host:port"),
+            ("http://203.0.113.9:7701", "REKCOD_INSECURE"),
+        ] {
+            let e = reg(u).unwrap_err().to_string();
+            assert!(e.contains(why), "{u}: {e}");
+        }
+        assert!(
+            call(&url, "POST", "/nodes/register", None, &json!({"join_token": "jt", "url": "https://127.0.0.1:17993", "zone": "Bad Zone"}))
+                .is_err()
+        );
+        assert_eq!(rows(), 2, "refused registrations leave no row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_takes_only_a_whole_fleet_database() {
+        let dir = temp("restore");
+        let live = dir.join("live.db");
+        let mut db = Db::open(&live).unwrap();
+        db.execute("insert into config values ('join_token', 'from-backup')", &[]).unwrap();
+        db.execute("insert into instances values ('web', 1, 'sb1', 'n1', 'ep', 'live')", &[]).unwrap();
+        drop(db);
+        let backup = dir.join("backup.db");
+        rusqlite::Connection::open(&live).unwrap().execute("vacuum into ?1", [backup.display().to_string()]).unwrap();
+        let target = dir.join("controller/fleet.db");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        Db::open(&target).unwrap().execute("insert into config values ('join_token', 'current')", &[]).unwrap();
+        let token =
+            || -> String { Db::open(&target).unwrap().query_one("select value from config where key = 'join_token'", &[]).unwrap().get(0) };
+        let fresh = dir.join("fresh.db");
+        drop(Db::open(&fresh).unwrap());
+        let damaged = dir.join("damaged.db");
+        let bytes = std::fs::read(&backup).unwrap();
+        std::fs::write(&damaged, &bytes[..bytes.len() / 2]).unwrap();
+        std::fs::write(dir.join("empty.db"), b"").unwrap();
+        std::fs::write(dir.join("text.db"), b"not a database at all, just text").unwrap();
+        for (name, why) in [("empty.db", "empty"), ("text.db", "SQLite"), ("fresh.db", "join token"), ("damaged.db", "damaged")] {
+            let e = format!("{:#}", restore_file(&dir.join(name), &target).unwrap_err());
+            assert!(e.contains(why) || (why == "damaged" && e.contains("malformed")), "{name}: {e}");
+            assert_eq!(token(), "current", "{name} replaced the database");
+        }
+        restore_file(&backup, &target).unwrap();
+        assert_eq!(token(), "from-backup");
+        let state: String = Db::open(&target).unwrap().query_one("select state from instances", &[]).unwrap().get(0);
+        assert_eq!(state, "lost");
+        assert!(
+            std::fs::read_dir(target.parent().unwrap())
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().contains("before-restore"))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
@@ -4195,7 +5386,8 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
     let pr = b["number"].as_i64().context("no PR number")?;
     let urls = [b["repository"]["clone_url"].as_str().unwrap_or(""), b["repository"]["html_url"].as_str().unwrap_or("")];
     let base = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
-        "select name, owner, ns from apps where preview_of is null and (git_url = ?1 or git_url = ?2 or git_url = ?3) limit 1",
+        "select name, owner, ns from apps where preview_of is null and destroying is null and (git_url = ?1 or git_url = ?2 or git_url = ?3)
+         order by created, name limit 1",
         &[&urls[0], &urls[1], &format!("{}.git", urls[1])],
     )?;
     let Some(base) = base else { return Ok(json!({"ignored": "no app for this repository"})) };
@@ -4234,8 +5426,13 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
                 // Its own empty bucket, deleted with the preview.
                 "bucket": c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_one("select bucket from apps where name = ?1", &[&base])?.get::<bool>(0),
             });
-            upsert_app(c, &ns, &who, &cfg, Some(&base))?;
-            let v = deploy(c, &load_app(c, &ns, &preview, &who, Role::Member)?, Some(head.into()), "github")?;
+            // Under the preview's lock from the upsert until it's live, so two deliveries for one
+            // pull request don't interleave.
+            let lock = c.app_lock(&app_key(&ns, &preview));
+            let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let admitted = upsert_app(c, &ns, &who, &cfg, Some(&base))?;
+            let v = deploy_locked(c, &load_app(c, &ns, &preview, &who, Role::Member)?, Some(head.into()), "github")?;
+            drop((admitted, guard));
             if let (Ok(token), Some(api)) = (std::env::var("GITHUB_TOKEN"), b["pull_request"]["comments_url"].as_str()) {
                 let body = json!({"body": format!("Preview: {}", v["url"].as_str().unwrap_or(""))}).to_string();
                 // The header goes in on stdin: on argv, `ps` would show the token to every user.
@@ -4267,7 +5464,9 @@ const CACHE: &str = "rekcod-cache";
 const BACKUPS: &str = "rekcod-backups";
 const KEEP_BACKUPS: usize = 48;
 
-/// `app-<app key>`; a hash of the key when that isn't a valid bucket name (too long).
+/// `app-<app key>`; a hash of the key when that isn't a valid bucket name (too long). New
+/// apps can't have a 32-hex key (`looks_hashed`), so the two spellings don't meet, and
+/// `bucket_owner` sorts out pairs from before that.
 pub fn app_bucket(app: &str) -> String {
     let b = format!("app-{app}");
     if crate::s3::valid_bucket(&b) {
@@ -4275,6 +5474,26 @@ pub fn app_bucket(app: &str) -> String {
     }
     use sha2::Digest;
     format!("app-{}", &hex(&sha2::Sha256::digest(app.as_bytes()))[..32])
+}
+
+/// Another app that has `app`'s bucket name, when one does: the first made of the apps with
+/// a bucket by that name owns it, and the others get no access to it.
+fn bucket_owner(c: &Controller, app: &str) -> Result<Option<String>> {
+    let bucket = app_bucket(app);
+    let rows =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select name from apps where bucket or storage_key is not null or name = ?1 order by created, name", &[&app])?;
+    Ok(rows.iter().map(|r| r.get::<String>(0)).find(|n| app_bucket(n) == bucket).filter(|n| n != app))
+}
+
+/// A removal that found nothing to remove (404) is done; a retry after a partial cleanup
+/// gets those.
+fn gone(r: Result<()>) -> Result<()> {
+    match r {
+        Err(e) if e.to_string().ends_with("(404)") => Ok(()),
+        r => r,
+    }
 }
 
 impl Controller {
@@ -4360,6 +5579,16 @@ fn bucket_env(c: &Controller, app: &App) -> Result<Vec<(&'static str, String)>> 
     }
     let s = c.storage_or_err().context("the app has [storage] bucket = true")?;
     let bucket = app_bucket(&app.name);
+    if bucket_owner(c, &app.name)?.is_some() {
+        bail!("{}'s bucket name, {bucket}, belongs to another app; an app of another name gets its own", app.short);
+    }
+    let leftover =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select 1 from leftover_storage where bucket = ?1", &[&bucket])?;
+    if leftover.is_some() {
+        bail!("{bucket} still holds a destroyed app's data; the controller removes it within a minute, then deploy again");
+    }
     s.create_bucket(&bucket)?;
     let key = match key {
         Some(k) => k,
@@ -4393,6 +5622,9 @@ fn app_s3(c: &Controller, app: &App) -> Result<(crate::s3::S3, String)> {
     if !on {
         bail!("{} has no bucket; set `[storage] bucket = true` in rekcod.toml and deploy", app.short);
     }
+    if bucket_owner(c, &app.name)?.is_some() {
+        bail!("{}'s bucket name, {}, belongs to another app", app.short, app_bucket(&app.name));
+    }
     Ok((c.storage_or_err()?.clone(), app_bucket(&app.name)))
 }
 
@@ -4410,7 +5642,7 @@ fn app_storage(c: &Controller, app: &App) -> Result<Value> {
     }))
 }
 
-/// How many objects the app's bucket holds; None when it has no bucket.
+/// How many objects the app's bucket holds; None when it has no bucket of its own.
 fn bucket_objects(c: &Controller, app: &str) -> Result<Option<usize>> {
     let on: bool =
         c.db.lock()
@@ -4418,6 +5650,9 @@ fn bucket_objects(c: &Controller, app: &str) -> Result<Option<usize>> {
             .query_one("select bucket from apps where name = ?1", &[&app])?
             .get(0);
     let Some(s) = c.storage.as_ref().filter(|_| on) else { return Ok(None) };
+    if bucket_owner(c, app)?.is_some() {
+        return Ok(None);
+    }
     let bucket = app_bucket(app);
     if !s.bucket_exists(&bucket)? {
         return Ok(Some(0));
@@ -4425,7 +5660,10 @@ fn bucket_objects(c: &Controller, app: &str) -> Result<Option<usize>> {
     Ok(Some(s.list(&bucket, "")?.len()))
 }
 
-/// Deletes the app's bucket (objects too), its user and its policy.
+/// Revokes the app's user and policy, then deletes its bucket (objects too). Any failure is
+/// an error, after which a retry starts from what's left: a removed user is forgotten at
+/// once, and what's already gone (404) counts as removed. A bucket that belongs to another
+/// app keeps its policy and contents.
 fn drop_bucket(c: &Controller, app: &str) -> Result<()> {
     let r =
         c.db.lock()
@@ -4433,17 +5671,35 @@ fn drop_bucket(c: &Controller, app: &str) -> Result<()> {
             .query_opt("select bucket, storage_key from apps where name = ?1", &[&app])?;
     let Some(r) = r else { return Ok(()) };
     let (on, key): (bool, Option<String>) = (r.get(0), r.get(1));
-    if !on && key.is_none() {
+    // Never deployed with storage: nothing was made.
+    if (!on || c.storage.is_none()) && key.is_none() {
         return Ok(());
     }
     let s = c.storage_or_err()?;
-    let bucket = app_bucket(app);
-    s.delete_bucket(&bucket, true)?;
     if let Some(k) = key {
-        let _ = s.remove_user(&k);
+        gone(s.remove_user(&k)).context("revoke the app's storage key")?;
+        // `bucket = 1` keeps the policy and bucket on a retry's list without the key.
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update apps set storage_key = null, storage_secret = null, bucket = 1 where name = ?1", &[&app])?;
     }
-    let _ = s.remove_policy(&bucket);
-    Ok(())
+    if bucket_owner(c, app)?.is_some() {
+        return Ok(());
+    }
+    let bucket = app_bucket(app);
+    gone(s.remove_policy(&bucket)).context("remove the bucket's policy")?;
+    s.delete_bucket(&bucket, true)
+}
+
+/// The app's stored release images and build cache (`release_store`).
+fn drop_release_store(c: &Controller, app: &str) -> Result<()> {
+    let Some(s) = &c.storage else { return Ok(()) };
+    if s.bucket_exists(RELEASES)? {
+        for o in s.list(RELEASES, &format!("{app}/"))? {
+            s.delete(RELEASES, &o.key)?;
+        }
+    }
+    gone(s.delete(CACHE, &format!("{app}.tar.zst")))
 }
 
 /// Uploads `fleet.db` (a `VACUUM INTO` copy, so nothing stops) as `fleet-<UTC time>.db` and
@@ -4519,22 +5775,72 @@ pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>,
     let db = db.unwrap_or_else(|| paths.home.join("controller").join("fleet.db"));
     std::fs::create_dir_all(db.parent().context("no parent")?)?;
     let tmp = db.with_extension("restoring");
-    s.get(BACKUPS, &key, &mut std::fs::File::create(&tmp)?)?;
+    let r = s.get(BACKUPS, &key, &mut std::fs::File::create(&tmp)?).and_then(|_| restore_file(&tmp, &db));
+    if r.is_err() {
+        for ext in ["restoring", "restoring-wal", "restoring-shm"] {
+            let _ = std::fs::remove_file(db.with_extension(ext));
+        }
+    }
+    r.with_context(|| format!("{key}: nothing was replaced"))?;
+    println!("restored {key} to {}; start the controller again", db.display());
+    Ok(())
+}
+
+/// Tables every controller's database has.
+const FLEET_TABLES: &[&str] =
+    &["config", "nodes", "tokens", "sandboxes", "apps", "releases", "instances", "jobs", "schedules", "namespaces"];
+
+/// Whether `path` is a whole fleet database: not empty, intact, a schema this rekcod
+/// knows, the fleet tables and the join token a controller writes at its first start.
+/// Opened read-only, so nothing is created or migrated in it first.
+fn check_backup(path: &Path) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    if std::fs::metadata(path)?.len() == 0 {
+        bail!("the backup is empty");
+    }
+    let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    let c = rusqlite::Connection::open_with_flags(path, flags).context("not a SQLite database")?;
+    let check: Vec<String> = c
+        .prepare("pragma integrity_check")
+        .and_then(|mut st| st.query_map([], |r| r.get(0))?.collect())
+        .context("not a SQLite database")?;
+    if check != ["ok"] {
+        bail!("the backup is damaged: {}", check.join("; "));
+    }
+    let version: i64 = c.query_row("pragma user_version", [], |r| r.get(0))?;
+    let newest = MIGRATIONS.len() as i64 + 1;
+    if version > newest {
+        bail!("the backup has schema {version}, from a newer rekcod (this one reads up to {newest})");
+    }
+    let tables: Vec<String> =
+        c.prepare("select name from sqlite_master where type = 'table'")?.query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
+    let missing: Vec<&str> = FLEET_TABLES.iter().copied().filter(|t| !tables.iter().any(|n| n == t)).collect();
+    if !missing.is_empty() {
+        bail!("not a fleet database: no {} table", missing.join(", "));
+    }
+    let join: Option<String> = c.query_row("select value from config where key = 'join_token'", [], |r| r.get(0)).optional()?;
+    if join.is_none_or(|j| j.is_empty()) {
+        bail!("no join token in it: a controller never ran on this database");
+    }
+    Ok(())
+}
+
+/// Puts the backup at `tmp` in place of `db` once it checks out; the old file is kept as
+/// `fleet.db.before-restore-<time>`.
+fn restore_file(tmp: &Path, db: &Path) -> Result<()> {
+    check_backup(tmp)?;
     // Whatever ran when the backup was taken may not run now: the first reconcile checks
     // each instance and takes back the ones that answer.
-    Db::open(&tmp)
-        .context("the backup isn't a usable database")?
-        .execute("update instances set state = 'lost' where state in ('live', 'sleeping', 'starting')", &[])?;
+    Db::open(tmp)?.execute("update instances set state = 'lost' where state in ('live', 'sleeping', 'starting')", &[])?;
     if db.exists() {
         let keep = db.with_extension(format!("db.before-restore-{}", now()));
-        std::fs::rename(&db, &keep)?;
+        std::fs::rename(db, &keep)?;
         eprintln!("rekcod: the old database is at {}", keep.display());
     }
     for ext in ["db-wal", "db-shm"] {
         let _ = std::fs::remove_file(db.with_extension(ext));
     }
-    std::fs::rename(&tmp, &db)?;
-    println!("restored {key} to {}; start the controller again", db.display());
+    std::fs::rename(tmp, db)?;
     Ok(())
 }
 
@@ -4613,6 +5919,19 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
     for f in ["join-token", "webhook-secret", "admin-token"] {
         std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o600))?;
+    }
+    // Nodes that joined before node certificates named the node hold one for their host; the
+    // controller accepts that from those nodes only, recorded the first time it starts.
+    if db.query_opt("select 1 from config where key = 'host_named_nodes'", &[])?.is_none() {
+        let ids: Vec<String> = db.query("select id from nodes where url like 'https://%'", &[])?.iter().map(|r| r.get(0)).collect();
+        db.execute("insert into config values ('host_named_nodes', ?1)", &[&ids.join(" ")])?;
+    }
+    let host_named: String = db.query_one("select value from config where key = 'host_named_nodes'", &[])?.get(0);
+    for r in db.query("select id, url from nodes where url like 'https://%'", &[])? {
+        let (id, url): (String, String) = (r.get(0), r.get(1));
+        if let Ok(a) = authority(&url) {
+            crate::tls::expect_node(&a, &id, host_named.split(' ').any(|h| h == id));
+        }
     }
     let sealed: i64 = db.query_one("select count(*) from apps where secrets <> '{}' or storage_secret is not null", &[])?.get(0);
     let key = secret_key(&dir.join("secret-key"), sealed)?;
@@ -4802,7 +6121,7 @@ mod tests {
         let r = remote(&home, Some("x")).unwrap();
         assert!(r.ca.is_some());
         assert!(call(&r.url, "GET", "/apps", Some(&r.token), &Value::Null).is_ok());
-        // A node registering over https gets a certificate for the host it advertised.
+        // A node registering over https gets a certificate naming the node (`tls::node_name`).
         c.db.lock().unwrap().execute("insert or replace into config values ('join_token', 'jt')", &[]).unwrap();
         let reg = call(
             &url,
@@ -5149,6 +6468,525 @@ mod tests {
         assert!(load_app_key(&c, "web").unwrap().unwrap().strict_spread);
         put(json!("soft")).unwrap();
         assert!(!load_app_key(&c, "web").unwrap().unwrap().strict_spread);
+    }
+
+    /// An S3 on localhost that records `METHOD /path?query` per request and answers with the
+    /// status of the first `fail` prefix that matches (200 otherwise). Every list is empty.
+    fn mock_s3(fail: Arc<Mutex<Vec<(&'static str, u16)>>>) -> (crate::s3::S3, Arc<Mutex<Vec<String>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("http://{}", l.local_addr().unwrap());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut r = BufReader::new(s);
+                let Ok(req) = crate::sandbox_api::read_request(&mut r) else { continue };
+                let q: Vec<String> = req.query.iter().map(|(k, v)| format!("{k}={v}")).collect();
+                let line = format!("{} {}?{}", req.method, req.path, q.join("&"));
+                log.lock().unwrap().push(line.clone());
+                let code = fail.lock().unwrap().iter().find(|(p, _)| line.starts_with(p)).map_or(200, |(_, c)| *c);
+                let body = if req.method == "GET" { "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>" } else { "" };
+                let _ = respond(r.get_mut(), code, "application/xml", body.as_bytes());
+            }
+        });
+        (crate::s3::S3 { endpoint, access_key: "root".into(), secret_key: "root".into() }, seen)
+    }
+
+    fn storage_controller(fail: Arc<Mutex<Vec<(&'static str, u16)>>>) -> (Arc<Controller>, Arc<Mutex<Vec<String>>>) {
+        let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        let (s3, seen) = mock_s3(fail);
+        ctl.storage = Some(s3);
+        (Arc::new(ctl), seen)
+    }
+
+    #[test]
+    fn literal_and_hashed_bucket_names_never_share_a_bucket() {
+        // A 62-character key is hashed; its digest is a valid 32-character name in default.
+        let (name, ns) = ("a".repeat(40), "b".repeat(20));
+        let long = app_key(&ns, &name);
+        assert_eq!(long.len(), 62);
+        let bucket = app_bucket(&long);
+        let digest = bucket.strip_prefix("app-").unwrap().to_string();
+        assert!(valid_label(&digest) && app_bucket(&digest) == bucket, "the spellings meet without the rule");
+
+        let (c, seen) = storage_controller(Default::default());
+        c.db.lock().unwrap().execute("insert into namespaces (name, created, salt) values (?1, 0, x'01')", &[&ns]).unwrap();
+        upsert_app(&c, &ns, &Caller::system("t"), &json!({"name": name, "git": {"url": "u"}, "bucket": true}), None).unwrap();
+        let e = upsert_app(&c, "default", &Caller::user("mallory"), &json!({"name": digest, "git": {"url": "u"}, "bucket": true}), None);
+        assert!(e.map(|_| ()).unwrap_err().to_string().contains("32 hex digits"));
+
+        // One made before the rule, later than the long app, gets no access to its bucket.
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into apps (name, owner, git_url, git_ref, port, created, bucket, storage_key) values (?1, 'mallory', 'u', 'main', 80, ?2, 1, 'app-m')",
+                &[&digest, &(now() + 10)],
+            )
+            .unwrap();
+        let legacy = load_app_key(&c, &digest).unwrap().unwrap();
+        assert!(bucket_env(&c, &legacy).unwrap_err().to_string().contains("belongs to another app"));
+        assert!(app_s3(&c, &legacy).is_err());
+        assert_eq!(bucket_objects(&c, &digest).unwrap(), None);
+        let owner = load_app_key(&c, &long).unwrap().unwrap();
+        let env = bucket_env(&c, &owner).unwrap();
+        assert!(env.contains(&("S3_BUCKET", bucket.clone())));
+
+        // Destroying the newer one revokes its own key and leaves the bucket and its policy.
+        seen.lock().unwrap().clear();
+        destroy_app(&c, &digest).unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert!(seen.iter().any(|l| l.starts_with("DELETE /rustfs/admin/v3/remove-user?accessKey=app-m")), "{seen:?}");
+        assert!(!seen.iter().any(|l| l.contains("remove-canned-policy") || l.starts_with(&format!("DELETE /{bucket}"))), "{seen:?}");
+        assert!(load_app_key(&c, &long).unwrap().is_some());
+    }
+
+    /// A signed `pull_request` delivery for PR `pr` of `https://github.com/a/foo`.
+    fn pr_event(action: &str, pr: i64, delivery: &str) -> crate::sandbox_api::Request {
+        let repo = json!({"full_name": "a/foo", "clone_url": "https://github.com/a/foo", "html_url": "https://github.com/a/foo"});
+        let body = json!({"action": action, "number": pr, "repository": repo,
+                          "pull_request": {"head": {"sha": "b".repeat(40), "repo": repo}, "labels": []}})
+        .to_string()
+        .into_bytes();
+        let headers = [
+            ("x-hub-signature-256", github_signature("whs", &body)),
+            ("x-github-event", "pull_request".into()),
+            ("x-github-delivery", delivery.into()),
+        ];
+        crate::sandbox_api::Request {
+            method: "POST".into(),
+            path: "/webhooks/github".into(),
+            query: vec![],
+            headers: headers.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            body,
+        }
+    }
+
+    #[test]
+    fn pull_request_events_never_take_over_an_app_with_the_preview_name() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        c.db.lock().unwrap().execute("insert into config values ('webhook_secret', 'whs')", &[]).unwrap();
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "foo", "git": {"url": "https://github.com/a/foo"}}), None)
+            .unwrap();
+        // Bob's own app, which happens to have the name PR 3's preview would get.
+        upsert_app(&c, "default", &Caller::user("bob"), &json!({"name": "foo-pr-3", "git": {"url": "https://github.com/b/other"}}), None)
+            .unwrap();
+        let sealed = c.seal("default", "bob's secret").unwrap();
+        c.db.lock()
+            .unwrap()
+            .execute("update apps set secrets = ?1 where name = 'foo-pr-3'", &[&json!({"TOKEN": sealed}).to_string()])
+            .unwrap();
+        let bob = || {
+            let r =
+                c.db.lock()
+                    .unwrap()
+                    .query_one("select owner, git_url, git_ref, preview_of, secrets from apps where name = 'foo-pr-3'", &[])
+                    .unwrap();
+            (r.get::<String>(0), r.get::<String>(1), r.get::<String>(2), r.get::<Option<String>>(3), r.get::<String>(4))
+        };
+        let before = bob();
+        for (i, action) in ["opened", "synchronize"].into_iter().enumerate() {
+            let e = github_webhook(&c, &pr_event(action, 3, &format!("d{i}"))).unwrap_err().to_string();
+            assert!(e.contains("isn't a preview of foo"), "{action}: {e}");
+            assert_eq!(bob(), before, "{action}");
+        }
+        assert_eq!(c.db.lock().unwrap().query_one("select count(*) from releases", &[]).unwrap().get::<i64>(0), 0);
+        // A name nobody has becomes a preview as before (its deploy fails here: no nodes).
+        for (i, action) in ["opened", "synchronize"].into_iter().enumerate() {
+            let e = github_webhook(&c, &pr_event(action, 4, &format!("e{i}"))).unwrap_err().to_string();
+            assert!(!e.contains("isn't a preview"), "{action}: {e}");
+        }
+        let r = c.db.lock().unwrap().query_one("select owner, preview_of from apps where name = 'foo-pr-4'", &[]).unwrap();
+        assert_eq!((r.get::<String>(0), r.get::<Option<String>>(1)), ("alice".into(), Some("foo".into())));
+    }
+
+    #[test]
+    fn resource_fields_are_whole_numbers_in_range() {
+        for bad in [json!(0), json!(-1), json!(i64::from(i32::MAX) + 1), json!(1.5), json!("2"), json!(65)] {
+            assert!(spec_count(&json!({"cpus": bad}), "cpus", 1, MAX_CPUS).is_err(), "{bad}");
+        }
+        assert_eq!(spec_count(&json!({}), "cpus", 2, MAX_CPUS).unwrap(), 2);
+        assert_eq!(spec_count(&json!({"cpus": null}), "cpus", 2, MAX_CPUS).unwrap(), 2);
+        assert_eq!(spec_count(&json!({"cpus": 64}), "cpus", 2, MAX_CPUS).unwrap(), 64);
+        assert!(spec_port(&json!({"port": 70000})).is_err() && spec_port(&json!({"port": -1})).is_err());
+        assert_eq!((spec_port(&json!({})).unwrap(), spec_port(&json!({"port": 8080})).unwrap()), (0, 8080));
+
+        // Over HTTP: refused before anything is stored.
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        for (field, value) in [
+            ("instances", json!(0)),
+            ("instances", json!(-1)),
+            ("instances", json!(1i64 << 32)),
+            ("cpus", json!(-1)),
+            ("memory_gib", json!(i64::from(i32::MAX) + 1)),
+            ("port", json!(70000)),
+        ] {
+            let mut b = json!({"name": "web", "git": {"url": "https://example.invalid/r", "ref": "a".repeat(40)}});
+            b[field] = value.clone();
+            let e = call(&url, "POST", "/apps", Some("alice-t"), &b).unwrap_err().to_string();
+            assert!(e.contains(field) && e.contains("(400)"), "{field}={value}: {e}");
+        }
+        assert_eq!(c.db.lock().unwrap().query_one("select count(*) from apps", &[]).unwrap().get::<i64>(0), 0);
+        c.db.lock()
+            .unwrap()
+            .execute("insert into apps (name, owner, git_url, git_ref, port, created) values ('web', 'alice', 'u', 'main', 80, 0)", &[])
+            .unwrap();
+        // 2^32 + 1 used to wrap to 1 instance.
+        for n in [json!(0), json!(-1), json!((1i64 << 32) + 1), Value::Null] {
+            let e = call(&url, "POST", "/apps/web/scale", Some("alice-t"), &json!({"instances": n})).unwrap_err().to_string();
+            assert!(e.contains("instances"), "{n}: {e}");
+        }
+        assert_eq!(c.db.lock().unwrap().query_one("select instances from apps", &[]).unwrap().get::<i64>(0), 1);
+        let e = call(&url, "POST", "/sandboxes", Some("alice-t"), &json!({"git": {"url": "https://example.invalid/r"}, "cpus": 0}));
+        assert!(e.unwrap_err().to_string().contains("cpus must be"));
+        for (field, value) in [("cpus", json!(0)), ("memory_gib", json!(-1)), ("cpus", json!(i64::from(i32::MAX) + 1))] {
+            let mut b = json!({"cmd": ["true"], "git": {"url": "https://example.invalid/r", "ref": "main"}});
+            b[field] = value.clone();
+            let e = call(&url, "POST", "/jobs", Some("alice-t"), &b).unwrap_err().to_string();
+            assert!(e.contains(&format!("{field} must be")), "{field}={value}: {e}");
+        }
+        assert_eq!(c.db.lock().unwrap().query_one("select count(*) from jobs", &[]).unwrap().get::<i64>(0), 0);
+    }
+
+    #[test]
+    fn quota_admission_holds_the_last_slot_for_one_create_or_scale() {
+        let setup = |limits: &str| {
+            let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+            let sql = format!("insert into namespaces (name, created, salt, {limits}) values ('team', 0, x'01', 1, 2)");
+            c.db.lock().unwrap().execute(&sql, &[]).unwrap();
+            c
+        };
+        let create = |c: &Controller, name: &str| {
+            upsert_app(c, "team", &Caller::system("t"), &json!({"name": name, "git": {"url": "u"}, "cpus": 2}), None).map(|_| ())
+        };
+        // Two creates at once for the last CPUs, then for the last app slot. Each admitted
+        // create holds its share while its first deploy runs (here: until both have answered).
+        for limits in ["max_apps, max_cpus", "max_cpus, max_apps"] {
+            let (limit, want) = if limits.starts_with("max_apps") { ("apps", "1 of 1 apps") } else { ("cpus", "of 1 CPUs") };
+            for _ in 0..10 {
+                let c = setup(limits);
+                let gate = std::sync::Barrier::new(2);
+                let results: Vec<_> = std::thread::scope(|s| {
+                    let run = |name: &'static str| {
+                        let (c, gate) = (&c, &gate);
+                        s.spawn(move || {
+                            gate.wait();
+                            upsert_app(c, "team", &Caller::system("t"), &json!({"name": name, "git": {"url": "u"}, "cpus": 1}), None)
+                        })
+                    };
+                    let (a, b) = (run("a"), run("b"));
+                    vec![a.join().unwrap(), b.join().unwrap()]
+                });
+                assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1, "{limit}");
+                let e = results.iter().find_map(|r| r.as_ref().err()).unwrap().to_string();
+                assert!(e.contains(want), "{limit}: {e}");
+            }
+        }
+        // A failed first deploy gives its share back.
+        let c = setup("max_apps, max_cpus");
+        c.db.lock().unwrap().execute("update namespaces set max_apps = 10, max_cpus = 2", &[]).unwrap();
+        let held = upsert_app(&c, "team", &Caller::system("t"), &json!({"name": "a", "git": {"url": "u"}, "cpus": 2}), None).unwrap();
+        assert!(create(&c, "b").unwrap_err().to_string().contains("4 of 2 CPUs"));
+        drop(held);
+        create(&c, "b").unwrap();
+
+        // A scale and a create at once for the last CPU: a live 1x1 app, 3 CPUs.
+        for _ in 0..10 {
+            let c = setup("max_apps, max_cpus");
+            c.db.lock().unwrap().execute("update namespaces set max_apps = 10, max_cpus = 3", &[]).unwrap();
+            upsert_app(&c, "team", &Caller::system("t"), &json!({"name": "live", "git": {"url": "u"}}), None).unwrap();
+            c.db.lock().unwrap().execute("update apps set live_release = 1", &[]).unwrap();
+            let live = load_app_key(&c, "live--team").unwrap().unwrap();
+            let gate = std::sync::Barrier::new(2);
+            let (scaled, created) = std::thread::scope(|s| {
+                let a = s.spawn(|| {
+                    gate.wait();
+                    admit(&c, &live, Some(2)).map(|_| ())
+                });
+                let b = s.spawn(|| {
+                    gate.wait();
+                    upsert_app(&c, "team", &Caller::system("t"), &json!({"name": "new", "git": {"url": "u"}, "cpus": 2}), None)
+                });
+                (a.join().unwrap(), b.join().unwrap())
+            });
+            assert!(scaled.is_ok() != created.is_ok(), "exactly one fits: {scaled:?} {:?}", created.as_ref().map(|_| ()));
+        }
+    }
+
+    /// Answers 200 to anything: an instance's health check.
+    fn health_server() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let ep = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            for mut s in l.incoming().flatten() {
+                let _ = crate::sandbox_api::read_request(&mut BufReader::new(&mut s));
+                let _ = respond(&mut s, 200, "text/plain", b"ok");
+            }
+        });
+        ep
+    }
+
+    #[test]
+    fn destroy_during_a_deploy_never_routes_or_keeps_the_old_instance() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        add_token(&c, "bob-t", "bob", false, "member", false, None);
+        // A worker whose first launch waits at `release`, as a slow build would.
+        let (old_ep, new_ep) = (health_server(), health_server());
+        let (entered_tx, entered) = std::sync::mpsc::channel::<()>();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let gate = Arc::new(Mutex::new(gate));
+        let deletes = Arc::new(Mutex::new(Vec::<String>::new()));
+        let launches = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into nodes (id, url, secret, mem_free, mem_total, last_seen) values ('n1', ?1, 's', 65536, 65536, ?2)",
+                &[&format!("http://{}", l.local_addr().unwrap()), &now()],
+            )
+            .unwrap();
+        {
+            let (deletes, launches, old_ep, new_ep) = (deletes.clone(), launches.clone(), old_ep.clone(), new_ep.clone());
+            std::thread::spawn(move || {
+                for s in l.incoming().flatten() {
+                    let (deletes, launches, gate, entered_tx) = (deletes.clone(), launches.clone(), gate.clone(), entered_tx.clone());
+                    let (old_ep, new_ep) = (old_ep.clone(), new_ep.clone());
+                    std::thread::spawn(move || {
+                        let mut r = BufReader::new(s);
+                        let req = crate::sandbox_api::read_request(&mut r).unwrap();
+                        let body = match req.method.as_str() {
+                            "POST" if req.path == "/instances" => {
+                                let first = launches.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                                if first {
+                                    entered_tx.send(()).unwrap();
+                                    gate.lock().unwrap().recv_timeout(Duration::from_secs(20)).unwrap();
+                                }
+                                let (sb, ep) = if first { ("old-sb", old_ep) } else { ("new-sb", new_ep) };
+                                json!({"sandbox": sb, "endpoint": ep, "pushed": false})
+                            }
+                            "DELETE" => {
+                                deletes.lock().unwrap().push(req.path.clone());
+                                json!({})
+                            }
+                            _ => json!({"logs": ""}),
+                        };
+                        let _ = respond(r.get_mut(), 200, "application/json", body.to_string().as_bytes());
+                    });
+                }
+            });
+        }
+        // Every route table from start to finish, as an edge would see it.
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let watcher = {
+            let (c, done) = (c.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut seen = std::collections::BTreeSet::new();
+                while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                    let r: HashMap<String, Route> = serde_json::from_value(routes(&c).unwrap()).unwrap();
+                    seen.extend(r.get("race-app.apps.test").map(|r| r.endpoints.clone()).unwrap_or_default());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                seen
+            })
+        };
+        let deploy_as = |token: &'static str, sha: &str| {
+            let (url, body) =
+                (url.clone(), json!({"name": "race-app", "git": {"url": "https://example.invalid/r", "ref": sha.repeat(40)}}));
+            std::thread::spawn(move || call(&url, "POST", "/apps", Some(token), &body))
+        };
+
+        let alice = deploy_as("alice-t", "a");
+        entered.recv_timeout(Duration::from_secs(10)).unwrap();
+        let destroy = {
+            let url = url.clone();
+            std::thread::spawn(move || call(&url, "DELETE", "/apps/race-app", Some("alice-t"), &json!({})))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while c.db.lock().unwrap().query_opt("select 1 from apps where destroying is not null", &[]).unwrap().is_none() {
+            assert!(Instant::now() < deadline, "destroy never started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // While Alice's destroy waits for her deploy, the name isn't Bob's to take.
+        let e = deploy_as("bob-t", "b").join().unwrap().unwrap_err().to_string();
+        assert!(e.contains("being destroyed"), "{e}");
+        release.send(()).unwrap();
+        let e = alice.join().unwrap().unwrap_err().to_string();
+        assert!(e.contains("destroyed during this deploy"), "{e}");
+        destroy.join().unwrap().unwrap();
+        assert_eq!(c.db.lock().unwrap().query_one("select count(*) from apps", &[]).unwrap().get::<i64>(0), 0);
+
+        let v = deploy_as("bob-t", "b").join().unwrap().unwrap();
+        assert_eq!(v["release"], 1);
+        done.store(true, std::sync::atomic::Ordering::SeqCst);
+        let seen = watcher.join().unwrap();
+        assert!(!seen.contains(&old_ep), "the old instance was routed: {seen:?}");
+        let r: HashMap<String, Route> = serde_json::from_value(routes(&c).unwrap()).unwrap();
+        assert_eq!(r["race-app.apps.test"].endpoints, vec![new_ep]);
+        assert_eq!(*deletes.lock().unwrap(), vec!["/sandboxes/old-sb".to_string()], "the old VM is deleted on the worker");
+        let mut db = c.db.lock().unwrap();
+        assert_eq!(db.query_one("select owner from apps where name = 'race-app'", &[]).unwrap().get::<String>(0), "bob");
+        let kept = db.query_one("select count(*) from instances where sandbox = 'old-sb'", &[]).unwrap().get::<i64>(0)
+            + db.query_one("select count(*) from sandboxes where id = 'old-sb'", &[]).unwrap().get::<i64>(0);
+        assert_eq!(kept, 0);
+    }
+
+    #[test]
+    fn destroy_keeps_the_app_until_storage_cleanup_succeeds() {
+        let fail = Arc::new(Mutex::new(vec![("DELETE /app-web?", 503)]));
+        let (c, seen) = storage_controller(fail.clone());
+        let (url, c) = serve_test(Arc::into_inner(c).unwrap());
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}, "bucket": true}), None).unwrap();
+        c.db.lock().unwrap().execute("update apps set storage_key = 'app-k1' where name = 'web'", &[]).unwrap();
+        let row = || {
+            c.db.lock()
+                .unwrap()
+                .query_opt("select destroying is not null, storage_key from apps where name = 'web'", &[])
+                .unwrap()
+                .map(|r| (r.get::<bool>(0), r.get::<Option<String>>(1)))
+        };
+        let destroy = || call(&url, "DELETE", "/apps/web", Some("alice-t"), &json!({"force": true}));
+        let retry = || {
+            c.db.lock().unwrap().execute("update apps set destroying = 0 where destroying is not null", &[]).unwrap();
+            retry_destroys(&c).unwrap();
+        };
+
+        // The bucket's DELETE fails: the key and policy are already revoked, the row stays.
+        let e = destroy().unwrap_err().to_string();
+        assert!(e.contains("storage cleanup failed") && e.contains("503"), "{e}");
+        let log = seen.lock().unwrap().clone();
+        let at = |p: &str| log.iter().position(|l| l.starts_with(p)).unwrap_or_else(|| panic!("no {p} in {log:?}"));
+        assert!(at("DELETE /rustfs/admin/v3/remove-user?accessKey=app-k1") < at("DELETE /rustfs/admin/v3/remove-canned-policy"));
+        assert!(at("DELETE /rustfs/admin/v3/remove-canned-policy") < at("DELETE /app-web?"));
+        assert_eq!(row(), Some((true, None)));
+        // Not an app anyone sees, routes to or can make again meanwhile.
+        assert_eq!(call(&url, "GET", "/apps", Some("alice-t"), &Value::Null).unwrap(), json!([]));
+        assert!(call(&url, "GET", "/apps/web", Some("alice-t"), &Value::Null).unwrap_err().to_string().contains("no app web"));
+        let again = upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}}), None);
+        assert!(again.map(|_| ()).unwrap_err().to_string().contains("being destroyed"));
+        // Still failing: the retry leaves it as it was.
+        retry();
+        assert_eq!(row(), Some((true, None)));
+        // RustFS answers again: the reconcile retry finishes it.
+        fail.lock().unwrap().clear();
+        retry();
+        assert_eq!(row(), None);
+
+        // Revocation failing: nothing is deleted until the key and policy are gone. A retry
+        // picks up where the last one stopped, and what's already gone (404) is done.
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}, "bucket": true}), None).unwrap();
+        c.db.lock().unwrap().execute("update apps set storage_key = 'app-k2' where name = 'web'", &[]).unwrap();
+        seen.lock().unwrap().clear();
+        *fail.lock().unwrap() = vec![("DELETE /rustfs/admin/v3/remove-user", 503)];
+        assert!(destroy().unwrap_err().to_string().contains("revoke the app's storage key"));
+        assert_eq!(row(), Some((true, Some("app-k2".into()))));
+        *fail.lock().unwrap() = vec![("DELETE /rustfs/admin/v3/remove-canned-policy", 503)];
+        retry();
+        assert_eq!(row(), Some((true, None)));
+        let log = seen.lock().unwrap().clone();
+        assert!(!log.iter().any(|l| l.starts_with("DELETE /app-web?")), "{log:?}");
+        *fail.lock().unwrap() = vec![("DELETE /rustfs/admin/v3/remove-canned-policy", 404)];
+        // By hand this time: destroy again retries at once.
+        destroy().unwrap();
+        assert_eq!(row(), None);
+    }
+
+    #[test]
+    fn destroy_without_storage_leaves_the_bucket_for_later() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}, "bucket": true}), None).unwrap();
+        c.db.lock().unwrap().execute("update apps set storage_key = 'app-k1' where name = 'web'", &[]).unwrap();
+        // The controller lost --storage: destroy still finishes and the name is free.
+        destroy_app(&c, "web").unwrap();
+        assert!(c.db.lock().unwrap().query_opt("select 1 from apps where name = 'web'", &[]).unwrap().is_none());
+        let left = |c: &Controller| -> Vec<(Option<String>, Option<String>)> {
+            let rows = c.db.lock().unwrap().query("select bucket, storage_key from leftover_storage", &[]).unwrap();
+            rows.iter().map(|r| (r.get(0), r.get(1))).collect()
+        };
+        assert_eq!(left(&c), [(Some("app-web".into()), Some("app-k1".into()))]);
+
+        // A controller with storage on the same database won't hand that bucket out, removes
+        // it on its next retry, and then will.
+        let fail = Arc::new(Mutex::new(vec![("DELETE /app-web?", 503)]));
+        let (sc, seen) = storage_controller(fail.clone());
+        let sc = Arc::into_inner(sc).unwrap();
+        let sc = Arc::new(Controller {
+            db: std::mem::replace(&mut *c.db.lock().unwrap(), Db::open(Path::new(":memory:")).unwrap()).into(),
+            ..sc
+        });
+        upsert_app(&sc, "default", &Caller::user("bob"), &json!({"name": "web", "git": {"url": "u"}, "bucket": true}), None).unwrap();
+        let app = load_app_key(&sc, "web").unwrap().unwrap();
+        assert!(bucket_env(&sc, &app).unwrap_err().to_string().contains("still holds a destroyed app's data"));
+        retry_destroys(&sc).unwrap();
+        assert_eq!(left(&sc).len(), 1, "a failed removal is kept for the next retry");
+        fail.lock().unwrap().clear();
+        retry_destroys(&sc).unwrap();
+        assert!(left(&sc).is_empty());
+        let log = seen.lock().unwrap().clone();
+        assert!(log.iter().any(|l| l.starts_with("DELETE /rustfs/admin/v3/remove-user?accessKey=app-k1")), "{log:?}");
+        assert!(bucket_env(&sc, &app).is_ok());
+    }
+
+    #[test]
+    fn a_destroy_only_finishes_the_app_it_marked() {
+        let (c, _) = storage_controller(Default::default());
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}}), None).unwrap();
+        c.db.lock().unwrap().execute("update apps set destroying = 1, generation = 5 where name = 'web'", &[]).unwrap();
+        // A destroy that marked generation 4 found it already redone: it leaves the row alone.
+        finish_destroy(&c, "web", 4).unwrap();
+        assert!(c.db.lock().unwrap().query_opt("select 1 from apps where name = 'web'", &[]).unwrap().is_some());
+        finish_destroy(&c, "web", 5).unwrap();
+        assert!(c.db.lock().unwrap().query_opt("select 1 from apps where name = 'web'", &[]).unwrap().is_none());
+        // Bob's new app of that name isn't touched by a stale destroy of Alice's.
+        upsert_app(&c, "default", &Caller::user("bob"), &json!({"name": "web", "git": {"url": "u"}}), None).unwrap();
+        finish_destroy(&c, "web", 5).unwrap();
+        assert!(c.db.lock().unwrap().query_opt("select 1 from apps where name = 'web' and owner = 'bob'", &[]).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_poisoned_app_lock_doesnt_stop_retries() {
+        let lock = Arc::new(Mutex::new(()));
+        let l2 = lock.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = l2.lock().unwrap();
+            panic!("a deploy panicked");
+        })
+        .join();
+        assert!(lock.is_poisoned());
+        assert!(try_app_lock(&lock).is_some());
+        let _held = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(try_app_lock(&lock).is_none());
+    }
+
+    #[test]
+    fn jobs_lost_before_an_upgrade_end() {
+        let mut db = Db::open(Path::new(":memory:")).unwrap();
+        for (id, finished) in [("j-old", Some(10)), ("j-new", None)] {
+            db.execute(
+                "insert into jobs (id, owner, node, spec, state, created, finished, ns, log) values (?1, 'a', 'n', '{}', 'lost', 0, ?2, 'default', '')",
+                &[&id, &finished],
+            )
+            .unwrap();
+        }
+        db.0.execute_batch(MIGRATIONS.last().unwrap()).unwrap();
+        let mut state = |id: &str| db.query_one("select state from jobs where id = ?1", &[&id]).unwrap().get::<String>(0);
+        assert_eq!((state("j-old"), state("j-new")), ("failed".into(), "lost".into()));
+    }
+
+    #[test]
+    fn schedules_are_checked_like_jobs() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        let base = json!({"name": "nightly", "every_secs": 3600, "cmd": ["true"], "git": {"url": "https://example.invalid/r"}});
+        for (field, value) in [("cpus", json!(-1)), ("memory_gib", json!(10_000)), ("cmd", json!([]))] {
+            let mut b = base.clone();
+            b[field] = value.clone();
+            let e = call(&url, "POST", "/jobs", Some("alice-t"), &b).unwrap_err().to_string();
+            assert!(e.contains("(400)"), "{field}={value}: {e}");
+        }
+        assert_eq!(c.db.lock().unwrap().query_one("select count(*) from schedules", &[]).unwrap().get::<i64>(0), 0);
+        call(&url, "POST", "/jobs", Some("alice-t"), &base).unwrap();
     }
 
     // Only VM creation is simulated: controller SQL, placement, HTTP and health checks are real.

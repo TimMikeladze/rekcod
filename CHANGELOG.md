@@ -24,11 +24,16 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
   is no longer in fleet.db, so keep `controller/admin-token`.
 - **Edges should use an edge token** (`controller token edge --edge`) instead of an admin
   one. Admin tokens still work.
-- **`rekcod mcp` and `rekcod sandbox serve` only create sandboxes for the directory they
-  started in** (`--root` adds others) and refuse `allow_hosts`, `secrets` and `mount` unless
-  started with `--allow-host`, `--secret` and `--allow-mount`.
+- **`rekcod mcp` and `rekcod sandbox serve` only create and reach sandboxes for the
+  directory they started in** (`--root` adds others) and refuse `allow_hosts`, `secrets`,
+  `mount` and macOS guests unless started with `--allow-host`, `--secret`, `--allow-mount`
+  and `--allow-macos`. A sandbox with more than the flags allow, made from the CLI or by
+  another server, isn't listed and every call on it gets a 403 naming the flag.
 - Sandboxes from before this keep working; `apply` falls back to the old mtime conflict
-  check for them.
+  check for them, and compares modes only for sandboxes whose manifest records them.
+- **Snapshot pushes have a new layout** (`snaps/<project>/<name>/<generation>/`). `snap
+  restore --pull` still reads older pushes, but a rekcod from before this can't pull what this
+  one pushes, so upgrade every Mac that pulls.
 
 ### Security
 
@@ -37,7 +42,12 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 - The node API's sandbox id can't be replaced by a query parameter; remote sandbox creates
   forward only user fields; golden disk and macOS image names are validated.
 - `sandbox apply` never writes through a symlink, refuses symlinks out of the project and
-  applies a frozen copy (`--reviewed` for what `diff` showed).
+  applies a frozen copy (`--reviewed` for what `diff` showed). Symlink chains are resolved
+  against the project as apply leaves it; `.git` is skipped under any case (`.GIT`) and
+  writes reaching it by inode are refused; the frozen copy is read without following links
+  and `diff` waits for a running apply. A `chmod` on the Mac since the copy is a conflict,
+  and a directory the workspace replaced with a file is applied.
+- `sandbox serve` doesn't serve the fleet node's `/instances` and `/jobs` routes.
 - The dashboard needs a per-launch token, and containers can't reach its port through
   `host.docker.internal`.
 - Workspace containers drop `NET_RAW`; a live `.git` is mounted read-only into sandboxes.
@@ -158,6 +168,21 @@ Version 0.3.0 in `Cargo.toml`; not tagged yet.
 - A data disk that isn't readable ext4 is never formatted (it was, on any blkid miss); its
   backup superblock is tried and the error reported.
 - A reader that falls behind a vsock stream no longer gets a short stream with a clean EOF.
+- `snap save --push` uploads into a new generation and writes the manifest last, so an
+  interrupted push no longer mixes archives from two pushes; `--pull` checks each archive's
+  SHA-256 and size.
+- `snap restore --pull` of a backup older than the local snapshot restores the backup, and of
+  two saves in the same second the second is kept. Saves, restores and removals of one
+  snapshot take turns.
+- A compose volume named `done` no longer makes `snap save` delete the snapshot it reports
+  saved, and a save whose generation didn't commit fails instead of reporting success.
+- A `docker pause` that fails partway through `snap save` no longer leaves the containers it
+  already paused frozen.
+- `import --from` a context that reaches rekcod's own daemon is refused instead of emptying
+  the volumes it was about to copy.
+- S3 downloads that end early are errors, not short files. Keys containing entity text such
+  as `&amp;` list and delete as themselves. A bucket check that gets a 500 is an error, not
+  "no bucket", so a bucket delete that didn't happen isn't reported as done.
 - A stale pid file no longer counts as a running VM, and `stop` no longer signals whatever
   process reused the pid. Two commands starting the VM at once boot one VM.
 - Mac ports another process serves on `*:PORT` aren't shadowed by a `127.0.0.1:PORT`

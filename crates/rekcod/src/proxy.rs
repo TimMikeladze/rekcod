@@ -8,7 +8,11 @@
 //! `Upgrade` header (attach, exec, BuildKit sessions) the connection is a raw
 //! pipe both ways, as before.
 
-use anyhow::{Context, Result, bail};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
+
+use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -20,29 +24,87 @@ pub const LOCAL_LABEL: &str = "dev.rekcod.local";
 const CREATE_MAX: usize = 4 << 20;
 const HEAD_MAX: usize = 64 << 10;
 
-/// Pipes one client connection to the engine.
+/// Pipes one client connection to the engine. A direction that ends cleanly half-closes
+/// (attach and exec rely on it). A bad request from the client ends both and is returned.
+/// A failed write to the engine doesn't: the engine closed its side (a container that
+/// exited while stdin still had data), and its output may still be queued for the client.
 pub async fn pipe<C, G>(client: C, guest: G) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     G: AsyncRead + AsyncWrite + Unpin,
 {
     let (client_rd, mut client_wr) = tokio::io::split(client);
-    let (mut guest_rd, mut guest_wr) = tokio::io::split(guest);
+    let (mut guest_rd, guest_wr) = tokio::io::split(guest);
+    let engine_closed = AtomicBool::new(false);
+    let mut guest_wr = Tracked { w: guest_wr, failed: &engine_closed };
     let up = async {
-        let mut client_rd = BufReader::new(client_rd);
-        requests(&mut client_rd, &mut guest_wr).await?;
-        // Upgraded (or EOF): whatever follows is opaque.
-        tokio::io::copy_buf(&mut client_rd, &mut guest_wr).await?;
-        guest_wr.shutdown().await?;
-        anyhow::Ok(())
+        let forwarded = async {
+            let mut client_rd = BufReader::new(client_rd);
+            requests(&mut client_rd, &mut guest_wr).await?;
+            // Upgraded (or EOF): whatever follows is opaque.
+            tokio::io::copy_buf(&mut client_rd, &mut guest_wr).await?;
+            anyhow::Ok(())
+        }
+        .await;
+        // The engine gets EOF after the last whole request, also when the next one is bad.
+        let shut = guest_wr.shutdown().await;
+        forwarded?;
+        anyhow::Ok(shut?)
     };
     let down = async {
         tokio::io::copy(&mut guest_rd, &mut client_wr).await?;
         client_wr.shutdown().await?;
         anyhow::Ok(())
     };
-    let (a, b) = tokio::join!(up, down);
-    a.and(b)
+    tokio::pin!(up, down);
+    let (mut up_done, mut down_done) = (false, false);
+    while !(up_done && down_done) {
+        tokio::select! {
+            r = &mut up, if !up_done => {
+                if r.is_err() && !engine_closed.load(Ordering::Relaxed) {
+                    return r;
+                }
+                up_done = true;
+            }
+            r = &mut down, if !down_done => {
+                r?;
+                down_done = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A writer that notes when a write, flush or shutdown fails.
+struct Tracked<'a, W> {
+    w: W,
+    failed: &'a AtomicBool,
+}
+
+impl<W: AsyncWrite + Unpin> Tracked<'_, W> {
+    fn note<T>(&self, r: Poll<std::io::Result<T>>) -> Poll<std::io::Result<T>> {
+        if let Poll::Ready(Err(_)) = &r {
+            self.failed.store(true, Ordering::Relaxed);
+        }
+        r
+    }
+}
+
+impl<W: AsyncWrite + Unpin> AsyncWrite for Tracked<'_, W> {
+    fn poll_write(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+        let r = Pin::new(&mut self.w).poll_write(cx, buf);
+        self.note(r)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let r = Pin::new(&mut self.w).poll_flush(cx);
+        self.note(r)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let r = Pin::new(&mut self.w).poll_shutdown(cx);
+        self.note(r)
+    }
 }
 
 /// Forwards requests until EOF or an upgrade request has been sent.
@@ -431,5 +493,63 @@ mod tests {
         assert!(!text.contains("Transfer-Encoding"), "{text}");
         assert!(text.contains("rekcod-local_"), "{text}");
         assert!(seen.ends_with(b"Upgrade: tcp\r\n\r\nGET not-http \x00\x01 raw bytes"));
+    }
+
+    #[tokio::test]
+    async fn a_bad_request_ends_the_connection() {
+        let (client, mut client_far) = tokio::io::duplex(1 << 16);
+        let (guest, mut guest_far) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(pipe(client, guest));
+        // The client stays connected and the engine never answers.
+        let ping = b"GET /_ping HTTP/1.1\r\nHost: docker\r\n\r\n";
+        client_far.write_all(ping).await.unwrap();
+        client_far.write_all(b"POST /containers/create HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n").await.unwrap();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), task).await.expect("pipe returns").unwrap();
+        assert!(r.as_ref().is_err_and(|e| e.to_string().contains("bad chunk size")), "{r:?}");
+        let mut seen = Vec::new();
+        guest_far.read_to_end(&mut seen).await.unwrap();
+        assert_eq!(seen, ping);
+        assert_eq!(client_far.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn output_survives_the_engine_closing_before_stdin_ends() {
+        // The client reads slowly (a small buffer), so the output is still queued in the
+        // proxy when the container exits and the next stdin write fails.
+        let (client, mut client_far) = tokio::io::duplex(4096);
+        let (guest, mut guest_far) = tokio::io::duplex(1 << 20);
+        let task = tokio::spawn(pipe(client, guest));
+        let attach = b"POST /containers/x/attach?stream=1&stdin=1 HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n";
+        client_far.write_all(attach).await.unwrap();
+        let mut head = vec![0; attach.len()];
+        guest_far.read_exact(&mut head).await.unwrap();
+        guest_far.write_all(&[b'x'; 200_000]).await.unwrap();
+        drop(guest_far);
+        client_far.write_all(b"more stdin\n").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mut out = Vec::new();
+        client_far.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out.len(), 200_000);
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_half_closed_attach_still_gets_its_output() {
+        let (client, mut client_far) = tokio::io::duplex(1 << 16);
+        let (guest, mut guest_far) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(pipe(client, guest));
+        let attach = b"POST /containers/x/attach?stream=1&stdin=1 HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\nstdin";
+        client_far.write_all(attach).await.unwrap();
+        // stdin is done; the output isn't.
+        client_far.shutdown().await.unwrap();
+        let mut seen = Vec::new();
+        guest_far.read_to_end(&mut seen).await.unwrap();
+        assert_eq!(seen, attach);
+        guest_far.write_all(b"HTTP/1.1 101 UPGRADED\r\n\r\noutput").await.unwrap();
+        guest_far.shutdown().await.unwrap();
+        let mut out = Vec::new();
+        client_far.read_to_end(&mut out).await.unwrap();
+        assert_eq!(out, b"HTTP/1.1 101 UPGRADED\r\n\r\noutput");
+        task.await.unwrap().unwrap();
     }
 }

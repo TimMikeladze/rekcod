@@ -33,7 +33,8 @@ rekcod build -t app .
 - `DOCKER_HOST=unix://~/.rekcod/run/docker.sock`, `DOCKER_CONTEXT` unset: it always
   targets rekcod, whatever context is active.
 - If the VM isn't running, it boots first (no context switch), so `rekcod run ...`
-  works from cold.
+  works from cold. With `REKCOD_NO_BOOT=1` it exits 1 instead; the dashboard's `events` and
+  `stats` followers run that way, so a page left open never starts a stopped VM.
 
 ## Which docker CLI
 

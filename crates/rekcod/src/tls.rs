@@ -110,14 +110,18 @@ pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::Server
     Ok(Arc::new(cfg))
 }
 
-fn client_config(ca_pem: &str) -> Result<Arc<rustls::ClientConfig>> {
+fn roots(ca_pem: &str) -> Result<Arc<rustls::RootCertStore>> {
     let mut roots = rustls::RootCertStore::empty();
     for c in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
         roots.add(c.map_err(|e| anyhow!("CA: {e}"))?)?;
     }
+    Ok(Arc::new(roots))
+}
+
+fn client_config(ca_pem: &str) -> Result<Arc<rustls::ClientConfig>> {
     let cfg = rustls::ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()?
-        .with_root_certificates(roots)
+        .with_root_certificates(roots(ca_pem)?)
         .with_no_client_auth();
     Ok(Arc::new(cfg))
 }
@@ -125,7 +129,7 @@ fn client_config(ca_pem: &str) -> Result<Arc<rustls::ClientConfig>> {
 /// CAs to trust, by `host:port`, plus one for any other https URL (a controller trusts its
 /// own CA for every node; a node trusts its controller's).
 static TRUST: Mutex<Option<HashMap<String, Arc<rustls::ClientConfig>>>> = Mutex::new(None);
-static DEFAULT_TRUST: OnceLock<Arc<rustls::ClientConfig>> = OnceLock::new();
+static DEFAULT_TRUST: OnceLock<(Arc<rustls::ClientConfig>, Arc<rustls::RootCertStore>)> = OnceLock::new();
 
 pub fn trust(authority: &str, ca_pem: &str) -> Result<()> {
     let cfg = client_config(ca_pem)?;
@@ -134,13 +138,106 @@ pub fn trust(authority: &str, ca_pem: &str) -> Result<()> {
 }
 
 pub fn trust_by_default(ca_pem: &str) -> Result<()> {
-    let _ = DEFAULT_TRUST.set(client_config(ca_pem)?);
+    let _ = DEFAULT_TRUST.set((client_config(ca_pem)?, roots(ca_pem)?));
     Ok(())
+}
+
+/// Node certificates name the node, not its host: several nodes can share a host, and a
+/// join-token holder gets a certificate only its own node ID accepts.
+pub fn node_name(id: &str) -> String {
+    format!("{id}.node.rekcod.invalid")
+}
+
+/// A node the controller dials at `host:port`: its ID, and whether its certificate is from
+/// before node names (it names the host).
+static NODES: Mutex<Option<HashMap<String, (String, bool)>>> = Mutex::new(None);
+
+/// The controller expects node `id`'s certificate from `authority`.
+pub fn expect_node(authority: &str, id: &str, host_named: bool) {
+    NODES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_default()
+        .insert(authority.to_ascii_lowercase(), (id.to_string(), host_named));
+}
+
+pub fn forget_node(authority: &str) {
+    if let Some(m) = NODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+        m.remove(&authority.to_ascii_lowercase());
+    }
+}
+
+fn expected_node(authority: &str) -> Option<(String, bool)> {
+    NODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_ref().and_then(|m| m.get(&authority.to_ascii_lowercase()).cloned())
+}
+
+/// Checks a node's certificate against its node name; one issued before node names may
+/// name its host instead.
+#[derive(Debug)]
+struct NodeCert {
+    inner: Arc<rustls::client::WebPkiServerVerifier>,
+    host: Option<ServerName<'static>>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for NodeCert {
+    fn verify_server_cert(
+        &self,
+        end: &CertificateDer<'_>,
+        inter: &[CertificateDer<'_>],
+        name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        self.inner.verify_server_cert(end, inter, name, ocsp, now).or_else(|e| match &self.host {
+            Some(h) => self.inner.verify_server_cert(end, inter, h, ocsp, now).map_err(|_| e),
+            None => Err(e),
+        })
+    }
+    fn verify_tls12_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(m, c, d)
+    }
+    fn verify_tls13_signature(
+        &self,
+        m: &[u8],
+        c: &CertificateDer<'_>,
+        d: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(m, c, d)
+    }
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// A client config and server name for a node the controller expects at `authority`.
+fn node_config(
+    authority: &str,
+    id: &str,
+    host_named: bool,
+    roots: Arc<rustls::RootCertStore>,
+) -> Result<(Arc<rustls::ClientConfig>, ServerName<'static>)> {
+    let inner = rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider()).build()?;
+    let host = if host_named {
+        Some(ServerName::try_from(host_of(authority).to_string()).map_err(|e| anyhow!("{authority}: {e}"))?)
+    } else {
+        None
+    };
+    let cfg = rustls::ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NodeCert { inner, host }))
+        .with_no_client_auth();
+    Ok((Arc::new(cfg), ServerName::try_from(node_name(id)).map_err(|e| anyhow!("node {id}: {e}"))?))
 }
 
 fn trusted(authority: &str) -> Option<Arc<rustls::ClientConfig>> {
     let t = TRUST.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    t.as_ref().and_then(|m| m.get(authority).cloned()).or_else(|| DEFAULT_TRUST.get().cloned())
+    t.as_ref().and_then(|m| m.get(authority).cloned()).or_else(|| DEFAULT_TRUST.get().map(|d| d.0.clone()))
 }
 
 /// A client connection, plain or TLS.
@@ -186,6 +283,11 @@ fn host_of(authority: &str) -> &str {
 pub fn connect(base: &str, authority: &str, tcp: TcpStream) -> Result<Stream> {
     if base.starts_with("http://") {
         return Ok(Stream::Plain(tcp));
+    }
+    if let (Some((id, host_named)), Some((_, roots))) = (expected_node(authority), DEFAULT_TRUST.get()) {
+        let (cfg, name) = node_config(authority, &id, host_named, roots.clone())?;
+        let conn = rustls::ClientConnection::new(cfg, name)?;
+        return Ok(Stream::Tls(Box::new(rustls::StreamOwned::new(conn, tcp))));
     }
     let cfg = trusted(authority)
         .ok_or_else(|| anyhow!("no CA for {authority}: add the remote with --ca-fingerprint (rekcod remote add NAME {base} --token T --ca-fingerprint sha256:...)"))?;
@@ -349,6 +451,51 @@ mod tests {
         if DEFAULT_TRUST.get().is_none() {
             assert!(connect("https://10.9.9.9:1", "10.9.9.9:1", tcp).is_err());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Serves one TLS handshake with `names` per connection; returns the address.
+    fn node_server(ca: &Ca, names: &[String]) -> std::net::SocketAddr {
+        let (cert, key) = ca.issue(names).unwrap();
+        let server = server_config(&cert, &key).unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for tcp in l.incoming().flatten() {
+                let Ok(mut s) = accept(Some(&server), tcp) else { continue };
+                let _ = s.write_all(b"ok");
+                let _ = s.flush();
+            }
+        });
+        addr
+    }
+
+    fn handshake(addr: std::net::SocketAddr, id: &str, host_named: bool, roots: &Arc<rustls::RootCertStore>) -> bool {
+        let (cfg, name) = node_config(&addr.to_string(), id, host_named, roots.clone()).unwrap();
+        let mut s = rustls::StreamOwned::new(rustls::ClientConnection::new(cfg, name).unwrap(), TcpStream::connect(addr).unwrap());
+        let mut b = [0u8; 2];
+        s.read_exact(&mut b).is_ok()
+    }
+
+    #[test]
+    fn node_certificates_are_bound_to_the_node_not_its_host() {
+        let dir = std::env::temp_dir().join(format!("rekcod-tls-nodes-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = ensure_node_ca(&dir).unwrap();
+        let roots = roots(&ca.pem).unwrap();
+        // Two nodes on one host: each certificate passes only for its own node.
+        let a = node_server(&ca, &[node_name("n-aaaa")]);
+        let b = node_server(&ca, &[node_name("n-bbbb")]);
+        assert!(handshake(a, "n-aaaa", false, &roots));
+        assert!(handshake(b, "n-bbbb", false, &roots));
+        assert!(!handshake(b, "n-aaaa", false, &roots), "n-bbbb's certificate must not pass for n-aaaa");
+        // A certificate naming the host (how nodes joined before) passes only for a node
+        // recorded as joined then.
+        let old = node_server(&ca, &["127.0.0.1".into()]);
+        assert!(!handshake(old, "n-aaaa", false, &roots));
+        assert!(handshake(old, "n-aaaa", true, &roots));
+        assert!(!handshake(b, "n-aaaa", true, &roots), "a host-named fallback still needs the host in the certificate");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

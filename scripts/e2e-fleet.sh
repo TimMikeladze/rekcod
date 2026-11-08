@@ -117,7 +117,10 @@ check "git options are refused on deploy" sh -c 'curl -s -m 10 --cacert "$0" -H 
 check "a node can't register the controller's name" sh -c 'curl -s -m 10 --cacert "$0" -X POST -d "{\"join_token\":\"$1\",\"url\":\"https://fleet-controller.test:17999\"}" https://127.0.0.1:17700/nodes/register | grep -q "controller.s own"' "$ca" "$join"
 # curl exits 60 when the certificate doesn't verify (not a connection error).
 check "a client pinned to the fleet CA refuses a node certificate" sh -c 'curl -s -m 5 --cacert "$0" https://127.0.0.1:17701/sandboxes >/dev/null; test $? -eq 60' "$ca"
-check "the node CA does verify it" sh -c 'curl -s -m 5 --cacert "$0" https://127.0.0.1:17701/sandboxes >/dev/null; test $? -ne 60' "$C/controller/node-ca.pem"
+# Node certificates name the node (`<id>.node.rekcod.invalid`), not 127.0.0.1.
+n1=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$N1/node.json")
+check "the node CA does verify it, for its node name" sh -c 'curl -s -m 5 --cacert "$0" --connect-to "$1.node.rekcod.invalid:17701:127.0.0.1:17701" "https://$1.node.rekcod.invalid:17701/sandboxes" >/dev/null; test $? -ne 60' "$C/controller/node-ca.pem" "$n1"
+check "a node certificate doesn't pass for its host" sh -c 'curl -s -m 5 --cacert "$0" https://127.0.0.1:17701/sandboxes >/dev/null; test $? -eq 60' "$C/controller/node-ca.pem"
 check "new apps aren't on the public listener" sh -c 'curl -s -m 3 -H "Host: hello.apps.test" http://127.0.0.1:18089/ | grep -q "no app"'
 check "app public" cr app public --remote admin hello
 sleep 2.5

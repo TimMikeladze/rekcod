@@ -45,36 +45,16 @@ else
   log "network up"
 fi
 
-# Data disk: holds all docker state. It's only ever formatted when it's blank: the Mac
-# just created it (rekcod.fresh=1) or its first 4 MiB are zeros. A disk with data that
-# isn't recognisable as ext4 is never formatted; dockerd doesn't start and the host
-# reports the error instead (`rekcod start --repair`).
+# Data disk: holds all docker state. It's only ever formatted when the Mac just created
+# it (data-disk.sh). One that isn't recognisable as ext4 is never formatted; dockerd
+# doesn't start and the host reports the error instead (`rekcod start --repair`).
 data_fail() {
   log "data disk error: $*"
   echo "$*" >/run/rekcod-data-failed
 }
-is_ext4() { blkid /dev/vdb 2>/dev/null | grep -q 'TYPE="ext4"'; }
-blank() { [ "$(head -c 4194304 /dev/vdb | tr -d '\000' | head -c 1 | wc -c)" -eq 0 ]; }
-if ! is_ext4; then
-  if grep -q 'rekcod\.fresh=1' /proc/cmdline || blank; then
-    log "formatting data disk"
-    mkfs.ext4 -q -L rekcod-data -m 0 -E lazy_itable_init=1,lazy_journal_init=1 /dev/vdb
-  else
-    # A damaged primary superblock: e2fsck can rebuild it from a backup. Plain boots try
-    # the first one; --repair (rekcod.fsck=yes) walks the others too, with -y.
-    log "data disk has no readable ext4 superblock; trying the backup"
-    e2fsck -p -b 32768 -B 4096 /dev/vdb >/dev/console 2>&1
-    if ! is_ext4 && grep -q 'rekcod\.fsck=yes' /proc/cmdline; then
-      for b in 98304 163840 229376 294912 819200 884736 1605632 2654208 4096000 7962624; do
-        log "trying backup superblock $b"
-        e2fsck -fy -b $b -B 4096 /dev/vdb >/dev/console 2>&1
-        is_ext4 && break
-      done
-    fi
-  fi
-fi
-if ! is_ext4; then
-  data_fail "/dev/vdb holds data but isn't a readable ext4 filesystem; not formatting it"
+. /etc/rekcod/data-disk.sh
+if ! data_disk_ready /dev/vdb "$(cat /proc/cmdline)"; then
+  data_fail "/dev/vdb isn't a readable ext4 filesystem, and only a disk the Mac just created is formatted"
 else
   # -p repairs what's safe to repair; 4 and up means it needs a person (or --repair, -y).
   if grep -q 'rekcod\.fsck=yes' /proc/cmdline; then

@@ -10,6 +10,7 @@ import { cmdLine, Head } from "@/components/table"
 import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table"
 import { useDash } from "@/hooks/dash-context"
+import { api } from "@/lib/api"
 import { ago, duration } from "@/lib/format"
 import type { Job } from "@/lib/types"
 
@@ -27,7 +28,7 @@ export function useTextStream(url: string | null) {
       setText("")
       setDone(false)
       try {
-        const r = await fetch(url, { signal: ctl.signal, cache: "no-store" })
+        const r = await api(url, { signal: ctl.signal })
         if (!r.ok || !r.body) {
           setText(await r.text())
           return
@@ -100,7 +101,7 @@ export function JobDetail({ id }: { id: string }) {
   useEffect(() => {
     if (!named) return
     const ctl = new AbortController()
-    fetch(`/api/job-history?name=${encodeURIComponent(named)}`, { signal: ctl.signal, cache: "no-store" })
+    api(`/api/job-history?name=${encodeURIComponent(named)}`, { signal: ctl.signal })
       .then(async (r) => {
         const body = await r.json().catch(() => ({ error: r.statusText }))
         if (!r.ok || body.error) throw new Error(body.error ?? r.statusText)

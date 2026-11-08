@@ -12,6 +12,7 @@ import { cmdLine, Head } from "@/components/table"
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table"
 import { useDash } from "@/hooks/dash-context"
+import { api } from "@/lib/api"
 import { ago, fmtBytes } from "@/lib/format"
 import type { Node } from "@/lib/types"
 
@@ -45,7 +46,7 @@ function History({ node }: { node: Node }) {
   useEffect(() => {
     let stop = false
     const load = () =>
-      fetch(`/api/node-history?id=${encodeURIComponent(id)}`, { cache: "no-store" })
+      api(`/api/node-history?id=${encodeURIComponent(id)}`)
         .then((r) => r.json())
         .then((b: { id?: string; samples?: NodeSample[] }) => !stop && b.samples && setRows({ id, samples: b.samples }))
         .catch(() => {})

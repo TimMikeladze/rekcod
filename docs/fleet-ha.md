@@ -184,7 +184,8 @@ buckets that hold anything you'd miss.
 ### 5. Jobs on a lost node
 
 `job run --retries N` (default 0): a job lost with its node is started again elsewhere, up to
-N times. Schedules already start the next run regardless.
+N times. Today a `lost` job may still be running, so its schedule waits until the node
+answers or `node rm` ends it; a retry needs the same rule.
 
 ## Order and cut lines
 

@@ -23,7 +23,9 @@ fn id_of(args: &Value) -> Result<String> {
 }
 
 /// What callers may ask for, fixed when `serve`, `mcp` or a fleet node starts. The caller
-/// is an agent or a remote user, so none of it comes from the request.
+/// is an agent or a remote user, so none of it comes from the request. It covers the
+/// sandboxes callers reach as well as the ones they create: an existing sandbox is only
+/// theirs to see and use if this server could have created it.
 #[derive(Clone, Debug, Default)]
 pub struct Policy {
     /// Directories a sandbox may be created for (they and anything under them). Empty:
@@ -35,17 +37,92 @@ pub struct Policy {
     pub allow_hosts: Vec<String>,
     /// Environment variables a caller may pass in by name with `secrets`.
     pub secrets: Vec<String>,
+    /// Allows macOS guests. Their network isn't filtered: they reach the internet, the Mac
+    /// and the LAN.
+    pub macos: bool,
+    /// A fleet node, which only the controller calls (node secret). It takes git sources,
+    /// serves [`NODE_ONLY`] and reaches only the sandboxes the fleet made, never the Mac
+    /// owner's. Only [`Policy::node`] sets it.
+    pub node: bool,
+}
+
+/// Operations for the controller, served only when [`Policy::node`] is set.
+const NODE_ONLY: &[&str] = &["deploy_instance", "wake_instance", "run_job", "job_get", "job_cancel", "logs"];
+
+/// A sandbox the server's policy doesn't cover; 403 over HTTP.
+#[derive(Debug)]
+pub struct Forbidden(pub String);
+impl std::fmt::Display for Forbidden {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for Forbidden {}
+
+enum Refusal {
+    /// Another project's, or the fleet's: answered like a sandbox that doesn't exist.
+    Hidden,
+    Forbidden(String),
 }
 
 impl Policy {
     /// Fleet nodes: only the controller calls them (node secret), and it filters what users send.
     pub fn node() -> Policy {
-        Policy { roots: vec![], mount: false, allow_hosts: vec!["*".into()], secrets: vec![] }
+        Policy { roots: vec![], mount: false, allow_hosts: vec!["*".into()], secrets: vec![], macos: true, node: true }
+    }
+
+    fn host_allowed(&self, h: &str) -> bool {
+        self.allow_hosts.iter().any(|a| a == "*" || a == h) || sandbox::DEV_HOSTS.contains(&h)
+    }
+
+    /// Why callers may not see or use the sandbox in `home`, if they may not.
+    fn refusal(&self, home: &std::path::Path, m: &sandbox::Meta) -> Option<Refusal> {
+        let fleet = home.join(crate::fleet::FLEET_MARKER).exists();
+        if self.node {
+            return (!fleet).then_some(Refusal::Hidden);
+        }
+        if fleet || !self.roots.iter().any(|r| m.project.starts_with(r)) {
+            return Some(Refusal::Hidden);
+        }
+        let any = self.allow_hosts.iter().any(|h| h == "*");
+        let why = if m.mode != "copy" && !self.mount {
+            "it shares the live directory; start the server with --allow-mount".to_string()
+        } else if m.os == "macos" && !self.macos {
+            "it's a macOS guest, whose network isn't filtered; start the server with --allow-macos".into()
+        } else if !m.os.is_empty() && m.os != "macos" {
+            format!("its os {:?} isn't one this server knows", m.os)
+        } else if !m.reach.is_empty() {
+            "it may reach addresses on the Mac or the LAN".into()
+        } else if let Some(s) = m.secrets.iter().find(|s| !self.secrets.contains(s)) {
+            format!("it has secret {s}; start the server with --secret {s}")
+        } else if !m.offline && m.allow.is_none() && !any {
+            "its network is open; start the server with --allow-host '*'".into()
+        } else {
+            let h = m.allow.iter().flatten().find(|h| !m.offline && !self.host_allowed(h))?;
+            format!("it may reach {h}; start the server with --allow-host {h}")
+        };
+        Some(Refusal::Forbidden(why))
+    }
+
+    /// The ID of the sandbox `args["id"]` names, once callers may use it.
+    fn target(&self, paths: &Paths, args: &Value) -> Result<String> {
+        let id = id_of(args)?;
+        let (home, meta) = sandbox::lookup(paths, &id)?;
+        match self.refusal(&home, &meta) {
+            None => Ok(meta.id),
+            Some(Refusal::Hidden) => Err(anyhow::Error::new(sandbox::NoSandbox(id))),
+            Some(Refusal::Forbidden(why)) => Err(anyhow::Error::new(Forbidden(format!("sandbox {id} isn't allowed here: {why}")))),
+        }
     }
 
     /// The project directory for a create, checked against `roots`.
     fn project(&self, dir: Option<&str>) -> Result<PathBuf> {
-        let Some(first) = self.roots.first() else { bail!("this server only creates sandboxes from git") };
+        let Some(first) = self.roots.first() else {
+            match self.node {
+                true => bail!("this server only creates sandboxes from git"),
+                false => bail!("this server allows no directories; start it with --root"),
+            }
+        };
         let dir = match dir {
             Some(d) => PathBuf::from(d).canonicalize().with_context(|| format!("dir {d}"))?,
             None => first.clone(),
@@ -61,12 +138,14 @@ impl Policy {
         if args["mount"].as_bool() == Some(true) && !self.mount {
             bail!("mount isn't allowed; start the server with --allow-mount");
         }
-        let any = self.allow_hosts.iter().any(|h| h == "*");
-        if let Some(h) = strs(&args["allow_hosts"]).into_iter().find(|h| !any && !self.allow_hosts.contains(h)) {
+        if let Some(h) = strs(&args["allow_hosts"]).into_iter().find(|h| !self.host_allowed(h)) {
             bail!("allow_hosts {h} isn't allowed; start the server with --allow-host {h}");
         }
         if let Some(s) = strs(&args["secrets"]).into_iter().find(|s| !self.secrets.contains(s)) {
             bail!("secret {s} isn't allowed; start the server with --secret {s}");
+        }
+        if args["os"].as_str() == Some("macos") && !self.macos {
+            bail!("os macos isn't allowed: a macOS guest's network isn't filtered; start the server with --allow-macos");
         }
         Ok(())
     }
@@ -106,8 +185,13 @@ fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<&[u8]>) -> 
     Ok((code, out.stdout, out.stderr))
 }
 
-/// One API operation. `exec` here collects output; HTTP streams it separately.
+/// One API operation. `exec` here collects output; HTTP streams it separately. Every
+/// operation on an existing sandbox authorizes it first ([`Policy::target`]).
 pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Value> {
+    if NODE_ONLY.contains(&name) && !policy.node {
+        bail!("unknown operation {name}");
+    }
+    let target = || policy.target(paths, args);
     Ok(match name {
         "create" => {
             let d = CreateOptions::default();
@@ -116,9 +200,7 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             // for `serve`/`mcp --root` a git URL would skip the root and have the Mac fetch
             // from any host before any sandbox exists.
             let dir = match args["git"]["url"].as_str() {
-                Some(url) if policy.roots.is_empty() => {
-                    Some(crate::fleet::clone(paths, url, args["git"]["ref"].as_str().unwrap_or("HEAD"))?)
-                }
+                Some(url) if policy.node => Some(crate::fleet::clone(paths, url, args["git"]["ref"].as_str().unwrap_or("HEAD"))?),
                 Some(_) => bail!("git sources are only for fleet nodes; pass dir"),
                 None => Some(policy.project(args["dir"].as_str())?),
             };
@@ -139,20 +221,24 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
                 reach: vec![],
             };
             let meta = sandbox::create(paths, o)?;
-            if policy.roots.is_empty() {
+            if policy.node {
                 crate::fleet::mark_fleet(paths, &meta.id);
             }
             serde_json::to_value(meta)?
         }
-        "list" => serde_json::to_value(sandbox::list(paths))?,
-        "get" => serde_json::to_value(sandbox::get(paths, &id_of(args)?)?)?,
+        "list" => {
+            let mine: Vec<sandbox::Listed> =
+                sandbox::list(paths).into_iter().filter(|l| policy.refusal(&l.home, &l.meta).is_none()).collect();
+            serde_json::to_value(mine)?
+        }
+        "get" => serde_json::to_value(sandbox::get(paths, &target()?)?)?,
         "exec" => {
-            let (exit, out, err) = exec_collect(paths, &id_of(args)?, args, None)?;
+            let (exit, out, err) = exec_collect(paths, &target()?, args, None)?;
             json!({"exit": exit, "stdout": String::from_utf8_lossy(&out), "stderr": String::from_utf8_lossy(&err)})
         }
         "read_file" => {
             let a = json!({"cmd": ["cat", "--", args["path"].as_str().context("missing path")?]});
-            let (exit, out, err) = exec_collect(paths, &id_of(args)?, &a, None)?;
+            let (exit, out, err) = exec_collect(paths, &target()?, &a, None)?;
             if exit != 0 {
                 bail!("{}", String::from_utf8_lossy(&err).trim());
             }
@@ -162,31 +248,31 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             let path = args["path"].as_str().context("missing path")?;
             let a = json!({"cmd": ["sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "-", path]});
             let body = args["content"].as_str().unwrap_or_default();
-            let (exit, _, err) = exec_collect(paths, &id_of(args)?, &a, Some(body.as_bytes()))?;
+            let (exit, _, err) = exec_collect(paths, &target()?, &a, Some(body.as_bytes()))?;
             if exit != 0 {
                 bail!("{}", String::from_utf8_lossy(&err).trim());
             }
             json!({"written": body.len()})
         }
         "fork" => {
-            let meta = sandbox::fork(paths, &id_of(args)?, args["name"].as_str().map(String::from))?;
-            if policy.roots.is_empty() {
+            let meta = sandbox::fork(paths, &target()?, args["name"].as_str().map(String::from))?;
+            if policy.node {
                 crate::fleet::mark_fleet(paths, &meta.id);
             }
             serde_json::to_value(meta)?
         }
         "diff" => {
-            let (changes, patch) = sandbox::patch(paths, &id_of(args)?)?;
+            let (changes, patch) = sandbox::patch(paths, &target()?)?;
             json!({"changes": changes, "patch": patch})
         }
         "apply" => json!({"changes": sandbox::apply(
             paths,
-            &id_of(args)?,
+            &target()?,
             args["check"].as_bool().unwrap_or(false),
             args["reviewed"].as_bool().unwrap_or(false)
         )?}),
         "stop" => {
-            let id = id_of(args)?;
+            let id = target()?;
             // An app instance stopped by the controller (idle) stays down across node restarts.
             if let Ok(h) = sandbox::home(paths, &id)
                 && h.join("instance.json").exists()
@@ -197,26 +283,28 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             json!({"stopped": true})
         }
         "remove" => {
-            sandbox::rm(paths, &[id_of(args)?], false)?;
+            sandbox::rm(paths, &[target()?], false)?;
             json!({"removed": true})
         }
         "screenshot" => {
+            let id = target()?;
             let out = std::env::temp_dir().join(format!("rekcod-shot-{}.png", sandbox::new_id()?));
-            sandbox::screenshot(paths, &id_of(args)?, &out)?;
+            sandbox::screenshot(paths, &id, &out)?;
             let png = std::fs::read(&out)?;
             let _ = std::fs::remove_file(&out);
             json!({"png_base64": crate::daemon::base64(&png)})
         }
         "input" => {
-            sandbox::input(paths, &id_of(args)?, &strs(&args["action"]))?;
+            sandbox::input(paths, &target()?, &strs(&args["action"]))?;
             json!({"done": true})
         }
         "deploy_instance" => crate::fleet::deploy_instance(paths, args)?,
-        "wake_instance" => crate::fleet::wake_instance(paths, &id_of(args)?)?,
+        "wake_instance" => crate::fleet::wake_instance(paths, &target()?)?,
         "run_job" => crate::fleet::run_job(paths, args)?,
+        // Job IDs, not sandboxes: `fleet.rs` checks their form.
         "job_get" => crate::fleet::job_get(paths, &id_of(args)?)?,
         "job_cancel" => crate::fleet::job_cancel(paths, &id_of(args)?)?,
-        "logs" => json!({"logs": crate::fleet::instance_logs(paths, &id_of(args)?)?}),
+        "logs" => json!({"logs": crate::fleet::instance_logs(paths, &target()?)?}),
         _ => bail!("unknown operation {name}"),
     })
 }
@@ -344,7 +432,11 @@ pub(crate) fn respond(w: &mut impl Write, code: u16, ctype: &str, body: &[u8]) -
 }
 
 fn error_code(e: &anyhow::Error) -> u16 {
-    if e.downcast_ref::<sandbox::NoSandbox>().is_some() { 404 } else { 400 }
+    match () {
+        _ if e.downcast_ref::<sandbox::NoSandbox>().is_some() => 404,
+        _ if e.downcast_ref::<Forbidden>().is_some() => 403,
+        _ => 400,
+    }
 }
 
 /// Maps a request to an operation name and its arguments.
@@ -436,14 +528,20 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
     }
     let mut w = r.into_inner();
     let body: Value = if req.body.is_empty() { json!({}) } else { serde_json::from_slice(&req.body).unwrap_or(json!({})) };
-    let Some((name, mut args)) = route(&req.method, &req.path, &req.query, &body) else {
+    // Node-only routes don't exist on `sandbox serve`.
+    let found = route(&req.method, &req.path, &req.query, &body).filter(|(name, _)| policy.node || !NODE_ONLY.contains(name));
+    let Some((name, mut args)) = found else {
         return respond(&mut w, 404, "application/json", br#"{"error":"no such endpoint"}"#);
     };
     if name == "write_file" {
         args["content"] = json!(String::from_utf8_lossy(&req.body));
     }
     if name == "exec" {
-        if let Err(e) = stream_exec(paths, &args, &mut w) {
+        let r = policy.target(paths, &args).and_then(|id| {
+            args["id"] = json!(id);
+            stream_exec(paths, &args, &mut w)
+        });
+        if let Err(e) = r {
             let _ = respond(&mut w, error_code(&e), "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
         }
         return Ok(());
@@ -730,15 +828,22 @@ mod tests {
     fn policy_limits_what_callers_ask_for() {
         let root = std::env::temp_dir().canonicalize().unwrap().join(format!("rekcod-pol-{}", std::process::id()));
         std::fs::create_dir_all(root.join("app")).unwrap();
-        let p = Policy { roots: vec![root.clone()], mount: false, allow_hosts: vec!["example.com".into()], secrets: vec!["TOKEN".into()] };
+        let p = Policy {
+            roots: vec![root.clone()],
+            allow_hosts: vec!["example.com".into()],
+            secrets: vec!["TOKEN".into()],
+            ..Default::default()
+        };
         assert_eq!(p.project(None).unwrap(), root);
         assert_eq!(p.project(Some(root.join("app").to_str().unwrap())).unwrap(), root.join("app"));
         assert!(p.project(Some("/")).is_err());
         assert!(p.project(Some(root.join("app/../..").to_str().unwrap())).is_err());
         assert!(p.check(&json!({"mount": true})).is_err());
-        assert!(p.check(&json!({"allow_hosts": ["example.com"], "secrets": ["TOKEN"]})).is_ok());
+        assert!(p.check(&json!({"allow_hosts": ["example.com", "github.com"], "secrets": ["TOKEN"]})).is_ok());
         assert!(p.check(&json!({"allow_hosts": ["*"]})).is_err());
         assert!(p.check(&json!({"secrets": ["AWS_SECRET_ACCESS_KEY"]})).is_err());
+        assert!(p.check(&json!({"os": "macos"})).unwrap_err().to_string().contains("--allow-macos"));
+        assert!(Policy { macos: true, ..p.clone() }.check(&json!({"os": "macos"})).is_ok());
         assert!(Policy::node().project(Some("/Users")).is_err());
         let refused = op(&Paths { home: std::env::temp_dir() }, &p, "create", &json!({"git": {"url": "https://127.0.0.1:1/x.git"}}));
         assert!(refused.unwrap_err().to_string().contains("only for fleet nodes"));
@@ -775,5 +880,149 @@ mod tests {
             mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "x"}}))
                 .unwrap();
         assert_eq!(bad["error"]["code"], -32602);
+    }
+
+    use crate::sandbox::testing::fake;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rekcod-api-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    /// Sends one request through `handle`; returns the status and body.
+    fn http(paths: &Paths, policy: &Policy, method: &str, path: &str, body: &str) -> (u16, String) {
+        struct Pipe(std::io::Cursor<Vec<u8>>, Vec<u8>);
+        impl Read for Pipe {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.0.read(b)
+            }
+        }
+        impl Write for Pipe {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.1.write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let req = format!("{method} {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let mut p = Pipe(std::io::Cursor::new(req.into_bytes()), vec![]);
+        handle(paths, policy, &mut p, None).unwrap();
+        let out = String::from_utf8_lossy(&p.1).to_string();
+        let (head, body) = out.split_once("\r\n\r\n").unwrap();
+        (head[9..12].parse().unwrap(), body.to_string())
+    }
+
+    fn mcp_call(paths: &Paths, policy: &Policy, tool: &str, args: Value) -> (bool, String) {
+        let msg = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {"name": tool, "arguments": args}});
+        let r = mcp_reply(paths, policy, &msg).unwrap();
+        (r["result"]["isError"] == true, r["result"]["content"][0]["text"].as_str().unwrap_or("").to_string())
+    }
+
+    #[test]
+    fn servers_only_reach_sandboxes_their_policy_covers() {
+        let base = tmp("existing");
+        let (a, b) = (base.join("a"), base.join("b"));
+        for d in [&a, &b] {
+            std::fs::create_dir_all(d).unwrap();
+            std::fs::write(d.join("f.txt"), "host").unwrap();
+        }
+        let paths = Paths { home: base.join("home") };
+        let ws = |id: &str| paths.home.join("sb").join(id).join("ws");
+        // Project B's sandbox, with a change reviewed from the CLI.
+        let sb = fake(&paths, &b, |m| m.name = Some("bee".into()));
+        std::fs::write(ws(&sb.id).join("f.txt"), "sandbox").unwrap();
+        sandbox::patch(&paths, &sb.id).unwrap();
+        let pol = Policy { roots: vec![a.clone()], ..Default::default() };
+        let (_, list) = mcp_call(&paths, &pol, "sandbox_list", json!({}));
+        assert!(!list.contains(&sb.id), "{list}");
+        for (tool, args) in [
+            ("sandbox_apply", json!({"id": sb.id, "reviewed": true})),
+            ("sandbox_apply", json!({"id": "bee"})),
+            ("sandbox_diff", json!({"id": sb.id})),
+            ("sandbox_exec", json!({"id": sb.id, "cmd": ["true"]})),
+            ("sandbox_read_file", json!({"id": sb.id, "path": "/etc/hostname"})),
+            ("sandbox_fork", json!({"id": sb.id})),
+            ("sandbox_stop", json!({"id": sb.id})),
+            ("sandbox_remove", json!({"id": sb.id})),
+        ] {
+            let (err, text) = mcp_call(&paths, &pol, tool, args);
+            assert!(err && text.starts_with("no sandbox"), "{tool}: {text}");
+        }
+        assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "host");
+        assert!(paths.home.join("sb").join(&sb.id).exists());
+        assert_eq!(http(&paths, &pol, "GET", "/sandboxes", ""), (200, "[]".into()));
+        for (method, path, body) in [
+            ("POST", format!("/sandboxes/{}/apply", sb.id), r#"{"reviewed": true}"#),
+            ("POST", format!("/sandboxes/{}/exec", sb.id), r#"{"cmd": ["true"]}"#),
+            ("GET", format!("/sandboxes/{}", sb.id), ""),
+            ("DELETE", "/sandboxes/bee".into(), ""),
+        ] {
+            assert_eq!(http(&paths, &pol, method, &path, body).0, 404, "{method} {path}");
+        }
+        assert_eq!(std::fs::read_to_string(b.join("f.txt")).unwrap(), "host");
+
+        // Under the root but broader than the policy: not listed, and refused with the flag
+        // the server would need.
+        let mine = fake(&paths, &a, |m| m.secrets = vec!["TOKEN".into()]);
+        std::fs::write(ws(&mine.id).join("f.txt"), "sandbox").unwrap();
+        let (code, body) = http(&paths, &pol, "POST", &format!("/sandboxes/{}/apply", mine.id), "{}");
+        assert!(code == 403 && body.contains("--secret TOKEN"), "{code} {body}");
+        assert_eq!(http(&paths, &pol, "GET", "/sandboxes", "").1, "[]");
+        for (edit, flag) in [
+            (Box::new(|m: &mut sandbox::Meta| m.mode = "mount".into()) as Box<dyn FnOnce(&mut sandbox::Meta)>, "--allow-mount"),
+            (Box::new(|m: &mut sandbox::Meta| m.allow = None), "--allow-host '*'"),
+            (Box::new(|m: &mut sandbox::Meta| m.allow = sandbox::allowlist(&["api.example.com".into()])), "--allow-host api.example.com"),
+            (Box::new(|m: &mut sandbox::Meta| m.os = "macos".into()), "--allow-macos"),
+            (Box::new(|m: &mut sandbox::Meta| m.reach = vec!["192.168.1.2:9000".into()]), "the Mac or the LAN"),
+        ] {
+            let m = fake(&paths, &a, edit);
+            let (err, text) = mcp_call(&paths, &pol, "sandbox_diff", json!({"id": m.id}));
+            assert!(err && text.contains(flag), "{flag}: {text}");
+        }
+        let pol = Policy { secrets: vec!["TOKEN".into()], ..pol };
+        let (_, list) = mcp_call(&paths, &pol, "sandbox_list", json!({}));
+        assert!(list.contains(&mine.id) && !list.contains(&sb.id), "{list}");
+        let (code, body) = http(&paths, &pol, "POST", &format!("/sandboxes/{}/apply", mine.id), "{}");
+        assert_eq!((code, body.as_str()), (200, r#"{"changes":[{"kind":"M","path":"f.txt"}]}"#));
+        assert_eq!(std::fs::read_to_string(a.join("f.txt")).unwrap(), "sandbox");
+
+        // A fleet node reaches only the fleet's sandboxes, and a user's server never does.
+        let node = Policy::node();
+        assert_eq!(http(&paths, &node, "GET", &format!("/sandboxes/{}", sb.id), "").0, 404);
+        std::fs::write(paths.home.join("sb").join(&sb.id).join(crate::fleet::FLEET_MARKER), b"").unwrap();
+        assert_eq!(http(&paths, &node, "GET", &format!("/sandboxes/{}", sb.id), "").0, 200);
+        let everything = Policy { roots: vec![base.clone()], ..Default::default() };
+        assert_eq!(http(&paths, &everything, "GET", &format!("/sandboxes/{}", sb.id), "").0, 404);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn node_routes_exist_only_on_nodes() {
+        let base = tmp("noderoutes");
+        let paths = Paths { home: base.join("home") };
+        std::fs::create_dir_all(&paths.home).unwrap();
+        let user = Policy { roots: vec![base.clone()], allow_hosts: vec!["*".into()], ..Default::default() };
+        let git = r#"{"app": "x", "release": 1, "git": {"url": "https://127.0.0.1:1/x.git"}, "id": "j-abc", "cmd": ["true"]}"#;
+        for (method, path, body) in [
+            ("POST", "/instances", git),
+            ("POST", "/instances/abc/wake", ""),
+            ("POST", "/jobs", git),
+            ("GET", "/jobs/j-abc", ""),
+            ("DELETE", "/jobs/j-abc", ""),
+            ("GET", "/sandboxes/abc/logs", ""),
+        ] {
+            assert_eq!(http(&paths, &user, method, path, body), (404, r#"{"error":"no such endpoint"}"#.into()), "{method} {path}");
+        }
+        for name in NODE_ONLY {
+            let e = op(&paths, &user, name, &serde_json::from_str(git).unwrap()).unwrap_err();
+            assert!(e.to_string().starts_with("unknown operation"), "{name}: {e}");
+        }
+        assert!(!paths.home.join("remote-ws").exists() && !paths.home.join("jobs").exists());
+        let (code, body) = http(&paths, &Policy::node(), "GET", "/jobs/j-abc", "");
+        assert!(code == 400 && body.contains("no job j-abc"), "{code} {body}");
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

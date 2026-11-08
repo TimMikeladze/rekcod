@@ -52,8 +52,84 @@ fn runtime_of_command(cmd: &str) -> Option<Runtime> {
     })
 }
 
-fn read(dir: &Path, name: &str) -> Option<String> {
-    std::fs::read_to_string(dir.join(name)).ok()
+/// Largest project file read on the Mac (version files, `rekcod.toml`).
+pub const MAX_PROJECT_FILE: u64 = 1 << 20;
+
+/// Reads `name`, a file directly in `dir`, without following a symlink: only a regular file
+/// of at most [`MAX_PROJECT_FILE`] bytes. `Ok(None)` when there's nothing by that name.
+/// Fleet nodes read cloned repositories with this, so a link to `/dev/zero` or to a file
+/// outside the checkout is an error, not a read.
+pub fn read_project_file(dir: &Path, name: &str) -> Result<Option<String>> {
+    read_file(dir, name, false)
+}
+
+/// [`read_project_file`], following a symlink when `follow`; the target must still be a
+/// regular file of at most [`MAX_PROJECT_FILE`] bytes.
+fn read_file(dir: &Path, name: &str, follow: bool) -> Result<Option<String>> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    if name.is_empty() || name.contains('/') || name == "." || name == ".." {
+        bail!("{name}: not a file name");
+    }
+    let d = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(dir)
+        .with_context(|| format!("open {}", dir.display()))?;
+    let c = std::ffi::CString::new(name)?;
+    // O_NONBLOCK: a FIFO would otherwise block the open until something writes to it.
+    let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+    let fd = unsafe { libc::openat(d.as_raw_fd(), c.as_ptr(), libc::O_RDONLY | nofollow | libc::O_NONBLOCK | libc::O_CLOEXEC) };
+    if fd < 0 {
+        let e = std::io::Error::last_os_error();
+        return match e.raw_os_error() {
+            Some(libc::ENOENT) => Ok(None),
+            Some(libc::ELOOP) => bail!("{name} is a symlink; only regular files in the repository are read"),
+            _ => Err(anyhow::Error::new(e).context(format!("open {name}"))),
+        };
+    }
+    let f = unsafe { std::fs::File::from_raw_fd(fd) };
+    let m = f.metadata()?;
+    if !m.is_file() {
+        bail!("{name} isn't a regular file");
+    }
+    let mut b = Vec::new();
+    f.take(MAX_PROJECT_FILE + 1).read_to_end(&mut b)?;
+    if b.len() as u64 > MAX_PROJECT_FILE {
+        bail!("{name} is over {} KiB", MAX_PROJECT_FILE >> 10);
+    }
+    Ok(Some(String::from_utf8(b).with_context(|| format!("{name} isn't UTF-8"))?))
+}
+
+/// A regular file `name` is directly in `dir` (a symlink doesn't count).
+pub fn has_project_file(dir: &Path, name: &str) -> bool {
+    std::fs::symlink_metadata(dir.join(name)).is_ok_and(|m| m.is_file())
+}
+
+/// A project's files as [`plan`] reads them. Repositories rekcod cloned (fleet checkouts,
+/// all under the rekcod home) are read without following symlinks; the Mac owner's own
+/// projects follow them, since monorepos link `.nvmrc` to a parent's.
+struct Project<'a> {
+    dir: &'a Path,
+    follow: bool,
+}
+
+impl Project<'_> {
+    fn read(&self, name: &str) -> Option<String> {
+        read_file(self.dir, name, self.follow).ok().flatten()
+    }
+
+    fn has(&self, name: &str) -> bool {
+        if self.follow { std::fs::metadata(self.dir.join(name)).is_ok_and(|m| m.is_file()) } else { has_project_file(self.dir, name) }
+    }
+}
+
+/// `dir` isn't under the rekcod home, where everything rekcod cloned lives.
+fn users_own(dir: &Path) -> bool {
+    let Ok(home) = crate::paths::home_dir() else { return false };
+    let home = home.canonicalize().unwrap_or(home);
+    !dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()).starts_with(home)
 }
 
 /// A version like `v22.3.1`, `22`, `>=20 <23`, `^3.12`, `lts/*`: major[.minor] or None.
@@ -73,9 +149,9 @@ fn clean_version(raw: &str, keep_minor: bool) -> Option<String> {
 }
 
 /// `.tool-versions` (asdf) and `mise.toml` entries: (tool, version).
-fn tool_versions(dir: &Path) -> Vec<(String, String)> {
+fn tool_versions(p: &Project) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    if let Some(text) = read(dir, ".tool-versions") {
+    if let Some(text) = p.read(".tool-versions") {
         for line in text.lines() {
             let mut f = line.split_whitespace();
             if let (Some(t), Some(v)) = (f.next(), f.next())
@@ -85,7 +161,7 @@ fn tool_versions(dir: &Path) -> Vec<(String, String)> {
             }
         }
     }
-    if let Some(text) = read(dir, "mise.toml").or_else(|| read(dir, ".mise.toml")) {
+    if let Some(text) = p.read("mise.toml").or_else(|| p.read(".mise.toml")) {
         let mut in_tools = false;
         for line in text.lines().map(str::trim) {
             if line.starts_with('[') {
@@ -112,11 +188,11 @@ fn runtime_of_tool(tool: &str) -> Option<Runtime> {
 }
 
 /// The runtime a project's files point to, in the order of docs/phase5.md §6.
-fn runtime_of_project(dir: &Path) -> Option<Runtime> {
-    if let Some(r) = tool_versions(dir).iter().find_map(|(t, _)| runtime_of_tool(t)) {
+fn runtime_of_project(p: &Project) -> Option<Runtime> {
+    if let Some(r) = tool_versions(p).iter().find_map(|(t, _)| runtime_of_tool(t)) {
         return Some(r);
     }
-    let has = |n: &str| dir.join(n).exists();
+    let has = |n: &str| p.has(n);
     if has(".bun-version") || has("bun.lock") || has("bun.lockb") {
         return Some(Runtime::Bun);
     }
@@ -142,8 +218,8 @@ fn runtime_of_project(dir: &Path) -> Option<Runtime> {
 }
 
 /// The version the project pins for `rt`, if any.
-fn version_for(dir: &Path, rt: Runtime) -> Option<String> {
-    let from_tools = tool_versions(dir)
+fn version_for(p: &Project, rt: Runtime) -> Option<String> {
+    let from_tools = tool_versions(p)
         .into_iter()
         .find(|(t, _)| runtime_of_tool(t) == Some(rt))
         .and_then(|(_, v)| clean_version(&v, matches!(rt, Runtime::Python | Runtime::Go)));
@@ -151,37 +227,41 @@ fn version_for(dir: &Path, rt: Runtime) -> Option<String> {
         return from_tools;
     }
     match rt {
-        Runtime::Node => read(dir, ".nvmrc").or_else(|| read(dir, ".node-version")).and_then(|v| clean_version(&v, false)).or_else(|| {
-            let pkg: serde_json::Value = serde_json::from_str(&read(dir, "package.json")?).ok()?;
+        Runtime::Node => p.read(".nvmrc").or_else(|| p.read(".node-version")).and_then(|v| clean_version(&v, false)).or_else(|| {
+            let pkg: serde_json::Value = serde_json::from_str(&p.read("package.json")?).ok()?;
             clean_version(pkg["engines"]["node"].as_str()?, false)
         }),
-        Runtime::Bun => read(dir, ".bun-version").and_then(|v| clean_version(&v, true)),
-        Runtime::Python => read(dir, ".python-version").and_then(|v| clean_version(&v, true)).or_else(|| {
-            let text = read(dir, "pyproject.toml")?;
+        Runtime::Bun => p.read(".bun-version").and_then(|v| clean_version(&v, true)),
+        Runtime::Python => p.read(".python-version").and_then(|v| clean_version(&v, true)).or_else(|| {
+            let text = p.read("pyproject.toml")?;
             let line = text.lines().find(|l| l.trim_start().starts_with("requires-python"))?;
             clean_version(line.split_once('=')?.1, true)
         }),
         Runtime::Go => {
-            let text = read(dir, "go.mod")?;
+            let text = p.read("go.mod")?;
             let line = text.lines().find(|l| l.starts_with("go "))?;
             clean_version(&line[3..], true)
         }
         Runtime::Rust => {
-            let text = read(dir, "rust-toolchain.toml").or_else(|| read(dir, "rust-toolchain"))?;
+            let text = p.read("rust-toolchain.toml").or_else(|| p.read("rust-toolchain"))?;
             let line = text.lines().find(|l| l.contains("channel")).unwrap_or(text.lines().next()?);
             clean_version(line, true)
         }
-        Runtime::Ruby => read(dir, ".ruby-version").and_then(|v| clean_version(&v, true)),
+        Runtime::Ruby => p.read(".ruby-version").and_then(|v| clean_version(&v, true)),
         Runtime::Deno => None,
     }
 }
 
 /// Decides image, dependency dirs and caches for `cmd` run in `dir`.
 pub fn plan(dir: &Path, cmd: &[String]) -> Option<Plan> {
+    plan_in(&Project { dir, follow: users_own(dir) }, cmd)
+}
+
+fn plan_in(p: &Project, cmd: &[String]) -> Option<Plan> {
     let first = cmd.first().map(String::as_str).unwrap_or_default();
-    let rt = runtime_of_command(first).or_else(|| runtime_of_project(dir))?;
-    let v = version_for(dir, rt);
-    let uses_uv = first == "uv" || first == "uvx" || dir.join("uv.lock").exists();
+    let rt = runtime_of_command(first).or_else(|| runtime_of_project(p))?;
+    let v = version_for(p, rt);
+    let uses_uv = first == "uv" || first == "uvx" || p.has("uv.lock");
     let image = match rt {
         Runtime::Node => format!("node:{}-slim", v.unwrap_or_else(|| "lts".into())),
         Runtime::Bun => format!("oven/bun:{}", v.unwrap_or_else(|| "1".into())),
@@ -429,6 +509,40 @@ mod tests {
         // The command wins over unrelated project files.
         assert_eq!(image(&[("package.json", "{}")], "python3 tool.py"), "python:3.13-slim");
         assert_eq!(image(&[], "./deploy.sh"), "");
+    }
+
+    #[test]
+    fn project_files_are_read_without_following_links() {
+        let dir = std::env::temp_dir().join(format!("rekcod-x-links-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let outside = dir.with_extension("outside");
+        std::fs::write(&outside, "3.9\n").unwrap();
+        std::os::unix::fs::symlink("/dev/zero", dir.join(".nvmrc")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join(".python-version")).unwrap();
+        // A link is an error, not a read, and detection goes on without it.
+        assert!(read_project_file(&dir, ".nvmrc").unwrap_err().to_string().contains("symlink"));
+        assert!(read_project_file(&dir, ".python-version").is_err());
+        let cloned = Project { dir: &dir, follow: false };
+        assert_eq!(plan_in(&cloned, &["node".into()]).unwrap().image, "node:lts-slim");
+        assert_eq!(plan_in(&cloned, &["python".into()]).unwrap().image, "python:3.13-slim");
+        assert!(!has_project_file(&dir, ".python-version"));
+        // The Mac owner's own project follows links (a monorepo's shared .python-version),
+        // but still only to a regular file.
+        assert!(users_own(&dir));
+        assert_eq!(plan(&dir, &["python".into()]).unwrap().image, "python:3.9-slim");
+        assert_eq!(plan(&dir, &["node".into()]).unwrap().image, "node:lts-slim");
+        // A FIFO doesn't block the open; a file over the limit isn't read.
+        let fifo = std::ffi::CString::new(dir.join("go.mod").to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(read_project_file(&dir, "go.mod").unwrap_err().to_string().contains("regular"));
+        assert!(read_file(&dir, "go.mod", true).unwrap_err().to_string().contains("regular"));
+        std::fs::write(dir.join("package.json"), vec![b' '; MAX_PROJECT_FILE as usize + 1]).unwrap();
+        assert!(read_project_file(&dir, "package.json").unwrap_err().to_string().contains("over"));
+        assert_eq!(read_project_file(&dir, "missing").unwrap(), None);
+        assert!(read_project_file(&dir, "../outside").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_file(&outside).unwrap();
     }
 
     #[test]

@@ -160,6 +160,8 @@ fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
     if !paths.root_disk().exists() || installed.trim() != version.trim() {
         // std::fs::copy clones on APFS, so this is instant and takes no space.
         std::fs::copy(guest.join("root.img"), paths.root_disk()).context("install root disk")?;
+        // The copy has the guest image's mode; VM disks are this user's only.
+        crate::paths::restrict(&paths.root_disk(), 0o600)?;
         std::fs::write(paths.guest_version(), &version)?;
     }
     // Sparse; the guest grows the filesystem to match at boot.
@@ -167,7 +169,8 @@ fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
         // Only a disk we just made may be formatted (boot.sh); removed once dockerd answers.
         std::fs::write(paths.data_fresh(), b"")?;
     }
-    let f = OpenOptions::new().create(true).truncate(false).write(true).open(paths.data_disk())?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = OpenOptions::new().create(true).truncate(false).write(true).mode(0o600).open(paths.data_disk())?;
     if f.metadata()?.len() < disk_gib << 30 {
         f.set_len(disk_gib << 30)?;
     }
@@ -737,6 +740,10 @@ pub fn compact(paths: &Paths) -> Result<()> {
 /// `docker <args>` against rekcod's socket, booting the VM first if needed.
 pub fn passthrough(paths: &Paths, args: &[String]) -> Result<std::convert::Infallible> {
     if running_pid(paths).is_none() {
+        // The dashboard's background followers set it: a stopped VM stays stopped.
+        if std::env::var_os("REKCOD_NO_BOOT").is_some_and(|v| !v.is_empty()) {
+            bail!("the VM isn't running (REKCOD_NO_BOOT is set, so it wasn't started)");
+        }
         let t0 = Instant::now();
         eprintln!("rekcod: starting the VM");
         boot(paths, &BootOptions::default())?;
@@ -818,6 +825,18 @@ fn ensure_image(target: &[&str], image: &str) -> Result<()> {
     Ok(())
 }
 
+/// Import empties each volume here before copying into it, so a context that is another name
+/// for rekcod's daemon would erase the data it was about to read. Compares `docker info` IDs.
+fn distinct_daemons(from: &str, src_id: &str, dst_id: &str) -> Result<()> {
+    if dst_id.is_empty() {
+        bail!("rekcod's docker daemon reports no ID; can't tell whether `{from}` is the same daemon");
+    }
+    if src_id == dst_id {
+        bail!("`{from}` is rekcod's own docker daemon (ID {dst_id}); --from must be the engine you're moving from");
+    }
+    Ok(())
+}
+
 pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes: bool, force: bool) -> Result<()> {
     let wanted = |name: &str| only.is_empty() || only.iter().any(|o| o == name);
     if from == CONTEXT {
@@ -831,6 +850,8 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
     let src: [&str; 2] = ["--context", from];
     docker::run_ok(&[&src[..], &["version", "--format", "{{.Server.Version}}"]].concat())
         .with_context(|| format!("source context `{from}` is not reachable"))?;
+    let daemon_id = |ctx: &[&str]| docker::run_ok(&[ctx, &["info", "--format", "{{.ID}}"]].concat());
+    distinct_daemons(from, &daemon_id(&src)?, &daemon_id(&dst)?)?;
 
     let (mut imported, mut skipped) = (0, 0);
     if images {
@@ -935,6 +956,16 @@ mod tests {
         )
         .unwrap();
         assert_eq!(port_lines(&ports), vec!["localhost:3000 -> x", "*:53/udp -> dns  ! not forwarded: in use"]);
+    }
+
+    #[test]
+    fn import_refuses_rekcods_own_daemon() {
+        let e = distinct_daemons("alias", "6f1c-same", "6f1c-same").unwrap_err();
+        assert!(e.to_string().contains("rekcod's own docker daemon"), "{e}");
+        assert!(distinct_daemons("alias", "", "").is_err());
+        distinct_daemons("desktop-linux", "aa-desktop", "bb-rekcod").unwrap();
+        // An engine that reports no ID can't be rekcod's daemon, which does.
+        distinct_daemons("podman", "", "bb-rekcod").unwrap();
     }
 
     #[test]

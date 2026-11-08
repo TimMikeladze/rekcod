@@ -41,8 +41,12 @@ isolation you should rely on against a determined attacker:
 
 - `rekcod x --sandbox` and `rekcod sandbox` (agent sandboxes). The threat model and what
   each one doesn't protect against are in [docs/sandbox.md](docs/sandbox.md) and
-  [docs/agent-sandboxes.md](docs/agent-sandboxes.md). The sandbox egress allowlist is
-  enforced inside the guest, not on the Mac.
+  [docs/agent-sandboxes.md](docs/agent-sandboxes.md). The egress allowlist and the block
+  on the Mac and LAN are enforced by the rekcod daemon on the Mac: a sandbox's network card
+  is a socket the daemon serves, so root in the guest flushing its own iptables changes
+  nothing ([docs/sandbox-network.md](docs/sandbox-network.md)). The guest's iptables and
+  DNS checks stay as a second layer. macOS sandboxes are the exception: plain NAT, no
+  allowlist, and the Mac and LAN are reachable.
 - Containers on the main VM. Any container you run can reach Mac services on `127.0.0.1`
   through `host.docker.internal`; that's a feature, and it means a hostile image can too.
 - The fleet. The controller, nodes and edge are meant for a private network you control

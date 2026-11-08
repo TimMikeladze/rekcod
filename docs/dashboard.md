@@ -39,15 +39,28 @@ gets a token instead:
   `http://localhost:PORT/auth?token=TOKEN`, and so does a second call, from that file.
 - `npm run dev` and `npm start` make their own token (or take `REKCOD_DASHBOARD_TOKEN`) and
   print the link. They don't write the file.
-- `/auth` compares the token in constant time, sets `rekcod-dashboard-PORT` (HttpOnly,
-  SameSite=Strict, Path=/, until the browser quits) and redirects to `/`. The port is in the
-  name because cookies ignore ports, and two dashboards would overwrite each other's.
-- `src/proxy.ts` checks the cookie on every request except build assets and icons. Without it
-  a page answers 401 with "Open this with `rekcod dashboard`", an API route answers 401.
-  A server started without a token (or one under 32 characters) answers 401 to everything.
-- Restarting the server (or the LaunchAgent at login) makes a new token, so open pages get
-  401 until you run `rekcod dashboard` again. Under the LaunchAgent the token stays out of
-  `dashboard.log`.
+- `/auth` compares the token in constant time. A wrong one gets a 401 page. The right one
+  gets a small page (`cache-control: no-store`, `referrer-policy: no-referrer`) that stores
+  the token in `localStorage` under `rekcod.token` and replaces itself with `/`, so the token
+  leaves the address bar and the history.
+- `localStorage` belongs to one origin: scheme, host **and** port. The page sends the token
+  on every API call as `Authorization: Bearer TOKEN` (`src/lib/api.ts`; ESLint refuses a bare
+  `fetch` or `EventSource` anywhere else in `src/`). No cookie is involved. Cookies ignore
+  ports, so a sign-in cookie on `localhost` went to every web server a container published on
+  another localhost port, which could replay it.
+- `src/proxy.ts` answers 401 to any `/api/` request without the right header; a token in a
+  cookie doesn't count. A server started without a token (or one under 32 characters)
+  answers 401 to every API call.
+- Pages are public shells that render nothing from the server: everything they show comes
+  from the API. A tab without a token, or whose token got a 401, shows "Open this with
+  `rekcod dashboard`" and makes no further calls.
+- Restarting the server (or the LaunchAgent at login) makes a new token, so open tabs switch
+  to the sign-in page at their next call until you run `rekcod dashboard` again; signing in
+  in one tab brings the others back. The token stays in `localStorage` after the browser
+  quits, but it's worthless once the server restarts. Under the LaunchAgent the token stays
+  out of `dashboard.log`.
+- Builds before the header kept the token in a `rekcod-dashboard-PORT` cookie. Every
+  response to a request that still carries one deletes it (`Max-Age=0`), whatever its port.
 
 `start.cjs` sets the listen address to 127.0.0.1 whatever `HOSTNAME` says and drops
 connections from any non-loopback peer, then loads Next's `server.js`. Pages can't be framed
@@ -99,8 +112,16 @@ The server keeps the latest state and pushes it to every open page over `GET /ap
   hour of samples at 5 s, so a reload keeps the history (`GET /api/stats?window=300|900|3600`).
   Each container keeps its colour for the server's lifetime.
 - `rekcod events` and `rekcod stats` only run while the VM does (they're docker commands, which
-  would boot it), and both stop a minute after the last page closes.
-- When the event stream drops, the page polls `GET /api/state` every 3 s.
+  would boot it), and both stop a minute after the last page closes. They run with
+  `REKCOD_NO_BOOT=1`, so one restarted on a state that still says "running" exits instead of
+  starting a VM that was just stopped.
+- The page reads the stream with `fetch` (`src/lib/sse.ts`), since `EventSource` can't send
+  the token. When the stream drops, the page polls `GET /api/state` every 3 s and reconnects
+  every 3 s; a 401 stops both and shows the sign-in page.
+- A page that stops reading (a stalled tab, a slow connection) gets at most 256 KB queued.
+  Past that, `state` and `stats` keep only their newest event and each activity entry its
+  newest, sent when the page catches up; its charts miss the stats samples in between. A page
+  more than 64 events behind is dropped and reconnects.
 
 A controller that doesn't answer isn't an empty fleet: each failed call is in
 `remote.errors` (`apps`, `jobs`, `nodes`, ...) and the first one in `remote.error`. The
@@ -148,12 +169,14 @@ action lists and never changes anything except by running `rekcod <argv>`.
   lists it, then the pages), and an action that confirms shows its warning under it. Running
   one goes through the same confirm and allow-list path as the buttons.
 - Each API route (`lib/guard.ts`) checks again, in order: `Host` is localhost (DNS
-  rebinding, 403), the sign-in cookie (401), `Sec-Fetch-Site` is `same-origin` or `none`
-  (403; a page on another localhost port is "same-site" and gets the SameSite=Strict
-  cookie), `Origin`, when sent, is this host (403; `null` included), and POSTs carry
-  `x-rekcod: 1` (403).
+  rebinding, 403), `Authorization: Bearer` with the token (401), `Sec-Fetch-Site` is
+  `same-origin` or `none` (403; a page on another localhost port is "same-site"), `Origin`,
+  when sent, is this host (403; `null` included), and POSTs carry `x-rekcod: 1` (403).
 - At most 16 log streams (`/api/stream`, `/api/logs`, `/api/instance-logs`) run at once, each
   its own `rekcod` process; the 17th gets 429 until one closes.
+- A log stream queues at most 64 KB the browser hasn't read. Past that the server stops
+  reading the `rekcod` process's output until the browser catches up, so the process blocks
+  on its writes instead of the server buffering a noisy container's logs.
 
 Read-only views that need more than `rekcod state` use fixed routes. Each runs one known
 command and only for a name or id in the current state; none takes argv from the page:
@@ -243,9 +266,13 @@ columns and every row action is in the row's menu.
 ```sh
 npm test           # vitest: allow-list, issues, notifications, palette (pages, recents), stats parsing, state merge,
                    # route validation, share, sorting, log levels and search, bulk kinds, activity filters, 5xx rate,
-                   # the token and cookie, guard.ts (Host, Origin, Sec-Fetch-Site, x-rekcod), the stream cap
+                   # the bearer token (a cookie doesn't count), api() and its 401 handling, expiring old cookies,
+                   # guard.ts (Host, Origin, Sec-Fetch-Site, x-rekcod) (auth.test.ts); the stream cap, a stalled reader
+                   # pausing a 16 MiB child, event coalescing and dropping, the SSE parser (stream.test.ts)
 npm run test:e2e   # Playwright against the fixture bundle, run through start.cjs and signed in through /auth
-                   # (auth.setup.ts); 401 without the cookie and for a wrong token (auth.spec.ts); every list and detail page, axe (no
+                   # (auth.setup.ts); 401 without the header, with the token in a cookie and for a wrong token, the
+                   # sign-in page for no token and an old one, a second localhost server getting no cookie or
+                   # header after sign-in, events, logs and the screenshot with the header (auth.spec.ts); every list and detail page, axe (no
                    # serious violations, no hydration errors), /?tab= redirect, Cmd+B rail, 404, filter, confirm/cancel, dry-run toast, /stream,
                    # keyboard rows, Cmd+K, 390 px, the phone drawer (dashboard.spec.ts); sorting, bulk select and its
                    # confirm, container tabs, log search, shortcuts, palette, empty states, toast View, row flash,
@@ -259,6 +286,9 @@ Both run in CI (`dashboard` job) and in `.githooks/pre-commit` when a staged fil
 
 - The token keeps out other machines and containers, not other processes running as you:
   they can read `dashboard.json` or the server's environment.
+- Script running on the dashboard's own origin can read the token from `localStorage`. The
+  dashboard serves no third-party script, and pages on other ports or hosts can't read it.
+- `localhost:PORT` and `127.0.0.1:PORT` are different origins; each needs its own sign-in.
 - Jobs come from the controller's last 50; the menu bar shows 10.
 - One remote at a time: the default one, like the menu bar. `remote use` and `ns use` switch it.
 - Deploys, scaling, env changes and `node pool` take arguments, so they're CLI-only; their

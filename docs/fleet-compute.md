@@ -64,17 +64,35 @@ rekcod job unschedule NAME
   `sandbox --remote create`. The image defaults to the `rekcod x` detection from version
   files, else `alpine:3.22`. There's no install step: put it in the command
   (`sh -c "pip install -r requirements.txt && python etl.py"`).
-- Controller places the job (`memory` GiB free), the node creates the sandbox, runs the
-  command in a background thread writing `~/.rekcod/jobs/ID/{log,result.json}`, then removes
-  the sandbox. `--timeout` kills it with exit 124.
-- The controller polls running jobs every 5 s (`GET /jobs/ID` on the node), and on finish
+- Controller places the job (`memory` GiB free) and stores it as `pending` with its quota
+  before it tells the node. The node creates the sandbox, runs the command in a background
+  thread writing `~/.rekcod/jobs/ID/{log,result.json}`, then removes the sandbox.
+  `--timeout` kills it with exit 124.
+- Starts are idempotent by job ID: a node that already has `jobs/ID` starts nothing. A start
+  whose reply got lost stays `pending` and the controller sends it again every 5 s until the
+  node answers; a node that answers with an error makes the job `failed`.
+- The controller polls unfinished jobs every 5 s (`GET /jobs/ID` on the node), and on finish
   stores exit code, duration and the log's last 64 KiB in `fleet.db`. Polling means a
   controller restart doesn't lose jobs.
-- `--every 1h` stores a schedule instead of running once. The watchdog starts a run when the
-  previous one finished and `every` has passed since it started. A schedule never runs two
-  at once.
-- A job on a node that goes silent is marked `lost`.
-- Owners and quotas: jobs belong to the token that started them, like sandboxes. Running
+- `--every 1h` stores a schedule instead of running once. The watchdog starts a run when no
+  earlier run of it is unfinished and `every` has passed since the last one started. A
+  schedule never runs two at once.
+- Job states: `pending`, `running`, `cancelling` and `lost` are unfinished; `done`, `failed`
+  and `cancelled` are final. Unfinished jobs hold their quota and their schedule's turn.
+- A job on a node that misses heartbeats for 15 s is `lost`, which means unknown, not over:
+  the node may still be running it. The controller keeps polling it; when the node answers
+  it's `running` again or gets its result. `rekcod node rm` ends the node's unfinished jobs
+  as `failed` (or `cancelled` if a cancel was waiting).
+- `job cancel` works on any unfinished job. The job goes `cancelling` and the controller
+  sends the node `DELETE /jobs/ID` (again every 5 s while there's no answer). The node stops
+  the job at its next step: after the clone, after the sandbox is created, or by killing
+  the command and removing the sandbox. A cancel that reaches the node before the start
+  leaves a cancelled result, so the late start does nothing. The job is `cancelled` once
+  the node reports it over.
+- Job sandboxes carry a `fleet-job` marker with the job ID. `node serve` removes job
+  sandboxes no job thread of its own runs, at startup and hourly, so a node restart doesn't
+  leave a job's VM running; the job then reports "the node restarted while the job ran".
+- Owners and quotas: jobs belong to the token that started them, like sandboxes. Unfinished
   jobs count toward `--max-sandboxes`.
 
 ## Menu bar

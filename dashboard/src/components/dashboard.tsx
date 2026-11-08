@@ -25,6 +25,7 @@ import { Volumes } from "@/components/tabs/volumes"
 import { Input } from "@/components/ui/input"
 import { Skeleton } from "@/components/ui/skeleton"
 import { DashContext, useDash } from "@/hooks/dash-context"
+import { useAuth } from "@/hooks/use-auth"
 import { useDashboard } from "@/hooks/use-dashboard"
 import { ago, fmtBytes } from "@/lib/format"
 import { issues, type Tab } from "@/lib/issues"
@@ -32,9 +33,33 @@ import type { State as S, Stat } from "@/lib/types"
 
 /**
  * Everything every page shares: live data (`useDash()`), the action runner, the sidebar, the
- * top bar, the palette. Pages render once the first state has arrived.
+ * top bar, the palette. Pages render once the first state has arrived. Without a token the
+ * server takes (lib/api.ts) it's the sign-in page instead, and nothing is fetched.
  */
 export function Shell({ children }: { children: React.ReactNode }) {
+  const auth = useAuth()
+  return auth === "in" ? <SignedIn>{children}</SignedIn> : <SignIn stale={auth === "stale"} />
+}
+
+function SignIn({ stale }: { stale: boolean }) {
+  useEffect(() => {
+    document.title = "Sign in · rekcod"
+  }, [])
+  return (
+    <main className="mx-auto max-w-[34rem] px-4 pt-[15vh] text-[15px] leading-normal">
+      <h1 className="text-2xl font-semibold">
+        Open this with <code className="rounded bg-muted px-1 font-mono text-[0.85em]">rekcod dashboard</code>
+      </h1>
+      <p className="mt-3">
+        The dashboard runs commands as you, so it needs the sign-in link that <code className="font-mono text-[13px]">rekcod dashboard</code> opens (or{" "}
+        <code className="font-mono text-[13px]">npm run dev</code> prints). Each launch has a new one.
+      </p>
+      {stale && <p className="mt-3 text-muted-foreground">This tab signed in to an earlier launch of the server.</p>}
+    </main>
+  )
+}
+
+function SignedIn({ children }: { children: React.ReactNode }) {
   const dash = useDashboard()
   const { state, error, refresh } = dash
   const remoteError = state?.remote?.error

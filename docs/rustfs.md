@@ -54,6 +54,23 @@ question in the spec; it does.
    deleted with the preview. `DELETE /apps/NAME` refuses a non-empty bucket unless
    `force`; the CLI asks on a terminal. `app storage NAME rotate` makes a new secret and
    redeploys the live commit.
+
+   The hash is the first 32 hex digits of SHA-256 of the key, so `app-<hash>` is also what
+   a default-namespace app named those 32 digits would get. New apps can't have a 32-hex
+   name. Bucket names didn't change, so nothing was moved; for a pair from before that
+   rule, the older app owns the bucket and the other one's deploys, `app storage` and
+   destroy are refused access to it (`bucket_owner` in `fleet.rs`).
+
+   Destroy revokes the app's user (`remove-user`), then the policy
+   (`remove-canned-policy`), then deletes the bucket's objects and the bucket, then the
+   app's `rekcod-releases/<app>/` objects and `rekcod-cache/<app>.tar.zst`. Any failure
+   stops there: the app row stays with `destroying` set, out of routes and lists, and its
+   name can't be deployed again. The reconcile loop tries again once a minute, starting
+   from what's left: a removed user is forgotten at once, and a 404 from any step counts
+   as already removed. `app destroy` on it retries at once. Without `--storage` the
+   controller can't reach RustFS, so destroy notes the key and bucket in
+   `leftover_storage` and removes the app; a controller with storage deletes them on its
+   next retry and won't give that bucket name to a new app until then.
 2. **Releases without rebuilds.** The controller sends nodes a `store` with root keys and
    `rekcod-releases/<app>/<commit>`. The key is the commit, not the release number, because
    rollback and recycle make a new release of an old commit. After a build the node runs
@@ -75,8 +92,19 @@ question in the spec; it does.
    checks it opens, moves the old fleet.db aside as `fleet.db.before-restore-<time>`, and
    puts it in place. `controller/secret-key` isn't in the backup.
 5. **Snapshots.** `snap save --push` uploads each snapshot volume as
-   `snaps/<project>/<name>/<volume>.tar.zst` plus a `manifest.json` with the volumes' labels;
-   `snap restore --pull` recreates the snapshot from them, then restores as usual. The
+   `snaps/<project>/<name>/<generation>/<volume>.tar.zst`, then `manifest.json` beside the
+   generations with the volumes' labels, the generation and each archive's SHA-256 and size.
+   The manifest goes last, so an interrupted push leaves the previous one intact; after it,
+   archives that neither the new nor the replaced manifest uses are deleted, including the
+   old layout's `<volume>.tar.zst`. `snap restore --pull` checks each archive's size and hash,
+   recreates the snapshot from them and commits it as the current one (even if the local
+   snapshot is newer), then restores as usual. Manifests without `generation` (pushed before
+   this layout) are read from `<volume>.tar.zst` without hashes. A rekcod from before this
+   layout can't pull a newer push: it asks for `<volume>.tar.zst`, which the push deleted,
+   so it fails instead of restoring stale data. Don't push one snapshot from two Macs at once: one push's cleanup can delete
+   the other's archives before its manifest goes up. That push then fails the check it runs
+   before writing the manifest; if the cleanup lands between that check and the write,
+   `--pull` fails on the missing archive until the next push. The
    target is `$S3_ENDPOINT`/`$S3_BUCKET` with the `AWS_*` keys, else the local RustFS and
    bucket `rekcod-snaps`. This is the CLI side; a pinned app moving between nodes isn't wired
    to it.

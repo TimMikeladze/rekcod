@@ -55,7 +55,7 @@ rekcod has three front ends: the CLI (`rekcod ...`), the menu bar item
 | Agent sandboxes: shell, diff, apply, stop, delete | `sandbox shell/diff/apply/stop/rm <id>` | Agent sandboxes › sandbox | `/sandboxes`, `/sandboxes/ID` |
 | macOS sandboxes: screenshot (opens in Preview) | `sandbox screenshot <id> <file> --open` | Agent sandboxes › sandbox | `/sandboxes/ID` (also an inline screenshot) |
 | Apps on the default remote: open, logs, make public/private, roll back, destroy, wake (asleep) or restart instances (awake) | `app open/logs/public/private/rollback/destroy/wake/recycle <name>` | Apps › app (only with a remote) | `/apps`, `/apps/NAME` |
-| Jobs on the default remote: output, cancel (running only) | `job logs/cancel <id>` | Jobs › job (only with a remote) | `/jobs`, `/jobs/ID` |
+| Jobs on the default remote: output, cancel (pending, running or lost) | `job logs/cancel <id>` | Jobs › job (only with a remote) | `/jobs`, `/jobs/ID` |
 | Switch the default remote's namespace | `ns use <name>` | Namespace: current › Switch to … (only when the token is in more than one) | sidebar remote menu |
 | Switch docker between this Mac's rekcod and a remote host | `host use <name>\|local` | Docker host: current › Use … (only with a host added; shown while the VM is stopped too) | sidebar docker host menu, `/fleet` |
 | Forward a remote host's published ports here | `host forward <name>` | Docker host › Forward ports from … (opens Terminal) | sidebar docker host menu, `/fleet` |

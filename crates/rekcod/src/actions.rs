@@ -1085,7 +1085,9 @@ pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
 
 pub fn job_actions(j: &RemoteJob) -> Vec<Action> {
     let id = j.id.as_str();
-    if j.state == "running" {
+    if j.state == "cancelling" {
+        vec![Action::rekcod(Kind::JobLogs, "Output", &["job", "logs", id, "--follow"]).interactive()]
+    } else if crate::fleet::job_active(&j.state) {
         vec![
             Action::rekcod(Kind::JobLogs, "Output", &["job", "logs", id, "--follow"]).interactive(),
             Action::rekcod(Kind::JobCancel, "Cancel", &["job", "cancel", id]).confirm(format!("Cancel job {id}? Its sandbox is deleted.")),
@@ -1424,6 +1426,11 @@ pub mod tests {
         assert!(matches!(&run[0].run, Run::Rekcod(v) if v.last().map(String::as_str) == Some("--follow")));
         let done = job_actions(&RemoteJob { state: "failed".into(), ..sample_job() });
         assert!(done.iter().any(|a| a.kind == Kind::JobRerun) && !done.iter().any(|a| a.kind == Kind::JobCancel));
+        // A job on a silent node may still run: it's cancelled, not rerun.
+        let lost = job_actions(&RemoteJob { state: "lost".into(), ..sample_job() });
+        assert!(lost.iter().any(|a| a.kind == Kind::JobCancel) && !lost.iter().any(|a| a.kind == Kind::JobRerun));
+        let cancelling = job_actions(&RemoteJob { state: "cancelling".into(), ..sample_job() });
+        assert!(cancelling.iter().all(|a| a.kind == Kind::JobLogs));
         let bans = ban_actions(&["198.51.100.7".into()], &sample_clients());
         assert!(!bans.iter().any(|a| a.kind == Kind::EdgeBan && !a.interactive), "an IP that's banned isn't offered again");
     }

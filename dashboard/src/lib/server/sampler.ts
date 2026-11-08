@@ -1,7 +1,7 @@
 import "server-only"
 import type { ChildProcess } from "node:child_process"
 import type { Sample, Stat, StatsResponse } from "@/lib/types"
-import { FIXTURE, readState, spawnRekcod } from "@/lib/rekcod"
+import { FIXTURE, readState, spawnWatcher } from "@/lib/rekcod"
 import { broadcast, once, subscribers } from "./bus"
 import { vmRunning } from "./hub"
 import { Colors, fakeSample, parseStatLine, Ring, SAMPLE_SECS, splitLines, KEEP } from "./stats"
@@ -33,7 +33,7 @@ const s = once<S>("sampler", () => ({
 
 function spawnChild() {
   if (!vmRunning()) return
-  const child = spawnRekcod(["stats", "--format", "{{json .}}"])
+  const child = spawnWatcher(["stats", "--format", "{{json .}}"])
   s.child = child
   let buf = ""
   child.stdout?.setEncoding("utf8")

@@ -15,6 +15,7 @@ import { Badge } from "@/components/ui/badge"
 import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell } from "@/components/ui/table"
 import { useDash } from "@/hooks/dash-context"
+import { api } from "@/lib/api"
 import { ago, duration } from "@/lib/format"
 import type { Release, TrafficMinute } from "@/lib/types"
 
@@ -51,7 +52,7 @@ function ReleaseRow({ app, r, gitUrl, live, target, now }: { app: string; r: Rel
   useEffect(() => {
     if (!open || log != null) return
     const ctl = new AbortController()
-    fetch(`/api/release?app=${encodeURIComponent(app)}&n=${r.n}`, { signal: ctl.signal, cache: "no-store" })
+    api(`/api/release?app=${encodeURIComponent(app)}&n=${r.n}`, { signal: ctl.signal })
       .then(async (res) => {
         const body = await res.json().catch(() => ({ error: res.statusText }))
         setLog(body.error ? `(${body.error})` : body.log || "(the controller kept no deploy log for this release)")

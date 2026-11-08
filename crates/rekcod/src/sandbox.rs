@@ -6,7 +6,7 @@ use std::ffi::CString;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -14,6 +14,7 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::paths::Paths;
+use crate::safefs::{Dir, State};
 
 /// The long-running container `exec` runs in.
 pub const WS: &str = "rekcod-ws";
@@ -21,8 +22,30 @@ const DISK_GIB: u64 = 64;
 const DEFAULT_IMAGE: &str = "debian:bookworm-slim";
 /// What `golden build` pulls when given no images.
 pub const GOLDEN_IMAGES: &[&str] = &["debian:bookworm-slim", "alpine:3.22", "node:lts-slim", "python:3.13-slim"];
-/// Not compared by `diff` or written by `apply`: VM-local dirs and git's own state.
-const SKIP: &[&str] = &[".git", "node_modules", ".venv", "target"];
+/// Not compared by `diff` or written by `apply`: dirs that stay in the VM. Git's own state
+/// is left out too, under any spelling ([`is_git`]).
+const SKIP: &[&str] = &["node_modules", ".venv", "target"];
+
+/// Whether the Mac's filesystem may take `name` for `.git`: compared without case, and
+/// without the code points HFS+ ignores in names (git's own `is_hfs_dotgit` list). `.git`
+/// is ASCII, so no other Unicode normalization of it exists; `safefs` also refuses writes
+/// that reach the project's real `.git` by inode, whatever the name.
+pub fn is_git(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else { return false };
+    let folded: String = name
+        .chars()
+        .filter(|c| !matches!(c, '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}'))
+        .map(|c| match c {
+            '\u{130}' | '\u{131}' => 'i',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect();
+    folded == ".git"
+}
+
+fn skipped(name: &std::ffi::OsStr) -> bool {
+    is_git(name) || SKIP.iter().any(|s| name.as_bytes() == s.as_bytes())
+}
 
 /// Egress preset `dev`: package registries, image registries, source hosts, distro mirrors.
 pub const DEV_HOSTS: &[&str] = &[
@@ -295,11 +318,17 @@ fn all(paths: &Paths) -> Vec<Sandbox> {
     out
 }
 
+/// The sandbox with ID `id`, or else the one named `id`.
 fn find(paths: &Paths, id: &str) -> Result<Sandbox> {
-    all(paths)
-        .into_iter()
-        .find(|s| s.meta.id == id || s.meta.name.as_deref() == Some(id))
-        .ok_or_else(|| anyhow::Error::new(NoSandbox(id.into())))
+    let mut all = all(paths);
+    let i = all.iter().position(|s| s.meta.id == id).or_else(|| all.iter().position(|s| s.meta.name.as_deref() == Some(id)));
+    i.map(|i| all.swap_remove(i)).ok_or_else(|| anyhow::Error::new(NoSandbox(id.into())))
+}
+
+/// A sandbox's state directory and metadata, for the API to authorize before it acts.
+pub fn lookup(paths: &Paths, id: &str) -> Result<(PathBuf, Meta)> {
+    let s = find(paths, id)?;
+    Ok((s.paths.home, s.meta))
 }
 
 #[derive(Debug)]
@@ -613,6 +642,7 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
             // No pause for macOS guests: flush, then clone what's on disk.
             let ip = parent.guest(paths)?;
             let _ = crate::macos::exec_command(paths, &ip, Some("/"), &[], &["sync".into()], false)?.status();
+            let _lock = review_lock(&parent.paths.home)?;
             crate::macos::pull_ws(paths, &ip, &parent.ws())?;
         }
         for f in ["disk.img", "aux.img", "hw.bin", "config.json"] {
@@ -655,28 +685,47 @@ pub struct Change {
     pub path: String,
 }
 
-/// Regular files and symlinks under `base`, skipping [`SKIP`]. FIFOs, sockets and devices
-/// are left out: reading a FIFO the sandbox made would hang `diff`.
-fn walk(base: &Path, rel: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
-    for e in rd.flatten() {
-        let name = e.file_name();
-        if SKIP.iter().any(|s| name.as_bytes() == s.as_bytes()) {
-            continue;
-        }
-        let r = rel.join(&name);
-        match e.file_type() {
-            Ok(t) if t.is_dir() => walk(base, &r, out),
-            Ok(t) if t.is_file() || t.is_symlink() => out.push(r),
-            _ => {}
+/// Directories (`d`), regular files (`f`) and symlinks (`l`) under `base`, without what
+/// [`skipped`] leaves out. FIFOs, sockets and devices are left out too: reading a FIFO the
+/// sandbox made would hang `diff`. Symlinked directories are listed, not entered.
+fn walk(base: &Path) -> Vec<(PathBuf, char)> {
+    fn into(base: &Path, rel: &Path, out: &mut Vec<(PathBuf, char)>) {
+        let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name();
+            if skipped(&name) {
+                continue;
+            }
+            let r = rel.join(&name);
+            match e.file_type() {
+                Ok(t) if t.is_dir() => {
+                    out.push((r.clone(), 'd'));
+                    into(base, &r, out);
+                }
+                Ok(t) if t.is_file() => out.push((r, 'f')),
+                Ok(t) if t.is_symlink() => out.push((r, 'l')),
+                _ => {}
+            }
         }
     }
+    let mut out = Vec::new();
+    into(base, Path::new(""), &mut out);
+    out
+}
+
+/// What [`walk`] finds that `diff` compares: files and symlinks.
+fn files(base: &Path) -> std::collections::BTreeSet<PathBuf> {
+    walk(base).into_iter().filter(|(_, k)| *k != 'd').map(|(p, _)| p).collect()
+}
+
+fn open_nofollow(p: &Path) -> std::io::Result<std::fs::File> {
+    std::os::unix::fs::OpenOptionsExt::custom_flags(std::fs::OpenOptions::new().read(true), libc::O_NOFOLLOW | libc::O_NONBLOCK).open(p)
 }
 
 /// Compares two files in 64 KiB pieces, not by reading both whole.
 fn same_bytes(a: &Path, b: &Path) -> bool {
     use std::io::Read;
-    let (Ok(mut fa), Ok(mut fb)) = (std::fs::File::open(a), std::fs::File::open(b)) else { return false };
+    let (Ok(mut fa), Ok(mut fb)) = (open_nofollow(a), open_nofollow(b)) else { return false };
     let (mut ba, mut bb) = (vec![0u8; 1 << 16], vec![0u8; 1 << 16]);
     loop {
         let Ok(n) = fa.read(&mut ba) else { return false };
@@ -694,16 +743,14 @@ fn same(a: &Path, b: &Path) -> bool {
     if ma.file_type().is_symlink() || mb.file_type().is_symlink() {
         return std::fs::read_link(a).ok() == std::fs::read_link(b).ok();
     }
-    ma.len() == mb.len() && ma.permissions() == mb.permissions() && same_bytes(a, b)
+    // The bits `apply` writes; it drops setuid, setgid and sticky.
+    let mode = |m: &std::fs::Metadata| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777;
+    ma.len() == mb.len() && mode(&ma) == mode(&mb) && same_bytes(a, b)
 }
 
 /// What `apply` would do to `project` to make it match `ws`.
 pub fn changes(project: &Path, ws: &Path) -> Vec<Change> {
-    let (mut a, mut b) = (Vec::new(), Vec::new());
-    walk(project, Path::new(""), &mut a);
-    walk(ws, Path::new(""), &mut b);
-    let a: std::collections::BTreeSet<PathBuf> = a.into_iter().collect();
-    let b: std::collections::BTreeSet<PathBuf> = b.into_iter().collect();
+    let (a, b) = (files(project), files(ws));
     let mut out: Vec<Change> = Vec::new();
     for p in b.iter() {
         if !a.contains(p) {
@@ -719,47 +766,59 @@ pub fn changes(project: &Path, ws: &Path) -> Vec<Change> {
     out
 }
 
-/// The project as the sandbox copied it: path to (kind, size, mtime ns). `apply` refuses
-/// to touch a path whose state on the Mac has moved on from this.
-type Manifest = std::collections::BTreeMap<String, crate::safefs::State>;
+/// The project as the sandbox copied it: path to (kind, size, mtime ns, mode), directories
+/// included. `apply` refuses to touch a path whose state on the Mac has moved on from this.
+type Manifest = std::collections::BTreeMap<String, State>;
 
 fn manifest(project: &Path) -> Manifest {
-    let mut files = Vec::new();
-    walk(project, Path::new(""), &mut files);
-    let Ok(dir) = crate::safefs::Dir::open(project) else { return Manifest::new() };
-    files.iter().filter_map(|f| Some((f.to_string_lossy().to_string(), dir.state(f)?))).collect()
+    let Ok(dir) = Dir::open(project) else { return Manifest::new() };
+    walk(project).iter().filter_map(|(f, _)| Some((f.to_string_lossy().to_string(), dir.state(f)?))).collect()
 }
 
-fn copy_sandbox(paths: &Paths, id: &str) -> Result<Sandbox> {
+/// Held across `diff`, `apply` and anything that replaces `ws/`, so what `apply --reviewed`
+/// writes is the copy the last `diff` showed, from start to end.
+fn review_lock(home: &Path) -> Result<std::fs::File> {
+    crate::paths::lock(&home.join("review.lock"))
+}
+
+/// A copy-mode sandbox, and its review lock.
+fn copy_sandbox(paths: &Paths, id: &str) -> Result<(Sandbox, std::fs::File)> {
     let s = find(paths, id)?;
     if s.meta.mode != "copy" {
         bail!("sandbox {} uses --mount; its edits are already in {}", s.meta.id, s.meta.project.display());
     }
+    let lock = review_lock(&s.paths.home)?;
     if s.macos() {
         // The guest's files live on its own disk; bring them back to compare.
         let ip = s.guest(paths)?;
         crate::macos::pull_ws(paths, &ip, &s.ws())?;
     }
-    Ok(s)
+    Ok((s, lock))
 }
 
 /// A frozen copy of the workspace in `<sandbox>/<name>`, so what's compared and written
 /// can't change under us while the sandbox keeps running. Its processes are paused while
 /// the directory is cloned, as for `fork`.
+/// Callers hold the review lock. The copy is cloned under a temporary name and renamed into
+/// place, so it's never seen half made and nothing writes into it once it's there.
 fn freeze(s: &Sandbox, name: &str) -> Result<PathBuf> {
-    let dst = s.paths.home.join(name);
-    if dst.exists() {
-        std::fs::remove_dir_all(&dst)?;
+    let (dst, tmp) = (s.paths.home.join(name), s.paths.home.join(format!("{name}.new")));
+    for d in [&tmp, &dst] {
+        if std::fs::symlink_metadata(d).is_ok() {
+            std::fs::remove_dir_all(d)?;
+        }
     }
     let pause = !s.macos() && s.running();
     if pause {
         let _ = s.docker()?.args(["pause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
-    let r = clonefile(&s.ws(), &dst);
+    let r = clonefile(&s.ws(), &tmp);
     if pause {
         let _ = s.docker()?.args(["unpause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
-    r.map(|_| dst)
+    r?;
+    std::fs::rename(&tmp, &dst)?;
+    Ok(dst)
 }
 
 /// Bytes a terminal would act on (escape sequences can hide lines from the reviewer),
@@ -779,7 +838,7 @@ pub fn printable(text: &str) -> String {
 /// Unified diff of the workspace against the project (`git diff --no-index` per file). The
 /// workspace is frozen into `<sandbox>/reviewed`, which `apply --reviewed` writes back.
 pub fn patch(paths: &Paths, id: &str) -> Result<(Vec<Change>, String)> {
-    let s = copy_sandbox(paths, id)?;
+    let (s, _lock) = copy_sandbox(paths, id)?;
     let ws = freeze(&s, "reviewed")?;
     let ch = changes(&s.meta.project, &ws);
     let mut out = String::new();
@@ -863,13 +922,38 @@ pub fn input(paths: &Paths, id: &str, action: &[String]) -> Result<()> {
     crate::macos::input(paths, &ip, action)
 }
 
+/// Whether the Mac's state of a path (`now`) is still what the sandbox copied (`then`). A
+/// directory counts as unchanged whatever its size and mtime; what's in it is checked path
+/// by path. Manifests from before modes were recorded don't compare them.
+fn unchanged(now: Option<State>, then: Option<State>) -> bool {
+    match (now, then) {
+        (None, None) => true,
+        (Some(n), Some(t)) if n.kind() == 'd' && t.kind() == 'd' => true,
+        (Some(n), Some(t)) => (n.0, n.1, n.2) == (t.0, t.1, t.2) && t.3.is_none_or(|m| n.3 == Some(m)),
+        _ => false,
+    }
+}
+
+/// Whether `p` was a directory when the sandbox copied the project. Older manifests list
+/// files only, so there a directory shows as the paths under it.
+fn was_dir(m: &Manifest, p: &str) -> bool {
+    let prefix = format!("{p}/");
+    m.get(p).is_some_and(|s| s.kind() == 'd') || m.range(prefix.clone()..).next().is_some_and(|(k, _)| k.starts_with(&prefix))
+}
+
 /// Changed paths whose state on the Mac differs from when the sandbox copied them. Without a
 /// manifest (sandboxes made before there was one), anything modified after `since`.
 fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Change]) -> Vec<String> {
-    let dir = crate::safefs::Dir::open(project).ok();
+    let dir = Dir::open(project).ok();
     ch.iter()
         .filter(|c| match (manifest, &dir) {
-            (Some(m), Some(d)) => d.state(Path::new(&c.path)) != m.get(&c.path).copied(),
+            (Some(m), Some(d)) => {
+                let now = d.state(Path::new(&c.path));
+                // A directory the workspace replaced with a file or link. What was in it
+                // shows up as deletions, each checked on its own.
+                let replaced = c.kind != 'D' && now.is_some_and(|s| s.kind() == 'd') && was_dir(m, &c.path);
+                !replaced && !unchanged(now, m.get(&c.path).copied())
+            }
             _ => std::fs::symlink_metadata(project.join(&c.path))
                 .and_then(|m| m.modified())
                 .is_ok_and(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) > since),
@@ -878,20 +962,161 @@ fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Chan
         .collect()
 }
 
+/// Why the symlink `link -> target` would leave the tree or reach into `.git`, resolving
+/// the links on the way one by one with `read_link` (None for anything that isn't a link).
+/// A name that isn't a link counts as a directory, since one may be made there later.
+fn leaves(link: &Path, target: &Path, read_link: &dyn Fn(&Path) -> Option<PathBuf>) -> Option<&'static str> {
+    enum Part {
+        Root,
+        Up,
+        Name(std::ffi::OsString),
+    }
+    fn parts(p: &Path) -> Vec<Part> {
+        p.components()
+            .filter_map(|c| match c {
+                Component::RootDir | Component::Prefix(_) => Some(Part::Root),
+                Component::ParentDir => Some(Part::Up),
+                Component::CurDir => None,
+                Component::Normal(n) => Some(Part::Name(n.to_os_string())),
+            })
+            .collect()
+    }
+    let mut at: Vec<std::ffi::OsString> = link.parent().map(|p| p.iter().map(|n| n.to_os_string()).collect()).unwrap_or_default();
+    let mut todo = parts(target);
+    todo.reverse();
+    let mut hops = 0;
+    while let Some(part) = todo.pop() {
+        match part {
+            Part::Root => return Some("it points outside the project"),
+            Part::Up => {
+                if at.pop().is_none() {
+                    return Some("it points outside the project");
+                }
+            }
+            Part::Name(n) => {
+                if is_git(&n) {
+                    return Some("it points into .git");
+                }
+                at.push(n);
+                if let Some(t) = read_link(&at.iter().collect::<PathBuf>()) {
+                    hops += 1;
+                    if hops > 32 {
+                        return Some("its links go round in a loop");
+                    }
+                    at.pop();
+                    todo.extend(parts(&t).into_iter().rev());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Refuses a symlink that leaves the project or reaches into `.git` in the tree `apply`
+/// leaves behind, so `b -> .` with `leak -> b/../outside` is caught although each looks
+/// fine alone. That covers links the project already had, in case a new one redirects
+/// them; one that already left the project before this apply is the Mac user's own.
+fn check_links(dir: &Dir, from: &Dir, src: &Path, ch: &[Change]) -> Result<()> {
+    let written: std::collections::HashSet<&Path> = ch.iter().filter(|c| c.kind != 'D').map(|c| Path::new(&c.path)).collect();
+    // Afterwards, paths under skipped directories are the project's and the rest are `src`'s.
+    let after = |p: &Path| if p.iter().any(skipped) { dir.read_link(p).ok() } else { from.read_link(p).ok() };
+    let before = |p: &Path| dir.read_link(p).ok();
+    for (p, _) in walk(src).into_iter().filter(|(_, k)| *k == 'l') {
+        let target = from.read_link(&p)?;
+        let Some(why) = leaves(&p, &target, &after) else { continue };
+        let theirs = !written.contains(p.as_path()) && dir.read_link(&p).ok().as_ref() == Some(&target);
+        if !theirs || leaves(&p, &target, &before).is_none() {
+            bail!("refusing symlink {} -> {}: {why}; nothing was applied", p.display(), target.display());
+        }
+    }
+    Ok(())
+}
+
+/// Directories in the project the workspace replaced with a file or symlink, each directory
+/// under them before its parent. Refuses one holding anything `apply` doesn't delete
+/// (a skipped directory such as `node_modules`, a FIFO).
+fn replaced_dirs(dir: &Dir, ch: &[Change]) -> Result<Vec<PathBuf>> {
+    let deleted: std::collections::HashSet<&Path> = ch.iter().filter(|c| c.kind == 'D').map(|c| Path::new(&c.path)).collect();
+    let mut out = Vec::new();
+    for c in ch.iter().filter(|c| c.kind != 'D') {
+        let rel = Path::new(&c.path);
+        if dir.state(rel).is_none_or(|s| s.kind() != 'd') {
+            continue;
+        }
+        let mut tree = dir.tree(rel)?;
+        if let Some((p, _)) = tree.iter().find(|(p, k)| *k != 'd' && !deleted.contains(p.as_path())) {
+            bail!("{} is a directory in the project holding {}, which apply doesn't remove; nothing was applied", c.path, p.display());
+        }
+        tree.reverse();
+        out.extend(tree.into_iter().filter(|(_, k)| *k == 'd').map(|(p, _)| p));
+        out.push(rel.to_path_buf());
+    }
+    Ok(out)
+}
+
+/// Writes `ch` from the frozen copy `from` (at `src`) into the project `dir`, updating
+/// `manifest` for what it wrote. Everything policy refuses is found before anything is
+/// written, so an apply is all or nothing as far as policy goes (an I/O error halfway can
+/// still leave it partial). Deletions go first, so a file can take a directory's place.
+fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest: Option<&mut Manifest>) -> Result<()> {
+    if let Some(c) = ch.iter().find(|c| Path::new(&c.path).iter().any(is_git)) {
+        bail!("refusing {}: it's inside .git; nothing was applied", c.path);
+    }
+    check_links(dir, from, src, ch)?;
+    let replaced = replaced_dirs(dir, ch)?;
+    let mut record = |rel: &Path| {
+        // What's there now is ours; a later apply mustn't call it a conflict.
+        if let Some(m) = manifest.as_mut() {
+            let key = rel.to_string_lossy().to_string();
+            match dir.state(rel) {
+                Some(st) => m.insert(key, st),
+                None => m.remove(&key),
+            };
+        }
+    };
+    for c in ch.iter().filter(|c| c.kind == 'D') {
+        dir.remove(Path::new(&c.path))?;
+        record(Path::new(&c.path));
+    }
+    for d in &replaced {
+        dir.remove_dir(d)?;
+        record(d);
+    }
+    for c in ch.iter().filter(|c| c.kind != 'D') {
+        let rel = Path::new(&c.path);
+        match from.state(rel).map(|s| s.kind()) {
+            Some('l') => dir.write_symlink(rel, &from.read_link(rel)?)?,
+            // Anything else must be a regular file reached without a symlink.
+            _ => dir.write_file(rel, from.open_file(rel)?)?,
+        }
+        record(rel);
+    }
+    Ok(())
+}
+
 /// Writes the workspace's changes into the real project. Returns what changed. With
 /// `reviewed`, writes the copy the last `diff` froze instead of the live workspace.
 pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: bool) -> Result<Vec<Change>> {
-    let s = copy_sandbox(paths, id)?;
+    let (s, _lock) = copy_sandbox(paths, id)?;
     let src = if reviewed {
         let r = s.paths.home.join("reviewed");
-        if !r.exists() {
+        if !r.is_dir() {
             bail!("nothing reviewed yet; run `rekcod sandbox diff {id}` first");
         }
         r
     } else {
         freeze(&s, "applying")?
     };
-    let ch = changes(&s.meta.project, &src);
+    let r = apply_from(s, &src, check);
+    if !reviewed {
+        let _ = std::fs::remove_dir_all(&src);
+    }
+    r
+}
+
+/// `apply` from the frozen copy `src`, with the review lock held.
+fn apply_from(mut s: Sandbox, src: &Path, check: bool) -> Result<Vec<Change>> {
+    let ch = changes(&s.meta.project, src);
     let mut manifest = s.manifest();
     let bad = conflicts(&s.meta.project, manifest.as_ref(), s.meta.created, &ch);
     if !bad.is_empty() {
@@ -900,49 +1125,15 @@ pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: bool) -> Result<Vec
     if check {
         return Ok(ch);
     }
-    // Refused entries are found before anything is written, so an apply is all or nothing
-    // as far as policy goes (an I/O error halfway can still leave it partial).
-    for c in ch.iter().filter(|c| c.kind != 'D') {
-        let from = src.join(&c.path);
-        if std::fs::symlink_metadata(&from)?.file_type().is_symlink() {
-            let target = std::fs::read_link(&from)?;
-            if !crate::safefs::link_stays_inside(Path::new(&c.path), &target) {
-                bail!("refusing symlink {} -> {}: it points outside the project; nothing was applied", c.path, target.display());
-            }
-        }
-    }
-    let dir = crate::safefs::Dir::open(&s.meta.project)?;
-    for c in &ch {
-        let rel = Path::new(&c.path);
-        match c.kind {
-            'D' => dir.remove(rel)?,
-            _ => {
-                let from = src.join(rel);
-                if std::fs::symlink_metadata(&from)?.file_type().is_symlink() {
-                    dir.write_symlink(rel, &std::fs::read_link(&from)?)?;
-                } else {
-                    dir.write_file(rel, &from)?;
-                }
-            }
-        }
-        // What's there now is ours; a later apply mustn't call it a conflict.
-        if let Some(m) = manifest.as_mut() {
-            match dir.state(rel) {
-                Some(st) => m.insert(c.path.clone(), st),
-                None => m.remove(&c.path),
-            };
-        }
-    }
+    let mut dir = Dir::open(&s.meta.project)?;
+    dir.protect(".git");
+    write_changes(&dir, &Dir::open(src)?, src, &ch, manifest.as_mut())?;
     match &manifest {
         Some(m) => s.save_manifest(m)?,
         None => {
-            let mut s = s;
             s.meta.created = now() + 1;
             s.save()?;
         }
-    }
-    if !reviewed {
-        let _ = std::fs::remove_dir_all(&src);
     }
     Ok(ch)
 }
@@ -1002,6 +1193,9 @@ pub struct Listed {
     /// The VM process, while it runs (CPU and memory in `rekcod state`).
     #[serde(skip)]
     pub pid: Option<i32>,
+    /// The sandbox's state directory.
+    #[serde(skip)]
+    pub home: PathBuf,
 }
 
 fn listed(s: Sandbox) -> Listed {
@@ -1012,7 +1206,7 @@ fn listed(s: Sandbox) -> Listed {
         .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
         .and_then(|v| v["mac"].as_str().and_then(crate::macos::running_ip));
     let pid = if running { crate::cli::running_pid(&s.paths) } else { None };
-    Listed { running, address, pid, meta: s.meta }
+    Listed { running, address, pid, home: s.paths.home, meta: s.meta }
 }
 
 /// Running macOS sandboxes (Apple's licence allows two per Mac).
@@ -1225,5 +1419,242 @@ mod tests {
         assert_eq!(a, "exec -i -w /Users/me/app -e A=1 rekcod-ws timeout -s KILL 5 npm test");
         let back: Meta = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
         assert_eq!(back, m);
+    }
+
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    use testing::fake;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("rekcod-sbt-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.canonicalize().unwrap()
+    }
+
+    /// A project holding `files`, a stopped copy sandbox of it, and that sandbox's workspace.
+    fn setup(name: &str, files: &[(&str, &str)]) -> (Paths, PathBuf, Meta, PathBuf) {
+        let base = tmp(name);
+        let project = base.join("p");
+        for (f, body) in files {
+            std::fs::create_dir_all(project.join(f).parent().unwrap()).unwrap();
+            std::fs::write(project.join(f), body).unwrap();
+        }
+        std::fs::create_dir_all(&project).unwrap();
+        let paths = Paths { home: base.join("home") };
+        let m = fake(&paths, &project, |_| {});
+        let ws = root(&paths).join(&m.id).join("ws");
+        (paths, project, m, ws)
+    }
+
+    fn paths_of(ch: &[Change]) -> Vec<(char, &str)> {
+        ch.iter().map(|c| (c.kind, c.path.as_str())).collect()
+    }
+
+    #[test]
+    fn git_metadata_is_never_applied() {
+        for n in [".git", ".GIT", ".Git", ".g\u{200c}it", ".gi\u{feff}t", ".G\u{130}T"] {
+            assert!(is_git(std::ffi::OsStr::new(n)), "{n}");
+        }
+        for n in ["git", ".gitignore", ".github", "x.git"] {
+            assert!(!is_git(std::ffi::OsStr::new(n)), "{n}");
+        }
+        let (paths, project, m, ws) = setup("git", &[("f", "x"), (".git/config", "[core]")]);
+        // Case-only renames: on case-insensitive APFS `.GIT` would resolve to the real `.git`.
+        std::fs::rename(ws.join(".git"), ws.join(".GIT")).unwrap();
+        std::fs::write(ws.join(".GIT/marker"), "hook").unwrap();
+        std::fs::create_dir_all(ws.join(".g\u{200c}it")).unwrap();
+        std::fs::write(ws.join(".g\u{200c}it/marker"), "hook").unwrap();
+        std::fs::write(ws.join("f"), "y").unwrap();
+        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('M', "f")]);
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, true).unwrap()), vec![('M', "f")]);
+        std::fs::rename(ws.join(".GIT"), ws.join(".Git")).unwrap();
+        std::fs::write(ws.join(".Git/marker2"), "hook").unwrap();
+        assert!(apply(&paths, &m.id, false, false).unwrap().is_empty());
+        assert!(!project.join(".git/marker").exists() && !project.join(".git/marker2").exists());
+        assert!(std::fs::symlink_metadata(project.join(".g\u{200c}it")).is_err());
+        assert_eq!(std::fs::read_to_string(project.join(".git/config")).unwrap(), "[core]");
+        // A change list that names `.git` some other way is refused before anything is written.
+        let ch = vec![Change { kind: 'A', path: ".GIT/hooks/pre-commit".into() }];
+        let e = write_changes(&Dir::open(&project).unwrap(), &Dir::open(&ws).unwrap(), &ws, &ch, None).unwrap_err();
+        assert!(e.to_string().contains("inside .git"), "{e}");
+    }
+
+    #[test]
+    fn link_resolution_follows_chains() {
+        let links: std::collections::HashMap<&str, &str> =
+            [("b", "."), ("sub/up", ".."), ("loop", "loop"), ("nm", "/opt/x"), ("deep/l", "../b")].into_iter().collect();
+        let rl = |p: &Path| links.get(p.to_str().unwrap()).map(PathBuf::from);
+        let leaves = |l: &str, t: &str| leaves(Path::new(l), Path::new(t), &rl);
+        assert_eq!(leaves("leak", "b/../outside"), Some("it points outside the project"));
+        assert_eq!(leaves("leak", "sub/up/../x"), Some("it points outside the project"));
+        assert_eq!(leaves("x", "deep/l/../y"), Some("it points outside the project"));
+        assert_eq!(leaves("x", "nm"), Some("it points outside the project"));
+        assert_eq!(leaves("x", "loop/a"), Some("its links go round in a loop"));
+        assert_eq!(leaves("x", "sub/.GIT/hooks"), Some("it points into .git"));
+        // Each of these stays in: `b` is the root, so `b/x` is `x`.
+        assert_eq!(leaves("ok", "b/x"), None);
+        assert_eq!(leaves("a/ok", "../sub/up/x"), None);
+        assert_eq!(leaves("ok", "missing/../x"), None);
+    }
+
+    #[test]
+    fn apply_refuses_symlink_chains_out_of_the_project() {
+        let (paths, project, m, ws) = setup("chains", &[("f", "x")]);
+        std::fs::write(project.parent().unwrap().join("outside-marker"), "outside").unwrap();
+        symlink(".", ws.join("b")).unwrap();
+        symlink("b/../outside-marker", ws.join("leak")).unwrap();
+        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        assert!(e.contains("leak") && e.contains("outside the project"), "{e}");
+        assert!(std::fs::symlink_metadata(project.join("leak")).is_err() && std::fs::symlink_metadata(project.join("b")).is_err());
+        // Split over two applies: the second link redirects the first.
+        std::fs::remove_file(ws.join("b")).unwrap();
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, false).unwrap()), vec![('A', "leak")]);
+        symlink(".", ws.join("b")).unwrap();
+        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        assert!(e.contains("leak"), "{e}");
+        assert!(std::fs::symlink_metadata(project.join("b")).is_err());
+        // Through a link in a directory apply leaves alone.
+        std::fs::remove_file(ws.join("b")).unwrap();
+        std::fs::create_dir_all(project.join("node_modules")).unwrap();
+        symlink("../..", project.join("node_modules/up")).unwrap();
+        symlink("node_modules/up/outside-marker", ws.join("x")).unwrap();
+        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        assert!(e.contains("refusing symlink x"), "{e}");
+        // A chain that stays inside is written; one into .git isn't.
+        std::fs::remove_file(ws.join("x")).unwrap();
+        std::fs::create_dir(ws.join("real")).unwrap();
+        std::fs::write(ws.join("real/file"), "r").unwrap();
+        symlink("real", ws.join("alias")).unwrap();
+        symlink("alias/file", ws.join("via")).unwrap();
+        apply(&paths, &m.id, false, false).unwrap();
+        assert_eq!(std::fs::read_to_string(project.join("via")).unwrap(), "r");
+        symlink("alias/../.GIT/hooks", ws.join("hooks")).unwrap();
+        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        assert!(e.contains("into .git"), "{e}");
+    }
+
+    #[test]
+    fn apply_writes_exactly_what_was_reviewed() {
+        let (paths, project, m, ws) = setup("review", &[("f", "old")]);
+        std::fs::write(ws.join("f"), "reviewed-A").unwrap();
+        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('M', "f")]);
+        std::fs::write(ws.join("f"), "unreviewed-B").unwrap();
+        apply(&paths, &m.id, false, true).unwrap();
+        assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "reviewed-A");
+        // A diff waits for an apply (or another diff) holding the sandbox's lock.
+        let home = root(&paths).join(&m.id);
+        let lock = review_lock(&home).unwrap();
+        let (p, id) = (paths.clone(), m.id.clone());
+        let t = std::thread::spawn(move || patch(&p, &id).map(|(ch, _)| ch.len()));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!t.is_finished());
+        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "reviewed-A");
+        drop(lock);
+        assert_eq!(t.join().unwrap().unwrap(), 1);
+        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "unreviewed-B");
+        // The copy is read without following links: a directory swapped for a link, inside
+        // the copy or out to a Mac path, is never read through.
+        let (inside, outside) = (tmp("review-inside"), tmp("review-outside"));
+        std::fs::write(outside.join("secret"), "host only").unwrap();
+        std::fs::create_dir(inside.join("sub")).unwrap();
+        std::fs::write(inside.join("sub/secret"), "elsewhere").unwrap();
+        symlink("sub", inside.join("z-dir")).unwrap();
+        let mac = tmp("review-mac");
+        symlink(&outside, mac.join("z-dir")).unwrap();
+        let dir = Dir::open(&project).unwrap();
+        let ch = vec![Change { kind: 'A', path: "z-dir/secret".into() }];
+        for src in [&inside, &mac] {
+            assert!(write_changes(&dir, &Dir::open(src).unwrap(), src, &ch, None).is_err(), "{}", src.display());
+        }
+        assert!(std::fs::symlink_metadata(project.join("z-dir")).is_err());
+    }
+
+    #[test]
+    fn apply_compares_and_writes_modes() {
+        let (paths, project, m, ws) = setup("mode", &[("f", "x"), ("g", "y")]);
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let was = mode(&project.join("f"));
+        std::fs::set_permissions(project.join("f"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let e = apply(&paths, &m.id, true, false).unwrap_err().to_string();
+        assert!(e.ends_with("since the sandbox copied it: f"), "{e}");
+        assert_eq!(mode(&project.join("f")), 0o600);
+        std::fs::set_permissions(project.join("f"), std::fs::Permissions::from_mode(was)).unwrap();
+        assert!(apply(&paths, &m.id, true, false).unwrap().is_empty());
+        std::fs::set_permissions(ws.join("g"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, false).unwrap()), vec![('M', "g")]);
+        assert_eq!(mode(&project.join("g")), 0o755);
+        assert!(apply(&paths, &m.id, true, false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn apply_replaces_a_directory_with_a_file() {
+        let (paths, project, m, ws) = setup("dir2file", &[("a/child", "x"), ("a/sub/deep", "y"), ("keep", "k")]);
+        // A manifest from before directories and modes were recorded.
+        let file = root(&paths).join(&m.id).join("manifest.json");
+        let new: Manifest = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        let old: std::collections::BTreeMap<&String, (char, u64, i128)> =
+            new.iter().filter(|(_, s)| s.kind() != 'd').map(|(k, s)| (k, (s.0, s.1, s.2))).collect();
+        std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+        std::fs::remove_dir_all(ws.join("a")).unwrap();
+        std::fs::write(ws.join("a"), "a file now").unwrap();
+        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('A', "a"), ('D', "a/child"), ('D', "a/sub/deep")]);
+        apply(&paths, &m.id, false, true).unwrap();
+        assert_eq!(std::fs::read_to_string(project.join("a")).unwrap(), "a file now");
+        // And back: the file replaced by a directory.
+        std::fs::remove_file(ws.join("a")).unwrap();
+        std::fs::create_dir(ws.join("a")).unwrap();
+        std::fs::write(ws.join("a/x"), "dir again").unwrap();
+        apply(&paths, &m.id, false, false).unwrap();
+        assert_eq!(std::fs::read_to_string(project.join("a/x")).unwrap(), "dir again");
+        // A conflict only when the Mac changed something under the directory.
+        let (paths, project, m, ws) = setup("dir2file-host", &[("d/child", "x"), ("e/child", "x"), ("e/node_modules/pkg", "p")]);
+        std::fs::remove_dir_all(ws.join("d")).unwrap();
+        std::fs::write(ws.join("d"), "file").unwrap();
+        std::fs::write(project.join("d/new"), "made on the Mac").unwrap();
+        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        assert!(e.ends_with("since the sandbox copied it: d/new"), "{e}");
+        std::fs::remove_file(project.join("d/new")).unwrap();
+        // One holding what apply leaves alone (node_modules) is refused before anything is written.
+        std::fs::remove_dir_all(ws.join("e")).unwrap();
+        std::fs::write(ws.join("e"), "file").unwrap();
+        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        assert!(e.contains("e/node_modules"), "{e}");
+        assert!(project.join("d/child").exists() && project.join("e/child").exists());
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    use super::*;
+
+    /// A stopped copy-mode sandbox of `project` in `paths`, laid out as `create` leaves
+    /// one, with no VM. `edit` changes its metadata before it's saved.
+    pub fn fake(paths: &Paths, project: &Path, edit: impl FnOnce(&mut Meta)) -> Meta {
+        let id = new_id().unwrap();
+        let home = root(paths).join(&id);
+        std::fs::create_dir_all(&home).unwrap();
+        let mut meta = Meta {
+            id,
+            name: None,
+            project: project.canonicalize().unwrap(),
+            mode: "copy".into(),
+            image: DEFAULT_IMAGE.into(),
+            golden: None,
+            allow: allowlist(&[]),
+            offline: false,
+            cpus: 2,
+            memory_gib: 2,
+            ttl_secs: 0,
+            secrets: vec![],
+            created: now(),
+            os: String::new(),
+            reach: vec![],
+        };
+        edit(&mut meta);
+        let s = Sandbox { meta, paths: Paths { home } };
+        clonefile(&s.meta.project, &s.ws()).unwrap();
+        s.save_manifest(&manifest(&s.meta.project)).unwrap();
+        s.save().unwrap();
+        s.meta
     }
 }

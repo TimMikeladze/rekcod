@@ -13,7 +13,8 @@ for one.
    project and never follows a symlink.
 3. **The sandbox API and MCP server** (`rekcod sandbox serve`, `rekcod mcp`): a caller gets
    only what the server was started with (`--root`, `--allow-host`, `--secret`,
-   `--allow-mount`).
+   `--allow-mount`, `--allow-macos`), for the sandboxes it creates and for ones that
+   already exist.
 4. **The fleet**: a token holder can do only what its role allows, in its namespaces. A
    node's owner's files, the controller's host, other tenants' sandboxes and app instances,
    and RustFS buckets other than an app's own are out of reach. Control-plane traffic is
@@ -29,16 +30,19 @@ for one.
   host socket the daemon opens after `Policy::check`, with SNI/Host checks for allowlisted
   hosts on 443/80. DNS goes over vsock to the daemon, which checks names
   (`daemon.rs::DnsFilter`). Guest iptables and the agent's DNS checks are a second layer.
-- **apply.** `sandbox.rs::apply` freezes the workspace (APFS clone, container paused),
-  diffs it, refuses symlinks leaving the project, then writes through `safefs.rs`: every
-  component opened with `O_NOFOLLOW` from a directory fd.
-- **API/MCP.** `sandbox_api.rs`: `Policy::check`/`project` gate `create`; `exec` env must be
-  `KEY=VALUE`; unix socket 0600, TCP listener loopback-only with a bearer token.
+- **apply.** `sandbox.rs::apply` holds the sandbox's review lock, freezes the workspace
+  (APFS clone, container paused), diffs it, resolves symlink chains against the tree it
+  will leave (`check_links`), then reads and writes through `safefs.rs`: every component
+  opened with `O_NOFOLLOW` from a directory fd, and the project's `.git` refused by inode.
+- **API/MCP.** `sandbox_api.rs`: `Policy::check`/`project` gate `create`; `Policy::target`
+  authorizes the sandbox every other operation names, and `list` is filtered the same way;
+  `/instances` and `/jobs` exist only under `Policy::node`; `exec` env must be `KEY=VALUE`;
+  unix socket 0600, TCP listener loopback-only with a bearer token.
 - **Fleet.** `fleet.rs`: tokens hashed (SHA-256) with roles per namespace, edge tokens,
   node secrets; TLS from `tls.rs`; nodes run sandboxes for the controller only
   (`Policy::node`, node secret); the controller forwards only whitelisted fields
   (`create_body`) and authorizes the path id. Release images reach nodes as presigned URLs.
-- **Dashboard.** `dashboard/src/proxy.ts`, `lib/guard.ts`, `lib/auth.ts`: token cookie,
+- **Dashboard.** `dashboard/src/proxy.ts`, `lib/guard.ts`, `lib/auth.ts`: bearer token from origin-scoped localStorage (no cookie),
   Host/Origin/Sec-Fetch-Site checks, argv must appear in the current `rekcod state`.
 
 ## Suggested tests

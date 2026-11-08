@@ -1,7 +1,7 @@
 import "server-only"
 import type { ChildProcess } from "node:child_process"
 import type { State } from "@/lib/types"
-import { FIXTURE, readState, spawnRekcod } from "@/lib/rekcod"
+import { FIXTURE, readState, spawnWatcher } from "@/lib/rekcod"
 import { broadcast, once, subscribers } from "./bus"
 import { mergeLocal } from "./merge"
 import { fakeNodes, recordNodes } from "./nodes"
@@ -129,7 +129,7 @@ export const vmRunning = () => h.current?.running === true
 
 function followEvents() {
   if (FIXTURE || h.events || !vmRunning()) return
-  const child = spawnRekcod(["events", "--format", "{{json .}}"])
+  const child = spawnWatcher(["events", "--format", "{{json .}}"])
   h.events = child
   let buf = ""
   child.stdout?.setEncoding("utf8")

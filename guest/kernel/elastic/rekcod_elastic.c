@@ -249,7 +249,11 @@ static void elastic_release(struct work_struct *work)
 		if (n && elastic_send(e, OP_RELEASE, batch, n)) {
 			u32 i;
 
-			/* The host still has them, or has nothing mapped there: keep them ours. */
+			/*
+			 * The host answers failure only while every one of them is still mapped
+			 * as before, so they're ours again. One it couldn't map back in gets a
+			 * success answer, and the REUSE before the next write maps it in first.
+			 */
 			dev_warn_ratelimited(&e->vdev->dev, "release of %u chunks failed\n", n);
 			spin_lock(&e->lock);
 			for (i = 0; i < n; i++) {

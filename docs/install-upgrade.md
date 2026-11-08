@@ -10,8 +10,13 @@ again. Items 7 and 8 of `docs/production-readiness.md`.
 headers), compares it with its own version, and if it's newer downloads
 `rekcod-darwin-arm64.tar.gz` and `SHA256SUMS` from the release, checks the tarball's sha256,
 and replaces its own binary (written next to it, then renamed over it, so a running VM
-daemon keeps the old file). The dashboard bundle in the tarball replaces
-`../share/rekcod/dashboard` next to the binary the same way.
+daemon keeps the old file). The dashboard bundle in the tarball is copied to
+`../share/rekcod/dashboard.new` next to the binary before anything is replaced, and the
+copy must have `server.js` and `start.cjs`. Then the binary is replaced and the old
+dashboard moved to `dashboard.old`, the new one renamed into place and the old one deleted;
+if the rename fails the old one goes back. A failed copy (a full disk, a permission error)
+leaves the old binary and dashboard, and `upgrade` exits with the error.
+`scripts/install.sh` installs in the same order.
 
 - `--check` only says whether there's a newer version (exit 1 if there is).
 - A binary under a Homebrew Cellar refuses and says `brew upgrade rekcod`.
@@ -74,7 +79,8 @@ root-owned and stays; uninstall prints its path.
 
 `rekcod doctor` prints checks with a fix for each that fails: VM running and answering,
 daemon and guest versions against the CLI, free disk on the Mac, data disk errors in the
-console log, sockets and `run/` permissions, docker context, `DOCKER_HOST`, the default
+console log, whether `~/.rekcod`, `run/`, `logs/` and `vm/` are 0700 and the VM disks
+0600 (every command sets that; doctor reports what it couldn't), docker context, `DOCKER_HOST`, the default
 socket, VM internet reachability (one TCP connect from a throwaway container), login
 agent state. `--bundle` also writes `~/.rekcod/doctor-<time>.tar.gz` with `status --json`,
 the last 2000 lines of each log and the config, never tokens or keys.

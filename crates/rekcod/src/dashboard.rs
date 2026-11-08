@@ -2,7 +2,8 @@
 //! 127.0.0.1 and opens it. A dashboard that's already running is just opened.
 //!
 //! Each launch gets a new token. It goes to the server in `REKCOD_DASHBOARD_TOKEN` and to
-//! `~/.rekcod/run/dashboard.json` (0600); the browser trades it for a cookie at `/auth`.
+//! `~/.rekcod/run/dashboard.json` (0600); `/auth` keeps it in the origin's localStorage and
+//! the page sends it as a bearer header. Not a cookie: cookies reach every localhost port.
 //! Containers reach the Mac's 127.0.0.1 through `host.docker.internal`, so loopback alone
 //! doesn't keep them out.
 

@@ -4,6 +4,7 @@ import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState } from "rea
 import { ArrowDown, ArrowUp, Check, Copy, Download, Filter, Pause, Play, Regex, TriangleAlert, WrapText } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { api } from "@/lib/api"
 import type { Action } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -168,7 +169,7 @@ export function LogView({ action, container, height = "70vh", className }: { act
       setText("")
       setDone(false)
       try {
-        const r = await fetch(url(src, since, timestamps), { signal: ctl.signal })
+        const r = await api(url(src, since, timestamps), { signal: ctl.signal })
         if (!r.ok || !r.body) {
           setText(await r.text())
           return

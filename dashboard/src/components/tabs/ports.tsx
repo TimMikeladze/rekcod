@@ -7,6 +7,7 @@ import { Head, match } from "@/components/table"
 import { Badge } from "@/components/ui/badge"
 import { Table, TableBody, TableCell, TableRow } from "@/components/ui/table"
 import { useDash } from "@/hooks/dash-context"
+import { api } from "@/lib/api"
 
 /** `GET /api/probe`: per TCP port, the HEAD status or why there's none. */
 type Probe = Record<string, { status: number | null; note: string }>
@@ -18,7 +19,7 @@ function useProbe(ports: number[]) {
     if (!key) return
     let stop = false
     const tick = () =>
-      fetch("/api/probe", { cache: "no-store" })
+      api("/api/probe")
         .then((r) => (r.ok ? r.json() : {}))
         .then((p) => !stop && setProbe(p))
         .catch(() => {})

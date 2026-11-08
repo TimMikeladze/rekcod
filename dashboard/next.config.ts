@@ -7,8 +7,7 @@ const nextConfig: NextConfig = {
   // directory keeps server.js at the top of standalone/ instead of under the repo's path.
   output: "standalone",
   outputFileTracingRoot: process.cwd(),
-  // Another localhost port is the same site, so its pages get the SameSite=Strict cookie;
-  // they still can't frame the dashboard and click its buttons.
+  // A page on another localhost port can't frame the dashboard and click its buttons.
   async headers() {
     return [{ source: "/:path*", headers: [{ key: "X-Frame-Options", value: "DENY" }, { key: "Content-Security-Policy", value: "frame-ancestors 'none'" }] }]
   },

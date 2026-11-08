@@ -88,21 +88,27 @@ pub fn upgrade(check: bool) -> Result<()> {
         if !Command::new("tar").arg("-xzf").arg(&tar).arg("-C").arg(work.join("x")).status()?.success() {
             bail!("couldn't unpack {TARBALL}");
         }
+        // Staged before anything is replaced: a failed copy leaves both the old binary and
+        // the old dashboard.
+        let dash = work.join("x/share/rekcod/dashboard");
+        let installed = dir.join("../share/rekcod/dashboard");
+        let staged = if dash.is_dir() && installed.parent().is_some_and(|p| p.is_dir()) {
+            Some(stage_dir(&dash, &installed, DASHBOARD_FILES).context("the new dashboard")?)
+        } else {
+            None
+        };
         // Next to the old one, then renamed over it: a VM daemon running from the old file
         // keeps its inode.
         let new = dir.join(".rekcod.new");
-        std::fs::copy(work.join("x/bin/rekcod"), &new)?;
-        std::fs::rename(&new, &exe)?;
-        let dash = work.join("x/share/rekcod/dashboard");
-        let installed = dir.join("../share/rekcod/dashboard");
-        if dash.is_dir() && installed.parent().is_some_and(|p| p.is_dir()) {
-            let old = installed.with_extension("old");
-            let _ = std::fs::remove_dir_all(&old);
-            if installed.exists() {
-                std::fs::rename(&installed, &old)?;
+        if let Err(e) = std::fs::copy(work.join("x/bin/rekcod"), &new).and_then(|_| std::fs::rename(&new, &exe)) {
+            let _ = std::fs::remove_file(&new);
+            if let Some(s) = &staged {
+                let _ = std::fs::remove_dir_all(s);
             }
-            Command::new("cp").arg("-R").arg(&dash).arg(&installed).status()?;
-            let _ = std::fs::remove_dir_all(&old);
+            return Err(anyhow::Error::from(e).context(format!("install {}", exe.display())));
+        }
+        if let Some(s) = staged {
+            swap_dir(&s, &installed).context("the binary is the new one, the dashboard still the old")?;
         }
         Ok(())
     })();
@@ -110,6 +116,54 @@ pub fn upgrade(check: bool) -> Result<()> {
     r?;
     let _ = Command::new("xattr").args(["-d", "com.apple.quarantine"]).arg(&exe).stderr(Stdio::null()).status();
     println!("rekcod {latest} installed at {}. A running VM keeps {current} until `rekcod stop && rekcod start`", exe.display());
+    Ok(())
+}
+
+/// What `rekcod dashboard` runs from a build (dashboard.rs); a copy without them isn't installed.
+const DASHBOARD_FILES: &[&str] = &["server.js", "start.cjs"];
+
+/// `<dir>.<ext>` next to `dir`.
+fn beside(dir: &Path, ext: &str) -> PathBuf {
+    let mut name = dir.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(".{ext}"));
+    dir.with_file_name(name)
+}
+
+/// Copies `src` to `<dst>.new` and checks the copy has every file in `required`. Nothing
+/// at `dst` changes; on failure the partial copy is removed.
+fn stage_dir(src: &Path, dst: &Path, required: &[&str]) -> Result<PathBuf> {
+    let staged = beside(dst, "new");
+    let _ = std::fs::remove_dir_all(&staged);
+    let cp = Command::new("cp").arg("-R").arg(src).arg(&staged).status().context("run cp")?;
+    let missing = required.iter().find(|f| !staged.join(f).is_file());
+    if cp.success() && missing.is_none() {
+        return Ok(staged);
+    }
+    let _ = std::fs::remove_dir_all(&staged);
+    if !cp.success() {
+        bail!("copying it to {} failed ({cp}); {} is unchanged", staged.display(), dst.display());
+    }
+    bail!("it has no {}; {} is unchanged", missing.copied().unwrap_or_default(), dst.display())
+}
+
+/// Puts a staged copy at `dst`. The old `dst` moves to `<dst>.old` first and comes back if
+/// the swap fails; it's deleted once the new one is in place.
+fn swap_dir(staged: &Path, dst: &Path) -> Result<()> {
+    let old = beside(dst, "old");
+    let _ = std::fs::remove_dir_all(&old);
+    let had = dst.exists();
+    if had && let Err(e) = std::fs::rename(dst, &old) {
+        let _ = std::fs::remove_dir_all(staged);
+        return Err(e).with_context(|| format!("move {} aside", dst.display()));
+    }
+    if let Err(e) = std::fs::rename(staged, dst) {
+        if had {
+            let _ = std::fs::rename(&old, dst);
+        }
+        let _ = std::fs::remove_dir_all(staged);
+        return Err(e).with_context(|| format!("move {} into place", staged.display()));
+    }
+    let _ = std::fs::remove_dir_all(&old);
     Ok(())
 }
 
@@ -205,9 +259,14 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
     let console = std::fs::read(paths.console_log()).unwrap_or_default();
     let disk_err = String::from_utf8_lossy(&console).lines().find(|l| l.contains("data disk error")).map(String::from);
     add("data disk", disk_err.is_none(), disk_err.unwrap_or("no errors this boot".into()), "rekcod stop && rekcod start --repair");
-    use std::os::unix::fs::PermissionsExt;
-    let mode = std::fs::metadata(paths.home.join("run")).map(|m| m.permissions().mode() & 0o777).unwrap_or(0);
-    add("run/ is private", mode & 0o077 == 0, format!("{mode:o}"), "chmod 700 ~/.rekcod/run");
+    // Paths::at already took group and other access off these; what's left it couldn't.
+    let open = paths.not_private();
+    add(
+        "state is private",
+        open.is_empty(),
+        if open.is_empty() { "home, run/, logs/ and vm/ 700, VM disks 600".into() } else { open.join(", ") },
+        "sudo chown -R \"$(whoami)\" ~/.rekcod, then any rekcod command sets the modes again",
+    );
     if crate::docker::available() {
         let ctx = crate::docker::current_context().unwrap_or_default();
         // `default` is /var/run/docker.sock, which is rekcod once the socket is routed.
@@ -353,6 +412,54 @@ mod tests {
         assert!(parse_version("v1.0.0") > parse_version("0.99.0"));
         assert!(compatible("0.3.1", "0.3.0") && !compatible("0.3.0", "0.2.1"));
         assert!(compatible("1.4.0", "1.2.0") && !compatible("2.0.0", "1.9.0"));
+    }
+
+    /// A dashboard build whose files all say `tag`.
+    fn build(dir: &Path, tag: &str) {
+        std::fs::create_dir_all(dir.join("lib")).unwrap();
+        for f in DASHBOARD_FILES.iter().chain(&["lib/chunk.js"]) {
+            std::fs::write(dir.join(f), tag).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_failed_dashboard_copy_keeps_the_installed_one() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = std::env::temp_dir().join(format!("rekcod-upgrade-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (installed, new) = (t.join("share/dashboard"), t.join("x/dashboard"));
+        build(&installed, "old");
+        build(&new, "new");
+        let kept = |installed: &Path| {
+            assert_eq!(std::fs::read_to_string(installed.join("server.js")).unwrap(), "old");
+            assert!(!beside(installed, "new").exists(), "the partial copy is gone");
+        };
+
+        // cp can't read this one, so the copy fails part way (root reads it anyway).
+        let unreadable = new.join("lib/unreadable.js");
+        std::fs::write(&unreadable, "x").unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(stage_dir(&new, &installed, DASHBOARD_FILES).is_err());
+            kept(&installed);
+        }
+        std::fs::remove_file(&unreadable).unwrap();
+
+        std::fs::remove_file(new.join("start.cjs")).unwrap();
+        let err = stage_dir(&new, &installed, DASHBOARD_FILES).unwrap_err();
+        assert!(err.to_string().contains("start.cjs"), "{err}");
+        kept(&installed);
+
+        build(&new, "new");
+        swap_dir(&stage_dir(&new, &installed, DASHBOARD_FILES).unwrap(), &installed).unwrap();
+        assert_eq!(std::fs::read_to_string(installed.join("lib/chunk.js")).unwrap(), "new");
+        assert!(!beside(&installed, "new").exists() && !beside(&installed, "old").exists());
+
+        // A first install has nothing to move aside.
+        let first = t.join("share/first");
+        swap_dir(&stage_dir(&new, &first, DASHBOARD_FILES).unwrap(), &first).unwrap();
+        assert!(first.join("start.cjs").is_file());
+        std::fs::remove_dir_all(&t).unwrap();
     }
 
     #[test]

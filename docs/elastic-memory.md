@@ -76,11 +76,18 @@ processes. Activity Monitor's Memory column (footprint) doesn't count elastic me
    write in flight and stayed that way for a whole interval, marks them `RELEASED` and sends
    `le32 op=1, le32 count, le32 chunk[count]`. For each chunk rekcod unmaps it from the guest,
    puts fresh pages at the same address with `mmap(MAP_FIXED)` and maps it in again; macOS
-   frees the old pages right away. It answers `le32 status` once the whole batch is remapped.
+   frees the old pages right away. It answers `le32 status` once every chunk of the batch is
+   done. On a failure the driver marks the batch `ACTIVE` again and writes to it, so rekcod
+   answers 1 only when each failed chunk is still mapped as before (its unmap failed). A
+   chunk that was unmapped but couldn't get pages mapped back has nothing mapped in the
+   guest: rekcod quarantines it, logs `chunk N is quarantined until the guest reuses it` to
+   `daemon.log`, and answers 0, so the driver keeps the batch `RELEASED`.
 5. **Reuse.** A write to a `RELEASED` chunk first sends `op=2` and waits for the answer. The
    driver holds its request lock from marking chunks released until rekcod answers, so a
-   reuse can't overtake the release it follows. rekcod has nothing to do for it: released
-   chunks are already fresh memory.
+   reuse can't overtake the release it follows. A released chunk is already fresh memory,
+   so rekcod answers at once. A quarantined one gets fresh pages and is mapped in again
+   first; if that fails the answer is 1, the driver fails that swap write with an I/O error
+   and leaves the chunk `RELEASED`, and the next write to it asks again.
 
 ## Why swap and not RAM
 
@@ -102,3 +109,6 @@ and only from the device's queue. And `unmapMemoryAtOffset` only takes back exac
 - Base RAM behaves as before: touched once, held until `rekcod stop`.
 - `KERNEL=alpine` guests (`guest/build.sh`) don't have the driver; the device sits unused.
 - Releases come 5 to 15 s after the guest frees swap, not at once.
+- The quarantine path is tested on the host against a fake region (`elastic.rs`), not with
+  a remap failure injected into a running VM. A read of a quarantined chunk still faults;
+  swap never reads a chunk with no data in it, but reading `/dev/rswap` by hand could.

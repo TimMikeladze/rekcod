@@ -5,6 +5,8 @@
 //!
 //! The classes aren't in objc2-virtualization 0.3 yet, so they're reached by name.
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, anyhow, bail};
@@ -47,12 +49,17 @@ fn parse_request(header: &[u8], body: &[u8], chunks: u64) -> Result<(u32, Vec<u6
     Ok((op, list))
 }
 
+/// Chunks the guest has nothing mapped at: a RELEASE unmapped them and putting pages back
+/// failed. They are never reported usable until a REUSE has mapped them in again.
+type Lost = Mutex<std::collections::BTreeSet<u64>>;
+
 struct Inner {
     size: u64,
     /// This process's mapping of the region.
     addr: usize,
     queue: DispatchRetained<DispatchQueue>,
     device: Mutex<Option<Retained<AnyObject>>>,
+    lost: Arc<Lost>,
 }
 // SAFETY: the device is only messaged on its own serial queue; `addr` is our mapping.
 unsafe impl Send for Inner {}
@@ -84,8 +91,20 @@ define_class!(
                 let element: Option<Retained<AnyObject>> = unsafe { msg_send![queue, nextElement] };
                 let Some(element) = element else { break };
                 match read_request(inner, &element) {
-                    Ok((ELASTIC_OP_RELEASE, chunks)) if !chunks.is_empty() => release(inner, device, element, chunks),
-                    // REUSE: released chunks are already fresh memory, so nothing to do.
+                    Ok((op, chunks)) if !chunks.is_empty() => {
+                        let regions: Retained<NSArray<AnyObject>> = unsafe { msg_send![device, sharedMemoryRegions] };
+                        let Some(region) = regions.firstObject() else {
+                            reply(&element, 1);
+                            continue;
+                        };
+                        let region: Rc<dyn Region> = Rc::new(VzRegion { region, addr: inner.addr });
+                        let answer = Box::new(move |status| reply(&element, status));
+                        if op == ELASTIC_OP_RELEASE {
+                            release(region, inner.lost.clone(), chunks, answer);
+                        } else {
+                            reuse(region, inner.lost.clone(), chunks, answer);
+                        }
+                    }
                     Ok(_) => reply(&element, 0),
                     Err(e) => {
                         log(&format!("elastic memory: bad request: {e:#}"));
@@ -127,71 +146,183 @@ fn reply(element: &AnyObject, status: u32) {
     }
 }
 
+/// What RELEASE and REUSE do to the shared memory region, chunk by chunk. A trait so the
+/// bookkeeping can be tested without a VM. Completions run on the device queue.
+trait Region {
+    /// Unmaps chunk `c` from the guest.
+    fn unmap(&self, c: u64, done: Box<dyn FnOnce(Result<(), String>)>);
+    /// Replaces our pages behind chunk `c` with fresh, unbacked ones.
+    fn fresh(&self, c: u64) -> Result<(), String>;
+    /// Maps our pages behind chunk `c` into the guest.
+    fn map(&self, c: u64, done: Box<dyn FnOnce(Result<(), String>)>);
+}
+
+/// The device's region, and our mapping of it at `addr`.
+struct VzRegion {
+    region: Retained<AnyObject>,
+    addr: usize,
+}
+
+/// A completion handler that hands the framework's error, if any, to `done`.
+fn completion(done: Box<dyn FnOnce(Result<(), String>)>) -> RcBlock<dyn Fn(*mut NSError)> {
+    let done = Cell::new(Some(done));
+    RcBlock::new(move |e: *mut NSError| {
+        if let Some(done) = done.take() {
+            done(unsafe { e.as_ref() }.map_or(Ok(()), |e| Err(e.localizedDescription().to_string())));
+        }
+    })
+}
+
+impl Region for VzRegion {
+    fn unmap(&self, c: u64, done: Box<dyn FnOnce(Result<(), String>)>) {
+        let block = completion(done);
+        unsafe {
+            let _: () = msg_send![&*self.region, unmapMemoryAtOffset: c * ELASTIC_CHUNK, size: ELASTIC_CHUNK, completionHandler: &*block];
+        }
+    }
+
+    fn fresh(&self, c: u64) -> Result<(), String> {
+        let p = self.addr + (c * ELASTIC_CHUNK) as usize;
+        let fresh = unsafe {
+            libc::mmap(
+                p as *mut libc::c_void,
+                ELASTIC_CHUNK as usize,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
+                -1,
+                0,
+            )
+        };
+        if fresh == libc::MAP_FAILED { Err(std::io::Error::last_os_error().to_string()) } else { Ok(()) }
+    }
+
+    fn map(&self, c: u64, done: Box<dyn FnOnce(Result<(), String>)>) {
+        let block = completion(done);
+        let p = (self.addr + (c * ELASTIC_CHUNK) as usize) as *mut libc::c_void;
+        unsafe {
+            let _: () =
+                msg_send![&*self.region, mapMemory: p, atOffset: c * ELASTIC_CHUNK, size: ELASTIC_CHUNK, completionHandler: &*block];
+        }
+    }
+}
+
+/// Runs `answer` once `pending` chunks are done.
+struct Batch {
+    pending: Cell<usize>,
+    answer: Cell<Option<Box<dyn FnOnce()>>>,
+}
+
+impl Batch {
+    fn new(pending: usize, answer: Box<dyn FnOnce()>) -> Rc<Batch> {
+        Rc::new(Batch { pending: pending.into(), answer: Some(answer).into() })
+    }
+
+    fn done(&self) {
+        self.pending.set(self.pending.get() - 1);
+        if self.pending.get() == 0
+            && let Some(answer) = self.answer.take()
+        {
+            answer();
+        }
+    }
+}
+
+fn quarantine(lost: &Lost, c: u64, err: &str) {
+    lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(c);
+    log(&format!("elastic memory: release: {err}; chunk {c} is quarantined until the guest reuses it"));
+}
+
 /// Gives the chunks' pages back to macOS: each is unmapped from the guest, replaced with
 /// fresh (unbacked) pages here and mapped in again. The guest sent RELEASE only for chunks
-/// it doesn't touch until we answer, which happens once every chunk is remapped.
+/// it doesn't touch until we answer, which happens once every chunk is done.
 /// (`MADV_FREE_REUSABLE` on pages the guest has mapped doesn't free them.)
-fn release(inner: &Arc<Inner>, device: &AnyObject, element: Retained<AnyObject>, chunks: Vec<u64>) {
-    let regions: Retained<NSArray<AnyObject>> = unsafe { msg_send![device, sharedMemoryRegions] };
-    let Some(region) = regions.firstObject() else {
-        reply(&element, 1);
-        return;
-    };
-    struct Batch {
-        pending: std::cell::Cell<usize>,
-        failed: std::cell::Cell<bool>,
-        element: Retained<AnyObject>,
-    }
-    let batch = std::rc::Rc::new(Batch { pending: std::cell::Cell::new(chunks.len()), failed: std::cell::Cell::new(false), element });
-    let finish = {
-        let batch = batch.clone();
-        std::rc::Rc::new(move |err: Option<String>| {
-            if let Some(e) = err {
-                log(&format!("elastic memory: release: {e}"));
-                batch.failed.set(true);
-            }
-            batch.pending.set(batch.pending.get() - 1);
-            if batch.pending.get() == 0 {
-                reply(&batch.element, u32::from(batch.failed.get()));
-            }
-        })
-    };
+///
+/// The guest takes a failure to mean the chunks are still its own and goes on writing to
+/// them, so the answer is 1 only when every failed chunk is still mapped as before (its
+/// unmap failed). A chunk left with nothing mapped is quarantined in `lost` and the answer
+/// is 0: the guest then counts them all as released and sends REUSE before writing to one.
+fn release(region: Rc<dyn Region>, lost: Arc<Lost>, chunks: Vec<u64>, answer: Box<dyn FnOnce(u32)>) {
+    let (kept, gone) = (Rc::new(Cell::new(false)), Rc::new(Cell::new(false)));
+    let batch = Batch::new(chunks.len(), {
+        let (kept, gone) = (kept.clone(), gone.clone());
+        Box::new(move || answer(u32::from(kept.get() && !gone.get())))
+    });
     for c in chunks {
-        let off = c * ELASTIC_CHUNK;
-        let p = inner.addr + off as usize;
-        let (region2, finish) = (region.clone(), finish.clone());
-        let unmapped = RcBlock::new(move |e: *mut NSError| {
-            if let Some(e) = unsafe { e.as_ref() } {
-                finish(Some(format!("unmap chunk {c}: {}", e.localizedDescription())));
-                return;
-            }
-            let fresh = unsafe {
-                libc::mmap(
-                    p as *mut libc::c_void,
-                    ELASTIC_CHUNK as usize,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_ANON | libc::MAP_PRIVATE | libc::MAP_FIXED,
-                    -1,
-                    0,
-                )
-            };
-            if fresh == libc::MAP_FAILED {
-                // Nothing is mapped at `off` in the guest now; the guest gets an error back
-                // and leaves the chunk alone.
-                finish(Some(format!("replace chunk {c}: {}", std::io::Error::last_os_error())));
-                return;
-            }
-            let finish = finish.clone();
-            let mapped = RcBlock::new(move |e: *mut NSError| {
-                finish(unsafe { e.as_ref() }.map(|e| format!("map chunk {c}: {}", e.localizedDescription())));
-            });
-            unsafe {
-                let _: () = msg_send![&*region2, mapMemory: p as *mut libc::c_void, atOffset: off, size: ELASTIC_CHUNK, completionHandler: &*mapped];
-            }
-        });
-        unsafe {
-            let _: () = msg_send![&*region, unmapMemoryAtOffset: off, size: ELASTIC_CHUNK, completionHandler: &*unmapped];
+        if lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains(&c) {
+            // Already has nothing mapped; only a guest that ignored an earlier answer asks.
+            gone.set(true);
+            batch.done();
+            continue;
         }
+        let (region2, lost, batch, kept, gone) = (region.clone(), lost.clone(), batch.clone(), kept.clone(), gone.clone());
+        region.unmap(
+            c,
+            Box::new(move |r| {
+                if let Err(e) = r {
+                    log(&format!("elastic memory: release: unmap chunk {c}: {e}"));
+                    kept.set(true);
+                    return batch.done();
+                }
+                if let Err(e) = region2.fresh(c) {
+                    quarantine(&lost, c, &format!("replace chunk {c}: {e}"));
+                    gone.set(true);
+                    return batch.done();
+                }
+                region2.map(
+                    c,
+                    Box::new(move |r| {
+                        if let Err(e) = r {
+                            quarantine(&lost, c, &format!("map chunk {c}: {e}"));
+                            gone.set(true);
+                        }
+                        batch.done();
+                    }),
+                );
+            }),
+        );
+    }
+}
+
+/// REUSE: the guest is about to write to these chunks again. A released one already has
+/// fresh pages mapped; a quarantined one is mapped in again first. The answer is 1 while
+/// any of them still has nothing mapped, and the guest then doesn't write to it.
+fn reuse(region: Rc<dyn Region>, lost: Arc<Lost>, chunks: Vec<u64>, answer: Box<dyn FnOnce(u32)>) {
+    let todo: std::collections::BTreeSet<u64> = {
+        let lost = lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        chunks.into_iter().filter(|c| lost.contains(c)).collect()
+    };
+    if todo.is_empty() {
+        return answer(0);
+    }
+    let failed = Rc::new(Cell::new(false));
+    let batch = Batch::new(todo.len(), {
+        let failed = failed.clone();
+        Box::new(move || answer(u32::from(failed.get())))
+    });
+    for c in todo {
+        if let Err(e) = region.fresh(c) {
+            log(&format!("elastic memory: reuse: replace chunk {c}: {e}"));
+            failed.set(true);
+            batch.done();
+            continue;
+        }
+        let (batch, lost, failed) = (batch.clone(), lost.clone(), failed.clone());
+        region.map(
+            c,
+            Box::new(move |r| {
+                match r {
+                    Ok(()) => {
+                        lost.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&c);
+                        log(&format!("elastic memory: chunk {c} is mapped again"));
+                    }
+                    Err(e) => {
+                        log(&format!("elastic memory: reuse: map chunk {c}: {e}"));
+                        failed.set(true);
+                    }
+                }
+                batch.done();
+            }),
+        );
     }
 }
 
@@ -325,8 +456,13 @@ pub fn configuration(size_mib: u64) -> Result<(Retained<AnyObject>, Elastic)> {
     if addr == libc::MAP_FAILED {
         bail!("reserve {size_mib} MiB of elastic memory: {}", std::io::Error::last_os_error());
     }
-    let inner =
-        Arc::new(Inner { size, addr: addr as usize, queue: DispatchQueue::new("dev.rekcod.elastic", None), device: Mutex::default() });
+    let inner = Arc::new(Inner {
+        size,
+        addr: addr as usize,
+        queue: DispatchQueue::new("dev.rekcod.elastic", None),
+        device: Mutex::default(),
+        lost: Arc::default(),
+    });
     let delegate: Retained<Delegate> = unsafe { msg_send![super(Delegate::alloc().set_ivars(inner.clone())), init] };
     let elastic = Elastic { _delegate: delegate.clone(), inner: inner.clone() };
     unsafe {
@@ -393,6 +529,94 @@ mod tests {
         assert!(!guest_supports(&without));
         assert!(!guest_supports(&dir.join("missing")));
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A region whose operations finish at once; `fail_*` chunks fail that step.
+    #[derive(Default)]
+    struct Fake {
+        /// Chunks mapped in the guest.
+        mapped: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+        fail_unmap: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+        fail_fresh: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+        fail_map: std::cell::RefCell<std::collections::BTreeSet<u64>>,
+        calls: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl Region for Fake {
+        fn unmap(&self, c: u64, done: Box<dyn FnOnce(Result<(), String>)>) {
+            self.calls.borrow_mut().push(format!("unmap {c}"));
+            let fail = self.fail_unmap.borrow().contains(&c);
+            if !fail {
+                self.mapped.borrow_mut().remove(&c);
+            }
+            done(if fail { Err("busy".into()) } else { Ok(()) });
+        }
+        fn fresh(&self, c: u64) -> Result<(), String> {
+            self.calls.borrow_mut().push(format!("fresh {c}"));
+            if self.fail_fresh.borrow().contains(&c) { Err("no memory".into()) } else { Ok(()) }
+        }
+        fn map(&self, c: u64, done: Box<dyn FnOnce(Result<(), String>)>) {
+            self.calls.borrow_mut().push(format!("map {c}"));
+            let fail = self.fail_map.borrow().contains(&c);
+            if !fail {
+                self.mapped.borrow_mut().insert(c);
+            }
+            done(if fail { Err("refused".into()) } else { Ok(()) });
+        }
+    }
+
+    #[test]
+    fn a_chunk_whose_remap_failed_is_never_handed_back_as_usable() {
+        use std::collections::BTreeSet;
+        let fake = Rc::new(Fake::default());
+        fake.mapped.borrow_mut().extend(0..4);
+        let lost: Arc<Lost> = Arc::default();
+        let answer: Rc<Cell<Option<u32>>> = Rc::default();
+        let answered = || {
+            let a = answer.clone();
+            Box::new(move |s| a.set(Some(s))) as Box<dyn FnOnce(u32)>
+        };
+        let lost_now = || lost.lock().unwrap().clone();
+
+        // Chunk 1 can't be mapped back in. Answering 1 would have the guest write to it.
+        fake.fail_map.borrow_mut().insert(1);
+        release(fake.clone(), lost.clone(), vec![0, 1], answered());
+        assert_eq!(answer.take(), Some(0));
+        assert_eq!(lost_now(), BTreeSet::from([1]));
+        assert!(!fake.mapped.borrow().contains(&1));
+        // REUSE maps it in again first, and fails while that does.
+        reuse(fake.clone(), lost.clone(), vec![1], answered());
+        assert_eq!(answer.take(), Some(1));
+        assert_eq!(lost_now(), BTreeSet::from([1]));
+        fake.fail_map.borrow_mut().clear();
+        reuse(fake.clone(), lost.clone(), vec![1], answered());
+        assert_eq!(answer.take(), Some(0));
+        assert!(lost_now().is_empty() && fake.mapped.borrow().contains(&1));
+
+        // The same when our fresh pages can't be put in place.
+        fake.fail_fresh.borrow_mut().insert(2);
+        release(fake.clone(), lost.clone(), vec![2], answered());
+        assert_eq!((answer.take(), lost_now()), (Some(0), BTreeSet::from([2])));
+        fake.fail_fresh.borrow_mut().clear();
+        reuse(fake.clone(), lost.clone(), vec![2], answered());
+        assert_eq!((answer.take(), lost_now()), (Some(0), BTreeSet::new()));
+
+        // A failed unmap leaves the chunk as it was: the guest may keep it.
+        fake.fail_unmap.borrow_mut().insert(3);
+        release(fake.clone(), lost.clone(), vec![0, 3], answered());
+        assert_eq!(answer.take(), Some(1));
+        assert!(lost_now().is_empty() && fake.mapped.borrow().is_superset(&BTreeSet::from([0, 3])));
+        // Unless another chunk in the batch lost its mapping.
+        fake.fail_map.borrow_mut().insert(0);
+        release(fake.clone(), lost.clone(), vec![0, 3], answered());
+        assert_eq!((answer.take(), lost_now()), (Some(0), BTreeSet::from([0])));
+
+        // A quarantined chunk isn't unmapped again; other chunks' REUSE costs nothing.
+        fake.calls.borrow_mut().clear();
+        release(fake.clone(), lost.clone(), vec![0], answered());
+        reuse(fake.clone(), lost.clone(), vec![3], answered());
+        assert_eq!(answer.take(), Some(0));
+        assert!(fake.calls.borrow().is_empty(), "{:?}", fake.calls.borrow());
     }
 
     #[test]

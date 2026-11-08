@@ -34,6 +34,16 @@ pub fn locked(path: &std::path::Path) -> bool {
     std::io::Error::last_os_error().raw_os_error() == Some(libc::EWOULDBLOCK)
 }
 
+/// Takes away whatever `path`'s mode allows beyond `mode`.
+pub fn restrict(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let m = std::fs::metadata(path)?.permissions().mode() & 0o777;
+    if m & !mode != 0 {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(m & mode))?;
+    }
+    Ok(())
+}
+
 /// Writes a file only this user can read, created 0600 rather than chmodded after.
 pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
     use std::io::Write;
@@ -50,6 +60,14 @@ pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
 /// Data disk size; sparse, so only used space costs anything on the Mac.
 pub const DEFAULT_DISK_GIB: u64 = 256;
 
+/// `$REKCOD_HOME`, default `~/.rekcod`, without creating anything.
+pub fn home_dir() -> Result<PathBuf> {
+    Ok(match std::env::var_os("REKCOD_HOME") {
+        Some(h) => PathBuf::from(h),
+        None => PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".rekcod"),
+    })
+}
+
 #[derive(Clone)]
 pub struct Paths {
     pub home: PathBuf,
@@ -57,22 +75,45 @@ pub struct Paths {
 
 impl Paths {
     pub fn new() -> Result<Paths> {
-        let home = match std::env::var_os("REKCOD_HOME") {
-            Some(h) => PathBuf::from(h),
-            None => PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".rekcod"),
-        };
-        Paths::at(home)
+        Paths::at(home_dir()?)
     }
 
     /// Another rekcod home (the sandbox VM's, `~/.rekcod/sandbox`).
+    ///
+    /// The home and its directories are 0700 and the VM disks 0600, whatever the umask, and
+    /// an existing install is brought there too: the data disk holds every volume and
+    /// container, and sockets in run/ reach dockerd (root in the VM, with /Users mounted).
+    /// Modes that can't be changed are left for `rekcod doctor` to report.
     pub fn at(home: PathBuf) -> Result<Paths> {
+        use std::os::unix::fs::DirBuilderExt;
         for dir in ["run", "logs", "vm"] {
-            std::fs::create_dir_all(home.join(dir))?;
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(home.join(dir))?;
         }
-        // Sockets in run/ reach dockerd (root in the VM, with /Users mounted): only this user.
+        let paths = Paths { home };
+        for (path, mode) in paths.private() {
+            if path.exists() {
+                let _ = restrict(&path, mode);
+            }
+        }
+        Ok(paths)
+    }
+
+    /// What only this user may reach, and the mode it should have.
+    fn private(&self) -> [(PathBuf, u32); 6] {
+        let dir = |d: &str| (self.home.join(d), 0o700);
+        [(self.home.clone(), 0o700), dir("run"), dir("logs"), dir("vm"), (self.root_disk(), 0o600), (self.data_disk(), 0o600)]
+    }
+
+    /// `path mode` for each of [`Paths::private`] that others can reach (`rekcod doctor`).
+    pub fn not_private(&self) -> Vec<String> {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(home.join("run"), std::fs::Permissions::from_mode(0o700));
-        Ok(Paths { home })
+        self.private()
+            .into_iter()
+            .filter_map(|(path, mode)| {
+                let m = std::fs::metadata(&path).ok()?.permissions().mode() & 0o777;
+                (m & !mode != 0).then(|| format!("{} {m:o}", path.display()))
+            })
+            .collect()
     }
 
     /// True for `~/.rekcod`. Other homes (tests, benches) must not repoint the shared
@@ -200,6 +241,36 @@ impl Paths {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_is_private_under_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let chmod = |p: &std::path::Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        let tmp = std::env::temp_dir().join(format!("rekcod-paths-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let home = tmp.join("home");
+        let dirs = ["", "run", "logs", "vm"].map(|d| home.join(d));
+
+        let paths = with_umask(0o022, || Paths::at(home.clone())).unwrap();
+        assert_eq!(dirs.each_ref().map(|d| mode(d)), [0o700; 4]);
+        assert_eq!(paths.not_private(), Vec::<String>::new());
+
+        // An install from before: everything readable by other accounts.
+        for d in &dirs {
+            chmod(d, 0o755);
+        }
+        for disk in [paths.root_disk(), paths.data_disk()] {
+            std::fs::write(&disk, b"").unwrap();
+            chmod(&disk, 0o644);
+        }
+        assert_eq!(paths.not_private().len(), 6);
+        with_umask(0o022, || Paths::at(home.clone())).unwrap();
+        assert_eq!(dirs.each_ref().map(|d| mode(d)), [0o700; 4]);
+        assert_eq!((mode(&paths.root_disk()), mode(&paths.data_disk())), (0o600, 0o600));
+        assert!(paths.not_private().is_empty());
+        std::fs::remove_dir_all(&tmp).unwrap();
+    }
 
     #[test]
     fn only_home_dot_rekcod_is_default() {

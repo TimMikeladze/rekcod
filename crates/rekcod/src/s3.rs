@@ -52,7 +52,7 @@ impl Response {
     }
 }
 
-fn hex(b: &[u8]) -> String {
+pub(crate) fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
@@ -118,42 +118,132 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-/// `<Tag>value</Tag>` contents, in order. Enough for ListObjectsV2 and error bodies.
-pub fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+/// `<Tag>...</Tag>` contents as they appear in the document (markup and entities included), in order.
+fn xml_raw<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
     let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
     let mut out = Vec::new();
     let mut rest = xml;
     while let Some(i) = rest.find(&open) {
         let after = &rest[i + open.len()..];
         let Some(j) = after.find(&close) else { break };
-        out.push(after[..j].replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", "\"").replace("&apos;", "'"));
+        out.push(&after[..j]);
         rest = &after[j + close.len()..];
     }
     out
 }
 
-/// Reads a `Transfer-Encoding: chunked` body.
+/// `<Tag>value</Tag>` text, decoded, in order. Enough for ListObjectsV2 and error bodies.
+pub fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    xml_raw(xml, tag).into_iter().map(unescape).collect()
+}
+
+/// Decodes XML entities in one pass, so `&amp;lt;` is `&lt;`, not `<`. Unknown or invalid
+/// references are left as they are.
+fn unescape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        rest = &rest[i..];
+        let decoded = rest.find(';').and_then(|j| {
+            let c = match &rest[1..j] {
+                "amp" => Some('&'),
+                "lt" => Some('<'),
+                "gt" => Some('>'),
+                "quot" => Some('"'),
+                "apos" => Some('\''),
+                e => e
+                    .strip_prefix("#x")
+                    .map(|h| u32::from_str_radix(h, 16))
+                    .or_else(|| e.strip_prefix('#').map(str::parse::<u32>))
+                    .and_then(Result::ok)
+                    .and_then(char::from_u32),
+            };
+            c.map(|c| (c, j))
+        });
+        match decoded {
+            Some((c, j)) => {
+                out.push(c);
+                rest = &rest[j + 1..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn early_eof(what: String) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::UnexpectedEof, what)
+}
+
+/// A `Content-Length` body. A connection that closes before the last byte is an
+/// `UnexpectedEof` error, never a short object.
+struct Exact<R> {
+    r: R,
+    left: u64,
+}
+
+impl<R: Read> Read for Exact<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.left == 0 || buf.is_empty() {
+            return Ok(0);
+        }
+        let max = buf.len().min(usize::try_from(self.left).unwrap_or(usize::MAX));
+        let n = self.r.read(&mut buf[..max])?;
+        if n == 0 {
+            return Err(early_eof(format!("connection closed with {} bytes of the body still to come", self.left)));
+        }
+        self.left -= n as u64;
+        Ok(n)
+    }
+}
+
+/// Reads a `Transfer-Encoding: chunked` body. It ends only at the zero-size chunk; a
+/// connection that closes before it is an `UnexpectedEof` error.
 struct Chunked<R> {
     r: R,
     left: usize,
+    /// A chunk's data was read; its CRLF comes next.
+    crlf: bool,
     done: bool,
+}
+
+impl<R> Chunked<R> {
+    fn new(r: R) -> Chunked<R> {
+        Chunked { r, left: 0, crlf: false, done: false }
+    }
+}
+
+impl<R: BufRead> Chunked<R> {
+    fn line(&mut self) -> std::io::Result<String> {
+        let mut line = String::new();
+        if self.r.read_line(&mut line)? == 0 || !line.ends_with('\n') {
+            return Err(early_eof("connection closed before the last chunk".into()));
+        }
+        Ok(line)
+    }
 }
 
 impl<R: BufRead> Read for Chunked<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.done {
+        if self.done || buf.is_empty() {
             return Ok(0);
         }
         if self.left == 0 {
-            let mut line = String::new();
-            self.r.read_line(&mut line)?;
-            if line.trim().is_empty() {
-                // The CRLF after the previous chunk.
-                line.clear();
-                self.r.read_line(&mut line)?;
+            if self.crlf {
+                if !self.line()?.trim().is_empty() {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "chunk longer than its size"));
+                }
+                self.crlf = false;
             }
-            let size = line.trim().split(';').next().unwrap_or("");
-            self.left = usize::from_str_radix(size, 16).map_err(|_| std::io::Error::other(format!("bad chunk size {size:?}")))?;
+            let line = self.line()?;
+            let size = line.trim().split(';').next().unwrap_or("").trim();
+            self.left = usize::from_str_radix(size, 16)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("bad chunk size {size:?}")))?;
             if self.left == 0 {
                 self.done = true;
                 return Ok(0);
@@ -162,9 +252,10 @@ impl<R: BufRead> Read for Chunked<R> {
         let max = buf.len().min(self.left);
         let n = self.r.read(&mut buf[..max])?;
         if n == 0 {
-            return Err(std::io::ErrorKind::UnexpectedEof.into());
+            return Err(early_eof(format!("connection closed with {} bytes of a chunk still to come", self.left)));
         }
         self.left -= n;
+        self.crlf = self.left == 0;
         Ok(n)
     }
 }
@@ -259,9 +350,9 @@ fn raw(method: &str, host: &str, target: &str, extra: &str, len: u64, body: Body
         let body: Box<dyn Read + Send> = if method == "HEAD" {
             Box::new(std::io::empty())
         } else if header("transfer-encoding").is_some_and(|t| t.eq_ignore_ascii_case("chunked")) {
-            Box::new(Chunked { r, left: 0, done: false })
+            Box::new(Chunked::new(r))
         } else if let Some(n) = header("content-length").and_then(|n| n.parse::<u64>().ok()) {
-            Box::new(r.take(n))
+            Box::new(Exact { r, left: n })
         } else {
             Box::new(r)
         };
@@ -304,8 +395,13 @@ impl S3 {
         r.ok(&format!("create bucket {bucket}")).map(|_| ())
     }
 
+    /// True on 200, false on 404. Any other answer (403, 500, ...) is an error, not "absent".
     pub fn bucket_exists(&self, bucket: &str) -> Result<bool> {
-        Ok(self.request("HEAD", &format!("/{bucket}"), &[], Body::Empty)?.status == 200)
+        match self.request("HEAD", &format!("/{bucket}"), &[], Body::Empty)?.status {
+            200 => Ok(true),
+            404 => Ok(false),
+            status => bail!("check bucket {bucket}: HTTP {status}"),
+        }
     }
 
     /// Every object under `prefix` (all pages).
@@ -318,11 +414,11 @@ impl S3 {
                 q.push(("continuation-token".into(), t.clone()));
             }
             let xml = self.request("GET", &format!("/{bucket}"), &q, Body::Empty)?.ok(&format!("list {bucket}"))?.text()?;
-            for c in xml_values(&xml, "Contents") {
+            for c in xml_raw(&xml, "Contents") {
                 out.push(Object {
-                    key: xml_values(&c, "Key").into_iter().next().unwrap_or_default(),
-                    size: xml_values(&c, "Size").into_iter().next().and_then(|s| s.parse().ok()).unwrap_or(0),
-                    modified: xml_values(&c, "LastModified").into_iter().next().unwrap_or_default(),
+                    key: xml_values(c, "Key").into_iter().next().unwrap_or_default(),
+                    size: xml_values(c, "Size").into_iter().next().and_then(|s| s.parse().ok()).unwrap_or(0),
+                    modified: xml_values(c, "LastModified").into_iter().next().unwrap_or_default(),
                 });
             }
             token = xml_values(&xml, "NextContinuationToken").into_iter().next();
@@ -333,6 +429,7 @@ impl S3 {
     }
 
     /// Deletes `bucket`; with `force` its objects first, else a non-empty bucket is an error.
+    /// Ok only when the DELETE succeeded or the bucket is confirmed absent (404).
     pub fn delete_bucket(&self, bucket: &str, force: bool) -> Result<()> {
         if !self.bucket_exists(bucket)? {
             return Ok(());
@@ -361,6 +458,17 @@ impl S3 {
     pub fn get(&self, bucket: &str, key: &str, w: &mut impl Write) -> Result<u64> {
         let mut r = self.request("GET", &format!("/{bucket}/{key}"), &[], Body::Empty)?.ok(&format!("get {bucket}/{key}"))?;
         Ok(std::io::copy(&mut r.body, w)?)
+    }
+
+    /// A small object's bytes, or None when there is no such key (404).
+    pub fn get_opt(&self, bucket: &str, key: &str) -> Result<Option<Vec<u8>>> {
+        let r = self.request("GET", &format!("/{bucket}/{key}"), &[], Body::Empty)?;
+        if r.status == 404 {
+            return Ok(None);
+        }
+        let mut b = Vec::new();
+        r.ok(&format!("get {bucket}/{key}"))?.body.read_to_end(&mut b)?;
+        Ok(Some(b))
     }
 
     pub fn delete(&self, bucket: &str, key: &str) -> Result<()> {
@@ -420,9 +528,154 @@ impl S3 {
     }
 }
 
+/// An S3 on 127.0.0.1 for tests: objects in memory, every bucket exists, ListObjectsV2 in
+/// one page. `fail` answers the next matching request with an error status instead.
+#[cfg(test)]
+pub(crate) mod mock {
+    use std::collections::BTreeMap;
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    pub(crate) struct State {
+        /// `bucket/key` -> bytes.
+        pub objects: BTreeMap<String, Vec<u8>>,
+        /// `METHOD /bucket/key`, in order.
+        pub log: Vec<String>,
+        /// (method, part of `/bucket/key`, status).
+        fail: Vec<(String, String, u16)>,
+    }
+
+    pub(crate) struct Mock {
+        pub s3: super::S3,
+        pub state: Arc<Mutex<State>>,
+    }
+
+    impl Mock {
+        pub fn fail(&self, method: &str, path: &str, status: u16) {
+            self.state.lock().unwrap().fail.push((method.into(), path.into(), status));
+        }
+        pub fn keys(&self) -> Vec<String> {
+            self.state.lock().unwrap().objects.keys().cloned().collect()
+        }
+    }
+
+    pub(crate) fn start() -> Mock {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let s3 =
+            super::S3 { endpoint: format!("http://{}", l.local_addr().unwrap()), access_key: "test".into(), secret_key: "test".into() };
+        let state = Arc::new(Mutex::new(State::default()));
+        let st = state.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let _ = serve(&st, s);
+            }
+        });
+        Mock { s3, state }
+    }
+
+    fn decode(s: &str) -> String {
+        let b = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            match (b[i], s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+                (b'%', Some(x)) => {
+                    out.push(x);
+                    i += 3;
+                }
+                (c, _) => {
+                    out.push(c);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn serve(state: &Mutex<State>, mut s: TcpStream) -> std::io::Result<()> {
+        let mut r = BufReader::new(s.try_clone()?);
+        let mut line = String::new();
+        r.read_line(&mut line)?;
+        let mut words = line.split_whitespace();
+        let (method, target) = (words.next().unwrap_or_default().to_string(), words.next().unwrap_or_default().to_string());
+        let mut len = 0;
+        loop {
+            let mut h = String::new();
+            if r.read_line(&mut h)? == 0 || h.trim().is_empty() {
+                break;
+            }
+            if let Some((k, v)) = h.split_once(':')
+                && k.eq_ignore_ascii_case("content-length")
+            {
+                len = v.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0; len];
+        r.read_exact(&mut body)?;
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let path = decode(path);
+        let mut st = state.lock().unwrap();
+        st.log.push(format!("{method} {path}"));
+        let (status, out) = match st.fail.iter().position(|(m, p, _)| *m == method && path.contains(p.as_str())) {
+            Some(i) => (st.fail.remove(i).2, Vec::new()),
+            None => answer(&mut st, &method, &path, query, body),
+        };
+        drop(st);
+        write!(s, "HTTP/1.1 {status} Mock\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", out.len())?;
+        if method != "HEAD" {
+            s.write_all(&out)?;
+        }
+        Ok(())
+    }
+
+    fn answer(st: &mut State, method: &str, path: &str, query: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
+        let path = path.trim_start_matches('/');
+        let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
+        if key.is_empty() {
+            return match method {
+                "GET" => {
+                    let prefix = query.split('&').find_map(|kv| kv.strip_prefix("prefix=")).map(decode).unwrap_or_default();
+                    let mut xml = String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");
+                    for (k, v) in &st.objects {
+                        if let Some(k) = k.strip_prefix(&format!("{bucket}/"))
+                            && k.starts_with(&prefix)
+                        {
+                            let k = k.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                            xml.push_str(&format!("<Contents><Key>{k}</Key><Size>{}</Size></Contents>", v.len()));
+                        }
+                    }
+                    (200, (xml + "</ListBucketResult>").into_bytes())
+                }
+                "DELETE" => (204, Vec::new()),
+                _ => (200, Vec::new()),
+            };
+        }
+        let full = format!("{bucket}/{key}");
+        match method {
+            "PUT" => {
+                st.objects.insert(full, body);
+                (200, Vec::new())
+            }
+            "GET" | "HEAD" => match st.objects.get(&full) {
+                Some(b) => (200, b.clone()),
+                None => (404, b"<Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>".to_vec()),
+            },
+            "DELETE" => {
+                st.objects.remove(&full);
+                (204, Vec::new())
+            }
+            _ => (405, Vec::new()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
 
     // From the AWS SigV4 S3 examples ("GET Object" and "Query String Authentication").
     const AK: &str = "AKIAIOSFODNN7EXAMPLE";
@@ -466,21 +719,117 @@ mod tests {
         assert_eq!(sig, "aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404");
     }
 
+    /// Answers connection n with `replies[n]`; returns a client and the request lines seen.
+    fn canned(replies: Vec<Vec<u8>>) -> (S3, Arc<Mutex<Vec<String>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let s3 = S3 { endpoint: format!("http://{}", l.local_addr().unwrap()), access_key: "a".into(), secret_key: "s".into() };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let got = seen.clone();
+        std::thread::spawn(move || {
+            for reply in replies {
+                let (mut s, _) = l.accept().unwrap();
+                let mut r = BufReader::new(s.try_clone().unwrap());
+                let mut line = String::new();
+                r.read_line(&mut line).unwrap();
+                got.lock().unwrap().push(line.split_whitespace().take(2).collect::<Vec<_>>().join(" "));
+                loop {
+                    let mut h = String::new();
+                    if r.read_line(&mut h).unwrap() == 0 || h == "\r\n" {
+                        break;
+                    }
+                }
+                s.write_all(&reply).unwrap();
+            }
+        });
+        (s3, seen)
+    }
+
+    fn reply(status: &str, body: &str) -> Vec<u8> {
+        format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).into_bytes()
+    }
+
+    fn early_eof(e: &anyhow::Error) -> bool {
+        e.downcast_ref::<std::io::Error>().is_some_and(|e| e.kind() == std::io::ErrorKind::UnexpectedEof)
+    }
+
     #[test]
-    fn list_xml() {
-        let xml = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a&amp;b</Key><Size>3</Size></Contents>\
+    fn xml_text_is_decoded_once() {
+        assert_eq!(xml_values("<Key>report&amp;amp;old</Key>", "Key"), ["report&amp;old"]);
+        assert_eq!(xml_values("<Key>&amp;lt;&lt;&#38;&#x26;&#60;&bogus;&#xZZ; & x</Key>", "Key"), ["&lt;<&&<&bogus;&#xZZ; & x"]);
+        let xml = "<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>a&amp;amp;b</Key><Size>3</Size></Contents>\
                    <Contents><Key>c</Key><Size>10</Size></Contents></ListBucketResult>";
-        let c = xml_values(xml, "Contents");
+        let c = xml_raw(xml, "Contents");
         assert_eq!(c.len(), 2);
-        assert_eq!(xml_values(&c[0], "Key"), ["a&b"]);
+        assert_eq!(xml_values(c[0], "Key"), ["a&amp;b"]);
+    }
+
+    #[test]
+    fn force_delete_removes_keys_with_entities() {
+        let m = mock::start();
+        // Keys that literally contain entity text list as themselves, so these are what's deleted.
+        m.s3.put("bucket", "report&amp;old", Body::Bytes(b"x")).unwrap();
+        m.s3.put("bucket", "a<b>&#38;", Body::Bytes(b"y")).unwrap();
+        let keys: Vec<String> = m.s3.list("bucket", "").unwrap().into_iter().map(|o| o.key).collect();
+        assert_eq!(keys, ["a<b>&#38;", "report&amp;old"]);
+        m.s3.delete_bucket("bucket", true).unwrap();
+        assert!(m.keys().is_empty(), "{:?}", m.keys());
     }
 
     #[test]
     fn chunked_body() {
-        let raw = b"3\r\nabc\r\n2;x=y\r\nde\r\n0\r\n\r\n";
-        let mut s = String::new();
-        Chunked { r: &raw[..], left: 0, done: false }.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "abcde");
+        let read = |raw: &[u8]| {
+            let mut s = Vec::new();
+            Chunked::new(raw).read_to_end(&mut s).map(|_| s)
+        };
+        assert_eq!(read(b"3\r\nabc\r\n2;x=y\r\nde\r\n0\r\n\r\n").unwrap(), b"abcde");
+        for cut in [&b"3\r\nabc\r\n"[..], b"3\r\nab", b"3\r\nabc", b"3\r\nabc\r\n2"] {
+            assert_eq!(read(cut).unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof, "{:?}", String::from_utf8_lossy(cut));
+        }
+        assert_eq!(read(b"3\r\nabcd\r\n0\r\n\r\n").unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn short_bodies_are_errors() {
+        let mut b = Vec::new();
+        assert_eq!(Exact { r: &b"abcdef"[..], left: 4 }.read_to_end(&mut b).unwrap(), 4);
+        assert_eq!(Exact { r: &b"abc"[..], left: 9 }.read_to_end(&mut b).unwrap_err().kind(), std::io::ErrorKind::UnexpectedEof);
+
+        // Nine bytes promised and three sent, then a chunked body without its last chunk.
+        let short = b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\nConnection: close\r\n\r\nabc".to_vec();
+        let chunked = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n3\r\nabc\r\n".to_vec();
+        let (s3, _) = canned(vec![short.clone(), short, chunked, reply("200 OK", "abcdefghi")]);
+        assert!(early_eof(&s3.get("b", "k", &mut Vec::new()).unwrap_err()));
+        assert!(early_eof(&url_get(&s3.presign("b", "k", 60).unwrap(), &mut Vec::new()).unwrap_err()));
+        assert!(early_eof(&s3.get("b", "k", &mut Vec::new()).unwrap_err()));
+        let mut b = Vec::new();
+        assert_eq!(s3.get("b", "k", &mut b).unwrap(), 9);
+        assert_eq!(b, b"abcdefghi");
+    }
+
+    #[test]
+    fn only_404_means_no_bucket() {
+        let (s3, _) = canned(vec![reply("200 OK", ""), reply("404 Not Found", ""), reply("500 Internal Server Error", "")]);
+        assert!(s3.bucket_exists("b").unwrap());
+        assert!(!s3.bucket_exists("b").unwrap());
+        assert!(s3.bucket_exists("b").is_err());
+
+        // A failed HEAD is an error, and nothing is deleted.
+        let (s3, seen) = canned(vec![reply("500 Internal Server Error", "")]);
+        assert!(s3.delete_bucket("b", true).is_err());
+        assert_eq!(*seen.lock().unwrap(), ["HEAD /b"]);
+        // Already gone.
+        let (s3, seen) = canned(vec![reply("404 Not Found", "")]);
+        s3.delete_bucket("b", true).unwrap();
+        assert_eq!(*seen.lock().unwrap(), ["HEAD /b"]);
+        // The DELETE itself fails.
+        let empty = "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>";
+        for status in ["503 Service Unavailable", "409 Conflict"] {
+            let (s3, seen) = canned(vec![reply("200 OK", ""), reply("200 OK", empty), reply(status, "")]);
+            assert!(s3.delete_bucket("b", true).is_err(), "{status}");
+            assert_eq!(seen.lock().unwrap().last().unwrap(), "DELETE /b");
+        }
+        let (s3, _) = canned(vec![reply("200 OK", ""), reply("200 OK", empty), reply("204 No Content", "")]);
+        s3.delete_bucket("b", true).unwrap();
     }
 
     #[test]

@@ -2,10 +2,14 @@
 
 import { useCallback, useEffect, useRef, useState } from "react"
 import type { DashData, Window } from "@/hooks/dash-context"
+import { api } from "@/lib/api"
 import { share } from "@/lib/share"
+import { readEvents } from "@/lib/sse"
 import type { ActivityEntry, Sample, Stat, State, StatsResponse } from "@/lib/types"
 
 const POLL_MS = 3000
+// What EventSource waits before reconnecting.
+const RETRY_MS = 3000
 const FS_KEEP_MS = 3600_000
 
 const byName = (list: Stat[]) => Object.fromEntries(list.map((s) => [s.name, s]))
@@ -45,7 +49,7 @@ export function useDashboard(): DashData {
     if (busy.current) return
     busy.current = true
     try {
-      const r = await fetch("/api/state", { cache: "no-store" })
+      const r = await api("/api/state")
       const body = await r.json()
       if (!r.ok) throw new Error(body.error ?? r.statusText)
       gotState(body)
@@ -58,7 +62,7 @@ export function useDashboard(): DashData {
 
   const loadStats = useCallback(async (w: Window) => {
     try {
-      const r: StatsResponse = await fetch(`/api/stats?window=${w}`, { cache: "no-store" }).then((r) => r.json())
+      const r: StatsResponse = await api(`/api/stats?window=${w}`).then((r) => r.json())
       if (windowRef.current !== w) return
       setStats((old) => sameStats(old, r.latest))
       setHistory(r.history)
@@ -77,7 +81,8 @@ export function useDashboard(): DashData {
 
   // The event stream, with polling while it's down.
   useEffect(() => {
-    let es: EventSource | null = null
+    let ctl: AbortController | null = null
+    let retry: ReturnType<typeof setTimeout> | undefined
     let poll: ReturnType<typeof setInterval> | null = null
     let stopped = false
     const startPolling = () => {
@@ -87,41 +92,48 @@ export function useDashboard(): DashData {
       if (poll) clearInterval(poll)
       poll = null
     }
-    const connect = () => {
+    const onEvent = (event: string, data: string) => {
+      const d = JSON.parse(data)
+      if (event === "state") gotState(d as State)
+      else if (event === "fail") setError((d as { error: string }).error)
+      else if (event === "stats") {
+        const s = d as { latest: Stat[]; sample: Sample[]; colors: Record<string, string> }
+        setStats((old) => sameStats(old, s.latest))
+        setColors((old) => share(old, s.colors))
+        if (s.sample.length) {
+          const cut = Date.now() - windowRef.current * 1000
+          setHistory((h) => [...h.filter((x) => x.t > cut), ...s.sample])
+        }
+      } else if (event === "activity") {
+        const a = d as ActivityEntry
+        setActivity((list) => [a, ...list.filter((x) => x.id !== a.id)])
+      }
+    }
+    const connect = async () => {
       if (stopped) return
-      es = new EventSource("/api/events")
-      es.onopen = () => {
+      ctl = new AbortController()
+      try {
+        const r = await api("/api/events", { signal: ctl.signal })
+        // Signed out: the shell swaps this page for the sign-in one.
+        if (r.status === 401) return
+        if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`)
         setLive(true)
         stopPolling()
-      }
-      es.onerror = () => {
-        setLive(false)
-        startPolling()
-      }
-      es.addEventListener("state", (e) => gotState(JSON.parse((e as MessageEvent).data)))
-      es.addEventListener("fail", (e) => setError(JSON.parse((e as MessageEvent).data).error))
-      es.addEventListener("stats", (e) => {
-        const d = JSON.parse((e as MessageEvent).data) as { latest: Stat[]; sample: Sample[]; colors: Record<string, string> }
-        setStats((old) => sameStats(old, d.latest))
-        setColors((old) => share(old, d.colors))
-        if (d.sample.length) {
-          const cut = Date.now() - windowRef.current * 1000
-          setHistory((h) => [...h.filter((s) => s.t > cut), ...d.sample])
-        }
-      })
-      es.addEventListener("activity", (e) => {
-        const a = JSON.parse((e as MessageEvent).data) as ActivityEntry
-        setActivity((list) => [a, ...list.filter((x) => x.id !== a.id)])
-      })
+        await readEvents(r.body, onEvent)
+      } catch {}
+      if (stopped) return
+      setLive(false)
+      startPolling()
+      retry = setTimeout(connect, RETRY_MS)
     }
     const first = setTimeout(() => {
       refresh()
       loadStats(windowRef.current)
-      fetch("/api/activity", { cache: "no-store" })
+      api("/api/activity")
         .then((r) => r.json())
         .then((l: ActivityEntry[]) => Array.isArray(l) && setActivity(l))
         .catch(() => {})
-      fetch("/api/vm-history", { cache: "no-store" })
+      api("/api/vm-history")
         .then((r) => r.json())
         .then((v: { fs?: DashData["fsHistory"] }) => v.fs && setFsHistory((h) => [...v.fs!, ...h.filter((x) => x.t > (v.fs!.at(-1)?.t ?? 0))]))
         .catch(() => {})
@@ -130,8 +142,9 @@ export function useDashboard(): DashData {
     return () => {
       stopped = true
       clearTimeout(first)
+      clearTimeout(retry)
       stopPolling()
-      es?.close()
+      ctl?.abort()
     }
   }, [refresh, loadStats, gotState])
 
@@ -139,7 +152,7 @@ export function useDashboard(): DashData {
     if (!ids.length) return
     const want = new Set(ids)
     setActivity((list) => list.map((a) => (want.has(a.id) ? { ...a, seen: true } : a)))
-    fetch("/api/activity", {
+    api("/api/activity", {
       method: "POST",
       headers: { "content-type": "application/json", "x-rekcod": "1" },
       body: JSON.stringify({ seen: ids }),

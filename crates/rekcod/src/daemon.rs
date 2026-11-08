@@ -117,7 +117,8 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     crate::lifecycle::trim_log_hourly(paths.daemon_log());
     let guest = paths.guest_dir()?;
     let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
-    if paths.data_fresh().exists() {
+    let fresh = paths.data_fresh().exists();
+    if fresh {
         cmdline.push_str(" rekcod.fresh=1");
     }
     if opts.repair {
@@ -222,6 +223,9 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let _ = std::fs::remove_file(&sock);
     let listener = crate::paths::with_umask(0o077, || UnixListener::bind(&sock)).with_context(|| format!("bind {}", sock.display()))?;
     tokio::spawn(docker_proxy(vm.clone(), listener));
+    if fresh {
+        tokio::spawn(forget_fresh_disk(vm.clone(), paths.data_fresh()));
+    }
 
     let caps = wait_for_agent(&vm).await?;
     let fs_cache = caps.split_whitespace().any(|c| c == CAP_FS_NOTIFY);
@@ -388,6 +392,21 @@ async fn shutdown(vm: &Vm) {
     log!("forcing VM stop");
     if let Err(e) = vm.force_stop().await {
         log!("force stop failed: {e:#}");
+    }
+}
+
+/// Removes the fresh-disk marker once dockerd answers. From then on the disk holds data and
+/// boot.sh must not format it, also when the `rekcod start` that booted us was interrupted
+/// before it saw dockerd answer.
+async fn forget_fresh_disk(vm: Vm, marker: PathBuf) {
+    loop {
+        if let Ok(c) = vm.connect(DOCKER_PORT).await
+            && http::get(c, "/_ping").await.is_ok_and(|b| b == b"OK")
+        {
+            let _ = std::fs::remove_file(&marker);
+            return;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
@@ -1038,7 +1057,14 @@ fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
                     log!("port {}:{}/{:?} -> {container}", binding.addr, binding.port, binding.proto);
                     let task = match listener {
                         Listener::Tcp(l) => tokio::spawn(accept_loop(vm.clone(), l, binding.port)),
-                        Listener::Udp(s) => tokio::spawn(udp_loop(vm.clone(), s, binding.port)),
+                        Listener::Udp(s) => {
+                            let vm = vm.clone();
+                            let connect = move || {
+                                let vm = vm.clone();
+                                async move { vm.connect(FORWARD_PORT).await }
+                            };
+                            tokio::spawn(udp_loop(connect, s, binding.port))
+                        }
                     };
                     Forward { container, task: Some(task), error: None }
                 }
@@ -1098,33 +1124,53 @@ fn listen(b: Binding, probe: bool) -> std::io::Result<Listener> {
 /// A UDP flow (one Mac client address) closes after this long without traffic.
 const UDP_IDLE: Duration = Duration::from_secs(60);
 
-type UdpFlows = Arc<Mutex<HashMap<SocketAddr, mpsc::Sender<Vec<u8>>>>>;
-
 /// Published UDP port: one vsock stream per Mac client address, carrying
-/// framed datagrams both ways (the agent relays them to docker-proxy).
-async fn udp_loop(vm: Vm, sock: UdpSocket, port: u16) {
-    let sock = Arc::new(sock);
-    let flows: UdpFlows = Arc::default();
+/// framed datagrams both ways (the agent relays them to docker-proxy). The flows are
+/// this task's and only it holds the socket, so aborting it frees the port at once and
+/// ends every flow with it.
+async fn udp_loop<C, F, S>(connect: C, sock: UdpSocket, port: u16)
+where
+    C: Fn() -> F,
+    F: std::future::Future<Output = Result<S>> + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let mut flows: HashMap<SocketAddr, mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let (reply, mut replies) = mpsc::channel::<(Vec<u8>, SocketAddr)>(UDP_QUEUE);
     let mut buf = vec![0u8; 65536];
     loop {
-        let Ok((n, from)) = sock.recv_from(&mut buf).await else { continue };
-        let packet = buf[..n].to_vec();
-        let existing = flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&from).cloned();
-        let packet = match existing {
-            // Full: the guest isn't keeping up, so drop the datagram, as a network would.
-            Some(tx) => match tx.try_send(packet) {
-                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
-                Err(mpsc::error::TrySendError::Closed(p)) => p,
-            },
-            None => packet,
-        };
-        if flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len() >= UDP_FLOWS_MAX {
-            continue;
+        tokio::select! {
+            r = sock.recv_from(&mut buf) => {
+                let Ok((n, from)) = r else { continue };
+                let packet = buf[..n].to_vec();
+                let packet = match flows.get(&from) {
+                    // Full: the guest isn't keeping up, so drop the datagram, as a network would.
+                    Some(tx) => match tx.try_send(packet) {
+                        Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => continue,
+                        Err(mpsc::error::TrySendError::Closed(p)) => p,
+                    },
+                    None => packet,
+                };
+                if flows.len() >= UDP_FLOWS_MAX {
+                    continue;
+                }
+                let (tx, rx) = mpsc::channel(UDP_QUEUE);
+                let _ = tx.try_send(packet);
+                flows.insert(from, tx);
+                tasks.spawn(udp_flow(connect(), reply.clone(), from, port, rx));
+            }
+            Some((p, to)) = replies.recv() => {
+                let _ = sock.send_to(&p, to).await;
+            }
+            Some(done) = tasks.join_next(), if !tasks.is_empty() => {
+                // A new flow for the same client may have replaced this one already.
+                if let Ok(from) = done
+                    && flows.get(&from).is_some_and(|tx| tx.is_closed())
+                {
+                    flows.remove(&from);
+                }
+            }
         }
-        let (tx, rx) = mpsc::channel(UDP_QUEUE);
-        let _ = tx.try_send(packet);
-        flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(from, tx);
-        tokio::spawn(udp_flow(vm.clone(), sock.clone(), from, port, rx, flows.clone()));
     }
 }
 
@@ -1132,10 +1178,21 @@ async fn udp_loop(vm: Vm, sock: UdpSocket, port: u16) {
 const UDP_QUEUE: usize = 256;
 const UDP_FLOWS_MAX: usize = 1024;
 
-async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut rx: mpsc::Receiver<Vec<u8>>, flows: UdpFlows) {
+/// One client's datagrams to the guest, and the guest's replies to `reply` for the
+/// listener to send. Returns the client's address when the flow ends.
+async fn udp_flow<S>(
+    guest: impl std::future::Future<Output = Result<S>>,
+    reply: mpsc::Sender<(Vec<u8>, SocketAddr)>,
+    from: SocketAddr,
+    port: u16,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+) -> SocketAddr
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite,
+{
     let last = Mutex::new(Instant::now());
     let result = async {
-        let (mut rd, mut wr) = tokio::io::split(vm.connect(FORWARD_PORT).await?);
+        let (mut rd, mut wr) = tokio::io::split(guest.await?);
         wr.write_all(forward_header(Proto::Udp, port).as_bytes()).await?;
         let up = async {
             while let Some(p) = rx.recv().await {
@@ -1153,7 +1210,7 @@ async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut
                 let mut p = vec![0u8; u16::from_be_bytes(len) as usize];
                 rd.read_exact(&mut p).await?;
                 *last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
-                sock.send_to(&p, from).await?;
+                reply.send((p, from)).await.map_err(|_| anyhow::anyhow!("the port was closed"))?;
             }
             #[allow(unreachable_code)]
             anyhow::Ok(())
@@ -1173,10 +1230,10 @@ async fn udp_flow(vm: Vm, sock: Arc<UdpSocket>, from: SocketAddr, port: u16, mut
         }
     }
     .await;
-    flows.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&from);
     if let Err(e) = result {
         log!("forward udp :{port} for {from}: {e:#}");
     }
+    from
 }
 
 async fn accept_loop(vm: Vm, listener: TcpListener, port: u16) {
@@ -1322,6 +1379,111 @@ mod tests {
         assert_eq!(with_elastic_held(r#"{"disk_used":1}"#.into(), Some(5)), r#"{"disk_used":1,"elastic_held":5}"#);
         assert_eq!(with_elastic_held(r#"{"disk_used":1}"#.into(), None), r#"{"disk_used":1}"#);
         assert_eq!(with_elastic_held("error: agent gone".into(), Some(5)), "error: agent gone");
+    }
+
+    /// Runs the guest's `data_disk_ready` (data-disk.sh) on a scratch image with stub
+    /// `blkid`, `mkfs.ext4` and `e2fsck`; nothing real is formatted. Returns whether it
+    /// left an ext4 disk, and the tools it ran.
+    fn data_disk_ready(image: &[u8], cmdline: &str, ext4: bool, recoverable: bool) -> (bool, String) {
+        use std::os::unix::fs::PermissionsExt;
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = std::env::temp_dir().join(format!("rekcod-data-disk-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("bin")).unwrap();
+        std::fs::write(t.join("vdb"), image).unwrap();
+        for (flag, on) in [("ext4", ext4), ("recoverable", recoverable)] {
+            if on {
+                std::fs::write(t.join(flag), b"").unwrap();
+            }
+        }
+        // blkid sees ext4 once $T/ext4 exists; mkfs makes it, and so does e2fsck on a disk
+        // whose backup superblock is intact.
+        let stubs = [
+            ("blkid", r#"[ -e "$T/ext4" ] && echo "$1: LABEL=\"rekcod-data\" TYPE=\"ext4\"""#),
+            ("mkfs.ext4", r#"echo "mkfs.ext4 $*" >>"$T/ran"; touch "$T/ext4""#),
+            ("e2fsck", r#"echo "e2fsck $*" >>"$T/ran"; [ -e "$T/recoverable" ] && touch "$T/ext4"; exit 8"#),
+        ];
+        for (name, body) in stubs {
+            let p = t.join("bin").join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../guest/rootfs/etc/rekcod/data-disk.sh");
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"log() { :; }; . "$1"; data_disk_ready "$2" "$3""#, "sh", script])
+            .arg(t.join("vdb"))
+            .arg(cmdline)
+            .env("PATH", format!("{}:/usr/bin:/bin", t.join("bin").display()))
+            .env("T", &t)
+            .env("REKCOD_CONSOLE", "/dev/null")
+            .status()
+            .unwrap();
+        let ran = std::fs::read_to_string(t.join("ran")).unwrap_or_default();
+        std::fs::remove_dir_all(&t).unwrap();
+        (status.success(), ran)
+    }
+
+    #[test]
+    fn data_disk_is_formatted_only_when_the_mac_just_made_it() {
+        let cmdline = |extra: &str| format!("{KERNEL_CMDLINE} {extra}");
+        let zeros = vec![0u8; 5 << 20];
+        // Zeros where the superblock and group descriptors were, ext4 data behind them.
+        let mut damaged = zeros.clone();
+        damaged[(4 << 20) + 100..(4 << 20) + 104].copy_from_slice(b"data");
+
+        let (ok, ran) = data_disk_ready(&zeros, &cmdline("rekcod.fresh=1"), false, false);
+        assert!(ok && ran.starts_with("mkfs.ext4 "), "{ran}");
+
+        let (ok, ran) = data_disk_ready(&damaged, &cmdline(""), false, false);
+        assert!(!ok && !ran.contains("mkfs") && ran.contains("e2fsck -p -b 32768"), "{ran}");
+        let (ok, ran) = data_disk_ready(&zeros, &cmdline(""), false, false);
+        assert!(!ok && !ran.contains("mkfs"), "a blank disk without the marker: {ran}");
+        let (ok, ran) = data_disk_ready(&damaged, &cmdline(""), false, true);
+        assert!(ok && !ran.contains("mkfs"), "recovered from the backup: {ran}");
+
+        // The marker but data written since: never formatted.
+        let mut written = zeros.clone();
+        written[1024..1028].copy_from_slice(b"\x53\xef\0\0");
+        let (ok, ran) = data_disk_ready(&written, &cmdline("rekcod.fresh=1"), false, false);
+        assert!(!ok && !ran.contains("mkfs"), "{ran}");
+
+        let (ok, ran) = data_disk_ready(&damaged, &cmdline("rekcod.fsck=yes"), false, false);
+        assert!(!ok && !ran.contains("mkfs") && ran.contains("e2fsck -fy -b 7962624"), "--repair walks every backup: {ran}");
+
+        let (ok, ran) = data_disk_ready(&damaged, &cmdline("rekcod.fresh=1"), true, false);
+        assert!(ok && ran.is_empty(), "an ext4 disk is left alone: {ran}");
+    }
+
+    #[tokio::test]
+    async fn removing_a_udp_port_frees_it_with_a_flow_open() {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        let (guests_tx, mut guests) = mpsc::unbounded_channel();
+        let connect = move || {
+            let (ours, guest) = tokio::io::duplex(1 << 16);
+            let _ = guests_tx.send(guest);
+            async move { anyhow::Ok(ours) }
+        };
+        let task = tokio::spawn(udp_loop(connect, sock, addr.port()));
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"ping", addr).await.unwrap();
+        let mut guest = guests.recv().await.unwrap();
+        let header = forward_header(Proto::Udp, addr.port());
+        let mut got = vec![0u8; header.len() + 6];
+        guest.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got[header.len()..], b"\0\x04ping");
+        guest.write_all(&frame(b"pong").unwrap()).await.unwrap();
+        let mut buf = [0u8; 16];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(5), client.recv_from(&mut buf)).await.unwrap().unwrap();
+        assert_eq!(&buf[..n], b"pong");
+
+        // What apply_forwards does when the port goes away.
+        task.abort();
+        let _ = task.await;
+        UdpSocket::bind(addr).await.expect("the port is free right away");
+        let closed = tokio::time::timeout(Duration::from_secs(5), guest.read(&mut buf)).await;
+        assert!(matches!(closed, Ok(Ok(0))), "the flow ended with it: {closed:?}");
     }
 
     #[test]

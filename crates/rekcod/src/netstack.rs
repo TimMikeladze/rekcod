@@ -247,7 +247,8 @@ impl Drop for Handle {
 /// Serves the network card whose daemon end is `fd` until the handle is dropped.
 pub fn start(fd: OwnedFd, policy: Arc<Policy>, log: Logger) -> io::Result<Handle> {
     socket2::SockRef::from(&fd).set_nonblocking(true)?;
-    let fd = AsyncFd::new(fd)?;
+    // SAFETY: an OwnedFd stays open, as the same descriptor, until the AsyncFd drops it.
+    let fd = unsafe { AsyncFd::register(fd) }?;
     let (udp_tx, udp_rx) = mpsc::channel(1024);
     let mut dev = Dev::default();
     let mut cfg = Config::new(HardwareAddress::Ethernet(EthernetAddress(GATEWAY_MAC)));

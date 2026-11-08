@@ -27,7 +27,7 @@ rusqlite = { version = "0.37", features = ["bundled"] }
 hmac = "0.12"
 sha2 = "0.10"
 aes-gcm = "0.10"
-zstd = "0.13"
+zstd = "0.14"
 objc2-app-kit = "0.3"
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio"] }

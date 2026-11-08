@@ -1,0 +1,75 @@
+<div class="search" data-search>
+  <label class="search-field">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" /><path d="m16 16 4 4" /></svg>
+    <span class="sr-only">Search documentation</span>
+    <input type="search" placeholder="Search docs…" autocomplete="off" aria-controls="search-results" />
+    <kbd aria-hidden="true">/</kbd>
+  </label>
+  <div id="search-results" class="search-results" hidden>
+    <p class="search-status" role="status" aria-live="polite"></p>
+    <ul aria-label="Search results"></ul>
+  </div>
+</div>
+
+<script>
+  interface SearchDocument { title: string; url: string; text: string }
+  const search = document.querySelector<HTMLElement>('[data-search]');
+  const input = search?.querySelector('input');
+  const panel = search?.querySelector<HTMLElement>('.search-results');
+  const status = search?.querySelector<HTMLElement>('.search-status');
+  const list = search?.querySelector('ul');
+  let documents: Promise<SearchDocument[]> | undefined;
+  let revision = 0;
+
+  async function loadDocuments() {
+    documents ??= fetch('/search.json').then((response) => {
+      if (!response.ok) throw new Error('Search unavailable');
+      return response.json() as Promise<SearchDocument[]>;
+    }).catch((error) => { documents = undefined; throw error; });
+    return documents;
+  }
+
+  async function update() {
+    if (!input || !panel || !status || !list) return;
+    const current = ++revision;
+    const query = input.value.trim().toLowerCase();
+    panel.hidden = !query;
+    list.replaceChildren();
+    if (!query) return;
+    status.textContent = 'Searching…';
+    try {
+      const index = await loadDocuments();
+      if (current !== revision) return;
+      const words = query.split(/\s+/);
+      const results = index.filter((doc) => words.every((word) => `${doc.title} ${doc.text}`.toLowerCase().includes(word)))
+        .sort((a, b) => Number(b.title.toLowerCase().includes(query)) - Number(a.title.toLowerCase().includes(query)))
+        .slice(0, 8);
+      status.textContent = results.length ? `${results.length} matching ${results.length === 1 ? 'document' : 'documents'}` : 'No matching documents. Try another word.';
+      for (const doc of results) {
+        const item = document.createElement('li');
+        const link = document.createElement('a');
+        link.href = doc.url;
+        link.textContent = doc.title;
+        item.append(link);
+        list.append(item);
+      }
+    } catch {
+      if (current === revision) status.textContent = 'Search could not load. Type again to retry.';
+    }
+  }
+
+  input?.addEventListener('input', update);
+  input?.addEventListener('focus', () => { if (input.value.trim()) void update(); });
+  document.addEventListener('click', (event) => {
+    if (panel && !search?.contains(event.target as Node)) panel.hidden = true;
+  });
+  document.addEventListener('keydown', (event) => {
+    if (!input || !panel) return;
+    if (event.key === 'Escape') { panel.hidden = true; input.blur(); }
+    const target = event.target as HTMLElement;
+    if (event.key === '/' && !target.closest('input, textarea, [contenteditable]')) {
+      event.preventDefault();
+      input.focus();
+    }
+  });
+</script>

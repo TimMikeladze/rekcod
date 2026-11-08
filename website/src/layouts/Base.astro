@@ -1,0 +1,77 @@
+---
+import '@fontsource-variable/geist';
+import '@fontsource-variable/geist-mono';
+import '../styles/global.css';
+import Search from '../components/Search.astro';
+import Arrow from '../components/Arrow.astro';
+import { repository } from '../lib/content';
+
+interface Props { title: string; description: string; docs?: boolean; source?: string; noindex?: boolean }
+const { title, description, docs = false, source = 'README.md', noindex = false } = Astro.props;
+const canonical = new URL(Astro.url.pathname, Astro.site);
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="theme-color" content="#ffffff" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content={title} />
+    <meta property="og:description" content={description} />
+    <meta property="og:url" content={canonical} />
+    <meta name="twitter:card" content="summary" />
+    {noindex && <meta name="robots" content="noindex" />}
+    <link rel="canonical" href={canonical} />
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <link rel="sitemap" href="/sitemap.xml" />
+    <title>{title}</title>
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+    <header class:list={['site-header', { 'has-search': docs }]}>
+      <a class="wordmark" href="/" aria-label="rekcod home"><img src="/logo.svg" alt="" width="32" height="32" /></a>
+      {docs && <Search />}
+      <nav class="header-nav" aria-label="Main navigation">
+        <a href="/docs/" aria-current={docs ? 'page' : undefined}>Docs</a>
+        <a href={repository}>GitHub <Arrow /></a>
+      </nav>
+    </header>
+    <slot />
+    <footer class="site-footer">
+      <a href="/">rekcod</a>
+      <div>
+        <a href={`${repository}/blob/main/${source}`}>View source <Arrow /></a>
+        <a href={`${repository}/blob/main/LICENSE`}>License</a>
+      </div>
+    </footer>
+    <div class="sr-only" role="status" aria-live="polite" id="copy-status"></div>
+    <script>
+      for (const pre of document.querySelectorAll<HTMLPreElement>('.prose pre')) {
+        const button = document.createElement('button');
+        button.className = 'copy-code';
+        button.type = 'button';
+        button.textContent = 'Copy';
+        button.setAttribute('aria-label', 'Copy code');
+        button.addEventListener('click', async () => {
+          try {
+            await navigator.clipboard.writeText(pre.querySelector('code')?.textContent ?? '');
+            button.textContent = 'Copied';
+            document.querySelector('#copy-status')!.textContent = 'Code copied to clipboard.';
+            setTimeout(() => { button.textContent = 'Copy'; }, 2000);
+          } catch {
+            button.textContent = 'Select code';
+            const range = document.createRange();
+            range.selectNodeContents(pre.querySelector('code') ?? pre);
+            const selection = window.getSelection();
+            selection?.removeAllRanges();
+            selection?.addRange(range);
+            document.querySelector('#copy-status')!.textContent = 'Code selected. Use your keyboard to copy.';
+          }
+        });
+        pre.append(button);
+      }
+    </script>
+  </body>
+</html>

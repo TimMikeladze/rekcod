@@ -37,6 +37,7 @@ How a feature behaves today and how to drive it.
 
 ## Building and releasing
 
+- [website.md](website.md): the Markdown landing page and docs viewer, local development and Vercel deployment.
 - [guest-build.md](guest-build.md): how `guest/build.sh` builds the guest, pinned versions.
 - [custom-kernel.md](custom-kernel.md): the guest kernel config and its measurements.
 - [releasing.md](releasing.md): tags, release assets, notarization, the e2e runner,

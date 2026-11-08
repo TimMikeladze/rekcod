@@ -2,3 +2,9 @@
 /out
 __pycache__/
 .DS_Store
+website/node_modules/
+website/dist/
+website/.astro/
+.vercel/
+.impeccable/review/
+.env.local

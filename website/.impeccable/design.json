@@ -1,0 +1,337 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-11-08T23:47:42.988Z",
+  "title": "Design System: rekcod website",
+  "extensions": {
+    "colorMeta": {
+      "background": {
+        "role": "neutral",
+        "displayName": "Page white",
+        "canonical": "#fff",
+        "tonalRamp": [
+          "oklch(15% 0.0000 0)",
+          "oklch(27% 0.0000 0)",
+          "oklch(39% 0.0000 0)",
+          "oklch(51% 0.0000 0)",
+          "oklch(63% 0.0000 0)",
+          "oklch(75% 0.0000 0)",
+          "oklch(87% 0.0000 0)",
+          "oklch(95% 0.0000 0)"
+        ]
+      },
+      "foreground": {
+        "role": "primary",
+        "displayName": "Reading near-black",
+        "canonical": "#20201e",
+        "tonalRamp": [
+          "oklch(15% 0.0012 106)",
+          "oklch(27% 0.0024 106)",
+          "oklch(39% 0.0036 106)",
+          "oklch(51% 0.0040 106)",
+          "oklch(63% 0.0040 106)",
+          "oklch(75% 0.0034 106)",
+          "oklch(87% 0.0020 106)",
+          "oklch(95% 0.0008 106)"
+        ]
+      },
+      "muted": {
+        "role": "neutral",
+        "displayName": "Secondary gray",
+        "canonical": "#62625d",
+        "tonalRamp": [
+          "oklch(15% 0.0027 106)",
+          "oklch(27% 0.0054 106)",
+          "oklch(39% 0.0081 106)",
+          "oklch(51% 0.0090 106)",
+          "oklch(63% 0.0090 106)",
+          "oklch(75% 0.0076 106)",
+          "oklch(87% 0.0045 106)",
+          "oklch(95% 0.0018 106)"
+        ]
+      },
+      "line": {
+        "role": "neutral",
+        "displayName": "Divider gray",
+        "canonical": "#e7e7e3",
+        "tonalRamp": [
+          "oklch(15% 0.0018 106)",
+          "oklch(27% 0.0036 106)",
+          "oklch(39% 0.0054 106)",
+          "oklch(51% 0.0060 106)",
+          "oklch(63% 0.0060 106)",
+          "oklch(75% 0.0051 106)",
+          "oklch(87% 0.0030 106)",
+          "oklch(95% 0.0012 106)"
+        ]
+      },
+      "surface": {
+        "role": "neutral",
+        "displayName": "Code and field surface",
+        "canonical": "#f7f7f5",
+        "tonalRamp": [
+          "oklch(15% 0.0009 106)",
+          "oklch(27% 0.0018 106)",
+          "oklch(39% 0.0027 106)",
+          "oklch(51% 0.0030 106)",
+          "oklch(63% 0.0030 106)",
+          "oklch(75% 0.0026 106)",
+          "oklch(87% 0.0015 106)",
+          "oklch(95% 0.0006 106)"
+        ]
+      },
+      "hover": {
+        "role": "neutral",
+        "displayName": "Control hover gray",
+        "canonical": "#efefec",
+        "tonalRamp": [
+          "oklch(15% 0.0012 106)",
+          "oklch(27% 0.0024 106)",
+          "oklch(39% 0.0036 106)",
+          "oklch(51% 0.0040 106)",
+          "oklch(63% 0.0040 106)",
+          "oklch(75% 0.0034 106)",
+          "oklch(87% 0.0020 106)",
+          "oklch(95% 0.0008 106)"
+        ]
+      },
+      "focus": {
+        "role": "primary",
+        "displayName": "Keyboard focus blue",
+        "canonical": "#3065c7",
+        "tonalRamp": [
+          "oklch(15% 0.0480 260)",
+          "oklch(27% 0.0960 260)",
+          "oklch(39% 0.1440 260)",
+          "oklch(51% 0.1600 260)",
+          "oklch(63% 0.1600 260)",
+          "oklch(75% 0.1360 260)",
+          "oklch(87% 0.0800 260)",
+          "oklch(95% 0.0320 260)"
+        ]
+      },
+      "button-hover": {
+        "role": "primary",
+        "displayName": "Primary action hover",
+        "canonical": "#3f3f39",
+        "tonalRamp": [
+          "oklch(15% 0.0036 106)",
+          "oklch(27% 0.0072 106)",
+          "oklch(39% 0.0108 106)",
+          "oklch(51% 0.0120 106)",
+          "oklch(63% 0.0120 106)",
+          "oklch(75% 0.0102 106)",
+          "oklch(87% 0.0060 106)",
+          "oklch(95% 0.0024 106)"
+        ]
+      },
+      "selection": {
+        "role": "neutral",
+        "displayName": "Text selection blue",
+        "canonical": "#dce6f8",
+        "tonalRamp": [
+          "oklch(15% 0.0105 260)",
+          "oklch(27% 0.0210 260)",
+          "oklch(39% 0.0315 260)",
+          "oklch(51% 0.0350 260)",
+          "oklch(63% 0.0350 260)",
+          "oklch(75% 0.0298 260)",
+          "oklch(87% 0.0175 260)",
+          "oklch(95% 0.0070 260)"
+        ]
+      },
+      "logo-ink": {
+        "role": "neutral",
+        "displayName": "Logo black",
+        "canonical": "#000",
+        "tonalRamp": [
+          "oklch(15% 0 0)",
+          "oklch(27% 0 0)",
+          "oklch(39% 0 0)",
+          "oklch(51% 0 0)",
+          "oklch(63% 0 0)",
+          "oklch(75% 0 0)",
+          "oklch(87% 0 0)",
+          "oklch(95% 0 0)"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Landing title",
+        "purpose": "Landing h1; fluid display type."
+      },
+      "headline": {
+        "displayName": "Document title",
+        "purpose": "Markdown h1; 32px at most 760px."
+      },
+      "title": {
+        "displayName": "Section heading",
+        "purpose": "Markdown h2; 22px at most 760px."
+      },
+      "subheading": {
+        "displayName": "Subsection heading",
+        "purpose": "Markdown h3."
+      },
+      "lead": {
+        "displayName": "README introduction",
+        "purpose": "First landing intro paragraph; 21px at most 760px."
+      },
+      "body": {
+        "displayName": "Markdown body",
+        "purpose": "Main reading text."
+      },
+      "label": {
+        "displayName": "Primary action label",
+        "purpose": "14px medium labels inside the primary action."
+      },
+      "code": {
+        "displayName": "Code block",
+        "purpose": "Geist Mono block code; 12px at most 760px."
+      }
+    },
+    "shadows": [],
+    "motion": [],
+    "breakpoints": [
+      {
+        "name": "wide-min",
+        "value": "1440px"
+      },
+      {
+        "name": "footer-gutters-max",
+        "value": "1230px"
+      },
+      {
+        "name": "two-column-max",
+        "value": "1100px"
+      },
+      {
+        "name": "mobile-max",
+        "value": "760px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Primary action",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Get started link. Styles: src/styles/global.css:108; markup: src/pages/index.astro.",
+      "html": "<a class=\"ds-button\" href=\"/docs/getting-started/\">Get started <svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M5 12h14m-6-6 6 6-6 6\"/></svg></a>",
+      "css": ".ds-button { font-family: var(--sans, 'Geist Variable', sans-serif); display: inline-flex; align-items: center; justify-content: center; gap: 16px; min-height: 44px; border-radius: 6px; padding: 10px 16px; color: var(--background, #fff); background: var(--foreground, #20201e); font-size: 14px; font-weight: 500; line-height: 1.6; text-decoration: none; } .ds-button:hover { background: #3f3f39; } .ds-button:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; }"
+    },
+    {
+      "name": "Text action",
+      "kind": "button",
+      "refersTo": "text-link",
+      "description": "Read the docs link. Styles: src/styles/global.css:110; markup: src/pages/index.astro.",
+      "html": "<a class=\"ds-text-link\" href=\"/docs/\">Read the docs <svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" stroke-linecap=\"round\" stroke-linejoin=\"round\" aria-hidden=\"true\"><path d=\"M5 12h14m-6-6 6 6-6 6\"/></svg></a>",
+      "css": ".ds-text-link { font-family: var(--sans, 'Geist Variable', sans-serif); display: inline-flex; align-items: center; gap: 8px; min-height: 44px; color: var(--foreground, #20201e); font-size: 14px; line-height: 1.6; text-decoration: none; text-underline-offset: 4px; text-decoration-thickness: 1px; } .ds-text-link:hover { text-decoration: underline; } .ds-text-link:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; }"
+    },
+    {
+      "name": "Documentation search",
+      "kind": "input",
+      "refersTo": "search-field",
+      "description": "Field wrapper owns focus; shortcut hides at 760px. Styles: src/styles/global.css:134; markup: src/components/Search.astro.",
+      "html": "<label class=\"ds-search-field\"><svg width=\"16\" height=\"16\" viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\" aria-hidden=\"true\"><circle cx=\"10.5\" cy=\"10.5\" r=\"6.5\"/><path d=\"m16 16 4 4\"/></svg><input type=\"search\" placeholder=\"Search docs\u2026\" aria-label=\"Search documentation\"/><kbd class=\"ds-shortcut\" aria-hidden=\"true\">/</kbd></label>",
+      "css": ".ds-search-field { font-family: var(--sans, 'Geist Variable', sans-serif); display: flex; align-items: center; gap: 10px; width: min(100%, 280px); min-height: 44px; padding: 0 12px; border: 1px solid var(--line, #e7e7e3); border-radius: 6px; color: var(--muted, #62625d); background: var(--surface, #f7f7f5); } .ds-search-field input { font-family: var(--sans, 'Geist Variable', sans-serif); width: 100%; min-width: 0; height: 42px; background: transparent; border: 0; outline: none; color: var(--foreground, #20201e); caret-color: var(--focus, #3065c7); font-size: 13px; } .ds-search-field input::placeholder { color: var(--muted, #62625d); } .ds-search-field:focus-within { outline: 2px solid var(--focus, #3065c7); outline-offset: 2px; } .ds-search-field input:focus-visible { outline: none; } .ds-shortcut { font: 11px var(--mono, 'Geist Mono Variable', monospace); border: 1px solid var(--line, #e7e7e3); padding: 0 5px; border-radius: 3px; } @media (max-width: 760px) { .ds-search-field { width: 100%; } .ds-shortcut { display: none; } }"
+    },
+    {
+      "name": "Document selector",
+      "kind": "input",
+      "refersTo": "document-select",
+      "description": "Native mobile select. Styles: src/styles/global.css:183; markup: src/pages/docs/[...slug].astro.",
+      "html": "<select class=\"ds-document-select\" aria-label=\"Choose a document\"><option>Overview</option><option selected>Getting started</option><option>Configuration</option></select>",
+      "css": ".ds-document-select { font-family: var(--sans, 'Geist Variable', sans-serif); width: 100%; min-width: 0; min-height: 44px; font-size: 13px; line-height: 1.6; color: var(--foreground, #20201e); background: var(--background, #fff); border: 1px solid var(--line, #e7e7e3); border-radius: 4px; padding: 8px; cursor: pointer; } .ds-document-select:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; }"
+    },
+    {
+      "name": "Document navigation",
+      "kind": "nav",
+      "refersTo": "nav-link",
+      "description": "Compact sidebar links with full background current state. Styles: src/styles/global.css:114; markup: src/pages/docs/[...slug].astro.",
+      "html": "<nav class=\"ds-document-nav\" aria-label=\"Documentation\"><a href=\"/docs/\" class=\"ds-nav-link\">Overview</a><a href=\"/docs/getting-started/\" class=\"ds-nav-link\" aria-current=\"page\">Getting started</a><a href=\"/docs/configuration/\" class=\"ds-nav-link\">Configuration</a></nav>",
+      "css": ".ds-document-nav { font-family: var(--sans, 'Geist Variable', sans-serif); font-size: 13px; } .ds-nav-link { display: block; padding: 8px 10px; border-radius: 4px; line-height: 1.45; color: var(--muted, #62625d); text-decoration: none; } .ds-nav-link:hover { color: var(--foreground, #20201e); background: var(--surface, #f7f7f5); } .ds-nav-link[aria-current] { color: var(--foreground, #20201e); background: var(--surface, #f7f7f5); font-weight: 550; } .ds-nav-link:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; }"
+    },
+    {
+      "name": "Code block",
+      "kind": "custom",
+      "refersTo": "code-block",
+      "description": "Scrollable code with reserved copy-button space. Styles: src/styles/global.css:87; copy behavior: src/layouts/Base.astro.",
+      "html": "<pre class=\"ds-code-block\" tabindex=\"0\"><code class=\"ds-code\"><span style=\"color:#702C00\">rekcod</span><span style=\"color:#032563\"> run</span><span style=\"color:#023B95\"> --rm</span><span style=\"color:#032563\"> hello-world</span></code><button class=\"ds-copy-code\" type=\"button\" aria-label=\"Copy code\">Copy</button></pre>",
+      "css": ".ds-code-block { font-family: var(--mono, 'Geist Mono Variable', monospace); position: relative; border: 1px solid var(--line, #e7e7e3); border-radius: 8px; padding: 24px 72px 24px 24px; margin: 24px 0; overflow: auto; color: #0e1116; background: var(--surface, #f7f7f5); font-size: 13px; line-height: 1.8; tab-size: 2; scrollbar-width: thin; scrollbar-color: #c7c7c0 var(--surface, #f7f7f5); } .ds-code { font-family: var(--mono, 'Geist Mono Variable', monospace); display: block; width: max-content; min-width: 100%; font-size: inherit; } .ds-copy-code { font-family: var(--sans, 'Geist Variable', sans-serif); position: absolute; top: 12px; right: 12px; border: 0; border-radius: 4px; min-width: 44px; min-height: 44px; padding: 8px; background: var(--surface, #f7f7f5); color: var(--muted, #62625d); font-size: 11px; line-height: 1.6; cursor: pointer; } .ds-copy-code:hover { background: var(--hover, #efefec); color: var(--foreground, #20201e); } .ds-copy-code:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; } @media (max-width: 760px) { .ds-code-block { padding: 20px 64px 20px 16px; font-size: 12px; } } .ds-code-block:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; }"
+    },
+    {
+      "name": "Code copy control",
+      "kind": "button",
+      "refersTo": "copy-code",
+      "description": "Copy button default and hover states. Runtime feedback belongs to src/layouts/Base.astro; preview is visual only.",
+      "html": "<button class=\"ds-copy\" type=\"button\" aria-label=\"Copy code\">Copy</button>",
+      "css": ".ds-copy { font-family: var(--sans, 'Geist Variable', sans-serif); border: 0; border-radius: 4px; min-width: 44px; min-height: 44px; padding: 8px; background: var(--surface, #f7f7f5); color: var(--muted, #62625d); font-size: 11px; line-height: 1.6; cursor: pointer; } .ds-copy:hover { background: var(--hover, #efefec); color: var(--foreground, #20201e); } .ds-copy:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; }"
+    },
+    {
+      "name": "Search results",
+      "kind": "custom",
+      "refersTo": "search-results",
+      "description": "Flat outlined result panel; rendered in normal flow for preview. Styles: src/styles/global.css:141; behavior: src/components/Search.astro.",
+      "html": "<div class=\"ds-search-results\"><p class=\"ds-search-status\" role=\"status\">1 matching document</p><ul class=\"ds-result-list\" aria-label=\"Search results\"><li><a class=\"ds-result\" href=\"/docs/getting-started/\">Getting started</a></li></ul></div>",
+      "css": ".ds-search-results { font-family: var(--sans, 'Geist Variable', sans-serif); width: max(100%, 360px); max-height: 60dvh; overflow: auto; border: 1px solid var(--line, #e7e7e3); border-radius: 8px; padding: 8px; background: var(--background, #fff); color: var(--foreground, #20201e); } .ds-search-status { font-size: 12px; line-height: 1.6; color: var(--muted, #62625d); padding: 8px; margin: 0; } .ds-result-list { list-style: none; padding: 0; margin: 0; } .ds-result { display: flex; align-items: center; min-height: 44px; padding: 10px; text-decoration: none; color: inherit; font-size: 13px; line-height: 1.6; border-radius: 4px; } .ds-result:hover, .ds-result:focus { background: var(--surface, #f7f7f5); } .ds-result:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; } @media (max-width: 760px) { .ds-search-results { width: 100%; } }"
+    },
+    {
+      "name": "Brand link",
+      "kind": "nav",
+      "refersTo": "wordmark",
+      "description": "Logo-only home link. Exact public/logo.svg geometry inlined for the preview; header and favicon reuse that asset. Source: src/layouts/Base.astro and src/styles/global.css:46.",
+      "html": "<a class=\"ds-wordmark\" href=\"/\" aria-label=\"rekcod home\"><svg class=\"ds-logo\" width=\"32\" height=\"32\" aria-hidden=\"true\" xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 24 24\">\n  <title>rekcod</title>\n  \n  <rect width=\"24\" height=\"24\" fill=\"#fff\" />\n  <path transform=\"rotate(180 12 12)\" fill=\"#000\" d=\"M13.983 11.078h2.119a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.119a.185.185 0 00-.185.185v1.888c0 .102.083.185.185.185m-2.954-5.43h2.118a.186.186 0 00.186-.186V3.574a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m0 2.716h2.118a.187.187 0 00.186-.186V6.29a.186.186 0 00-.186-.185h-2.118a.185.185 0 00-.185.185v1.887c0 .102.082.185.185.186m-2.93 0h2.12a.186.186 0 00.184-.186V6.29a.185.185 0 00-.185-.185H8.1a.185.185 0 00-.185.185v1.887c0 .102.083.185.185.186m-2.964 0h2.119a.186.186 0 00.185-.186V6.29a.185.185 0 00-.185-.185H5.136a.186.186 0 00-.186.185v1.887c0 .102.084.185.186.186m5.893 2.715h2.118a.186.186 0 00.186-.185V9.006a.186.186 0 00-.186-.186h-2.118a.185.185 0 00-.185.185v1.888c0 .102.082.185.185.185m-2.93 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.083.185.185.185m-2.964 0h2.119a.185.185 0 00.185-.185V9.006a.185.185 0 00-.184-.186h-2.12a.186.186 0 00-.186.186v1.887c0 .102.084.185.186.185m-2.92 0h2.12a.185.185 0 00.184-.185V9.006a.185.185 0 00-.184-.186h-2.12a.185.185 0 00-.184.185v1.888c0 .102.082.185.185.185M23.763 9.89c-.065-.051-.672-.51-1.954-.51-.338.001-.676.03-1.01.087-.248-1.7-1.653-2.53-1.716-2.566l-.344-.199-.226.327c-.284.438-.49.922-.612 1.43-.23.97-.09 1.882.403 2.661-.595.332-1.55.413-1.744.42H.751a.751.751 0 00-.75.748 11.376 11.376 0 00.692 4.062c.545 1.428 1.355 2.48 2.41 3.124 1.18.723 3.1 1.137 5.275 1.137.983.003 1.963-.086 2.93-.266a12.248 12.248 0 003.823-1.389c.98-.567 1.86-1.288 2.61-2.136 1.252-1.418 1.998-2.997 2.553-4.4h.221c1.372 0 2.215-.549 2.68-1.009.309-.293.55-.65.707-1.046l.098-.288Z\" />\n</svg></a>",
+      "css": ".ds-wordmark { display: inline-flex; align-items: center; justify-content: center; min-width: 44px; min-height: 44px; text-decoration: none; } .ds-logo { display: block; width: 32px; height: 32px; } .ds-wordmark:focus-visible { outline: 2px solid var(--focus, #3065c7); outline-offset: 4px; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "Super minimal Markdown reader",
+    "overview": "The user's explicit direction is super minimal. The landing page and documentation\nshare an untextured white surface, near-black text and fine gray dividers. The\nminimal brief overrides ornamental concepts. Direction reference: `seed:86aa5abe0dc81372`.\n\nFORM: a code-led Markdown reader with a typographic landing page. Self-hosted Geist\ncarries the reading text; Geist Mono carries code. The README introduction supplies\nthe landing lead. Spacing, type size and full-surface background changes establish\nhierarchy. No decorative imagery, shadows, animation or transitions are implemented.\n\nThe user explicitly chose the Docker whale rotated 180 degrees, in black and white,\nas the logo. The same SVG identifies the header and the browser favicon. This brand\nasset is part of the minimal interface. The app bar shows the logo without the product name.",
+    "keyCharacteristics": [
+      "White page, near-black text and quiet neutral surfaces.",
+      "Geist text with Geist Mono code.",
+      "A centered landing column and responsive documentation grid.",
+      "Native document selection on mobile and visible keyboard focus.",
+      "A black and white Docker whale rotated 180 degrees."
+    ],
+    "rules": [
+      {
+        "name": "The Full Surface Rule",
+        "body": "Use a uniform background for selection and grouping. Borders divide or outline; they never form decorative left-edge rails.",
+        "section": "colors"
+      },
+      {
+        "name": "The Reading Rule",
+        "body": "Keep prose at the body size and line height. Reserve the display treatment for the landing title and use heading spacing to expose document structure.",
+        "section": "typography"
+      },
+      {
+        "name": "The Contained Overflow Rule",
+        "body": "Code blocks and tables scroll within their containers. Preserve native browser history gestures and document scrolling.",
+        "section": "layout"
+      },
+      {
+        "name": "The Logo Rule",
+        "body": "Use the Docker whale rotated 180 degrees in black and white for the header and favicon. The app bar shows only the symbol. Keep its geometry intact.",
+        "section": "shapes"
+      },
+      {
+        "name": "The Visible Focus Rule",
+        "body": "Keep the global keyboard outline visible (2px, offset 4px). Search may place that outline on the field wrapper; do not remove the wrapper treatment when suppressing the input outline.",
+        "section": "components"
+      }
+    ],
+    "dos": [
+      "Do use the shared Geist and Geist Mono families.",
+      "Do preserve Markdown structure, readable prose and contained code/table scrolling.",
+      "Do indicate the current document with a full surface background.",
+      "Do retain visible keyboard focus and native browser navigation gestures."
+    ],
+    "donts": [
+      "Don't add decorative imagery, motion, shadows or gradients to this minimal system.",
+      "Don't add decorative left-edge rails to navigation, quotes or containers.",
+      "Don't invent a dark theme or an ornamental accent palette.",
+      "Don't give body copy the landing title's display treatment."
+    ]
+  }
+}

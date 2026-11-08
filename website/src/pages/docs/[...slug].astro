@@ -1,0 +1,66 @@
+---
+import Base from '../../layouts/Base.astro';
+import Arrow from '../../components/Arrow.astro';
+import { compileMarkdown, getDocuments, getNavigation, repository } from '../../lib/content';
+
+export async function getStaticPaths() {
+  const documents = await getDocuments();
+  const navigation = getNavigation(documents);
+  const files = new Set(documents.map((doc) => doc.file));
+  return documents.filter((doc) => doc.url !== '/').map((doc) => ({
+    params: { slug: doc.url.replace(/^\/docs\//, '').replace(/\/$/, '') || undefined },
+    props: { doc, navigation, files },
+  }));
+}
+
+const { doc, navigation, files } = Astro.props;
+const rendered = await compileMarkdown(doc.markdown, doc.file, files);
+const contents = rendered.headings.filter((heading) => heading.depth === 2 || heading.depth === 3);
+const ordered = navigation.flatMap((group) => group.items);
+const position = ordered.findIndex((item) => item.url === doc.url);
+const previous = position > 0 ? ordered[position - 1] : null;
+const next = position >= 0 ? ordered[position + 1] : ordered[0];
+---
+<Base title={`${doc.title} — rekcod`} description={doc.description} docs source={doc.file}>
+  <div class="mobile-navigation">
+    <label for="document-select">Documentation</label>
+    <select id="document-select" aria-label="Choose a document">
+      <option value="/docs/" selected={doc.url === '/docs/'}>Overview</option>
+      {navigation.map((group) => <optgroup label={group.title}>
+        {group.items.map((item) => <option value={item.url} selected={item.url === doc.url}>{item.title}</option>)}
+      </optgroup>)}
+    </select>
+  </div>
+  <div class="docs-layout">
+    <aside class="docs-sidebar" aria-label="Documentation navigation">
+      <nav>
+        <a class="overview-link" href="/docs/" aria-current={doc.url === '/docs/' ? 'page' : undefined}>Overview</a>
+        {navigation.map((group) => <section class="nav-group">
+          <h2>{group.title}</h2>
+          <ul>{group.items.map((item) => <li><a href={item.url} aria-current={item.url === doc.url ? 'page' : undefined}>{item.title}</a></li>)}</ul>
+        </section>)}
+      </nav>
+    </aside>
+    <main id="main" class="doc-main">
+      <article class="prose" set:html={rendered.html} />
+      <a class="edit-link" href={`${repository}/edit/main/${doc.file}`}>Edit this page on GitHub <Arrow /></a>
+      <nav class="page-navigation" aria-label="Adjacent documents">
+        {previous ? <a href={previous.url}><span>Previous</span>{previous.title}</a> : <span />}
+        {next && <a href={next.url}><span>Next</span>{next.title}</a>}
+      </nav>
+    </main>
+    {contents.length > 0 && <aside class="on-this-page" aria-label="On this page">
+      <p>On this page</p>
+      <nav><ul>{contents.map((heading) => <li class:list={{ nested: heading.depth === 3 }}><a href={`#${heading.id}`}>{heading.text}</a></li>)}</ul></nav>
+    </aside>}
+  </div>
+</Base>
+
+<script>
+  document.querySelector<HTMLSelectElement>('#document-select')?.addEventListener('change', (event) => {
+    window.location.assign((event.target as HTMLSelectElement).value);
+  });
+  const sidebar = document.querySelector<HTMLElement>('.docs-sidebar');
+  const current = sidebar?.querySelector<HTMLElement>('[aria-current="page"]');
+  if (sidebar && current) sidebar.scrollTop = current.offsetTop - sidebar.clientHeight / 2;
+</script>

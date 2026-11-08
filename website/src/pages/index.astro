@@ -1,0 +1,25 @@
+---
+import Base from '../layouts/Base.astro';
+import Arrow from '../components/Arrow.astro';
+import { compileMarkdown, getDocuments, landingParts } from '../lib/content';
+
+const documents = await getDocuments();
+const readme = documents.find((doc) => doc.file === 'README.md')!;
+const files = new Set(documents.map((doc) => doc.file));
+const parts = landingParts(readme.markdown);
+const intro = await compileMarkdown(parts.intro, readme.file, files);
+const body = await compileMarkdown(parts.body, readme.file, files);
+---
+<Base title={`${parts.title} — ${readme.description.split('.')[0]}`} description={readme.description}>
+  <main id="main" class="landing">
+    <section class="hero" aria-labelledby="hero-title">
+      <h1 id="hero-title">{parts.title}</h1>
+      <div class="prose hero-intro" set:html={intro.html} />
+      <div class="hero-actions">
+        <a class="button" href="/docs/getting-started/">Get started <Arrow direction="right" /></a>
+        <a class="text-link" href="/docs/">Read the docs <Arrow direction="right" /></a>
+      </div>
+    </section>
+    <article class="prose readme" aria-label="README" set:html={body.html} />
+  </main>
+</Base>

@@ -80,7 +80,7 @@ cr app deploy --git "$url" --ref main --name hello >/dev/null 2>&1 && echo "dev-
 cr app deploy --git "$url" --ref "$v1" --name nap --idle-stop 30s >/dev/null || echo "dev-fleet: nap deploy failed"
 
 echo "dev-fleet: jobs"
-job() { cr job run --git "$url" --ref "$v1" --image alpine:3.22 "$@"; }
+job() { cr job run --git "$url" --ref "$v1" --image alpine:3.24 "$@"; }
 job --name ok -- sh -c 'cat VERSION; echo done' >/dev/null 2>&1
 job --name broken -- sh -c 'echo about to fail; exit 3' >/dev/null 2>&1
 job --name slow --detach -- sh -c 'for i in $(seq 120); do echo tick $i; sleep 1; done' >/dev/null

@@ -19,9 +19,9 @@ use crate::safefs::{Dir, State};
 /// The long-running container `exec` runs in.
 pub const WS: &str = "rekcod-ws";
 const DISK_GIB: u64 = 64;
-const DEFAULT_IMAGE: &str = "debian:bookworm-slim";
+const DEFAULT_IMAGE: &str = "debian:trixie-slim";
 /// What `golden build` pulls when given no images.
-pub const GOLDEN_IMAGES: &[&str] = &["debian:bookworm-slim", "alpine:3.22", "node:lts-slim", "python:3.13-slim"];
+pub const GOLDEN_IMAGES: &[&str] = &["debian:trixie-slim", "alpine:3.24", "node:lts-slim", "python:3.14-slim"];
 /// Not compared by `diff` or written by `apply`: dirs that stay in the VM. Git's own state
 /// is left out too, under any spelling ([`is_git`]).
 const SKIP: &[&str] = &["node_modules", ".venv", "target"];

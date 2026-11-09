@@ -23,7 +23,7 @@ walk() { docker run --rm -v "$tree:/t:ro" python:3.13-slim python3 -c 'import os
 restart() { "$R" stop --no-switch >/dev/null; "$R" start --no-switch >/dev/null; }
 
 docker pull -q python:3.13-slim >/dev/null
-docker run --rm -v "$tree:/t:ro" alpine:3.22 true  # remember it as a bind source
+docker run --rm -v "$tree:/t:ro" alpine:3.24 true  # remember it as a bind source
 restart; sleep 3
 echo "warmed at boot (walk 3 s after start): $(walk) ms"
 rm -f "$HOME/.rekcod/vm/warm-paths"

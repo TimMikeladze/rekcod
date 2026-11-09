@@ -76,7 +76,7 @@ bob=$(cr controller token bob --remote admin | sed -n 's/.*"token": "\(.*\)".*/\
 cr remote add alice https://127.0.0.1:17700 --token "$alice" --ca-fingerprint "$fp"
 cr remote add bob https://127.0.0.1:17700 --token "$bob" --ca-fingerprint "$fp"
 check "new nodes wait for approval" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"pending\"")" = 3' "$R"
-check "a pending node gets nothing" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.22' "$R" "$url"
+check "a pending node gets nothing" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.24' "$R" "$url"
 for n in $(cr node ls --remote admin | sed -n 's/.*"id": "\(n-[a-z0-9]*\)".*/\1/p'); do cr node approve "$n" --remote admin >/dev/null; done
 check "three nodes ready" sh -c 'test "$("$0" node ls --remote admin | grep -c "\"ready\"")" = 3' "$R"
 check "a user token can't read routes" sh -c '! "$0" edge bans --remote alice' "$R"
@@ -84,7 +84,7 @@ edge=$(cr controller token edge --edge --remote admin | sed -n 's/.*"token": "\(
 cr remote add edge https://127.0.0.1:17700 --token "$edge" --ca-fingerprint "$fp"
 check "an edge token can't list nodes" sh -c '! "$0" node ls --remote edge' "$R"
 
-s1=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.22 2>"$C/err")
+s1=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.24 2>"$C/err")
 check "remote create from git" test -n "$s1"
 check "remote exec sees the clone" sh -c 'test "$("$0" sandbox exec --remote alice "$1" -- cat VERSION)" = v1' "$R" "$s1"
 check "remote exec keeps the exit code" sh -c '"$0" sandbox exec --remote alice "$1" -- sh -c "exit 5"; test $? = 5' "$R" "$s1"
@@ -92,9 +92,9 @@ check "another user can't reach it" sh -c '! "$0" sandbox exec --remote bob "$1"
 check "apply isn't offered remotely" sh -c '! "$0" sandbox apply --remote alice "$1"' "$R" "$s1"
 first=$(cr sandbox ls --remote alice | sed -n 's/.*"node": "\(.*\)".*/\1/p' | head -1)
 cr node drain "$first" --remote admin >/dev/null
-s2=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.22 2>/dev/null)
+s2=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.24 2>/dev/null)
 check "drained node gets no new sandboxes" sh -c '"$0" sandbox ls --remote alice | grep -A1 "\"$1\"" | grep "\"node\"" | grep -vq "$2" || "$0" sandbox ls --remote alice | grep -B3 "\"$1\"" | grep "\"node\"" | grep -vq "$2"' "$R" "$s2" "$first"
-check "quota (2) refuses a third" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.22' "$R" "$url"
+check "quota (2) refuses a third" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.24' "$R" "$url"
 check "remote rm" sh -c '"$0" sandbox rm --remote alice "$1" "$2"' "$R" "$s1" "$s2"
 sqlite3 "$C/controller/fleet.db" "update nodes set state = 'ready'"
 
@@ -193,7 +193,7 @@ check "no non-200 during the recycle" sh -c '! grep -qv "^200$" "$0" && test -s 
 check "destroy nap" cr app destroy --remote admin nap
 
 echo "jobs"
-job() { cr job run --remote alice --git "$url" --ref "$v1" --image alpine:3.22 "$@"; }
+job() { cr job run --remote alice --git "$url" --ref "$v1" --image alpine:3.24 "$@"; }
 out=$(job -- sh -c 'cat VERSION; echo hi; exit 3' 2>/dev/null); code=$?
 check "job exit code comes back" test "$code" = 3
 check "job output streams (sees the clone)" sh -c 'printf "%s" "$0" | grep -q hi && printf "%s" "$0" | grep -q v1' "$out"
@@ -218,13 +218,13 @@ carol=$(cr controller token carol --remote admin | sed -n 's/.*"token": "\(.*\)"
 cr remote add carol https://127.0.0.1:17700 --token "$carol" --ca-fingerprint "$fp"
 check "members see it in ns ls" sh -c '"$0" ns ls --remote bob | grep -q "\"name\": \"team\""' "$R"
 check "others don't" sh -c '! "$0" ns ls --remote carol | grep -q "\"team\""' "$R"
-s3=$(cr sandbox create --remote alice --ns team --git "$url" --ref main --image alpine:3.22 --cpus 1 --memory 1 2>"$C/err")
+s3=$(cr sandbox create --remote alice --ns team --git "$url" --ref main --image alpine:3.24 --cpus 1 --memory 1 2>"$C/err")
 check "sandbox in a namespace" test -n "$s3"
 check "viewer lists it" sh -c '"$0" sandbox ls --remote bob --ns team | grep -q "$1"' "$R" "$s3"
 check "viewer can't exec" sh -c '! "$0" sandbox exec --remote bob --ns team "$1" -- true' "$R" "$s3"
 check "non-member can't reach it" sh -c '! "$0" sandbox exec --remote carol --ns team "$1" -- true' "$R" "$s3"
 check "it isn't in default" sh -c '! "$0" sandbox exec --remote alice "$1" -- true' "$R" "$s3"
-check "namespace quota refuses 4 more CPUs" sh -c '"$0" sandbox create --remote alice --ns team --git "$1" --ref main --image alpine:3.22 --cpus 4 --memory 1 2>&1 | grep -q "of 4 CPUs"' "$R" "$url"
+check "namespace quota refuses 4 more CPUs" sh -c '"$0" sandbox create --remote alice --ns team --git "$1" --ref main --image alpine:3.24 --cpus 4 --memory 1 2>&1 | grep -q "of 4 CPUs"' "$R" "$url"
 cr sandbox rm --remote alice --ns team "$s3" >/dev/null
 check "deploy into team" cr app deploy --remote alice --ns team --git "$url" --ref "$v1" --name hello
 sleep 2.5

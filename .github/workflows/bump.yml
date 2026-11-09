@@ -1,0 +1,47 @@
+name: bump
+# Weekly: move the pinned guest and Mac CLI versions to the newest releases
+# (scripts/bump-versions.py) and open or update the `bump/versions` PR.
+#
+# Needs "Allow GitHub Actions to create and approve pull requests" in the repository's
+# Actions settings. A PR opened with GITHUB_TOKEN doesn't start other workflows, so this
+# dispatches ci.yml on the branch itself; its checks show on the PR's head commit.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: bump
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: bump
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/bump-versions.py --summary "$RUNNER_TEMP/body.md"
+      - name: open or update the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet; then echo "nothing to update"; exit 0; fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C bump/versions
+          git commit -qam "chore: bump pinned guest and CLI versions"
+          git push --force origin bump/versions
+          if gh pr view bump/versions --json state -q .state 2>/dev/null | grep -q OPEN; then
+            gh pr edit bump/versions --body-file "$RUNNER_TEMP/body.md"
+          else
+            gh pr create --head bump/versions --title "chore: bump pinned guest and CLI versions" --body-file "$RUNNER_TEMP/body.md"
+          fi
+          gh workflow run ci.yml --ref bump/versions

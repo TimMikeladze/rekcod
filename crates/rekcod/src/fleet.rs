@@ -720,7 +720,7 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         dir: Some(dir.clone()),
         name: Some(format!("{app}-r{release}-{}", &sandbox::new_id()?[..4])),
         mount: true,
-        image: Some("alpine:3.22".into()),
+        image: Some("alpine:3.24".into()),
         cpus: a["cpus"].as_u64().unwrap_or(1) as usize,
         memory_gib: a["memory_gib"].as_u64().unwrap_or(1),
         allow_hosts: vec!["*".into()],
@@ -934,7 +934,7 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
         .as_str()
         .map(String::from)
         .or_else(|| crate::xrun::plan(src, cmd).map(|p| p.image))
-        .unwrap_or_else(|| "alpine:3.22".into());
+        .unwrap_or_else(|| "alpine:3.24".into());
     let o = sandbox::CreateOptions {
         dir: Some(src.to_path_buf()),
         name: Some(id.to_string()),
@@ -6432,7 +6432,7 @@ mod tests {
         std::fs::write(dir.join("requirements.txt"), "").unwrap();
         let d = generated_dockerfile(&dir, "python3 app.py").unwrap();
         assert!(
-            d.starts_with("FROM python:3.13-slim\n") && d.contains("pip install") && d.ends_with("CMD [\"python3\",\"app.py\"]\n"),
+            d.starts_with("FROM python:3.14-slim\n") && d.contains("pip install") && d.ends_with("CMD [\"python3\",\"app.py\"]\n"),
             "{d}"
         );
         std::fs::remove_dir_all(dir).unwrap();

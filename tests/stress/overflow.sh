@@ -23,7 +23,7 @@ before=$(grep -c "invalidating everything under" "$log" 2>/dev/null || echo 0)
 
 mkdir -p "$root/hot"
 for i in $(seq 1 200); do echo "v1-$i" >"$root/hot/f$i"; done
-"${d[@]}" run -d --name rekcod-overflow -v "$root:/c" alpine:3.22 sleep 3600 >/dev/null
+"${d[@]}" run -d --name rekcod-overflow -v "$root:/c" alpine:3.24 sleep 3600 >/dev/null
 "${d[@]}" exec rekcod-overflow sh -c 'cat /c/hot/* >/dev/null; ls /c/hot/g1 2>/dev/null' # warm + cached negative
 
 echo "burst: $n files"

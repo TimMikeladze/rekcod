@@ -1,5 +1,5 @@
 //! Bundled docker CLI, compose and buildx for machines without a docker CLI
-//! (docs/cli-passthrough.md). Downloaded on first use, sha256-pinned, using the
+//! (`rekcod <docker command>`). Downloaded on first use, sha256-pinned, using the
 //! system `curl` and `tar`.
 
 use std::path::{Path, PathBuf};
@@ -7,7 +7,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-pub const CLI_VERSION: &str = "29.9.0";
+pub const CLI_VERSION: &str = "29.9.3";
 
 struct Asset {
     url: &'static str,
@@ -20,20 +20,20 @@ struct Asset {
 
 const ASSETS: &[Asset] = &[
     Asset {
-        url: "https://download.docker.com/mac/static/stable/aarch64/docker-29.9.0.tgz",
-        sha256: "c640fd61d9ba801e0ea282fd0df344d6943efd1994c7454537707cdb7a3d3e0b",
+        url: "https://download.docker.com/mac/static/stable/aarch64/docker-29.9.3.tgz",
+        sha256: "79145e169bca0b9571d02de8e1cd311a36e0e8fdb4599b6661a87b1bb3afbe13",
         dest: "docker",
         member: Some("docker/docker"),
     },
     Asset {
-        url: "https://github.com/docker/compose/releases/download/v5.6.0/docker-compose-darwin-aarch64",
-        sha256: "bd714a42b46e51757fc1121085b3096b9064e3f80d3ca5a991e33f44df4f43c9",
+        url: "https://github.com/docker/compose/releases/download/v5.7.0/docker-compose-darwin-aarch64",
+        sha256: "54495ff81dd8cae11861455f0308a293a530149beba8f1d90ff3f295b11cf035",
         dest: "cli-plugins/docker-compose",
         member: None,
     },
     Asset {
-        url: "https://github.com/docker/buildx/releases/download/v0.38.0/buildx-v0.38.0.darwin-arm64",
-        sha256: "85989b895add5f119c1ccf8eada2f6892fc33ccf16bd8917638eae404ef26344",
+        url: "https://github.com/docker/buildx/releases/download/v0.38.2/buildx-v0.38.2.darwin-arm64",
+        sha256: "81702e18713cfd495bfe594943fa57f470eda16c0653ae3de15cd411df273c41",
         dest: "cli-plugins/docker-buildx",
         member: None,
     },

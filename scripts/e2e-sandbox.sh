@@ -18,7 +18,7 @@ touch -t 202001010000 "$p/keep.txt" "$p/gone.txt"
 names=()
 for i in 1 2 3 4 5 6 7 8; do names+=("e2e-sb$i"); done
 
-check "create" "$R" sandbox create "$p" --name e2e-sb1 --image alpine:3.22
+check "create" "$R" sandbox create "$p" --name e2e-sb1 --image alpine:3.24
 check "exit code passes through" sh -c '"$0" sandbox exec e2e-sb1 -- sh -c "exit 7"; test $? = 7' "$R"
 check "unknown sandbox exits 2" sh -c '"$0" sandbox exec e2e-nope -- true; test $? = 2' "$R"
 check "only the project is visible" sh -c '! "$0" sandbox exec e2e-sb1 -- ls "$HOME"' "$R"
@@ -39,9 +39,9 @@ check "Mac unreachable" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 2 10.0.2.
 # daemon on the Mac decides every connection (docs/sandbox-network.md).
 lan=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || echo 192.168.64.1)
 id=$("$R" sandbox ls --json | python3 -I -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if s.get("name")=="e2e-sb1"][0])')
-DOCKER_HOST="unix://${REKCOD_HOME:-$HOME/.rekcod}/sb/$id/run/docker.sock" docker run --rm --privileged --pid=host alpine:3.22 \
+DOCKER_HOST="unix://${REKCOD_HOME:-$HOME/.rekcod}/sb/$id/run/docker.sock" docker run --rm --privileged --pid=host alpine:3.24 \
   nsenter -t 1 -m -u -n -i sh -c 'iptables -F; iptables -P OUTPUT ACCEPT; iptables -P FORWARD ACCEPT' >/dev/null 2>&1
-check "guest root flushed iptables" sh -c '! DOCKER_HOST="unix://$1/sb/$2/run/docker.sock" docker run --rm --privileged --pid=host alpine:3.22 nsenter -t 1 -n iptables -S OUTPUT | grep -q REJECT' _ "${REKCOD_HOME:-$HOME/.rekcod}" "$id"
+check "guest root flushed iptables" sh -c '! DOCKER_HOST="unix://$1/sb/$2/run/docker.sock" docker run --rm --privileged --pid=host alpine:3.24 nsenter -t 1 -n iptables -S OUTPUT | grep -q REJECT' _ "${REKCOD_HOME:-$HOME/.rekcod}" "$id"
 check "flushed: allowed registry" "$R" sandbox exec e2e-sb1 -- wget -q -T 10 -O /dev/null https://dl-cdn.alpinelinux.org/alpine/
 check "flushed: direct IPs refused" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 3 1.1.1.1 443' "$R"
 check "flushed: Mac LAN address refused" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 3 "$1" 22' "$R" "$lan"
@@ -54,7 +54,7 @@ check "fork copies the workspace" sh -c '"$0" sandbox fork e2e-sb1 --name e2e-sb
 "$R" sandbox exec e2e-sb2 -- touch child-only >/dev/null 2>&1
 check "fork: child writes stay in the child" sh -c '! "$0" sandbox exec e2e-sb1 -- test -e child-only' "$R"
 check "stop, then exec boots it again" sh -c '"$0" sandbox stop e2e-sb2 && "$0" sandbox exec e2e-sb2 -- true' "$R"
-for i in 3 4 5 6 7 8; do "$R" sandbox create "$p" --name "e2e-sb$i" --image alpine:3.22 --memory 1 >/dev/null 2>&1 & done
+for i in 3 4 5 6 7 8; do "$R" sandbox create "$p" --name "e2e-sb$i" --image alpine:3.24 --memory 1 >/dev/null 2>&1 & done
 wait
 check "8 sandboxes at once" sh -c 'test "$("$0" sandbox ls | grep -c "e2e-sb. .*running")" = 8' "$R"
 check "mcp lists tools" sh -c 'echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}" | "$0" mcp | grep -q sandbox_exec' "$R"

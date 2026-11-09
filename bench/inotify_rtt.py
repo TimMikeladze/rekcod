@@ -35,7 +35,7 @@ def main():
                'n=$(cat /w/ping) && [ -n "$n" ] && touch /r/pong-$n;; esac; done')
     subprocess.run(
         docker + ["run", "-d", "--rm", "--name", name, "-v", f"{w}:/w", "-v", f"{r}:/r",
-                  "alpine:3.22", "sh", "-c", f"inotifyd - /w | ({handler})"],
+                  "alpine:3.24", "sh", "-c", f"inotifyd - /w | ({handler})"],
         check=True, stdout=subprocess.DEVNULL,
     )
     samples = []

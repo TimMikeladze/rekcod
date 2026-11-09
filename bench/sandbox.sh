@@ -38,7 +38,7 @@ id=$($B sandbox create "$proj" --image python:3.13-slim 2>/dev/null)
 $B sandbox exec "$id" -- python3 -c "
 import time, urllib.request
 t, n = time.time(), 0
-r = urllib.request.urlopen('https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-standard-3.22.0-aarch64.iso')
+r = urllib.request.urlopen('https://dl-cdn.alpinelinux.org/alpine/v3.24/releases/aarch64/alpine-standard-3.24.4-aarch64.iso')
 while b := r.read(1 << 20):
     n += len(b)
 print(f'{n / (time.time() - t) / 1e6:.0f} MB/s ({n >> 20} MiB)')"

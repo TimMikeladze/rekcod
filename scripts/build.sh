@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build rekcod: host binary (signed for Virtualization.framework), guest agent,
 # and the guest image (out/guest). The guest image is built by guest/build.sh
-# inside the running rekcod VM (docs/guest-build.md), so `rekcod start` first.
+# inside the running rekcod VM, so `rekcod start` first.
 # KERNEL, KERNEL_REPO, FUSE_PATCH and the guest/versions.env overrides pass through.
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -25,7 +25,7 @@ export REKCOD_GUEST_WORK=/var/lib/docker/.rekcod-guest-build
 export KERNEL='${KERNEL:-}' KERNEL_REPO='${KERNEL_REPO:-}' FUSE_PATCH='${FUSE_PATCH:-}'
 export ALPINE_RELEASE='${ALPINE_RELEASE:-}' MINIROOTFS_SHA256='${MINIROOTFS_SHA256:-}'
 export DOCKER_VERSION='${DOCKER_VERSION:-}' DOCKER_SHA256='${DOCKER_SHA256:-}'
-export LINUX_VIRT_VERSION='${LINUX_VIRT_VERSION:-}' LINUX_SHA256='${LINUX_SHA256:-}'
+export LINUX_VERSION='${LINUX_VERSION:-}' LINUX_SHA256='${LINUX_SHA256:-}' LINUX_VIRT_VERSION='${LINUX_VIRT_VERSION:-}'
 sh '$PWD/guest/build.sh' '$PWD/out/agent/rekcod-agent' '$PWD/out/guest'
 EOF
 fi

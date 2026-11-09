@@ -266,8 +266,8 @@ fn plan_in(p: &Project, cmd: &[String]) -> Option<Plan> {
         Runtime::Node => format!("node:{}-slim", v.unwrap_or_else(|| "lts".into())),
         Runtime::Bun => format!("oven/bun:{}", v.unwrap_or_else(|| "1".into())),
         Runtime::Deno => "denoland/deno:latest".into(),
-        Runtime::Python if uses_uv => format!("ghcr.io/astral-sh/uv:python{}-bookworm-slim", v.unwrap_or_else(|| "3.13".into())),
-        Runtime::Python => format!("python:{}-slim", v.unwrap_or_else(|| "3.13".into())),
+        Runtime::Python if uses_uv => format!("ghcr.io/astral-sh/uv:python{}-bookworm-slim", v.unwrap_or_else(|| "3.14".into())),
+        Runtime::Python => format!("python:{}-slim", v.unwrap_or_else(|| "3.14".into())),
         Runtime::Go => format!("golang:{}", v.unwrap_or_else(|| "1".into())),
         Runtime::Rust => format!("rust:{}", v.unwrap_or_else(|| "1".into())),
         Runtime::Ruby => format!("ruby:{}-slim", v.unwrap_or_else(|| "3".into())),
@@ -507,7 +507,7 @@ mod tests {
         assert_eq!(image(&[(".tool-versions", "nodejs 18.19.0\npython 3.11.2\n")], "make"), "node:18-slim");
         assert_eq!(image(&[("mise.toml", "[tools]\npython = \"3.10\"\n")], "pytest"), "python:3.10-slim");
         // The command wins over unrelated project files.
-        assert_eq!(image(&[("package.json", "{}")], "python3 tool.py"), "python:3.13-slim");
+        assert_eq!(image(&[("package.json", "{}")], "python3 tool.py"), "python:3.14-slim");
         assert_eq!(image(&[], "./deploy.sh"), "");
     }
 
@@ -525,7 +525,7 @@ mod tests {
         assert!(read_project_file(&dir, ".python-version").is_err());
         let cloned = Project { dir: &dir, follow: false };
         assert_eq!(plan_in(&cloned, &["node".into()]).unwrap().image, "node:lts-slim");
-        assert_eq!(plan_in(&cloned, &["python".into()]).unwrap().image, "python:3.13-slim");
+        assert_eq!(plan_in(&cloned, &["python".into()]).unwrap().image, "python:3.14-slim");
         assert!(!has_project_file(&dir, ".python-version"));
         // The Mac owner's own project follows links (a monorepo's shared .python-version),
         // but still only to a regular file.

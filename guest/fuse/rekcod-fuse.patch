@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: GPL-2.0-only
 
 diff --color -ruN -x rekcod.c a/Makefile b/Makefile
---- a/Makefile	2026-10-11 11:58:15
-+++ b/Makefile	2026-10-11 11:58:15
-@@ -11,7 +11,7 @@
- obj-$(CONFIG_VIRTIO_FS) += virtiofs.o
- 
- fuse-y := dev.o dir.o file.o inode.o control.o xattr.o acl.o readdir.o ioctl.o
+--- a/Makefile	2026-11-08 19:52:11
++++ b/Makefile	2026-11-08 19:52:11
+@@ -13,7 +13,7 @@
+ fuse-y := trace.o	# put trace.o first so we see ftrace errors sooner
+ fuse-y += dev.o dir.o file.o inode.o control.o xattr.o acl.o readdir.o ioctl.o req_timeout.o req.o
+ fuse-y += poll.o notify.o
 -fuse-y += iomode.o
 +fuse-y += iomode.o rekcod.o
  fuse-$(CONFIG_FUSE_DAX) += dax.o
- fuse-$(CONFIG_FUSE_PASSTHROUGH) += passthrough.o
- 
+ fuse-$(CONFIG_FUSE_PASSTHROUGH) += passthrough.o backing.o
+ fuse-$(CONFIG_SYSCTL) += sysctl.o
 diff --color -ruN -x rekcod.c a/dir.c b/dir.c
---- a/dir.c	2026-10-11 11:58:15
-+++ b/dir.c	2026-10-11 11:58:40
-@@ -141,7 +141,8 @@
+--- a/dir.c	2026-11-08 19:52:11
++++ b/dir.c	2026-11-08 19:52:11
+@@ -334,7 +334,8 @@
   */
  void fuse_invalidate_atime(struct inode *inode)
  {
@@ -25,23 +25,23 @@ diff --color -ruN -x rekcod.c a/dir.c b/dir.c
  		fuse_invalidate_attr_mask(inode, STATX_ATIME);
  }
  
-@@ -704,6 +705,7 @@
- 	d_instantiate(entry, inode);
+@@ -910,6 +911,7 @@
+ 	fuse_dentry_set_epoch(entry, epoch);
  	fuse_change_entry_timeout(entry, &outentry);
  	fuse_dir_changed(dir);
 +	rekcod_entry_changed(entry);
  	err = generic_file_open(inode, file);
  	if (!err) {
  		file->private_data = ff;
-@@ -842,6 +844,7 @@
+@@ -1044,6 +1046,7 @@
  		fuse_change_entry_timeout(entry, &outarg);
  	}
  	fuse_dir_changed(dir);
 +	rekcod_entry_changed(entry);
- 	return 0;
+ 	return d;
  
   out_put_forget_req:
-@@ -999,6 +1002,7 @@
+@@ -1227,6 +1230,7 @@
  	if (!err) {
  		fuse_dir_changed(dir);
  		fuse_entry_unlinked(entry);
@@ -49,7 +49,7 @@ diff --color -ruN -x rekcod.c a/dir.c b/dir.c
  	} else if (err == -EINTR || err == -ENOENT)
  		fuse_invalidate_entry(entry);
  	return err;
-@@ -1022,6 +1026,7 @@
+@@ -1251,6 +1255,7 @@
  	if (!err) {
  		fuse_dir_changed(dir);
  		fuse_entry_unlinked(entry);
@@ -57,7 +57,7 @@ diff --color -ruN -x rekcod.c a/dir.c b/dir.c
  	} else if (err == -EINTR || err == -ENOENT)
  		fuse_invalidate_entry(entry);
  	return err;
-@@ -1059,6 +1064,8 @@
+@@ -1288,6 +1293,8 @@
  		fuse_dir_changed(olddir);
  		if (olddir != newdir)
  			fuse_dir_changed(newdir);
@@ -66,7 +66,7 @@ diff --color -ruN -x rekcod.c a/dir.c b/dir.c
  
  		/* newent will end up negative */
  		if (!(flags & RENAME_EXCHANGE) && d_really_is_positive(newent))
-@@ -1208,7 +1215,7 @@
+@@ -1444,7 +1451,7 @@
  	memset(&inarg, 0, sizeof(inarg));
  	memset(&outarg, 0, sizeof(outarg));
  	/* Directories have separate file-handle space */
@@ -75,7 +75,7 @@ diff --color -ruN -x rekcod.c a/dir.c b/dir.c
  		struct fuse_file *ff = file->private_data;
  
  		inarg.getattr_flags |= FUSE_GETATTR_FH;
-@@ -1269,7 +1276,7 @@
+@@ -1505,7 +1512,7 @@
  	memset(&inarg, 0, sizeof(inarg));
  	memset(&outarg, 0, sizeof(outarg));
  	/* Directories have separate file-handle space */
@@ -84,7 +84,7 @@ diff --color -ruN -x rekcod.c a/dir.c b/dir.c
  		struct fuse_file *ff = file->private_data;
  
  		inarg.getattr_flags |= FUSE_GETATTR_FH;
-@@ -1888,7 +1895,7 @@
+@@ -2125,7 +2132,7 @@
  		inarg.ctime = inode_get_ctime_sec(inode);
  		inarg.ctimensec = inode_get_ctime_nsec(inode);
  	}
@@ -93,7 +93,7 @@ diff --color -ruN -x rekcod.c a/dir.c b/dir.c
  		inarg.valid |= FATTR_FH;
  		inarg.fh = ff->fh;
  	}
-@@ -1985,7 +1992,7 @@
+@@ -2222,7 +2229,7 @@
  	memset(&inarg, 0, sizeof(inarg));
  	memset(&outarg, 0, sizeof(outarg));
  	iattr_to_fattr(idmap, fc, attr, &inarg, trust_local_cmtime);
@@ -103,8 +103,8 @@ diff --color -ruN -x rekcod.c a/dir.c b/dir.c
  		inarg.valid |= FATTR_FH;
  		inarg.fh = ff->fh;
 diff --color -ruN -x rekcod.c a/file.c b/file.c
---- a/file.c	2026-10-11 11:58:15
-+++ b/file.c	2026-10-11 11:58:15
+--- a/file.c	2026-11-08 19:52:11
++++ b/file.c	2026-11-08 19:52:11
 @@ -69,6 +69,7 @@
  	}
  
@@ -113,7 +113,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  	refcount_set(&ff->count, 1);
  	RB_CLEAR_NODE(&ff->polled_node);
  	init_waitqueue_head(&ff->poll_wait);
-@@ -110,7 +111,9 @@
+@@ -109,7 +110,9 @@
  
  		if (!args) {
  			/* Do nothing when server does not implement 'opendir' */
@@ -121,10 +121,10 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
 +		} else if ((args->opcode == FUSE_RELEASE && ff->fm->fc->no_open) ||
 +			   fuse_file_lazy(ff)) {
 +			/* never opened on the host: nothing to release there */
- 			fuse_release_end(ff->fm, args, 0);
+ 			fuse_release_end(args, 0);
  		} else if (sync) {
  			fuse_simple_request(ff->fm, args);
-@@ -149,7 +152,13 @@
+@@ -154,7 +157,13 @@
  	ff->fh = 0;
  	/* Default for no-open */
  	ff->open_flags = FOPEN_KEEP_CACHE | (isdir ? FOPEN_CACHE_DIR : 0);
@@ -139,7 +139,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  		/* Store outarg for fuse_finish_open() */
  		struct fuse_open_out *outargp = &ff->args->open_outarg;
  		int err;
-@@ -181,6 +190,25 @@
+@@ -186,6 +195,25 @@
  	return ff;
  }
  
@@ -165,7 +165,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
  		 bool isdir)
  {
-@@ -380,7 +408,8 @@
+@@ -385,7 +413,8 @@
  	 * before commencing with fs shutdown doesn't work if submounts are
  	 * used.
  	 */
@@ -175,7 +175,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  }
  
  void fuse_release_common(struct file *file, bool isdir)
-@@ -550,7 +579,7 @@
+@@ -488,7 +517,7 @@
  		return err;
  
  	err = 0;
@@ -184,7 +184,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  		goto inval_attr_out;
  
  	memset(&inarg, 0, sizeof(inarg));
-@@ -589,7 +618,7 @@
+@@ -527,7 +556,7 @@
  	struct fuse_fsync_in inarg;
  
  	memset(&inarg, 0, sizeof(inarg));
@@ -193,7 +193,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  	inarg.fsync_flags = datasync ? FUSE_FSYNC_FDATASYNC : 0;
  	args.opcode = opcode;
  	args.nodeid = get_node_id(inode);
-@@ -655,7 +684,7 @@
+@@ -593,7 +622,7 @@
  	struct fuse_file *ff = file->private_data;
  	struct fuse_args *args = &ia->ap.args;
  
@@ -202,7 +202,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  	ia->read.in.offset = pos;
  	ia->read.in.size = count;
  	ia->read.in.flags = file->f_flags;
-@@ -2698,7 +2727,7 @@
+@@ -2488,7 +2517,7 @@
  	struct fuse_file *ff = file->private_data;
  
  	memset(inarg, 0, sizeof(*inarg));
@@ -211,7 +211,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  	inarg->owner = fuse_lock_owner_id(fc, fl->c.flc_owner);
  	inarg->lk.start = fl->fl_start;
  	inarg->lk.end = fl->fl_end;
-@@ -2839,7 +2868,7 @@
+@@ -2629,7 +2658,7 @@
  	struct fuse_file *ff = file->private_data;
  	FUSE_ARGS(args);
  	struct fuse_lseek_in inarg = {
@@ -220,16 +220,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  		.offset = offset,
  		.whence = whence
  	};
-@@ -2962,7 +2991,7 @@
- {
- 	struct fuse_file *ff = file->private_data;
- 	struct fuse_mount *fm = ff->fm;
--	struct fuse_poll_in inarg = { .fh = ff->fh, .kh = ff->kh };
-+	struct fuse_poll_in inarg = { .fh = fuse_file_fh(ff), .kh = ff->kh };
- 	struct fuse_poll_out outarg;
- 	FUSE_ARGS(args);
- 	int err;
-@@ -3160,7 +3189,7 @@
+@@ -2838,7 +2867,7 @@
  	struct fuse_mount *fm = ff->fm;
  	FUSE_ARGS(args);
  	struct fuse_fallocate_in inarg = {
@@ -239,9 +230,9 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  		.length = length,
  		.mode = mode
 diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
---- a/fuse_i.h	2026-10-11 11:58:15
-+++ b/fuse_i.h	2026-10-11 11:58:40
-@@ -254,6 +254,16 @@
+--- a/fuse_i.h	2026-11-08 19:52:11
++++ b/fuse_i.h	2026-11-08 19:52:11
+@@ -304,6 +304,16 @@
  
  	} readdir;
  
@@ -255,10 +246,10 @@ diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
 +	unsigned int rekcod_flags;
 +	struct mutex rekcod_mutex;
 +
- 	/** RB node to be linked on fuse_conn->polled_files */
+ 	/** @polled_node: RB node to be linked on fuse_conn->polled_files */
  	struct rb_node polled_node;
  
-@@ -587,6 +597,7 @@
+@@ -391,6 +401,7 @@
  	bool no_control:1;
  	bool no_force_umount:1;
  	bool legacy_opts_show:1;
@@ -266,17 +257,17 @@ diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
  	enum fuse_dax_mode dax_mode;
  	unsigned int max_read;
  	unsigned int blksize;
-@@ -759,6 +770,9 @@
- 	/** Is flush not implemented by fs? */
+@@ -564,6 +575,9 @@
+ 	/** @no_flush: Is flush not implemented by fs? */
  	unsigned no_flush:1;
  
-+	/** rekcod: defer OPEN/OPENDIR of read-only files and dirs (see file.c) */
++	/** @rekcod: defer OPEN/OPENDIR of read-only files and dirs (see file.c) */
 +	unsigned rekcod:1;
 +
- 	/** Is setxattr not implemented by fs? */
+ 	/** @no_setxattr: Is setxattr not implemented by fs? */
  	unsigned no_setxattr:1;
  
-@@ -1225,6 +1239,26 @@
+@@ -1049,6 +1063,26 @@
  void fuse_invalidate_atime(struct inode *inode);
  
  u64 fuse_time_to_jiffies(u64 sec, u32 nsec);
@@ -304,9 +295,9 @@ diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
  	fuse_time_to_jiffies((o)->attr_valid, (o)->attr_valid_nsec)
  
 diff --color -ruN -x rekcod.c a/ioctl.c b/ioctl.c
---- a/ioctl.c	2026-10-11 11:58:15
-+++ b/ioctl.c	2026-10-11 11:58:15
-@@ -218,7 +218,7 @@
+--- a/ioctl.c	2026-11-08 19:52:11
++++ b/ioctl.c	2026-11-08 19:52:11
+@@ -221,7 +221,7 @@
  	struct fuse_file *ff = file->private_data;
  	struct fuse_mount *fm = ff->fm;
  	struct fuse_ioctl_in inarg = {
@@ -315,7 +306,7 @@ diff --color -ruN -x rekcod.c a/ioctl.c b/ioctl.c
  		.cmd = cmd,
  		.arg = arg,
  		.flags = flags
-@@ -425,6 +425,16 @@
+@@ -427,6 +427,16 @@
  
  long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
  {
@@ -332,7 +323,7 @@ diff --color -ruN -x rekcod.c a/ioctl.c b/ioctl.c
  	return fuse_ioctl_common(file, cmd, arg, 0);
  }
  
-@@ -444,7 +454,7 @@
+@@ -446,7 +456,7 @@
  	int err;
  
  	memset(&inarg, 0, sizeof(inarg));
@@ -341,10 +332,22 @@ diff --color -ruN -x rekcod.c a/ioctl.c b/ioctl.c
  	inarg.cmd = cmd;
  
  #if BITS_PER_LONG == 32
+diff --color -ruN -x rekcod.c a/poll.c b/poll.c
+--- a/poll.c	2026-11-08 19:52:11
++++ b/poll.c	2026-11-08 19:52:11
+@@ -75,7 +75,7 @@
+ {
+ 	struct fuse_file *ff = file->private_data;
+ 	struct fuse_mount *fm = ff->fm;
+-	struct fuse_poll_in inarg = { .fh = ff->fh, .kh = ff->kh };
++	struct fuse_poll_in inarg = { .fh = fuse_file_fh(ff), .kh = ff->kh };
+ 	struct fuse_poll_out outarg;
+ 	FUSE_ARGS(args);
+ 	int err;
 diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
---- a/virtio_fs.c	2026-10-11 11:58:15
-+++ b/virtio_fs.c	2026-10-11 11:58:15
-@@ -77,6 +77,9 @@
+--- a/virtio_fs.c	2026-11-08 19:52:11
++++ b/virtio_fs.c	2026-11-08 19:52:11
+@@ -78,6 +78,9 @@
  	void *window_kaddr;
  	phys_addr_t window_phys_addr;
  	size_t window_len;
@@ -354,7 +357,7 @@ diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
  };
  
  struct virtio_fs_forget_req {
-@@ -109,10 +112,12 @@
+@@ -111,10 +114,12 @@
  enum {
  	OPT_DAX,
  	OPT_DAX_ENUM,
@@ -367,7 +370,7 @@ diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
  	fsparam_enum("dax", OPT_DAX_ENUM, dax_param_enums),
  	{}
  };
-@@ -135,6 +140,9 @@
+@@ -137,6 +142,9 @@
  	case OPT_DAX_ENUM:
  		ctx->dax_mode = result.uint_32;
  		break;
@@ -377,7 +380,7 @@ diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
  	default:
  		return -EINVAL;
  	}
-@@ -753,6 +761,164 @@
+@@ -781,6 +789,197 @@
  }
  
  /* Work function for request completion */
@@ -418,28 +421,61 @@ diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
 +	e->attr_valid_nsec = 0;
 +}
 +
-+/* READDIRPLUS replies carry an entry_out per name; the reply sits in pages. */
-+static void rekcod_readdirplus_ttl(struct fuse_args_pages *ap, unsigned int len)
++/*
++ * Copies @n bytes at offset @off of a reply that sits in @ap's folios, to @buf
++ * (or from it, with @to_reply). Since 6.16 a READDIRPLUS reply can span several
++ * pages, so one record may straddle a page boundary.
++ */
++static bool rekcod_reply_copy(struct fuse_args_pages *ap, unsigned int off,
++			      void *buf, unsigned int n, bool to_reply)
 +{
 +	unsigned int i;
 +
-+	for (i = 0; i < ap->num_pages && len; i++) {
-+		unsigned int left = min(len, ap->descs[i].length);
-+		char *base = kmap_local_page(ap->pages[i]);
-+		char *p = base + ap->descs[i].offset;
++	for (i = 0; i < ap->num_folios && n; i++) {
++		unsigned int dlen = ap->descs[i].length;
 +
-+		len -= left;
-+		while (left >= FUSE_NAME_OFFSET_DIRENTPLUS) {
-+			struct fuse_direntplus *d = (struct fuse_direntplus *)p;
-+			size_t reclen = FUSE_DIRENTPLUS_SIZE(d);
-+
-+			if (!d->dirent.namelen || reclen > left)
-+				break;
-+			rekcod_entry_ttl(&d->entry_out);
-+			p += reclen;
-+			left -= reclen;
++		if (off >= dlen) {
++			off -= dlen;
++			continue;
 +		}
-+		kunmap_local(base);
++		while (n && off < dlen) {
++			size_t pos = ap->descs[i].offset + off;
++			unsigned int take = min3(n, dlen - off,
++						 (unsigned int)(PAGE_SIZE - offset_in_page(pos)));
++			char *p = kmap_local_folio(ap->folios[i], pos);
++
++			if (to_reply)
++				memcpy(p, buf, take);
++			else
++				memcpy(buf, p, take);
++			kunmap_local(p);
++			buf += take;
++			n -= take;
++			off += take;
++		}
++		off = 0;
++	}
++	return !n;
++}
++
++/* READDIRPLUS replies carry an entry_out per name; the reply sits in folios. */
++static void rekcod_readdirplus_ttl(struct fuse_args_pages *ap, unsigned int len)
++{
++	unsigned int off = 0;
++
++	while (len - off >= FUSE_NAME_OFFSET_DIRENTPLUS) {
++		struct fuse_direntplus d;
++		size_t reclen;
++
++		if (!rekcod_reply_copy(ap, off, &d, FUSE_NAME_OFFSET_DIRENTPLUS, false))
++			return;
++		reclen = FUSE_DIRENTPLUS_SIZE(&d);
++		if (!d.dirent.namelen || reclen > len - off)
++			return;
++		rekcod_entry_ttl(&d.entry_out);
++		if (!rekcod_reply_copy(ap, off, &d.entry_out, sizeof(d.entry_out), true))
++			return;
++		off += reclen;
 +	}
 +}
 +
@@ -542,8 +578,8 @@ diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
  static void virtio_fs_request_complete(struct fuse_req *req,
  				       struct virtio_fs_vq *fsvq)
  {
-@@ -768,6 +934,11 @@
- 	 */
+@@ -791,6 +990,11 @@
+ 
  	args = req->args;
  	copy_args_from_argbuf(args, req);
 +	if (((struct virtio_fs *)fsvq->vq->vdev->priv)->rekcod) {
@@ -554,7 +590,7 @@ diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
  
  	if (args->out_pages && args->page_zeroing) {
  		len = args->out_args[args->out_numargs - 1].size;
-@@ -1582,6 +1753,14 @@
+@@ -1604,6 +1808,14 @@
  	err = fuse_fill_super_common(sb, ctx);
  	if (err < 0)
  		goto err_free_fuse_devs;

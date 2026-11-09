@@ -50,7 +50,7 @@ static bool rekcod_watched(struct inode *inode)
 /*
  * Resolve an absolute path through the dcache only: the first component via
  * kern_path (the share's mount point, e.g. /Users), the rest with
- * d_hash_and_lookup. Unlike LOOKUP_CACHED this accepts dentries whose TTL
+ * try_lookup_noperm. Unlike LOOKUP_CACHED this accepts dentries whose TTL
  * expired: they are still what containers see, so they must be invalidated.
  */
 static int rekcod_walk(const char *path, struct path *out)
@@ -82,7 +82,7 @@ static int rekcod_walk(const char *path, struct path *out)
 		comp = rest;
 		rest = strchr(comp, '/');
 		q = (struct qstr)QSTR_INIT(comp, rest ? (u32)(rest - comp) : (u32)strlen(comp));
-		child = d_hash_and_lookup(p.dentry, &q);
+		child = try_lookup_noperm(&q, p.dentry);
 		if (IS_ERR_OR_NULL(child) || d_really_is_negative(child) || !d_is_dir(child)) {
 			if (!IS_ERR_OR_NULL(child))
 				dput(child);
@@ -203,7 +203,7 @@ static void rekcod_one(char *path, const struct rekcod_stat *st)
 	dir = d_inode(parent.dentry);
 	fc = get_fuse_conn(dir);
 
-	old = d_hash_and_lookup(parent.dentry, &name);
+	old = try_lookup_noperm(&name, parent.dentry);
 	if (IS_ERR(old))
 		old = NULL;
 	if (rekcod_cache_matches(old, st)) {
@@ -244,7 +244,7 @@ static void rekcod_one(char *path, const struct rekcod_stat *st)
 
 	/* Re-look-up only when someone watches; otherwise the next access does it. */
 	if (rekcod_watched(dir) || rekcod_watched(old_inode)) {
-		now = lookup_one_unlocked(&nop_mnt_idmap, name.name, parent.dentry, name.len);
+		now = lookup_one_unlocked(&nop_mnt_idmap, &name, parent.dentry);
 		exists = !IS_ERR(now) && d_really_is_positive(now);
 		if (exists && (!existed || d_inode(now) != old_inode))
 			fsnotify_create(dir, now);

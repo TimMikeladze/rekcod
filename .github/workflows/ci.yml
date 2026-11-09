@@ -3,6 +3,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # bump.yml runs it on the bump/versions branch (its PR can't trigger workflows itself).
+  workflow_dispatch:
   # release.yml runs this whole workflow before it publishes anything.
   workflow_call:
     inputs:
@@ -33,6 +35,7 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build --locked -p rekcod
       - run: REKCOD=target/debug/rekcod python3 scripts/e2e-edges.py
+      - run: python3 -m unittest scripts/test_bump_versions.py
       - run: packaging/server/test.sh
       - run: cargo clippy --locked -p rekcod -p rekcod-proto -- -D warnings
       - run: cargo clippy --locked -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings

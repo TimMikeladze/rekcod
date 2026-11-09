@@ -103,7 +103,7 @@ def main():
     root = tempfile.mkdtemp(prefix="rekcod-fsx-", dir=os.path.expanduser("~"))
     name = "rekcod-fsx"
     docker(args.context, "rm", "-f", name, check=False)
-    docker(args.context, "run", "-d", "--name", name, "-v", f"{root}:/c", "alpine:3.22", "sleep", "3600")
+    docker(args.context, "run", "-d", "--name", name, "-v", f"{root}:/c", "alpine:3.24", "sleep", "3600")
     print(f"fsx: seed {args.seed}, {args.ops} ops, context {args.context}, dir {root}")
     worst, failures = 0.0, 0
     try:

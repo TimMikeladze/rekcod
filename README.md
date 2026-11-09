@@ -145,7 +145,7 @@ stay in VM volumes. Mac and Linux builds of native dependencies stay separate.
 Use `--image` to choose an image yourself:
 
 ```sh
-rekcod x --image alpine:3.22 sh
+rekcod x --image alpine:3.24 sh
 ```
 
 For a command that should only see the current project directory,

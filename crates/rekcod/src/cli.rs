@@ -15,7 +15,7 @@ use crate::http;
 use crate::paths::Paths;
 use crate::vm;
 
-const HELPER_IMAGE: &str = "alpine:3.22";
+const HELPER_IMAGE: &str = "alpine:3.24";
 
 fn block_on<F: Future>(f: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread().enable_all().build().expect("tokio runtime").block_on(f)

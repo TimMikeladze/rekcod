@@ -38,7 +38,7 @@ use sha2::{Digest, Sha256};
 use crate::paths::Paths;
 use crate::s3::{Body, S3};
 
-const HELPER_IMAGE: &str = "alpine:3.22";
+const HELPER_IMAGE: &str = "alpine:3.24";
 const SNAP: &str = "dev.rekcod.snap";
 const SNAP_PROJECT: &str = "dev.rekcod.snap.project";
 const SNAP_NAME: &str = "dev.rekcod.snap.name";

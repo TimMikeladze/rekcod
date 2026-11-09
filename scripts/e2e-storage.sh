@@ -38,7 +38,7 @@ git init -q --bare "$repo/app.git"
 git clone -q "$repo/app.git" "$repo/w" 2>/dev/null
 # Answers every request with VERSION and its S3 env.
 cat >"$repo/w/Dockerfile" <<'EOF'
-FROM alpine:3.22
+FROM alpine:3.24
 COPY VERSION /VERSION
 CMD ["sh","-c","while true; do { printf 'HTTP/1.0 200 OK\\r\\n\\r\\n'; cat /VERSION; env | grep -E '^(S3_|AWS_)' | sort; } | nc -l -p 8000 >/dev/null; done"]
 EOF

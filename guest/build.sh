@@ -1,25 +1,22 @@
 #!/bin/sh
 # rekcod guest: kernel + Alpine userland + upstream static dockerd + rekcod-agent,
-# built in plain chroots (docs/guest-build.md). Runs as root on Linux arm64.
+# built in plain chroots. Runs as root on Linux arm64 (scripts/build.sh runs it in the VM).
 #   guest/build.sh <rekcod-agent binary> <out dir>
 # The chroot scripts are single-quoted on purpose: they expand inside the chroot.
 # shellcheck disable=SC2016
 set -eu
 
 G=$(cd "$(dirname "$0")" && pwd)
-# ALPINE_RELEASE, DOCKER_VERSION, LINUX_VIRT_VERSION and their sha256s.
+# ALPINE_RELEASE, DOCKER_VERSION, LINUX_VERSION, LINUX_VIRT_VERSION and their sha256s.
 # shellcheck source=guest/versions.env
 . "$G/versions.env"
 ALPINE=${ALPINE_RELEASE%.*}
-LINUX_VERSION=${LINUX_VIRT_VERSION%-r*}
-# custom = our kernel (docs/custom-kernel.md): kernel.org sources for the version
-# Alpine ships, Alpine's config + guest/kernel/rekcod.config, fuse patch in-tree,
-# no initramfs. alpine = Alpine's stock linux-virt with out-of-tree fuse modules.
+# custom = our kernel: kernel.org's linux-$LINUX_VERSION with guest/kernel/base.config +
+# guest/kernel/rekcod.config, fuse patch and elastic memory driver in-tree, no initramfs.
+# alpine = Alpine's stock linux-virt of the same version, with out-of-tree fuse modules.
 KERNEL=${KERNEL:-custom}
-# Kernel package source: empty = the Alpine release's linux-virt; or e.g.
-# https://dl-cdn.alpinelinux.org/alpine/edge/main for a newer one (set LINUX_VIRT_VERSION
-# and LINUX_SHA256 to match).
-KERNEL_REPO=${KERNEL_REPO:-}
+# Where KERNEL=alpine gets linux-virt=$LINUX_VIRT_VERSION.
+KERNEL_REPO=${KERNEL_REPO:-$ALPINE_KERNEL_REPO}
 # 0 = stock fuse/virtiofs (bisecting; boot.sh falls back to uncached sharing)
 FUSE_PATCH=${FUSE_PATCH:-1}
 WORK=${REKCOD_GUEST_WORK:-/var/tmp/rekcod-guest}
@@ -69,7 +66,7 @@ inroot() {
   cp -L /etc/resolv.conf "$r/etc/resolv.conf.host" && mv "$r/etc/resolv.conf.host" "$r/etc/resolv.conf"
   st=0; chroot "$r" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
     ALPINE="$ALPINE" DOCKER_VERSION="$DOCKER_VERSION" DOCKER_SHA256="$DOCKER_SHA256" \
-    LINUX_VIRT_VERSION="$LINUX_VIRT_VERSION" LINUX_VERSION="$LINUX_VERSION" LINUX_SHA256="$LINUX_SHA256" \
+    LINUX_VERSION="$LINUX_VERSION" LINUX_SHA256="$LINUX_SHA256" LINUX_VIRT_VERSION="$LINUX_VIRT_VERSION" \
     KERNEL_REPO="$KERNEL_REPO" FUSE_PATCH="$FUSE_PATCH" \
     /bin/sh -euc "$2" || st=$?
   [ "$had_resolv" = 1 ] || rm -f "$r/etc/resolv.conf"
@@ -115,16 +112,15 @@ apk add --no-cache build-base bc bison flex perl openssl openssl-dev elfutils-de
 # --- kernel: leaves $KOUT/Image (raw arm64), $KOUT/lib/modules and, only if the
 # kernel needs one, $KOUT/initramfs ---------------------------------------------------
 # Keyed on the kernel steps only (this section of build.sh), so rootfs edits don't recompile.
-key=$( { echo "$ALPINE $KERNEL $KERNEL_REPO $FUSE_PATCH $LINUX_VIRT_VERSION $LINUX_SHA256"; sed -n '/^# --- kernel/,/^# --- pack/p' "$G/build.sh"
+key=$( { echo "$ALPINE $KERNEL $FUSE_PATCH $LINUX_VERSION $LINUX_SHA256"
+         [ "$KERNEL" = custom ] || echo "$KERNEL_REPO $LINUX_VIRT_VERSION"; sed -n '/^# --- kernel/,/^# --- pack/p' "$G/build.sh"
          find "$G/kernel" "$G/fuse" -type f | LC_ALL=C sort | xargs cat; } | sha256sum | cut -c1-16)
 KOUT=$KCACHE/$key
-# Shared by both kernel paths, run in a chroot after linux-virt is installed: checks the
-# package's kernel is the pinned one, then fetches and verifies its kernel.org tarball.
-KERNEL_TARBALL='KREL=$(ls /lib/modules); KV=${KREL%%-*}
-[ "$KV" = "$LINUX_VERSION" ] || { echo "linux-virt is $KV, guest/versions.env pins $LINUX_VERSION" >&2; exit 1; }
-wget -qO /tmp/linux.tar.xz "https://cdn.kernel.org/pub/linux/kernel/v${KV%%.*}.x/linux-$KV.tar.xz"
+# Shared by both kernel paths, run in a chroot: fetches and verifies the pinned kernel.org
+# tarball as /tmp/linux.tar.xz.
+KERNEL_TARBALL='wget -qO /tmp/linux.tar.xz "https://cdn.kernel.org/pub/linux/kernel/v${LINUX_VERSION%%.*}.x/linux-$LINUX_VERSION.tar.xz"
 [ "$(sha256sum /tmp/linux.tar.xz | cut -d" " -f1)" = "$LINUX_SHA256" ] ||
-  { echo "sha256 mismatch for linux-$KV.tar.xz (want $LINUX_SHA256, guest/versions.env)" >&2; exit 1; }'
+  { echo "sha256 mismatch for linux-$LINUX_VERSION.tar.xz (want $LINUX_SHA256, guest/versions.env)" >&2; exit 1; }'
 if [ -f "$KOUT/Image" ]; then
   log "kernel: cached ($key)"
 elif [ "$KERNEL" = custom ]; then
@@ -132,20 +128,19 @@ elif [ "$KERNEL" = custom ]; then
   rm -rf "$T/src" "$T/patch" "$T/elastic" "$T/kout"
   copyroot "$G/fuse" "$T/patch"
   copyroot "$G/kernel/elastic" "$T/elastic"
-  inroot "$T" '
-apk add --no-cache ${KERNEL_REPO:+--repository "$KERNEL_REPO"} "linux-virt=$LINUX_VIRT_VERSION"
-'"$KERNEL_TARBALL"'
+  inroot "$T" "$KERNEL_TARBALL"'
 mkdir /src && tar -xJf /tmp/linux.tar.xz -C /src --strip-components=1
-rm /tmp/linux.tar.xz && cp /boot/config-*-virt /src/alpine.config
+rm /tmp/linux.tar.xz
 '
+  install -m 0644 -o 0 -g 0 "$G/kernel/base.config" "$T/src/base.config"
   install -m 0644 -o 0 -g 0 "$G/kernel/rekcod.config" "$T/src/rekcod.config"
   inroot "$T" '
 cd /src
 if [ "$FUSE_PATCH" = 1 ]; then (cd fs/fuse && patch -p1 < /patch/rekcod-fuse.patch && cp /patch/rekcod.c .); fi
-# Elastic memory driver (docs/elastic-memory.md), built in.
+# Elastic memory driver (crates/rekcod/src/elastic.rs is the host side), built in.
 cp /elastic/rekcod_elastic.c drivers/block/ && echo "obj-y += rekcod_elastic.o" >> drivers/block/Makefile
 printf "CONFIG_LOCALVERSION=\"-rekcod\"\n# CONFIG_LOCALVERSION_AUTO is not set\n" >>rekcod.config
-ARCH=arm64 scripts/kconfig/merge_config.sh -m alpine.config rekcod.config >/dev/null
+ARCH=arm64 scripts/kconfig/merge_config.sh -m base.config rekcod.config >/dev/null
 make ARCH=arm64 olddefconfig >/dev/null
 # merge_config only warns; a fragment line that did not stick is a build error
 # (an "is not set" may vanish with its parent menu; it just must not be y/m)
@@ -168,8 +163,13 @@ else
   rm -rf "$A" && cp -a "$R" "$A"
   copyroot "$G/fuse" "$A/patch"
   inroot "$A" '
-apk add --no-cache build-base xz ${KERNEL_REPO:+--repository "$KERNEL_REPO"} \
-  "linux-virt=$LINUX_VIRT_VERSION" "linux-virt-dev=$LINUX_VIRT_VERSION"
+# Only the kernel, its modules and the initramfs leave this chroot, so it can follow the
+# kernel repo (edge) entirely; edge packages mixed into a release root conflict.
+echo "$KERNEL_REPO" > /etc/apk/repositories
+apk upgrade --no-cache --available >/dev/null
+apk add --no-cache build-base xz "linux-virt=$LINUX_VIRT_VERSION" "linux-virt-dev=$LINUX_VIRT_VERSION"
+KREL=$(ls /lib/modules); KV=${KREL%%-*}
+[ "$KV" = "$LINUX_VERSION" ] || { echo "linux-virt is $KV, guest/versions.env pins $LINUX_VERSION" >&2; exit 1; }
 '"$KERNEL_TARBALL"'
 mkdir /src && tar -xJf /tmp/linux.tar.xz -C /src --strip-components=2 "linux-$KV/fs/fuse"
 rm /tmp/linux.tar.xz

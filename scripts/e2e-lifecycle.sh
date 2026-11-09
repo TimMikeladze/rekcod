@@ -3,7 +3,7 @@
 # kill -9, stale pid files, concurrent starts, a damaged data disk, --repair, port
 # shadowing, the login agent's exit codes. Leaves your main VM alone.
 #
-# Needs alpine:3.22 in the current docker context (it's copied in; the test VM may not
+# Needs alpine:3.24 in the current docker context (it's copied in; the test VM may not
 # have internet), and a guest: REKCOD_GUEST_DIR, else out/guest.
 #   REKCOD=/path/to/signed/rekcod scripts/e2e-lifecycle.sh
 set -uo pipefail
@@ -33,10 +33,10 @@ check "data.fresh is gone once dockerd answered" test ! -e "$REKCOD_HOME/vm/data
 check "settings saved" grep -q '"memory_gib": 2' "$REKCOD_HOME/config.json"
 check "VM disks excluded from Time Machine" sh -c "tmutil isexcluded '$REKCOD_HOME/vm' | grep -q Excluded"
 check "run/ is private" sh -c "stat -f %Lp '$REKCOD_HOME/run' | grep -qx 700"
-docker save alpine:3.22 | $D load >/dev/null
+docker save alpine:3.24 | $D load >/dev/null
 $D volume create keep >/dev/null
-$D run --rm -v keep:/k alpine:3.22 sh -c 'echo precious > /k/f'
-check "a stalled reader gets all 200 MiB" sh -c "$D run --rm alpine:3.22 dd if=/dev/zero bs=1M count=200 2>/dev/null | (sleep 8; wc -c) | grep -q 209715200"
+$D run --rm -v keep:/k alpine:3.24 sh -c 'echo precious > /k/f'
+check "a stalled reader gets all 200 MiB" sh -c "$D run --rm alpine:3.24 dd if=/dev/zero bs=1M count=200 2>/dev/null | (sleep 8; wc -c) | grep -q 209715200"
 
 echo "crashes"
 kill -9 "$(cat "$REKCOD_HOME/run/daemon.pid")"; sleep 1
@@ -45,14 +45,14 @@ check "a stale pid file doesn't count as running" sh -c "'$R' status | grep -q '
 "$R" start --no-switch >/dev/null 2>&1 &
 wait
 check "two starts at once boot one VM" sh -c "test \$(pgrep -f '$R daemon' | wc -l) -eq 1"
-check "data survives kill -9" sh -c "$D run --rm -v keep:/k alpine:3.22 cat /k/f | grep -q precious"
+check "data survives kill -9" sh -c "$D run --rm -v keep:/k alpine:3.24 cat /k/f | grep -q precious"
 
 echo "damaged data disk"
 "$R" stop --no-switch >/dev/null
 check "a clean stop is recorded" grep -q clean "$REKCOD_HOME/run/last-exit"
 dd if=/dev/zero of="$REKCOD_HOME/vm/data.img" bs=1024 seek=1 count=1 conv=notrunc 2>/dev/null
 check "a zeroed superblock is rebuilt from the backup" start
-check "and the data is still there" sh -c "$D run --rm -v keep:/k alpine:3.22 cat /k/f | grep -q precious"
+check "and the data is still there" sh -c "$D run --rm -v keep:/k alpine:3.24 cat /k/f | grep -q precious"
 "$R" stop --no-switch >/dev/null
 dd if=/dev/urandom of="$REKCOD_HOME/vm/data.img" bs=1M count=200 conv=notrunc 2>/dev/null
 check "a disk past the first backup isn't formatted; start says so" sh -c "! '$R' start --no-switch 2>&1 | tee /dev/stderr | grep -q ready"
@@ -61,14 +61,14 @@ check "the error names --repair" sh -c "'$R' status >/dev/null; grep -aq 'not fo
 check "start --repair brings it back" start --repair
 check "dockerd answers after the repair" $D info
 # 200 MiB of junk took docker's own metadata with it; the image comes back for what follows.
-docker save alpine:3.22 | $D load >/dev/null
+docker save alpine:3.24 | $D load >/dev/null
 
 echo "ports"
 port=18555
 python3 -c "import socket,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1); s.bind(('0.0.0.0', $port)); s.listen(); time.sleep(120)" &
 listener=$!
 sleep 1
-$D run -d --name shadow -p 127.0.0.1:$port:80 alpine:3.22 sleep 300 >/dev/null
+$D run -d --name shadow -p 127.0.0.1:$port:80 alpine:3.24 sleep 300 >/dev/null
 sleep 2
 check "a port the Mac already serves isn't taken" sh -c "'$R' status --json | python3 -c 'import json,sys; sys.exit(0 if any(p.get(\"port\") == $port and p.get(\"error\") for p in json.load(sys.stdin)[\"ports\"]) else 1)'"
 $D rm -f shadow >/dev/null

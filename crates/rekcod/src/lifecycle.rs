@@ -298,7 +298,7 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
                 "--rm",
                 "--network",
                 "bridge",
-                "alpine:3.22",
+                "alpine:3.24",
                 "nc",
                 "-z",
                 "-w",

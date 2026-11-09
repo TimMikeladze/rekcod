@@ -16,8 +16,8 @@ const body = await compileMarkdown(parts.body, readme.file, files);
       <h1 id="hero-title">{parts.title}</h1>
       <div class="prose hero-intro" set:html={intro.html} />
       <div class="hero-actions">
-        <a class="button" href="/docs/getting-started/">Get started <Arrow direction="right" /></a>
-        <a class="text-link" href="/docs/">Read the docs <Arrow direction="right" /></a>
+        <a class="button" href="#run-your-first-container">Get started <Arrow direction="right" /></a>
+        <a class="text-link" href="#how-it-works">How it works <Arrow direction="right" /></a>
       </div>
     </section>
     <article class="prose readme" aria-label="README" set:html={body.html} />

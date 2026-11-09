@@ -3,7 +3,6 @@ import { readFile } from 'node:fs/promises';
 import {
   compileMarkdown,
   getDocuments,
-  getNavigation,
   landingParts,
   resolveLink,
   routeFor,
@@ -16,7 +15,7 @@ describe('repository Markdown', () => {
     expect(parts.title).toBe('rekcod');
     expect(parts.intro).toContain('Docker Desktop alternative');
     expect(parts.body).toContain('rekcod start');
-    expect(parts.intro + parts.body).toContain('All docs');
+    expect(parts.intro + parts.body).toContain('[MIT](LICENSE)');
     const edited = landingParts('# Changed name\n\nChanged introduction.\n\n## Install now\n\n```sh\nnew-command\n```');
     expect(edited.title).toBe('Changed name');
     expect(edited.intro).toContain('Changed introduction.');
@@ -52,15 +51,17 @@ describe('repository Markdown', () => {
     expect(rendered.html).not.toContain('javascript:');
   });
 
-  test('discovers repository documents and derives sidebar groups from the index', async () => {
+  test('uses only the root README as website content', async () => {
     const documents = await getDocuments();
-    expect(documents.some((doc) => doc.file === 'docs/getting-started.md')).toBe(true);
-    expect(documents.some((doc) => doc.file === 'examples/github-runner/README.md')).toBe(true);
-    expect(new Set(documents.map((doc) => doc.url)).size).toBe(documents.length);
-    const navigation = getNavigation(documents);
-    expect(navigation.find((group) => group.title === 'Using rekcod')?.items.some((item) => item.url === '/docs/getting-started/')).toBe(true);
-    for (const group of navigation) {
-      for (const item of group.items) expect(documents.some((doc) => doc.url === item.url)).toBe(true);
-    }
+    expect(documents.map((doc) => doc.file)).toEqual(['README.md']);
+    expect(documents[0].url).toBe('/');
+  });
+
+  test('preserves Mermaid source for rendering and escapes embedded HTML', async () => {
+    const rendered = await compileMarkdown('```mermaid\nflowchart TD\n  A["<img src=x onerror=alert(1)>"] --> B["Linux & Docker"]\n```\n\n```sh\nrekcod start\n```', 'README.md', new Set());
+    expect(rendered.html).toContain('<pre class="mermaid">flowchart TD\n');
+    expect(rendered.html).toMatch(/(?:&lt;|&#x3C;)img /i);
+    expect(rendered.html).not.toContain('<img');
+    expect(rendered.html).toContain('class="shiki ');
   });
 });

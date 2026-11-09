@@ -1,4 +1,4 @@
-import { readFile, readdir } from 'node:fs/promises';
+import { readFile } from 'node:fs/promises';
 import path from 'node:path';
 import type { Root as HastRoot } from 'hast';
 import type { Root as MarkdownRoot } from 'mdast';
@@ -35,11 +35,6 @@ export interface Heading {
   text: string;
 }
 
-export interface NavigationGroup {
-  title: string;
-  items: { title: string; url: string }[];
-}
-
 export function routeFor(file: string): string {
   if (file === 'README.md') return '/';
   const slug = file.replace(/^docs\//, '').replace(/(?:^|\/)README\.md$/, '').replace(/\.md$/i, '').toLowerCase();
@@ -71,23 +66,8 @@ export function landingParts(markdown: string): { title: string; intro: string; 
   };
 }
 
-async function markdownFiles(directory: string): Promise<string[]> {
-  const entries = await readdir(path.join(root, directory), { withFileTypes: true });
-  const nested = await Promise.all(entries.map(async (entry) => {
-    const file = path.posix.join(directory, entry.name);
-    if (entry.isDirectory()) return markdownFiles(file);
-    return entry.isFile() && entry.name.endsWith('.md') ? [file] : [];
-  }));
-  return nested.flat();
-}
-
 export async function getDocuments(): Promise<Document[]> {
-  const files = [
-    'README.md', 'CONTRIBUTING.md', 'CHANGELOG.md', 'SECURITY.md',
-    ...(await markdownFiles('docs')),
-    ...(await markdownFiles('examples')),
-    'guest/fuse/README.md',
-  ];
+  const files = ['README.md'];
   const documents = await Promise.all(files.sort().map(async (file) => {
     const markdown = await readFile(path.join(root, file), 'utf8');
     const tree = parser.parse(markdown) as MarkdownRoot;
@@ -110,34 +90,6 @@ export async function getDocuments(): Promise<Document[]> {
   return documents;
 }
 
-export function getNavigation(documents: Document[]): NavigationGroup[] {
-  const index = documents.find((doc) => doc.file === 'docs/README.md');
-  if (!index) throw new Error('Missing docs/README.md');
-  const files = new Set(documents.map((doc) => doc.file));
-  const byUrl = new Map(documents.map((doc) => [doc.url, doc]));
-  const groups: NavigationGroup[] = [];
-  const included = new Set(['/', '/docs/']);
-  let current: NavigationGroup | undefined;
-
-  for (const node of (parser.parse(index.markdown) as MarkdownRoot).children) {
-    if (node.type === 'heading' && node.depth === 2) {
-      current = { title: toString(node), items: [] };
-      groups.push(current);
-    } else if (current) {
-      visit(node, 'link', (link) => {
-        const url = resolveLink(link.url, index.file, files).split('#')[0];
-        const doc = byUrl.get(url);
-        if (!doc || included.has(url)) return;
-        current!.items.push({ title: doc.title, url });
-        included.add(url);
-      });
-    }
-  }
-  const remaining = documents.filter((doc) => !included.has(doc.url));
-  if (remaining.length) groups.push({ title: 'More documentation', items: remaining.map((doc) => ({ title: doc.title, url: doc.url })) });
-  return groups.filter((group) => group.items.length > 0);
-}
-
 const renderer = unified()
   .use(remarkParse)
   .use(remarkGfm)
@@ -145,6 +97,17 @@ const renderer = unified()
   .use(rehypeRaw)
   .use(rehypeSanitize)
   .use(rehypeSlug)
+  .use(() => (tree: HastRoot) => {
+    visit(tree, 'element', (node) => {
+      if (node.tagName !== 'pre') return;
+      const code = node.children[0];
+      if (code?.type !== 'element' || code.tagName !== 'code') return;
+      const classes = code.properties.className;
+      if (!Array.isArray(classes) || !classes.includes('language-mermaid')) return;
+      node.properties.className = ['mermaid'];
+      node.children = [{ type: 'text', value: toText(code, { whitespace: 'pre' }) }];
+    });
+  })
   .use(rehypeShiki, { theme: 'github-light-high-contrast', fallbackLanguage: 'text' });
 
 export async function compileMarkdown(markdown: string, file: string, files: Set<string>) {

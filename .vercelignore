@@ -1,16 +1,6 @@
 *
 !vercel.json
 !README.md
-!CONTRIBUTING.md
-!CHANGELOG.md
-!SECURITY.md
-!docs
-!docs/**
-!examples
-!examples/**
-!guest
-!guest/fuse
-!guest/fuse/README.md
 !website
 !website/**
 website/node_modules

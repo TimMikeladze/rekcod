@@ -87,6 +87,9 @@
   .prose code { font-family: var(--mono); font-size: 0.84em; padding: 2px 5px; border-radius: 4px; background: var(--surface); }
   .prose pre { position: relative; border: 1px solid var(--line); border-radius: 8px; padding: 24px 72px 24px 24px; margin: 24px 0; overflow: auto; font-size: 13px; line-height: 1.8; tab-size: 2; scrollbar-width: thin; scrollbar-color: #c7c7c0 var(--surface); background: var(--surface) !important; }
   .prose pre code { padding: 0; background: transparent; font-size: inherit; display: block; width: max-content; min-width: 100%; }
+  .prose pre.mermaid { padding: 24px; font-family: var(--sans); line-height: normal; }
+  .prose pre.mermaid[data-processed] { white-space: normal; }
+  .prose pre.mermaid svg { display: block; max-width: 100%; height: auto; margin: 0 auto; }
   .prose table { display: block; width: 100%; max-width: 100%; overflow: auto; border-collapse: collapse; margin: 24px 0; font-size: 13px; line-height: 1.6; scrollbar-width: thin; scrollbar-color: #c7c7c0 var(--surface); font-variant-numeric: tabular-nums; }
   .prose th { text-align: left; font-weight: 550; background: var(--surface); }
   .prose th, .prose td { padding: 12px 16px; border-bottom: 1px solid var(--line); min-width: 112px; vertical-align: top; }

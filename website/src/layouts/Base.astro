@@ -2,12 +2,11 @@
 import '@fontsource-variable/geist';
 import '@fontsource-variable/geist-mono';
 import '../styles/global.css';
-import Search from '../components/Search.astro';
 import Arrow from '../components/Arrow.astro';
 import { repository } from '../lib/content';
 
-interface Props { title: string; description: string; docs?: boolean; source?: string; noindex?: boolean }
-const { title, description, docs = false, source = 'README.md', noindex = false } = Astro.props;
+interface Props { title: string; description: string; source?: string; noindex?: boolean }
+const { title, description, source = 'README.md', noindex = false } = Astro.props;
 const canonical = new URL(Astro.url.pathname, Astro.site);
 ---
 <!doctype html>
@@ -30,11 +29,10 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
-    <header class:list={['site-header', { 'has-search': docs }]}>
+    <header class="site-header">
       <a class="wordmark" href="/" aria-label="rekcod home"><img src="/logo.svg" alt="" width="32" height="32" /></a>
-      {docs && <Search />}
       <nav class="header-nav" aria-label="Main navigation">
-        <a href="/docs/" aria-current={docs ? 'page' : undefined}>Docs</a>
+        <a href="/#run-your-first-container">Install</a>
         <a href={repository}>GitHub <Arrow /></a>
       </nav>
     </header>
@@ -48,7 +46,33 @@ const canonical = new URL(Astro.url.pathname, Astro.site);
     </footer>
     <div class="sr-only" role="status" aria-live="polite" id="copy-status"></div>
     <script>
-      for (const pre of document.querySelectorAll<HTMLPreElement>('.prose pre')) {
+      const diagrams = document.querySelectorAll<HTMLPreElement>('.prose pre.mermaid');
+      if (diagrams.length) {
+        const { default: mermaid } = await import('mermaid');
+        await document.fonts.ready;
+        mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: 'strict',
+          theme: 'base',
+          fontFamily: 'Geist Variable, sans-serif',
+          themeVariables: {
+            primaryColor: '#f7f7f5',
+            primaryTextColor: '#20201e',
+            primaryBorderColor: '#b4b4ad',
+            lineColor: '#62625d',
+            secondaryColor: '#efefec',
+            tertiaryColor: '#ffffff',
+          },
+          flowchart: { htmlLabels: false, useMaxWidth: true },
+          sequence: { useMaxWidth: true },
+        });
+        await mermaid.run({ nodes: diagrams });
+        for (const svg of document.querySelectorAll<SVGSVGElement>('.mermaid > svg')) {
+          svg.style.minWidth = `${svg.viewBox.baseVal.width * 0.85}px`;
+        }
+      }
+
+      for (const pre of document.querySelectorAll<HTMLPreElement>('.prose pre:not(.mermaid)')) {
         const button = document.createElement('button');
         button.className = 'copy-code';
         button.type = 'button';

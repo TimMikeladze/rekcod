@@ -7,7 +7,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
-pub const CLI_VERSION: &str = "29.9.3";
+pub const CLI_VERSION: &str = "29.10.0";
 
 struct Asset {
     url: &'static str,
@@ -20,20 +20,20 @@ struct Asset {
 
 const ASSETS: &[Asset] = &[
     Asset {
-        url: "https://download.docker.com/mac/static/stable/aarch64/docker-29.9.3.tgz",
-        sha256: "79145e169bca0b9571d02de8e1cd311a36e0e8fdb4599b6661a87b1bb3afbe13",
+        url: "https://download.docker.com/mac/static/stable/aarch64/docker-29.10.0.tgz",
+        sha256: "84025e01f7716eb8bd1064c49a9d2b3a38547fa963983e81017c73ee8c5d540b",
         dest: "docker",
         member: Some("docker/docker"),
     },
     Asset {
-        url: "https://github.com/docker/compose/releases/download/v5.7.0/docker-compose-darwin-aarch64",
-        sha256: "54495ff81dd8cae11861455f0308a293a530149beba8f1d90ff3f295b11cf035",
+        url: "https://github.com/docker/compose/releases/download/v5.7.1/docker-compose-darwin-aarch64",
+        sha256: "5a9aa8b5fb5b1e3cd83f39c80e570ae30aafd74cd9b47264fbe4ff7e6e6251ca",
         dest: "cli-plugins/docker-compose",
         member: None,
     },
     Asset {
-        url: "https://github.com/docker/buildx/releases/download/v0.38.2/buildx-v0.38.2.darwin-arm64",
-        sha256: "81702e18713cfd495bfe594943fa57f470eda16c0653ae3de15cd411df273c41",
+        url: "https://github.com/docker/buildx/releases/download/v0.39.0/buildx-v0.39.0.darwin-arm64",
+        sha256: "0190e4b9c85510974290f9a597e86c4d8200be782aeaa3df7d756ab4423d6b2d",
         dest: "cli-plugins/docker-buildx",
         member: None,
     },

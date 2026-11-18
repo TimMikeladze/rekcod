@@ -656,7 +656,11 @@ impl DnsFilter {
                 Some(answer)
             }
             name => {
-                log!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain question)"));
+                // The name is the guest's: escaped, cut short, and a few lines a second at most.
+                static LOGGED: dns::Throttle = dns::Throttle::new(5);
+                if LOGGED.allow() {
+                    log!("rekcod-egress: refused dns {}", dns::printable(name.as_deref().unwrap_or("(not one plain question)")));
+                }
                 dns::refused(query)
             }
         }
@@ -675,7 +679,8 @@ async fn dns_bridge(vm: Vm, filter: Option<Arc<DnsFilter>>) {
 
 async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
     let (mut rd, mut wr) = tokio::io::split(vm.connect(DNS_PORT).await?);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    // Bounded: a guest that stops reading answers stops having its queries read.
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
     // Queries resolving at once; more wait, so a flood can't spawn tasks without limit.
     let in_flight = Arc::new(tokio::sync::Semaphore::new(256));
     let writer = tokio::spawn(async move {
@@ -701,7 +706,7 @@ async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
                     None => resolve(&query).await,
                 };
                 if let Some(frame) = answer.as_deref().and_then(frame) {
-                    let _ = tx.send(frame);
+                    let _ = tx.send(frame).await;
                 }
             });
         }
@@ -737,14 +742,7 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
         servers = dns::nameservers(&resolv, dns::if_index);
     }
     for server in servers {
-        let local: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
-        let Ok(sock) = UdpSocket::bind(local).await else { continue };
-        if sock.send_to(query, server).await.is_err() {
-            continue;
-        }
-        let mut buf = vec![0u8; 4096];
-        if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
-            buf.truncate(n);
+        if let Some(buf) = dns::ask_udp(query, server, Duration::from_secs(2)).await {
             // Truncated (TC): the full answer only comes over TCP.
             if buf.len() > 2
                 && buf[2] & 0x02 != 0

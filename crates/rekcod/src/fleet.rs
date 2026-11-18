@@ -3016,6 +3016,14 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
             if !valid_label(name) {
                 bail!("namespace names are lowercase letters, digits and single dashes, at most 40");
             }
+            // A delete that's still settling (a job cancelling) leaves rows under the name.
+            let left: i64 = c
+                .db()
+                .query_one("select (select count(*) from jobs where ns = ?1) + (select count(*) from sandboxes where ns = ?1)", &[&name])?
+                .get(0);
+            if left > 0 {
+                bail!("{name} was deleted and still has jobs or sandboxes settling; try again in a minute");
+            }
             let salt: [u8; 16] = random_bytes()?;
             c.db()
                 .execute("insert into namespaces (name, created, salt) values (?1, ?2, ?3)", &[&name, &now(), &salt.to_vec()])
@@ -3124,14 +3132,27 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
                     .execute(&format!("update jobs set state = 'cancelling' where id = ?1 and state in {JOB_ACTIVE_SQL}"), &[&id])?;
                 let _ = refresh_job(c, &id, &node, "cancelling");
             }
-            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // Nothing of it may be found by a namespace made later under the same name: finished
+            // jobs, dead sandbox rows, instance logs and traffic go; the audit trail and jobs still
+            // cancelling move to a name `valid_label` never matches.
+            let tomb = format!("{n} (deleted {})", now());
+            let suffix = format!("--{n}");
+            let mut db = c.db();
             for t in ["members", "node_pools", "schedules"] {
                 db.execute(&format!("delete from {t} where ns = ?1"), &[n])?;
             }
-            // The salt goes with the row; earlier backups keep a copy (docs/namespaces.md).
+            db.execute(&format!("delete from jobs where ns = ?1 and state not in {JOB_ACTIVE_SQL}"), &[n])?;
+            db.execute("delete from sandboxes where ns = ?1 and state <> 'running'", &[n])?;
+            for t in ["jobs", "sandboxes", "audit"] {
+                db.execute(&format!("update {t} set ns = ?2 where ns = ?1"), &[n, &tomb])?;
+            }
+            for t in ["instance_logs", "traffic"] {
+                db.execute(&format!("delete from {t} where substr(app, -length(?1)) = ?1"), &[&suffix])?;
+            }
+            // The salt goes with the row; earlier backups keep a copy.
             db.execute("delete from namespaces where name = ?1", &[n])?;
             drop(db);
-            c.audit(n, &who.name, "delete namespace", n, true);
+            c.audit(&tomb, &who.name, "delete namespace", n, true);
             Ok(json!({"deleted": n, "apps": apps}))
         }
         _ => Err(anyhow!("no such endpoint")),
@@ -5187,7 +5208,7 @@ mod job_and_node_tests {
         run_job_on(host.clone(), &paths, &json!({"id": "j-env", "git": {"url": "u"}, "cmd": ["printenv"], "env": ["HOME"]})).unwrap();
         let v = finished(&paths, "j-env");
         assert_eq!(v["exit"].as_i64(), Some(-1), "{v}");
-        assert!(v["log"].as_str().unwrap().contains("use KEY=VALUE"), "{v}");
+        assert!(v["error"].as_str().unwrap().contains("use KEY=VALUE"), "{v}");
         assert_eq!(host.created.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -7210,6 +7231,34 @@ mod tests {
         call(&url, "DELETE", "/tokens", Some("admin-t"), &json!({"name": "ci/deploy"})).unwrap();
         assert!(call(&url, "DELETE", "/tokens/ci%2Fdeploy", Some("admin-t"), &json!({})).unwrap_err().to_string().contains("(400)"));
         assert_eq!(names(&c), ["admin", "alice"]);
+    }
+
+    #[test]
+    fn a_namespace_made_again_gets_nothing_of_the_deleted_one() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        add_token(&c, "otto-t", "otto", false, "none", false, None);
+        call(&url, "POST", "/namespaces", Some("admin-t"), &json!({"name": "team"})).unwrap();
+        c.db()
+            .execute(
+                "insert into jobs (id, owner, node, spec, state, created, finished, log, ns) values ('j-old', 'mia', 'n', '{}', 'done', 0, 1, 'postgres://app:hunter2@db', 'team')",
+                &[],
+            )
+            .unwrap();
+        c.db().execute("insert into traffic values ('web--team', 1, 1, 0, 1, 1)", &[]).unwrap();
+        call(&url, "DELETE", "/namespaces/team", Some("admin-t"), &json!({})).unwrap();
+        call(&url, "POST", "/namespaces", Some("admin-t"), &json!({"name": "team"})).unwrap();
+        call(&url, "POST", "/namespaces/team/members", Some("admin-t"), &json!({"who": "otto", "role": "viewer"})).unwrap();
+        let e = call(&url, "GET", "/ns/team/jobs/j-old", Some("otto-t"), &Value::Null).unwrap_err().to_string();
+        assert!(e.contains("no job j-old"), "{e}");
+        assert_eq!(call(&url, "GET", "/ns/team/jobs", Some("otto-t"), &Value::Null).unwrap()["jobs"], json!([]));
+        let mut db = c.db();
+        let audit: Vec<(String, String)> =
+            db.query("select ns, action from audit order by rowid", &[]).unwrap().iter().map(|r| (r.get(0), r.get(1))).collect();
+        let kept: Vec<&str> = audit.iter().filter(|(ns, _)| ns == "team").map(|(_, a)| a.as_str()).collect();
+        assert_eq!(kept, ["create namespace", "member viewer"], "only the new namespace's rows: {audit:?}");
+        assert_eq!(audit.iter().filter(|(ns, _)| ns.starts_with("team (deleted ")).count(), 2, "{audit:?}");
+        assert_eq!(db.query_one("select count(*) from traffic", &[]).unwrap().get::<i64>(0), 0);
     }
 
     #[test]

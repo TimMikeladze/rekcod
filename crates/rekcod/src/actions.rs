@@ -34,6 +34,7 @@ pub enum Kind {
     SandboxStop,
     SandboxRemove,
     SandboxScreenshot,
+    SandboxPrune,
     AppOpen,
     AppLogs,
     AppRollback,
@@ -97,7 +98,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 78] = [
+    pub const ALL: [Kind; 79] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -118,6 +119,7 @@ impl Kind {
         Kind::SandboxStop,
         Kind::SandboxRemove,
         Kind::SandboxScreenshot,
+        Kind::SandboxPrune,
         Kind::AppOpen,
         Kind::AppLogs,
         Kind::AppRollback,
@@ -1370,8 +1372,12 @@ pub fn volume_actions(v: &Volume) -> Vec<Action> {
 
 /// Prunes, while the VM runs. Snapshot volumes are left out of `volume prune`.
 pub fn disk_actions(running: bool, images: &[Image], volumes: &[Volume], disk: Option<&Disk>) -> Vec<Action> {
+    // Sandboxes are files on the Mac; removing them needs no VM.
+    let sandboxes = Action::rekcod(Kind::SandboxPrune, "Remove unused agent sandboxes", &["sandbox", "prune"]).confirm(
+        "Delete agent sandboxes stopped and unused for a week, and what failed creates left? Unapplied changes in them are lost.".into(),
+    );
     if !running {
-        return vec![];
+        return vec![sandboxes];
     }
     let dangling: Vec<&Image> = images.iter().filter(|i| i.dangling && i.containers.is_empty()).collect();
     let loose: Vec<&Volume> = volumes.iter().filter(|v| v.anonymous && !v.snapshot && v.containers.is_empty()).collect();
@@ -1399,6 +1405,7 @@ pub fn disk_actions(running: bool, images: &[Image], volumes: &[Volume], disk: O
             .confirm("Remove every network no container uses? Compose recreates its networks on the next up.".into()),
         Action::rekcod(Kind::SystemPrune, "Remove everything unused", &["system", "prune", "-f"])
             .confirm("Remove stopped containers, unused networks, dangling images and unused build cache? Volumes are kept.".into()),
+        sandboxes,
     ]
 }
 
@@ -1823,6 +1830,7 @@ pub mod tests {
                     | Kind::NetworkRemove
                     | Kind::NetworkPrune
                     | Kind::SystemPrune
+                    | Kind::SandboxPrune
             ) || (a.kind == Kind::EdgeBan && !a.interactive);
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }
@@ -1840,7 +1848,7 @@ pub mod tests {
         let vp = d.iter().find(|a| a.kind == Kind::VolumePrune).unwrap();
         assert!(matches!(&vp.run, Run::Rekcod(v) if v.contains(&"label!=dev.rekcod.snap".to_string())));
         assert!(!volume_actions(&sample_volumes()[0]).iter().any(|a| a.kind == Kind::VolumeRemove), "a volume in use can't be removed");
-        assert!(disk_actions(false, &[], &[], None).is_empty());
+        assert_eq!(disk_actions(false, &[], &[], None).iter().map(|a| a.kind).collect::<Vec<_>>(), vec![Kind::SandboxPrune]);
     }
 
     #[test]

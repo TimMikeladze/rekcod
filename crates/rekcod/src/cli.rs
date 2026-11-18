@@ -202,8 +202,11 @@ fn random_mac() -> Result<String> {
 }
 
 /// Root disk follows the installed guest version; data disk and MAC persist.
-fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
-    let guest = paths.guest_dir()?;
+fn prepare_vm(paths: &Paths, disk_gib: u64, guest: Option<&std::path::Path>) -> Result<()> {
+    let guest = match guest {
+        Some(g) => g.to_path_buf(),
+        None => paths.guest_dir()?,
+    };
     let version = std::fs::read_to_string(guest.join("VERSION")).unwrap_or_else(|_| "dev".into());
     let installed = std::fs::read_to_string(paths.guest_version()).unwrap_or_default();
     if !paths.root_disk().exists() || installed.trim() != version.trim() {
@@ -320,17 +323,13 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         return Ok(Some(pid));
     }
     {
-        if let Some(dir) = &opts.guest_dir {
-            // SAFETY: single-threaded CLI, before spawning anything.
-            unsafe { std::env::set_var("REKCOD_GUEST_DIR", dir) };
-        }
         // The main VM boots with what `rekcod start` was last given; sandboxes say their own.
         let saved = if opts.project.is_none() { saved(paths) } else { Saved::default() };
         if opts.repair {
             // A fresh copy of the release's root disk; it holds nothing of yours.
             let _ = std::fs::remove_file(paths.root_disk());
         }
-        prepare_vm(paths, opts.disk_gib.max(saved.disk_gib.unwrap_or(0)))?;
+        prepare_vm(paths, opts.disk_gib.max(saved.disk_gib.unwrap_or(0)), opts.guest_dir.as_deref())?;
         let cpus = opts.cpus.or(saved.cpus).unwrap_or_else(default_cpus).clamp(1, vm::max_cpus());
         let host_mib = sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
         let memory_mib = opts.memory_gib.or(saved.memory_gib).map(|g| g << 10).unwrap_or((host_mib / 2).min(8 << 10));
@@ -347,6 +346,10 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
+        // On the child, not set_var: the API servers that boot sandboxes are threaded.
+        if let Some(dir) = &opts.guest_dir {
+            cmd.env("REKCOD_GUEST_DIR", dir);
+        }
         if let Some(base) = opts.base_memory_gib.or(saved.base_memory_gib) {
             cmd.args(["--base-memory-mib", &(base << 10).to_string()]);
         }
@@ -398,6 +401,8 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
             let round = Instant::now();
             if api_get(paths, "/_ping").is_ok_and(|b| b == b"OK") {
                 let _ = std::fs::remove_file(paths.data_fresh());
+                // Reaped when it exits, so a server that boots sandboxes collects no zombies.
+                std::thread::spawn(move || child.wait());
                 break;
             }
             if checked.elapsed() > Duration::from_millis(500) {

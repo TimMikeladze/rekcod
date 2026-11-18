@@ -164,7 +164,7 @@ enum Cmd {
         /// Don't forward listening ports automatically.
         #[arg(long)]
         no_autoports: bool,
-        /// Run in a separate VM that sees only this directory (docs/sandbox.md).
+        /// Run in a separate VM that sees only this directory, read-write.
         #[arg(long)]
         sandbox: bool,
         /// No network at all.
@@ -180,7 +180,7 @@ enum Cmd {
         #[arg(required = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Throwaway VMs for AI agents: a full dockerd that sees a copy of one project (docs/agent-sandboxes.md).
+    /// Throwaway VMs for AI agents: a full dockerd that sees a copy of one project.
     Sandbox {
         /// Run on a fleet controller (`rekcod remote add`); no NAME means the default remote.
         #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
@@ -493,9 +493,10 @@ enum SandboxCmd {
         /// Only print what would change; exit 1 if anything would.
         #[arg(long)]
         check: bool,
-        /// Write the copy the last `diff` showed, not the workspace as it is now.
-        #[arg(long)]
-        reviewed: bool,
+        /// Write the copy the `diff` that printed REVIEW showed, not the workspace as it is
+        /// now. Refused once a later diff (yours or an agent's) has replaced that copy.
+        #[arg(long, value_name = "REVIEW")]
+        reviewed: Option<String>,
     },
     /// Save a macOS sandbox's screen as PNG.
     Screenshot {
@@ -541,6 +542,12 @@ enum SandboxCmd {
         #[arg(long, conflicts_with = "ids")]
         all: bool,
     },
+    /// Delete stopped sandboxes not used for a while, and what failed creates left behind.
+    Prune {
+        /// Last used longer ago than this.
+        #[arg(long, default_value = "168h", value_parser = duration_secs)]
+        older_than: u64,
+    },
     /// Serve the sandbox API on ~/.rekcod/run/sandbox.sock.
     Serve {
         /// Also listen on 127.0.0.1:PORT, with a bearer token.
@@ -574,6 +581,10 @@ struct ApiPolicyArgs {
     /// the internet, the Mac and the LAN.
     #[arg(long)]
     allow_macos: bool,
+    /// Let callers write a sandbox's changes into the project on the Mac (`apply`). Without
+    /// it they can diff and `apply` with `check` only; you apply with `rekcod sandbox apply`.
+    #[arg(long)]
+    allow_apply: bool,
 }
 
 impl ApiPolicyArgs {
@@ -594,6 +605,7 @@ impl ApiPolicyArgs {
             allow_hosts: self.allow_hosts,
             secrets: self.secrets,
             macos: self.allow_macos,
+            apply: self.allow_apply,
             node: false,
         })
     }
@@ -1314,8 +1326,20 @@ fn main() {
         libc::sigemptyset(&mut none);
         libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
     }
-    if !matches!(command, Cmd::Daemon { .. }) {
-        // Behave like other CLIs when piped into `head` (the daemon keeps Rust's SIGPIPE-ignore).
+    // Servers keep Rust's SIGPIPE-ignore: a peer or a child that closes its end is an error
+    // to handle, not a reason for the daemon, `mcp` or an API server to die.
+    let serves = matches!(
+        command,
+        Cmd::Daemon { .. }
+            | Cmd::Mcp(_)
+            | Cmd::Sandbox { cmd: SandboxCmd::Serve { .. }, .. }
+            | Cmd::Node(NodeCmd::Serve { .. } | NodeCmd::Join { .. })
+            | Cmd::Controller(ControllerCmd::Serve { .. })
+            | Cmd::Storage(StorageCmd::Serve { .. })
+            | Cmd::Edge(EdgeCmd::Serve { .. })
+    );
+    if !serves {
+        // Behave like other CLIs when piped into `head`.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
     let result = paths::Paths::new().and_then(|paths| match command {
@@ -1945,7 +1969,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
             let code = sandbox::exec(paths, &id, sandbox::ExecOptions { workdir, env, timeout_secs: timeout, tty }, &cmd)?;
             std::process::exit(code)
         }
-        SandboxCmd::Shell { id } => sandbox::shell(paths, &id),
+        SandboxCmd::Shell { id } => std::process::exit(sandbox::shell(paths, &id)?),
         SandboxCmd::Cp { src, dst } => sandbox::cp(paths, &src, &dst),
         SandboxCmd::Fork { id, name, json } => {
             let m = sandbox::fork(paths, &id, name)?;
@@ -1958,7 +1982,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         }
         SandboxCmd::Diff { id, stat } => sandbox::diff(paths, &id, stat),
         SandboxCmd::Apply { id, check, reviewed } => {
-            let ch = sandbox::apply(paths, &id, check, reviewed)?;
+            let ch = sandbox::apply(paths, &id, check, reviewed.as_deref())?;
             sandbox::print_changes(&ch);
             if check && !ch.is_empty() {
                 std::process::exit(1);
@@ -1978,7 +2002,8 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         SandboxCmd::Log { id, follow, json, net } => sandbox::log(paths, &id, follow, json, net),
         SandboxCmd::Ls { json } => sandbox::print_list(paths, json),
         SandboxCmd::Stop { id } => sandbox::stop(paths, &id),
-        SandboxCmd::Rm { ids, all } => sandbox::rm(paths, &ids, all),
+        SandboxCmd::Rm { ids, all } => sandbox::rm_each(paths, &ids, all, &mut |id| println!("{id}")),
+        SandboxCmd::Prune { older_than } => sandbox::prune(paths, older_than, &mut |id| println!("{id}")),
         SandboxCmd::Serve { listen, policy } => sandbox_api::serve(paths.clone(), policy.policy()?, listen),
         SandboxCmd::Golden(Golden::Build { name, images }) => sandbox::golden_build(paths, &name, &images),
         SandboxCmd::Golden(Golden::Ls) => sandbox::golden_list(paths),

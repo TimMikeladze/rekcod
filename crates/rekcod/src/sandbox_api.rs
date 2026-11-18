@@ -1,6 +1,6 @@
-//! The sandbox API for agents (docs/agent-sandboxes.md): HTTP on a unix socket
-//! (`rekcod sandbox serve`) and MCP over stdio (`rekcod mcp`). Both call `op`, which
-//! calls `sandbox.rs`, so they offer what the CLI offers.
+//! The sandbox API for agents (README, "Review an agent's changes before applying them"):
+//! HTTP on a unix socket (`rekcod sandbox serve`) and MCP over stdio (`rekcod mcp`). Both
+//! call `op`, which calls `sandbox.rs`, so they offer what the CLI offers.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -16,6 +16,37 @@ use crate::sandbox::{self, CreateOptions, ExecOptions};
 
 fn strs(v: &Value) -> Vec<String> {
     v.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect()
+}
+
+/// A boolean argument: JSON `true`/`false`, or the strings `"true"`/`"false"` a query string
+/// carries. Anything else that is present is an error, so `?check=1` can't apply for real.
+fn flag(args: &Value, key: &str) -> Result<bool> {
+    match &args[key] {
+        Value::Null => Ok(false),
+        Value::Bool(b) => Ok(*b),
+        Value::String(s) if s == "true" => Ok(true),
+        Value::String(s) if s == "false" => Ok(false),
+        v => bail!("{key} takes true or false, not {v}"),
+    }
+}
+
+/// A whole-number argument, as a JSON number or a query string's digits.
+fn num(args: &Value, key: &str) -> Result<Option<u64>> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::Number(n) if n.is_u64() => Ok(n.as_u64()),
+        Value::String(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(s.parse()?)),
+        v => bail!("{key} takes a whole number, not {v}"),
+    }
+}
+
+/// A string argument; another JSON type is an error rather than absent.
+fn text<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s)),
+        v => bail!("{key} takes a string, not {v}"),
+    }
 }
 
 fn id_of(args: &Value) -> Result<String> {
@@ -40,6 +71,9 @@ pub struct Policy {
     /// Allows macOS guests. Their network isn't filtered: they reach the internet, the Mac
     /// and the LAN.
     pub macos: bool,
+    /// Allows `apply` to write into the project on the Mac. Off, callers get `check` only
+    /// and a person applies from the CLI after reading the diff.
+    pub apply: bool,
     /// A fleet node, which only the controller calls (node secret). It takes git sources,
     /// serves [`NODE_ONLY`] and reaches only the sandboxes the fleet made, never the Mac
     /// owner's. Only [`Policy::node`] sets it.
@@ -68,7 +102,8 @@ enum Refusal {
 impl Policy {
     /// Fleet nodes: only the controller calls them (node secret), and it filters what users send.
     pub fn node() -> Policy {
-        Policy { roots: vec![], mount: false, allow_hosts: vec!["*".into()], secrets: vec![], macos: true, node: true }
+        // The controller never forwards apply.
+        Policy { roots: vec![], mount: false, allow_hosts: vec!["*".into()], secrets: vec![], macos: true, apply: false, node: true }
     }
 
     fn host_allowed(&self, h: &str) -> bool {
@@ -135,7 +170,7 @@ impl Policy {
     }
 
     fn check(&self, args: &Value) -> Result<()> {
-        if args["mount"].as_bool() == Some(true) && !self.mount {
+        if flag(args, "mount")? && !self.mount {
             bail!("mount isn't allowed; start the server with --allow-mount");
         }
         if let Some(h) = strs(&args["allow_hosts"]).into_iter().find(|h| !self.host_allowed(h)) {
@@ -144,7 +179,7 @@ impl Policy {
         if let Some(s) = strs(&args["secrets"]).into_iter().find(|s| !self.secrets.contains(s)) {
             bail!("secret {s} isn't allowed; start the server with --secret {s}");
         }
-        if args["os"].as_str() == Some("macos") && !self.macos {
+        if text(args, "os")? == Some("macos") && !self.macos {
             bail!("os macos isn't allowed: a macOS guest's network isn't filtered; start the server with --allow-macos");
         }
         Ok(())
@@ -158,31 +193,125 @@ fn exec_opts(args: &Value) -> Result<ExecOptions> {
     if let Some(e) = env.iter().find(|e| !e.contains('=')) {
         bail!("env {e}: use KEY=VALUE");
     }
-    Ok(ExecOptions { workdir: args["workdir"].as_str().map(String::from), env, timeout_secs: args["timeout_secs"].as_u64(), tty: false })
+    Ok(ExecOptions { workdir: text(args, "workdir")?.map(String::from), env, timeout_secs: num(args, "timeout_secs")?, tty: false })
 }
 
-/// Runs a command to completion: (exit, stdout, stderr).
-fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-    let cmd = strs(&args["cmd"]);
-    if cmd.is_empty() {
-        bail!("missing cmd");
-    }
-    let mut c = sandbox::exec_cmd(paths, id, &exec_opts(args)?, &cmd)?;
-    let t0 = Instant::now();
+/// Most output kept per stream of a collected exec, and the largest file `read_file`
+/// returns. Past it the command is killed: an endless printer can't grow the server.
+const MAX_OUTPUT: usize = 8 << 20;
+
+/// What a collected command left.
+pub(crate) struct Collected {
+    pub code: i32,
+    pub out: Vec<u8>,
+    pub err: Vec<u8>,
+    /// A stream passed the cap and the command was killed.
+    pub truncated: bool,
+}
+
+/// Runs `c` to completion. `stdin` is fed from a thread, and the child closing its end
+/// (EPIPE) ends the feed, not this process. At most `cap` bytes of each stream are kept;
+/// past that, or after `deadline`, the child is killed (exit 124 for the deadline, as
+/// `timeout` does). The child is always waited for.
+pub(crate) fn collect(
+    c: &mut std::process::Command,
+    stdin: Option<Vec<u8>>,
+    cap: usize,
+    deadline: Option<std::time::Duration>,
+) -> Result<Collected> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     let mut child = c
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("run docker")?;
-    if let Some(data) = stdin {
-        let mut w = child.stdin.take().context("stdin")?;
-        w.write_all(data)?;
+    let feed = match (stdin, child.stdin.take()) {
+        (Some(data), Some(mut w)) => Some(std::thread::spawn(move || match w.write_all(&data) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            r => r,
+        })),
+        _ => None,
+    };
+    let over = Arc::new(AtomicBool::new(false));
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        let over = over.clone();
+        std::thread::spawn(move || {
+            let (mut kept, mut buf) = (Vec::new(), vec![0u8; 1 << 16]);
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let room = cap - kept.len();
+                kept.extend_from_slice(&buf[..n.min(room)]);
+                if n > room {
+                    over.store(true, Ordering::SeqCst);
+                }
+            }
+            kept
+        })
+    };
+    let out = read(Box::new(child.stdout.take().context("stdout")?));
+    let err = read(Box::new(child.stderr.take().context("stderr")?));
+    let t0 = Instant::now();
+    let mut nap = std::time::Duration::from_millis(1);
+    let (status, timed_out) = loop {
+        if let Some(st) = child.try_wait()? {
+            break (st, false);
+        }
+        let late = deadline.is_some_and(|d| t0.elapsed() >= d);
+        if late || over.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            break (child.wait()?, late);
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(50));
+    };
+    let (out, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    if let Some(f) = feed {
+        f.join().map_err(|_| anyhow!("stdin writer panicked"))?.context("write stdin")?;
     }
-    let out = child.wait_with_output()?;
-    let code = out.status.code().unwrap_or(1);
-    sandbox::record(paths, id, &cmd, code, t0.elapsed().as_millis());
-    Ok((code, out.stdout, out.stderr))
+    use std::os::unix::process::ExitStatusExt;
+    let code = if timed_out { 124 } else { status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) };
+    Ok(Collected { code, out, err, truncated: over.load(Ordering::SeqCst) })
+}
+
+/// Runs `args["cmd"]` in the sandbox to completion.
+fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<Vec<u8>>) -> Result<Collected> {
+    let cmd = strs(&args["cmd"]);
+    if cmd.is_empty() {
+        bail!("missing cmd");
+    }
+    let (mut c, deadline) = sandbox::exec_command(paths, id, &exec_opts(args)?, &cmd)?;
+    let _busy = sandbox::busy(paths, id);
+    let t0 = Instant::now();
+    let r = collect(&mut c, stdin, MAX_OUTPUT, deadline.map(std::time::Duration::from_secs))?;
+    sandbox::record(paths, id, &cmd, r.code, t0.elapsed().as_millis());
+    Ok(r)
+}
+
+/// The bytes of the file `path` in the sandbox, up to [`MAX_OUTPUT`].
+fn read_file(paths: &Paths, id: &str, path: &str) -> Result<Vec<u8>> {
+    let r = exec_collect(paths, id, &json!({"cmd": ["cat", "--", path]}), None)?;
+    if r.truncated {
+        bail!("{path} is over {} MiB; copy it out with `rekcod sandbox cp`", MAX_OUTPUT >> 20);
+    }
+    if r.code != 0 {
+        bail!("{}", String::from_utf8_lossy(&r.err).trim());
+    }
+    Ok(r.out)
+}
+
+/// Writes `body` to `path` in the sandbox, making its directory; returns the bytes written.
+fn write_file(paths: &Paths, id: &str, path: &str, body: Vec<u8>) -> Result<usize> {
+    let n = body.len();
+    let a = json!({"cmd": ["sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "-", path]});
+    let r = exec_collect(paths, id, &a, Some(body))?;
+    if r.code != 0 {
+        bail!("{}", String::from_utf8_lossy(&r.err).trim());
+    }
+    Ok(n)
 }
 
 /// One API operation. `exec` here collects output; HTTP streams it separately. Every
@@ -206,17 +335,17 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             };
             let o = CreateOptions {
                 dir,
-                name: args["name"].as_str().map(String::from),
-                mount: args["mount"].as_bool().unwrap_or(false),
-                image: args["image"].as_str().map(String::from),
-                golden: args["golden"].as_str().map(String::from).unwrap_or(d.golden),
-                cpus: args["cpus"].as_u64().map(|c| c as usize).unwrap_or(d.cpus),
-                memory_gib: args["memory_gib"].as_u64().unwrap_or(d.memory_gib),
+                name: text(args, "name")?.map(String::from),
+                mount: flag(args, "mount")?,
+                image: text(args, "image")?.map(String::from),
+                golden: text(args, "golden")?.map(String::from).unwrap_or(d.golden),
+                cpus: num(args, "cpus")?.map(|c| c as usize).unwrap_or(d.cpus),
+                memory_gib: num(args, "memory_gib")?.unwrap_or(d.memory_gib),
                 allow_hosts: strs(&args["allow_hosts"]),
-                offline: args["offline"].as_bool().unwrap_or(false),
+                offline: flag(args, "offline")?,
                 secrets: strs(&args["secrets"]),
-                ttl_secs: args["ttl_secs"].as_u64().unwrap_or(d.ttl_secs),
-                os: args["os"].as_str().map(String::from),
+                ttl_secs: num(args, "ttl_secs")?.unwrap_or(d.ttl_secs),
+                os: text(args, "os")?.map(String::from),
                 // Never from the API: it opens a hole to the Mac and LAN.
                 reach: vec![],
             };
@@ -233,26 +362,27 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
         }
         "get" => serde_json::to_value(sandbox::get(paths, &target()?)?)?,
         "exec" => {
-            let (exit, out, err) = exec_collect(paths, &target()?, args, None)?;
-            json!({"exit": exit, "stdout": String::from_utf8_lossy(&out), "stderr": String::from_utf8_lossy(&err)})
-        }
-        "read_file" => {
-            let a = json!({"cmd": ["cat", "--", args["path"].as_str().context("missing path")?]});
-            let (exit, out, err) = exec_collect(paths, &target()?, &a, None)?;
-            if exit != 0 {
-                bail!("{}", String::from_utf8_lossy(&err).trim());
+            let r = exec_collect(paths, &target()?, args, None)?;
+            let mut v = json!({"exit": r.code, "stdout": String::from_utf8_lossy(&r.out), "stderr": String::from_utf8_lossy(&r.err)});
+            if r.truncated {
+                v["truncated"] = json!(true);
             }
-            json!({"content": String::from_utf8_lossy(&out)})
+            v
         }
+        // JSON carries text: a file that isn't UTF-8 comes back as base64. HTTP sends bytes.
+        "read_file" => match String::from_utf8(read_file(paths, &target()?, text(args, "path")?.context("missing path")?)?) {
+            Ok(text) => json!({"content": text}),
+            Err(e) => json!({"content_base64": crate::daemon::base64(e.as_bytes())}),
+        },
         "write_file" => {
-            let path = args["path"].as_str().context("missing path")?;
-            let a = json!({"cmd": ["sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "-", path]});
-            let body = args["content"].as_str().unwrap_or_default();
-            let (exit, _, err) = exec_collect(paths, &target()?, &a, Some(body.as_bytes()))?;
-            if exit != 0 {
-                bail!("{}", String::from_utf8_lossy(&err).trim());
-            }
-            json!({"written": body.len()})
+            let path = text(args, "path")?.context("missing path")?;
+            let body = match (text(args, "content")?, text(args, "content_base64")?) {
+                (Some(t), None) => t.as_bytes().to_vec(),
+                (None, Some(b)) => base64_decode(b)?,
+                (None, None) => vec![],
+                (Some(_), Some(_)) => bail!("pass content or content_base64, not both"),
+            };
+            json!({"written": write_file(paths, &target()?, path, body)?})
         }
         "fork" => {
             let meta = sandbox::fork(paths, &target()?, args["name"].as_str().map(String::from))?;
@@ -261,16 +391,20 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             }
             serde_json::to_value(meta)?
         }
-        "diff" => {
-            let (changes, patch) = sandbox::patch(paths, &target()?)?;
-            json!({"changes": changes, "patch": patch})
+        "diff" => serde_json::to_value(sandbox::patch(paths, &target()?)?)?,
+        "apply" => {
+            let id = target()?;
+            let reviewed = text(args, "reviewed").context("reviewed takes the review ID a diff returned")?;
+            let check = flag(args, "check")?;
+            if !check && !policy.apply {
+                return Err(anyhow::Error::new(Forbidden(
+                    "apply writes into the project on the Mac, which this server doesn't allow (only check); \
+                     apply with `rekcod sandbox apply`, or start the server with --allow-apply"
+                        .into(),
+                )));
+            }
+            json!({"changes": sandbox::apply(paths, &id, check, reviewed)?})
         }
-        "apply" => json!({"changes": sandbox::apply(
-            paths,
-            &target()?,
-            args["check"].as_bool().unwrap_or(false),
-            args["reviewed"].as_bool().unwrap_or(false)
-        )?}),
         "stop" => {
             let id = target()?;
             // An app instance stopped by the controller (idle) stays down across node restarts.
@@ -475,40 +609,78 @@ pub fn route(method: &str, path: &str, query: &[(String, String)], body: &Value)
     Some((op, args))
 }
 
-/// `exec` over HTTP: NDJSON events as the command prints, then `{"exit": n}`.
+/// `exec` over HTTP: NDJSON events as the command prints, then `{"exit": n}`. A client that
+/// goes away gets the command killed; a macOS guest's command is killed after
+/// `timeout_secs` (exit 124). The child is always waited for.
 fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Result<()> {
     let id = id_of(args)?;
     let cmd = strs(&args["cmd"]);
     if cmd.is_empty() {
         bail!("missing cmd");
     }
-    let mut c = sandbox::exec_cmd(paths, &id, &exec_opts(args)?, &cmd)?;
+    let (mut c, deadline) = sandbox::exec_command(paths, &id, &exec_opts(args)?, &cmd)?;
+    let _busy = sandbox::busy(paths, &id);
     let t0 = Instant::now();
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")?;
     let (tx, rx) = std::sync::mpsc::channel::<(&'static str, Vec<u8>)>();
-    let mut readers = Vec::new();
     for (name, mut pipe) in [
         ("stdout", Box::new(child.stdout.take().context("stdout")?) as Box<dyn Read + Send>),
         ("stderr", Box::new(child.stderr.take().context("stderr")?)),
     ] {
         let tx = tx.clone();
-        readers.push(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = pipe.read(&mut buf) {
                 if n == 0 || tx.send((name, buf[..n].to_vec())).is_err() {
                     break;
                 }
             }
-        }));
+        });
     }
     drop(tx);
-    for (name, data) in rx {
-        writeln!(w, "{}", json!({ name: String::from_utf8_lossy(&data) }))?;
-        w.flush()?;
+    let mut timed_out = false;
+    // A character split across two reads is held back until the rest arrives.
+    let mut pending: std::collections::HashMap<&str, Vec<u8>> = Default::default();
+    let sent = (|| -> Result<()> {
+        write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")?;
+        loop {
+            let wait = deadline.map(|d| std::time::Duration::from_secs(d).saturating_sub(t0.elapsed()));
+            let got = match wait {
+                Some(left) => rx.recv_timeout(left),
+                None => rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+            };
+            match got {
+                Ok((name, data)) => {
+                    let buf = pending.entry(name).or_default();
+                    buf.extend_from_slice(&data);
+                    let rest = buf.split_off(buf.len() - incomplete_tail(buf));
+                    let text = String::from_utf8_lossy(&std::mem::replace(buf, rest)).into_owned();
+                    if !text.is_empty() {
+                        writeln!(w, "{}", json!({ name: text }))?;
+                        w.flush()?;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    let _ = child.kill();
+                    return Ok(());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    for (name, rest) in pending.drain().filter(|(_, b)| !b.is_empty()) {
+                        writeln!(w, "{}", json!({ name: String::from_utf8_lossy(&rest) }))?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+    })();
+    if sent.is_err() {
+        let _ = child.kill();
     }
-    let code = child.wait()?.code().unwrap_or(1);
+    let status = child.wait()?;
+    let code = if timed_out { 124 } else { status.code().unwrap_or(1) };
     sandbox::record(paths, &id, &cmd, code, t0.elapsed().as_millis());
+    sent?;
     writeln!(w, "{}", json!({"exit": code}))?;
     Ok(())
 }
@@ -523,19 +695,49 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
             return respond(r.get_mut(), 401, "application/json", br#"{"error":"bad token"}"#);
         }
     }
+    // Only Content-Length bodies are read; a chunked one would arrive empty and its
+    // arguments be taken as absent.
+    if req.header("transfer-encoding").is_some() {
+        return respond(r.get_mut(), 400, "application/json", br#"{"error":"send the body with Content-Length, not Transfer-Encoding"}"#);
+    }
     if let Err(e) = read_body(&mut r, &mut req, MAX_BODY) {
         return respond(r.get_mut(), 413, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
     }
     let mut w = r.into_inner();
-    let body: Value = if req.body.is_empty() { json!({}) } else { serde_json::from_slice(&req.body).unwrap_or(json!({})) };
+    // `null` is what some clients send for no arguments.
+    let body: Option<Value> = match serde_json::from_slice::<Value>(&req.body) {
+        _ if req.body.is_empty() => Some(json!({})),
+        Ok(Value::Null) => Some(json!({})),
+        Ok(v) => Some(v).filter(Value::is_object),
+        Err(_) => None,
+    };
     // Node-only routes don't exist on `sandbox serve`.
-    let found = route(&req.method, &req.path, &req.query, &body).filter(|(name, _)| policy.node || !NODE_ONLY.contains(name));
-    let Some((name, mut args)) = found else {
+    let found = route(&req.method, &req.path, &req.query, body.as_ref().unwrap_or(&json!({})))
+        .filter(|(name, _)| policy.node || !NODE_ONLY.contains(name));
+    let Some((name, args)) = found else {
         return respond(&mut w, 404, "application/json", br#"{"error":"no such endpoint"}"#);
     };
-    if name == "write_file" {
-        args["content"] = json!(String::from_utf8_lossy(&req.body));
+    // A body that doesn't parse is refused, not read as no arguments: `{"check": true,}`
+    // mustn't apply for real. `write_file`'s body is the file.
+    if body.is_none() && name != "write_file" {
+        return respond(&mut w, 400, "application/json", br#"{"error":"the body isn't a JSON object"}"#);
     }
+    if name == "read_file" || name == "write_file" {
+        // Bytes both ways, not through `op`'s JSON.
+        let r = policy.target(paths, &args).and_then(|id| {
+            let path = text(&args, "path")?.context("missing path")?;
+            match name {
+                "read_file" => read_file(paths, &id, path),
+                _ => Ok(json!({"written": write_file(paths, &id, path, std::mem::take(&mut req.body))?}).to_string().into_bytes()),
+            }
+        });
+        let ctype = if name == "read_file" { "application/octet-stream" } else { "application/json" };
+        return match r {
+            Ok(body) => respond(&mut w, 200, ctype, &body),
+            Err(e) => respond(&mut w, error_code(&e), "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes()),
+        };
+    }
+    let mut args = args;
     if name == "exec" {
         let r = policy.target(paths, &args).and_then(|id| {
             args["id"] = json!(id);
@@ -548,10 +750,9 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
     }
     match op(paths, policy, name, &args) {
         Ok(v) if name == "screenshot" => {
-            let png = base64_decode(v["png_base64"].as_str().unwrap_or(""));
+            let png = base64_decode(v["png_base64"].as_str().unwrap_or(""))?;
             respond(&mut w, 200, "image/png", &png)
         }
-        Ok(v) if name == "read_file" => respond(&mut w, 200, "application/octet-stream", v["content"].as_str().unwrap_or("").as_bytes()),
         Ok(v) => respond(&mut w, if name == "create" { 201 } else { 200 }, "application/json", v.to_string().as_bytes()),
         Err(e) => respond(&mut w, error_code(&e), "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes()),
     }
@@ -623,16 +824,19 @@ pub(crate) fn spawn_limited<T: Send + 'static>(f: impl FnOnce() -> T + Send + 's
     });
 }
 
-fn base64_decode(s: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Standard base64 with padding; anything else is an error, not bytes.
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let (mut acc, mut bits) = (0u32, 0);
-    for c in s.bytes().filter(|c| *c != b'=') {
+    for c in s.bytes() {
         let v = match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
             b'+' => 62,
-            _ => 63,
+            b'/' => 63,
+            _ => bail!("content_base64 isn't base64"),
         } as u32;
         acc = acc << 6 | v;
         bits += 6;
@@ -641,7 +845,28 @@ fn base64_decode(s: &str) -> Vec<u8> {
             out.push((acc >> bits) as u8);
         }
     }
-    out
+    if bits >= 6 {
+        bail!("content_base64 isn't base64");
+    }
+    Ok(out)
+}
+
+/// How many bytes at the end of `b` start a UTF-8 character that isn't complete yet.
+fn incomplete_tail(b: &[u8]) -> usize {
+    for back in 1..=b.len().min(3) {
+        let c = b[b.len() - back];
+        if c & 0xc0 == 0x80 {
+            continue;
+        }
+        let need = match c {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        return if need > back { back } else { 0 };
+    }
+    0
 }
 
 // -------------------------------------------------------------------- MCP
@@ -687,7 +912,7 @@ fn tools() -> Vec<Tool> {
         (
             "sandbox_read_file",
             "read_file",
-            "Read a file in the sandbox.",
+            "Read a file in the sandbox (up to 8 MiB). Returns content, or content_base64 when the file isn't UTF-8.",
             false,
             json!({"id": id, "path": {"type": "string"}}),
             vec!["id", "path"],
@@ -695,10 +920,10 @@ fn tools() -> Vec<Tool> {
         (
             "sandbox_write_file",
             "write_file",
-            "Write a file in the sandbox.",
+            "Write a file in the sandbox, making its directory. Pass content as text or content_base64 for bytes.",
             false,
-            json!({"id": id, "path": {"type": "string"}, "content": {"type": "string"}}),
-            vec!["id", "path", "content"],
+            json!({"id": id, "path": {"type": "string"}, "content": {"type": "string"}, "content_base64": {"type": "string"}}),
+            vec!["id", "path"],
         ),
         (
             "sandbox_fork",
@@ -711,7 +936,8 @@ fn tools() -> Vec<Tool> {
         (
             "sandbox_diff",
             "diff",
-            "Changes in the sandbox's workspace compared with the real project, as a patch.",
+            "Changes in the sandbox's workspace compared with the real project, as a patch, and the review ID that \
+             sandbox_apply takes to write exactly what this diff showed. Replaces the copy any earlier diff froze.",
             false,
             json!({"id": id}),
             vec!["id"],
@@ -724,7 +950,7 @@ fn tools() -> Vec<Tool> {
             json!({
                 "id": id,
                 "check": {"type": "boolean", "description": "Only report what would change"},
-                "reviewed": {"type": "boolean", "description": "Write the copy the last sandbox_diff showed, not the workspace as it is now"}
+                "reviewed": {"type": "string", "description": "The review ID sandbox_diff returned: write the copy that diff showed, not the workspace as it is now; refused if a later diff replaced it"}
             }),
             vec!["id"],
         ),
@@ -751,12 +977,15 @@ pub fn mcp_reply(paths: &Paths, policy: &Policy, msg: &Value) -> Option<Value> {
             "serverInfo": {"name": "rekcod", "version": env!("CARGO_PKG_VERSION")}
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools().into_iter().map(|(name, _, desc, destructive, props, req)| json!({
+        // Without --allow-apply, sandbox_apply isn't offered (a call with check still works).
+        "tools/list" => Ok(
+            json!({"tools": tools().into_iter().filter(|t| policy.apply || t.0 != "sandbox_apply").map(|(name, _, desc, destructive, props, req)| json!({
             "name": name,
             "description": desc,
             "inputSchema": {"type": "object", "properties": props, "required": req},
-            "annotations": {"destructiveHint": destructive, "readOnlyHint": matches!(name, "sandbox_list" | "sandbox_read_file" | "sandbox_diff")}
-        })).collect::<Vec<_>>()})),
+            "annotations": {"destructiveHint": destructive, "readOnlyHint": matches!(name, "sandbox_list" | "sandbox_read_file")}
+        })).collect::<Vec<_>>()}),
+        ),
         "tools/call" => {
             let name = msg["params"]["name"].as_str().unwrap_or("");
             let args = msg["params"]["arguments"].clone();
@@ -781,11 +1010,28 @@ pub fn mcp_reply(paths: &Paths, policy: &Policy, msg: &Value) -> Option<Value> {
     })
 }
 
-/// `rekcod mcp`: newline-delimited JSON-RPC on stdin/stdout.
+/// A private, close-on-exec copy of `fd`.
+fn private_dup(fd: i32) -> Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let d = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if d < 0 {
+        bail!("dup fd {fd}: {}", std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(d) })
+}
+
+/// `rekcod mcp`: newline-delimited JSON-RPC on stdin/stdout. Requests are read from and
+/// replies written to private copies of fds 0 and 1, which then point at /dev/null and
+/// stderr: nothing else in this process (a `println!`) or its children (ssh, docker)
+/// can read a queued request or write a line into the stream.
 pub fn mcp(paths: Paths, policy: Policy) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
-    for line in stdin.lock().lines() {
+    use std::os::fd::AsRawFd;
+    let (input, mut out) = (private_dup(0)?, private_dup(1)?);
+    let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null")?;
+    if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 || unsafe { libc::dup2(2, 1) } < 0 {
+        bail!("redirect stdio: {}", std::io::Error::last_os_error());
+    }
+    for line in BufReader::new(input).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -853,6 +1099,41 @@ mod tests {
     }
 
     #[test]
+    fn collected_commands_are_bounded() {
+        let sh = |script: &str| {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        // A child that exits without reading its stdin: the feed ends, the exit code comes back.
+        let r = collect(&mut sh("echo no >&2; exit 3"), Some(vec![b'x'; 4 << 20]), MAX_OUTPUT, None).unwrap();
+        assert_eq!((r.code, r.err.as_slice(), r.truncated), (3, &b"no\n"[..], false));
+        let r = collect(&mut sh("cat"), Some(b"round trip".to_vec()), MAX_OUTPUT, None).unwrap();
+        assert_eq!((r.code, r.out.as_slice()), (0, &b"round trip"[..]));
+        // An endless printer is cut at the cap and killed.
+        let r = collect(&mut sh("yes"), None, 1 << 20, None).unwrap();
+        assert!(r.truncated && r.out.len() == 1 << 20 && r.code != 0, "{}", r.code);
+        let t0 = Instant::now();
+        let r = collect(&mut sh("sleep 30"), None, MAX_OUTPUT, Some(std::time::Duration::from_secs(1))).unwrap();
+        assert_eq!(r.code, 124);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn bytes_survive_base64_and_split_reads() {
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(base64_decode(&crate::daemon::base64(&all)).unwrap(), all);
+        assert_eq!(base64_decode("aGk=").unwrap(), b"hi");
+        assert!(base64_decode("a$==").is_err() && base64_decode("a").is_err());
+        let e = "\u{e9}\u{20ac}\u{1f600}".as_bytes();
+        assert_eq!(incomplete_tail(&e[..1]), 1);
+        assert_eq!(incomplete_tail(&e[..2]), 0);
+        assert_eq!(incomplete_tail(&e[..4]), 2);
+        assert_eq!(incomplete_tail(&e[..7]), 2);
+        assert_eq!(incomplete_tail(b"ok\xff"), 0);
+    }
+
+    #[test]
     fn requests_are_capped() {
         let long = format!("GET /{} HTTP/1.1\r\n\r\n", "a".repeat(20 << 10));
         assert!(read_request(&mut std::io::Cursor::new(long)).is_err());
@@ -871,10 +1152,16 @@ mod tests {
         let init = mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"})).unwrap();
         assert_eq!(init["result"]["protocolVersion"], PROTOCOL);
         let list = mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+        assert!(!list["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "sandbox_apply"));
+        let pol = Policy { apply: true, ..Default::default() };
+        let list = mcp_reply(&paths, &pol, &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         let tools = list["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 12);
         let apply = tools.iter().find(|t| t["name"] == "sandbox_apply").unwrap();
         assert_eq!(apply["annotations"]["destructiveHint"], true);
+        // A diff replaces the reviewed copy, so a client mustn't run it without asking.
+        let diff = tools.iter().find(|t| t["name"] == "sandbox_diff").unwrap();
+        assert_eq!(diff["annotations"]["readOnlyHint"], false);
         assert!(mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
         let bad =
             mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "x"}}))
@@ -939,7 +1226,7 @@ mod tests {
         let (_, list) = mcp_call(&paths, &pol, "sandbox_list", json!({}));
         assert!(!list.contains(&sb.id), "{list}");
         for (tool, args) in [
-            ("sandbox_apply", json!({"id": sb.id, "reviewed": true})),
+            ("sandbox_apply", json!({"id": sb.id, "reviewed": "0123"})),
             ("sandbox_apply", json!({"id": "bee"})),
             ("sandbox_diff", json!({"id": sb.id})),
             ("sandbox_exec", json!({"id": sb.id, "cmd": ["true"]})),
@@ -955,7 +1242,7 @@ mod tests {
         assert!(paths.home.join("sb").join(&sb.id).exists());
         assert_eq!(http(&paths, &pol, "GET", "/sandboxes", ""), (200, "[]".into()));
         for (method, path, body) in [
-            ("POST", format!("/sandboxes/{}/apply", sb.id), r#"{"reviewed": true}"#),
+            ("POST", format!("/sandboxes/{}/apply", sb.id), r#"{"reviewed": "0123"}"#),
             ("POST", format!("/sandboxes/{}/exec", sb.id), r#"{"cmd": ["true"]}"#),
             ("GET", format!("/sandboxes/{}", sb.id), ""),
             ("DELETE", "/sandboxes/bee".into(), ""),
@@ -985,7 +1272,16 @@ mod tests {
         let pol = Policy { secrets: vec!["TOKEN".into()], ..pol };
         let (_, list) = mcp_call(&paths, &pol, "sandbox_list", json!({}));
         assert!(list.contains(&mine.id) && !list.contains(&sb.id), "{list}");
-        let (code, body) = http(&paths, &pol, "POST", &format!("/sandboxes/{}/apply", mine.id), "{}");
+        // Agents check; only a server started with --allow-apply lets them write the project.
+        let apply = format!("/sandboxes/{}/apply", mine.id);
+        let (code, body) = http(&paths, &pol, "POST", &apply, "{}");
+        assert!(code == 403 && body.contains("--allow-apply"), "{code} {body}");
+        let (err, text) = mcp_call(&paths, &pol, "sandbox_apply", json!({"id": mine.id}));
+        assert!(err && text.contains("--allow-apply"), "{text}");
+        assert_eq!(std::fs::read_to_string(a.join("f.txt")).unwrap(), "host");
+        assert_eq!(http(&paths, &pol, "POST", &apply, r#"{"check": true}"#).0, 200);
+        let pol = Policy { apply: true, ..pol };
+        let (code, body) = http(&paths, &pol, "POST", &apply, "{}");
         assert_eq!((code, body.as_str()), (200, r#"{"changes":[{"kind":"M","path":"f.txt"}]}"#));
         assert_eq!(std::fs::read_to_string(a.join("f.txt")).unwrap(), "sandbox");
 
@@ -996,6 +1292,38 @@ mod tests {
         assert_eq!(http(&paths, &node, "GET", &format!("/sandboxes/{}", sb.id), "").0, 200);
         let everything = Policy { roots: vec![base.clone()], ..Default::default() };
         assert_eq!(http(&paths, &everything, "GET", &format!("/sandboxes/{}", sb.id), "").0, 404);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn apply_arguments_never_fail_open() {
+        let base = tmp("failopen");
+        let project = base.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("f"), "old").unwrap();
+        let paths = Paths { home: base.join("home") };
+        let pol = Policy { roots: vec![base.clone()], apply: true, ..Default::default() };
+        let sb = fake(&paths, &project, |_| {});
+        std::fs::write(paths.home.join("sb").join(&sb.id).join("ws/f"), "from-sandbox").unwrap();
+        let apply = format!("/sandboxes/{}/apply", sb.id);
+        assert_eq!(
+            http(&paths, &pol, "POST", &format!("{apply}?check=true"), ""),
+            (200, r#"{"changes":[{"kind":"M","path":"f"}]}"#.into())
+        );
+        for (path, body) in [
+            (apply.clone(), r#"{"check": true,}"#),
+            (apply.clone(), "[]"),
+            (apply.clone(), r#"{"check": "yes"}"#),
+            (format!("{apply}?check=1"), ""),
+            (format!("{apply}?reviewed=true"), ""),
+            (apply.clone(), r#"{"reviewed": true}"#),
+        ] {
+            let (code, text) = http(&paths, &pol, "POST", &path, body);
+            assert_eq!(code, 400, "{path} {body}: {text}");
+        }
+        assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "old");
+        assert_eq!(http(&paths, &pol, "GET", &format!("/sandboxes/{}", sb.id), "null").0, 200);
+        assert!(num(&json!({"t": "5"}), "t").unwrap() == Some(5) && num(&json!({"t": "-5"}), "t").is_err());
         std::fs::remove_dir_all(base).unwrap();
     }
 

@@ -810,6 +810,8 @@ enum ControllerCmd {
         #[arg(long)]
         auto_approve: bool,
         /// POST a JSON line ({"text": ...}) here when a node is lost or a deploy or backup fails.
+        /// With --install it's kept in ~/.rekcod/controller/alert-webhook (0600), not the
+        /// job, and used whenever the flag isn't given; an empty value removes it.
         #[arg(long)]
         alert_webhook: Option<String>,
         /// Also keep the hourly fleet.db backups here (another disk, a synced folder).
@@ -1273,6 +1275,10 @@ enum ServerCmd {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Record pmset as it is, for `rekcod uninstall` to put back (the server pkg runs it
+    /// before it sets pmset).
+    #[command(hide = true)]
+    RecordPower,
 }
 
 #[derive(Subcommand)]
@@ -1386,7 +1392,13 @@ fn main() {
             remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/undrain"), &serde_json::json!({}))
         }
         Cmd::Controller(ControllerCmd::Serve { install: true, .. }) => {
-            service::install(&paths, "controller", &service::args_without_install())
+            // A webhook URL is a credential, and a daemon's plist is world-readable: it goes
+            // in a 0600 file the controller reads instead.
+            let (args, hook) = service::take_flag(&service::args_without_install(), "--alert-webhook");
+            if let Some(h) = hook {
+                server::set_alert_webhook(&paths, &h)?;
+            }
+            service::install(&paths, "controller", &args)
         }
         Cmd::Controller(ControllerCmd::Serve {
             db,
@@ -1402,23 +1414,26 @@ fn main() {
             tls_names,
             bonjour,
             ..
-        }) => fleet::controller_serve(
-            &paths,
-            fleet::ControllerOptions {
-                db,
-                listen,
-                domain,
-                drain_secs: drain,
-                storage,
-                storage_credentials,
-                auto_approve,
-                alert_webhook,
-                backup_dir,
-                http,
-                tls_names,
-                bonjour,
-            },
-        ),
+        }) => {
+            let alert_webhook = alert_webhook.or_else(|| server::alert_webhook(&paths));
+            fleet::controller_serve(
+                &paths,
+                fleet::ControllerOptions {
+                    db,
+                    listen,
+                    domain,
+                    drain_secs: drain,
+                    storage,
+                    storage_credentials,
+                    auto_approve,
+                    alert_webhook,
+                    backup_dir,
+                    http,
+                    tls_names,
+                    bonjour,
+                },
+            )
+        }
         Cmd::Controller(ControllerCmd::Backup { remote }) => remote_call(&paths, &remote, "POST", "/backups", &serde_json::json!({})),
         Cmd::Controller(ControllerCmd::Backups { remote }) => remote_call(&paths, &remote, "GET", "/backups", &serde_json::Value::Null),
         Cmd::Controller(ControllerCmd::Restore { key, db, storage_credentials }) => {
@@ -1513,6 +1528,10 @@ fn main() {
         }
         Cmd::Server(ServerCmd::Uninstall) => server::uninstall(),
         Cmd::Server(ServerCmd::AtBoot { user }) => server::at_boot(user.as_deref()),
+        Cmd::Server(ServerCmd::RecordPower) => {
+            server::record_power(&paths);
+            Ok(())
+        }
         Cmd::Server(ServerCmd::Restart) => server::restart(),
         Cmd::Host(HostCmd::Ls { json }) => {
             host::print_list(json);

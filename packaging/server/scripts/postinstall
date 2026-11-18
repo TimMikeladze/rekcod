@@ -1,11 +1,11 @@
 #!/bin/bash
-# Installer runs this as root after copying rekcod into /usr/local (docs/server-pkg.md).
+# Installer runs this as root after copying rekcod into /usr/local.
 # Sets this Mac up as a server for whoever is logged in on its screen, then leaves the
 # `rekcod remote add` line for the user's other Mac in ~/Desktop/rekcod-pair.txt.
 #
 # $3 is the target volume. Run as a normal user, it sets up that user and skips pmset.
 # REKCOD_PKG_TEST_ROOT=1 takes the root branch anyway (packaging/server/test.sh stubs the
-# commands it runs).
+# commands it runs; REKCOD_PKG_DAEMONS stands in for /Library/LaunchDaemons).
 set -uo pipefail
 umask 077
 vol=${3:-/}
@@ -16,7 +16,7 @@ domain=$(cat "$vol/usr/local/share/rekcod/server-domain" 2>/dev/null || echo app
 say() { echo "rekcod: $*" | tee -a "$log"; }
 
 if [[ $EUID == 0 || -n ${REKCOD_PKG_TEST_ROOT:-} ]]; then
-  say "$(pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1 2>&1 && echo 'never sleeps, lid shut or not; boots again after a power cut')"
+  pmset_on() { say "$(pmset -a sleep 0 disablesleep 1 autorestart 1 womp 1 2>&1 && echo 'never sleeps, lid shut or not; boots again after a power cut')"; }
   # With the firewall on, other Macs connect to the controller and edge but get no data back.
   fw=/usr/libexec/ApplicationFirewall/socketfilterfw
   if "$fw" --getglobalstate 2>/dev/null | grep -q enabled; then
@@ -26,18 +26,33 @@ if [[ $EUID == 0 || -n ${REKCOD_PKG_TEST_ROOT:-} ]]; then
   user=$(stat -f %Su /dev/console)
   # loginwindow and _mbsetupuser (Setup Assistant) own the console when nobody is logged in.
   if [[ -z $user || $user == root || $user == loginwindow || $user == _* ]]; then
+    pmset_on
     say "installed $rekcod; nobody is logged in on the screen, so log in and run: rekcod server setup --domain $domain"
     exit 0
   fi
   uid=$(id -u "$user")
   home=$(dscl . -read "/Users/$user" NFSHomeDirectory | sed -n 's/^NFSHomeDirectory: //p')
   if [[ -z $home ]]; then
+    pmset_on
     say "no home folder for $user; log in and run: rekcod server setup --domain $domain"
     exit 0
   fi
   as_user() { launchctl asuser "$uid" sudo -u "$user" -H env HOME="$home" PATH="$vol/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin" "$@"; }
   # The user's, so TextEdit can open it on a failure, and nobody else's.
   chown "$user" "$log"
+  # What `rekcod uninstall` puts back, recorded before pmset changes it.
+  as_user "$rekcod" server record-power >>"$log" 2>&1
+  pmset_on
+  # An earlier install left LaunchDaemons. Setup runs as the user without a terminal, so it
+  # can't replace them (sudo); with them gone it installs agents, and at-boot below makes
+  # them daemons again on the new binary.
+  daemons=${REKCOD_PKG_DAEMONS:-/Library/LaunchDaemons}
+  for n in storage controller node edge vm; do
+    p=$daemons/dev.rekcod.$n.plist
+    [[ -f $p ]] || continue
+    launchctl bootout "system/dev.rekcod.$n" >/dev/null 2>&1
+    rm -f "$p" && say "replacing the earlier install's $n service"
+  done
 else
   user=$(id -un) home=$HOME
   as_user() { "$@"; }

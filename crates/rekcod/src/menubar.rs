@@ -793,7 +793,7 @@ fn domain() -> String {
 }
 
 pub fn install() -> Result<()> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let exe = crate::service::stable_exe()?;
     let path = plist_path()?;
     std::fs::create_dir_all(path.parent().context("plist dir")?)?;
     // Replace a previous registration (e.g. the binary moved).

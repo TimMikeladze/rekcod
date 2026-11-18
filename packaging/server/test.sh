@@ -8,12 +8,15 @@ t=$(mktemp -d)
 trap 'rm -rf "$t"' EXIT
 # A space in the home path: dscl output has to be read whole.
 home="$t/home dir"
-mkdir -p "$t/vol/usr/local/bin" "$t/vol/usr/local/share/rekcod" "$home/Desktop" "$t/stub"
+mkdir -p "$t/vol/usr/local/bin" "$t/vol/usr/local/share/rekcod" "$home/Desktop" "$t/stub" "$t/daemons"
 echo apps.example.com > "$t/vol/usr/local/share/rekcod/server-domain"
 cat > "$t/vol/usr/local/bin/rekcod" <<EOF
 #!/bin/sh
 echo "\$*" >> "$t/calls"
+[ "\$1 \$2" = "server record-power" ] && { grep -q "^pmset -a" "$t/calls" && echo "pmset already changed" >> "$t/calls"; exit 0; }
 [ "\$1 \$2" = "server setup" ] || exit 0
+# A daemon left by an earlier install: setup (no sudo here) would fail on it.
+ls "$t/daemons"/dev.rekcod.*.plist >/dev/null 2>&1 && { echo "LaunchDaemons still there" >&2; exit 1; }
 [ -n "\${FAIL:-}" ] && exit 1
 echo "storage installed: runs now and at login"
 echo "remote https://rekcod-3f9a1c2b7d4e.bonjour tok123 sha256:ff"
@@ -31,7 +34,7 @@ stub sudo 'shift 3; exec "$@"'
 stub pmset "echo \"pmset \$*\" >> '$t/calls'"
 stub chown 'true'
 chmod +x "$t/vol/usr/local/bin/rekcod" "$t/stub/"*
-run() { HOME=$home PATH=$t/stub:$PATH REKCOD_PKG_LOG=$t/log bash "$here/scripts/postinstall" pkg / "$t/vol" >/dev/null; }
+run() { HOME=$home PATH=$t/stub:$PATH REKCOD_PKG_LOG=$t/log REKCOD_PKG_DAEMONS=$t/daemons bash "$here/scripts/postinstall" pkg / "$t/vol" >/dev/null; }
 fail() { echo "FAIL: $*" >&2; exit 1; }
 want="rekcod remote add tims-mac-mini https://rekcod-3f9a1c2b7d4e.bonjour --token tok123 --ca-fingerprint sha256:ff"
 pair=$home/Desktop/rekcod-pair.txt
@@ -54,7 +57,16 @@ rm -f "$t/calls" "$t/log"
 REKCOD_PKG_TEST_ROOT=1 run || fail "as root: exited $?"
 check "as root"
 grep -q "^pmset -a sleep 0" "$t/calls" || fail "as root: no pmset"
+grep -qx "server record-power" "$t/calls" || fail "as root: pmset not recorded for uninstall"
+! grep -q "pmset already changed" "$t/calls" || fail "as root: pmset recorded after it was changed"
 grep -qx "server at-boot --user tim" "$t/calls" || fail "as root: no at-boot: $(cat "$t/calls")"
+
+# Installed over an earlier install: its LaunchDaemons go, setup succeeds, at-boot makes new ones.
+rm -f "$t/calls"
+touch "$t/daemons/dev.rekcod.controller.plist" "$t/daemons/dev.rekcod.vm.plist"
+REKCOD_PKG_TEST_ROOT=1 run || fail "over an earlier install: exited $?: $(cat "$t/log")"
+check "over an earlier install"
+[[ -z $(ls "$t/daemons") ]] || fail "over an earlier install: daemons left: $(ls "$t/daemons")"
 
 # Setup Assistant owns the console: pmset still runs, setup doesn't.
 rm -f "$t/calls"

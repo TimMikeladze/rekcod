@@ -622,7 +622,11 @@ static RELAY_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 
 /// Forwards `ip:ext` (0 picks one) to the Mac's `127.0.0.1:port` for sandbox `id`, until
 /// [`close_relay`]; returns the bound port.
-fn start_relay(id: &str, ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
+/// Relays `ext` to the instance's port on loopback. While `home` has [`ASLEEP_MARKER`] the
+/// port belongs to nobody: a job's sandbox or anything else may have taken it, so clients are
+/// closed rather than sent there.
+fn start_relay(id: &str, home: &Path, ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
+    let asleep = home.join(ASLEEP_MARKER);
     close_relay(id);
     let l = TcpListener::bind((ip, ext))?;
     let addr = l.local_addr()?;
@@ -642,6 +646,9 @@ fn start_relay(id: &str, ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
             }
             if RELAY_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_RELAY_CONNECTIONS {
                 RELAY_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
+            if asleep.exists() {
                 continue;
             }
             let _ = c.set_read_timeout(None);
@@ -998,6 +1005,8 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
     {
         env.insert("S3_ENDPOINT".into(), json!(vm_endpoint(e)));
     }
+    // Chosen before the sandbox exists: its VM may open this port on the Mac and no other.
+    let hp = free_port()?;
     let o = sandbox::CreateOptions {
         dir: Some(dir.clone()),
         name: Some(format!("{app}-r{release}-{}", &sandbox::new_id()?[..4])),
@@ -1029,7 +1038,6 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
                 }
             }
         }
-        let hp = free_port()?;
         let (mut d, _) = sandbox::docker_cmd(paths, &meta.id)?;
         d.args(["run", "-d", "--name", "app", "--restart", "unless-stopped", "-p", &format!("127.0.0.1:{hp}:{port}")]);
         let env_file = sandbox::home(paths, &meta.id)?.join("run-env");
@@ -1047,8 +1055,12 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        // Something answering on the port isn't enough: it has to be this sandbox's daemon.
+        if !wait_holds_port(paths, &meta.id, hp, HOLD_WAIT) {
+            bail!("port {hp} is held by something else on this node");
+        }
         let ip = *NODE_IP.get().unwrap_or(&IpAddr::from([127, 0, 0, 1]));
-        let ext = start_relay(&meta.id, ip, 0, hp)?;
+        let ext = start_relay(&meta.id, &sandbox::home(paths, &meta.id)?, ip, 0, hp)?;
         std::fs::write(sandbox::home(paths, &meta.id)?.join("instance.json"), json!({"hp": hp, "ext": ext}).to_string())?;
         let host = NODE_HOST.get().cloned().unwrap_or_else(|| ip.to_string());
         Ok(json!({"sandbox": meta.id, "endpoint": format!("{host}:{ext}"), "health": toml.get("app.health"), "pushed": pushed.is_some(),
@@ -1108,6 +1120,18 @@ pub fn instance_logs(paths: &Paths, id: &str) -> Result<String> {
 /// Node op: boots a sleeping instance's VM and starts its app container again; returns
 /// once the published port is back on the Mac.
 pub fn wake_instance(paths: &Paths, id: &str) -> Result<Value> {
+    wake_instance_with(paths, id, HOLD_WAIT, &|| {
+        let (mut d, _) = sandbox::docker_cmd(paths, id)?;
+        let out = d.args(["start", "app"]).stdin(Stdio::null()).output()?;
+        if !out.status.success() {
+            bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    })
+}
+
+/// [`wake_instance`] with the `docker start app` step given, so tests can run it without a VM.
+fn wake_instance_with(paths: &Paths, id: &str, hold_wait: Duration, start: &dyn Fn() -> Result<()>) -> Result<Value> {
     let home = sandbox::home(paths, id)?;
     let _ = std::fs::remove_file(home.join(ASLEEP_MARKER));
     let v: Value = serde_json::from_slice(&std::fs::read(home.join("instance.json"))?)?;
@@ -1115,15 +1139,11 @@ pub fn wake_instance(paths: &Paths, id: &str) -> Result<Value> {
     let t0 = Instant::now();
     // dockerd may still be coming up right after the boot.
     loop {
-        let (mut d, _) = sandbox::docker_cmd(paths, id)?;
-        let out = d.args(["start", "app"]).stdin(Stdio::null()).output()?;
-        if out.status.success() {
-            break;
+        match start() {
+            Ok(()) => break,
+            Err(e) if t0.elapsed() > Duration::from_secs(30) => bail!("start failed: {e:#}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(300)),
         }
-        if t0.elapsed() > Duration::from_secs(30) {
-            bail!("start failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-        }
-        std::thread::sleep(Duration::from_millis(300));
     }
     while TcpStream::connect(("127.0.0.1", hp)).is_err() {
         if t0.elapsed() > Duration::from_secs(20) {
@@ -1131,7 +1151,48 @@ pub fn wake_instance(paths: &Paths, id: &str) -> Result<Value> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // While it slept, something else (a job's autoports, any process) may have taken the
+    // port; the relay would then hand that the app's traffic.
+    if !wait_holds_port(paths, id, hp, hold_wait) {
+        bail!("port {hp} is held by something else on this node");
+    }
     Ok(json!({"woken": id, "ms": t0.elapsed().as_millis() as u64}))
+}
+
+/// How long after the port answers the daemon may take to list it in run/status.json (it
+/// opens the listener first, then writes the file).
+const HOLD_WAIT: Duration = Duration::from_secs(5);
+
+/// [`holds_port`], asked again until `within` has passed.
+fn wait_holds_port(paths: &Paths, id: &str, hp: u16, within: Duration) -> bool {
+    let t0 = Instant::now();
+    loop {
+        if holds_port(paths, id, hp) {
+            return true;
+        }
+        if t0.elapsed() >= within {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether sandbox `id`'s running daemon has `hp` open on 127.0.0.1: its run/status.json
+/// is from the daemon whose pid file is locked now, and lists the port without an error.
+fn holds_port(paths: &Paths, id: &str, hp: u16) -> bool {
+    let Ok(home) = sandbox::home(paths, id) else { return false };
+    let sb = Paths { home };
+    let Some(status) = std::fs::read(sb.status_file()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
+        return false;
+    };
+    let Some(pid) = crate::cli::running_pid(&sb) else { return false };
+    status["pid"].as_i64() == Some(pid as i64)
+        && status["ports"].as_array().into_iter().flatten().any(|p| {
+            p["port"].as_u64() == Some(hp as u64)
+                && p["address"] == "127.0.0.1"
+                && p["proto"] == "tcp"
+                && p.get("error").is_none_or(Value::is_null)
+        })
 }
 
 fn job_dir(paths: &Paths, id: &str) -> Result<PathBuf> {
@@ -1602,7 +1663,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             continue;
         };
         let (hp, ext) = (v["hp"].as_u64().unwrap_or(0) as u16, v["ext"].as_u64().unwrap_or(0) as u16);
-        if let Err(e) = start_relay(&l.meta.id, ip, ext, hp) {
+        if let Err(e) = start_relay(&l.meta.id, &home, ip, ext, hp) {
             eprintln!("rekcod: relay for {}: {e:#}", l.meta.id);
         }
         if !home.join(ASLEEP_MARKER).exists() {
@@ -6635,6 +6696,83 @@ mod job_and_node_tests {
         d
     }
 
+    /// A sandbox `id` whose daemon (this process, holding its pid file) lists `ports`.
+    fn port_sandbox(home: &Path, id: &str, pid: u32, ports: Value) -> (PathBuf, std::fs::File) {
+        let d = fake_sandbox(home, id, id, &[]);
+        std::fs::create_dir_all(d.join("run")).unwrap();
+        let lock = crate::paths::lock(&d.join("run/daemon.pid")).unwrap();
+        std::fs::write(d.join("run/daemon.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(d.join("run/status.json"), json!({"pid": pid, "ports": ports}).to_string()).unwrap();
+        (d, lock)
+    }
+
+    #[test]
+    fn a_port_counts_as_the_instances_only_when_its_daemon_lists_it() {
+        let home = temp("holds-port");
+        let paths = Paths { home: home.clone() };
+        let me = std::process::id();
+        let entry = |extra: Value| {
+            let mut e = json!({"proto": "tcp", "address": "127.0.0.1", "port": 41001, "container": "app"});
+            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            json!([e])
+        };
+        let (_d, _l) = port_sandbox(&home, "sbgood", me, entry(json!({})));
+        assert!(holds_port(&paths, "sbgood", 41001));
+        assert!(!holds_port(&paths, "sbgood", 41002), "another port");
+        let (_d, _l) = port_sandbox(&home, "sberr", me, entry(json!({"error": "Address already in use"})));
+        assert!(!holds_port(&paths, "sberr", 41001), "listed with an error");
+        let (_d, _l) = port_sandbox(&home, "sbpid", me + 1, entry(json!({})));
+        assert!(!holds_port(&paths, "sbpid", 41001), "status from another daemon");
+        let (_d, l) = port_sandbox(&home, "sbdown", me, entry(json!({})));
+        drop(l);
+        assert!(!holds_port(&paths, "sbdown", 41001), "no daemon running");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_wake_fails_when_something_else_has_the_instances_port() {
+        let home = temp("wake-port");
+        let paths = Paths { home: home.clone() };
+        // A job's autoport, say, took the port while the instance slept.
+        let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hp = squatter.local_addr().unwrap().port();
+        let (d, _l) = port_sandbox(&home, "sbwake", std::process::id(), json!([]));
+        std::fs::write(d.join("instance.json"), json!({"hp": hp, "ext": 0}).to_string()).unwrap();
+        std::fs::write(d.join(ASLEEP_MARKER), "").unwrap();
+        let e = wake_instance_with(&paths, "sbwake", Duration::from_millis(200), &|| Ok(())).unwrap_err().to_string();
+        assert!(e.contains("held by something else"), "{e}");
+        // Listed by the daemon, it wakes.
+        let status =
+            json!({"pid": std::process::id(), "ports": [{"proto": "tcp", "address": "127.0.0.1", "port": hp, "container": "app"}]});
+        std::fs::write(d.join("run/status.json"), status.to_string()).unwrap();
+        assert_eq!(wake_instance_with(&paths, "sbwake", Duration::from_millis(200), &|| Ok(())).unwrap()["woken"], "sbwake");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_sleeping_instances_relay_sends_nobody_to_its_port() {
+        let up = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = up.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut s in up.incoming().flatten() {
+                let _ = s.write_all(b"hi");
+            }
+        });
+        let home = temp("relay-asleep");
+        std::fs::write(home.join(ASLEEP_MARKER), "").unwrap();
+        let ext = start_relay("relay-asleep", &home, IpAddr::from([127, 0, 0, 1]), 0, port).unwrap();
+        let mut c = TcpStream::connect(("127.0.0.1", ext)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut b = Vec::new();
+        assert!(matches!(c.read_to_end(&mut b), Ok(0)) || b.is_empty(), "closed, nothing relayed: {b:?}");
+        std::fs::remove_file(home.join(ASLEEP_MARKER)).unwrap();
+        let mut b = [0u8; 2];
+        TcpStream::connect(("127.0.0.1", ext)).unwrap().read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"hi");
+        close_relay("relay-asleep");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn a_node_restart_removes_job_sandboxes_nothing_runs() {
         let home = temp("job-orphans");
@@ -10685,7 +10823,9 @@ mod tests {
                 let _ = s.write_all(b"hi");
             }
         });
-        let ext = start_relay("relay-test", IpAddr::from([127, 0, 0, 1]), 0, port).unwrap();
+        let home = std::env::temp_dir().join(format!("rekcod-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let ext = start_relay("relay-test", &home, IpAddr::from([127, 0, 0, 1]), 0, port).unwrap();
         let mut b = [0u8; 2];
         TcpStream::connect(("127.0.0.1", ext)).unwrap().read_exact(&mut b).unwrap();
         assert_eq!(&b, b"hi");

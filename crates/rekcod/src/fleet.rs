@@ -426,16 +426,42 @@ fn relay_allowed(peer: IpAddr, node: IpAddr, allow: &[IpAddr]) -> bool {
     peer.is_loopback() || peer == unmap(node) || allow.contains(&peer)
 }
 
-/// Forwards `ip:ext` (0 picks one) to the Mac's `127.0.0.1:port`; returns the bound port.
-fn start_relay(ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
+/// A running relay: where it listens and the flag that ends its accept loop.
+struct Relay {
+    addr: SocketAddr,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Instance relays by sandbox ID, so removing the sandbox closes its relay.
+static RELAYS: Mutex<std::collections::BTreeMap<String, Relay>> = Mutex::new(std::collections::BTreeMap::new());
+
+/// Connections forwarded at once over all relays; more are closed at once. Each takes two
+/// descriptors and a thread.
+const MAX_RELAY_CONNECTIONS: usize = 1024;
+static RELAY_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Forwards `ip:ext` (0 picks one) to the Mac's `127.0.0.1:port` for sandbox `id`, until
+/// [`close_relay`]; returns the bound port.
+fn start_relay(id: &str, ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
+    close_relay(id);
     let l = TcpListener::bind((ip, ext))?;
-    let bound = l.local_addr()?.port();
+    let addr = l.local_addr()?;
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    RELAYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(id.to_string(), Relay { addr, stop: stop.clone() });
     std::thread::spawn(move || {
+        use std::sync::atomic::Ordering;
         for c in l.incoming().flatten() {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
             let peer = c.peer_addr().map(|a| a.ip()).unwrap_or(IpAddr::from([0, 0, 0, 0]));
             // This Mac's own address on whichever interface the connection came in on.
             let local = c.local_addr().map(|a| a.ip()).unwrap_or(ip);
             if !relay_allowed(peer, local, &RELAY_ALLOW.read().unwrap_or_else(std::sync::PoisonError::into_inner)) {
+                continue;
+            }
+            if RELAY_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_RELAY_CONNECTIONS {
+                RELAY_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
                 continue;
             }
             let _ = c.set_read_timeout(None);
@@ -443,10 +469,23 @@ fn start_relay(ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
                 if let Ok(up) = TcpStream::connect(("127.0.0.1", port)) {
                     pipe(c, up);
                 }
+                RELAY_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
             });
         }
     });
-    Ok(bound)
+    Ok(addr.port())
+}
+
+/// Closes sandbox `id`'s relay, if it has one: its port is free and its thread ends.
+pub fn close_relay(id: &str) {
+    let Some(r) = RELAYS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(id) else { return };
+    r.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    // The accept loop only sees the flag with a connection in hand.
+    let mut wake = r.addr;
+    if wake.ip().is_unspecified() {
+        wake.set_ip(IpAddr::from([127, 0, 0, 1]));
+    }
+    let _ = TcpStream::connect_timeout(&wake, Duration::from_secs(1));
 }
 
 /// `rekcod.toml`: `[app]`, `[resources]` and `[env]` with `key = value` lines.
@@ -766,12 +805,13 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
             std::thread::sleep(Duration::from_millis(100));
         }
         let ip = *NODE_IP.get().unwrap_or(&IpAddr::from([127, 0, 0, 1]));
-        let ext = start_relay(ip, 0, hp)?;
+        let ext = start_relay(&meta.id, ip, 0, hp)?;
         std::fs::write(sandbox::home(paths, &meta.id)?.join("instance.json"), json!({"hp": hp, "ext": ext}).to_string())?;
         let host = NODE_HOST.get().cloned().unwrap_or_else(|| ip.to_string());
         Ok(json!({"sandbox": meta.id, "endpoint": format!("{host}:{ext}"), "health": toml.get("app.health"), "pushed": pushed}))
     })();
     if result.is_err() {
+        close_relay(&meta.id);
         let _ = sandbox::rm(paths, std::slice::from_ref(&meta.id), false);
     }
     result
@@ -1157,6 +1197,8 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     let cfg: NodeConfig = serde_json::from_slice(&std::fs::read(paths.home.join("node.json")).context("not joined; `rekcod node join`")?)?;
     let addr: SocketAddr = cfg.listen.parse()?;
     graceful_exit(None);
+    // launchd's soft limit of 256 descriptors; each relay and forwarded connection takes some.
+    crate::daemon::raise_fd_limit();
     if let Some(ca) = &cfg.ca {
         crate::tls::trust_by_default(ca)?;
     }
@@ -1185,7 +1227,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             continue;
         };
         let (hp, ext) = (v["hp"].as_u64().unwrap_or(0) as u16, v["ext"].as_u64().unwrap_or(0) as u16);
-        if let Err(e) = start_relay(ip, ext, hp) {
+        if let Err(e) = start_relay(&l.meta.id, ip, ext, hp) {
             eprintln!("rekcod: relay for {}: {e:#}", l.meta.id);
         }
         if !home.join(ASLEEP_MARKER).exists() {
@@ -1234,6 +1276,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
                     for id in v["delete"].as_array().into_iter().flatten().filter_map(|i| i.as_str()) {
                         if sandbox::home(&hb_paths, id).is_ok_and(|h| h.join(FLEET_MARKER).exists()) {
                             eprintln!("rekcod: removing {id}: the controller doesn't know it");
+                            close_relay(id);
                             let _ = sandbox::rm(&hb_paths, &[id.to_string()], false);
                         }
                     }
@@ -6114,6 +6157,7 @@ fn secret_key(path: &Path, sealed_values: i64) -> Result<[u8; 32]> {
 pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     let dir = paths.home.join("controller");
     std::fs::create_dir_all(&dir)?;
+    crate::daemon::raise_fd_limit();
     let db_path = o.db.clone().unwrap_or_else(|| dir.join("fleet.db"));
     let mut db = Db::open(&db_path)?;
     for (key, file) in [("join_token", "join-token"), ("webhook_secret", "webhook-secret")] {
@@ -7708,6 +7752,24 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn removing_an_instance_closes_its_relay() {
+        let up = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = up.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut s in up.incoming().flatten() {
+                let _ = s.write_all(b"hi");
+            }
+        });
+        let ext = start_relay("relay-test", IpAddr::from([127, 0, 0, 1]), 0, port).unwrap();
+        let mut b = [0u8; 2];
+        TcpStream::connect(("127.0.0.1", ext)).unwrap().read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"hi");
+        close_relay("relay-test");
+        wait_until(|| TcpStream::connect(("127.0.0.1", ext)).is_err());
+        assert!(!RELAYS.lock().unwrap().contains_key("relay-test"));
     }
 
     #[test]

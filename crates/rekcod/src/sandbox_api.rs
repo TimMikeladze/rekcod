@@ -283,7 +283,10 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             json!({"stopped": true})
         }
         "remove" => {
-            sandbox::rm(paths, &[target()?], false)?;
+            let id = target()?;
+            sandbox::rm(paths, std::slice::from_ref(&id), false)?;
+            // An app instance's relay goes with it.
+            crate::fleet::close_relay(&id);
             json!({"removed": true})
         }
         "screenshot" => {

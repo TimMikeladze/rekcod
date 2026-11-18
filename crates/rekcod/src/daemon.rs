@@ -348,8 +348,8 @@ fn clean_exit(paths: &Paths) {
 }
 
 /// launchd starts agents with a soft limit of 256 descriptors; every forwarded connection
-/// and docker client takes two.
-fn raise_fd_limit() {
+/// and docker client takes two. The VM daemon, node and controller raise it.
+pub(crate) fn raise_fd_limit() {
     let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
         return;

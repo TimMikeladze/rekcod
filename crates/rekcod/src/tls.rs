@@ -348,11 +348,24 @@ impl Write for ServerStream {
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             ServerStream::Plain(s) => s.flush(),
-            ServerStream::Tls(s) => {
-                s.flush()?;
-                // Send close_notify with the end of the response.
-                s.conn.send_close_notify();
-                s.conn.complete_io(&mut s.sock).map(|_| ())
+            ServerStream::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// close_notify goes once, when the response is done: streamed replies (exec output) flush
+/// after every chunk and must stay open.
+impl Drop for ServerStream {
+    fn drop(&mut self) {
+        // Mid-handshake there's nothing to close, and completing it could wait on a dead peer.
+        if let ServerStream::Tls(s) = self
+            && !s.conn.is_handshaking()
+        {
+            s.conn.send_close_notify();
+            while s.conn.wants_write() {
+                if s.conn.write_tls(&mut s.sock).is_err() {
+                    break;
+                }
             }
         }
     }
@@ -505,6 +518,35 @@ mod tests {
         assert!(fingerprint(&bundle).is_err());
         // One certificate encoded again is the same certificate.
         assert_eq!(fingerprint(&pem_of(&ca_cert(&real.pem).unwrap())).unwrap(), real.fingerprint().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A flush mid-response (exec output, one per chunk) must not end the stream.
+    #[test]
+    fn a_flush_keeps_the_response_open() {
+        let dir = std::env::temp_dir().join(format!("rekcod-tls-flush-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = ensure_ca(&dir).unwrap();
+        let (cert, key) = ca.issue(&["127.0.0.1".into()]).unwrap();
+        let server = server_config(&cert, &key).unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::spawn(move || {
+            let mut s = accept(Some(&server), l.accept().unwrap().0).unwrap();
+            let _ = s.read(&mut [0u8; 64]);
+            for part in [b"a", b"b"] {
+                s.write_all(part).unwrap();
+                s.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        trust(&addr.to_string(), &ca.pem).unwrap();
+        let mut s = connect(&format!("https://{addr}"), &addr.to_string(), TcpStream::connect(addr).unwrap()).unwrap();
+        s.write_all(b"go").unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "ab");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

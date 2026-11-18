@@ -88,6 +88,8 @@ s1=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.2
 check "remote create from git" test -n "$s1"
 check "remote exec sees the clone" sh -c 'test "$("$0" sandbox exec --remote alice "$1" -- cat VERSION)" = v1' "$R" "$s1"
 check "remote exec keeps the exit code" sh -c '"$0" sandbox exec --remote alice "$1" -- sh -c "exit 5"; test $? = 5' "$R" "$s1"
+# Output in two chunks: each chunk is flushed, and the stream must stay open for the next.
+check "remote exec streams every chunk" sh -c 'o=$("$0" sandbox exec --remote alice "$1" -- sh -c "echo a; sleep 1; echo b; exit 3"); test $? = 3 && test "$o" = "$(printf "a\nb")"' "$R" "$s1"
 check "another user can't reach it" sh -c '! "$0" sandbox exec --remote bob "$1" -- true' "$R" "$s1"
 check "apply isn't offered remotely" sh -c '! "$0" sandbox apply --remote alice "$1"' "$R" "$s1"
 first=$(cr sandbox ls --remote alice | sed -n 's/.*"node": "\(.*\)".*/\1/p' | head -1)

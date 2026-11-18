@@ -5,6 +5,13 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
+# git exports GIT_DIR, GIT_INDEX_FILE and friends to hooks. A test that runs `git init` in a temp
+# dir would act on this repository instead (it set core.bare=true on the shared .git once).
+cargo() { env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE -u GIT_PREFIX -u GIT_COMMON_DIR -u GIT_OBJECT_DIRECTORY -u GIT_ALTERNATE_OBJECT_DIRECTORIES cargo "$@"; }
+# git exports these to hooks; tests that run git (clone, init) must not inherit them,
+# or `git init` in a temp dir rewrites this repository's config (core.bare = true).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX
+
 echo "pre-commit: cargo fmt --check"
 cargo fmt --all --check || { echo "pre-commit: run \`cargo fmt --all\` and re-stage"; exit 1; }
 echo "pre-commit: clippy"
@@ -18,5 +25,5 @@ cargo test -q --workspace
 # The dashboard, when it's installed (cd dashboard && npm ci) and a staged change touches it.
 if [[ -d dashboard/node_modules ]] && git diff --cached --name-only | grep -q '^dashboard/'; then
   echo "pre-commit: dashboard"
-  (cd dashboard && npm test --silent && npm run --silent typecheck && npm run --silent lint && npm run --silent test:e2e)
+  (cd dashboard && unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX && npm test --silent && npm run --silent typecheck && npm run --silent lint && npm run --silent test:e2e)
 fi

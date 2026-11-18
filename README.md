@@ -350,10 +350,17 @@ idle_stop = "15m"
 NODE_ENV = "production"
 ```
 
-The application must listen on `0.0.0.0` at `app.port`, and the health path must return
-HTTP 200. With a Dockerfile, rekcod builds that file. Without one, `app.start` is
-required and rekcod selects a toolchain image from the command and project files.
+The application must listen on `0.0.0.0` at `app.port`, and a GET of the health path
+must answer with a 2xx or 3xx status within 2 s. Redirects aren't followed, so a health
+path that redirects to a login page passes. With a Dockerfile, rekcod builds that file.
+Without one, `app.start` is required and rekcod selects a toolchain image from the
+command and project files.
 `idle_stop` stops the app's VMs after inactivity; the next request wakes them.
+
+Inactivity means no new HTTP request through the edge. A sleeping app's VMs are stopped,
+so everything in them stops with it: background loops, queue consumers, open WebSockets.
+A WebSocket counts as activity only when it opens, and traffic that reaches the app any
+other way doesn't count. `rekcod app wake blog --remote mini` starts it without a request.
 
 Commit the configuration and push before deploying. The server must be able to clone
 the repository's `origin`; uncommitted changes are not sent.
@@ -454,6 +461,32 @@ so GitHub's Redeliver runs it again.
 The controller used to have one webhook secret for every app at `/webhooks/github`. That
 route is gone; set each repository's hook up again with `app webhook`.
 
+### Add and remove nodes
+
+Run `rekcod node join` on each Mac that should run app instances, as shown above, with the
+controller's join token from `~/.rekcod/controller/join-token` and the fingerprint
+`rekcod controller ca` prints on the controller. A new node waits as `pending` and gets no
+work until an admin approves it:
+
+```sh
+rekcod node ls --remote mini
+rekcod node approve NODE_ID --remote mini
+rekcod node rm NODE_ID --remote mini
+rekcod controller rotate-join --remote mini
+```
+
+At most 20 nodes can wait for approval; further joins are refused until some are approved
+or removed. A controller started with `--auto-approve` makes new nodes `ready` at once.
+`server setup` starts it that way, so on a server set up with `host add --server` anyone
+with the join token can add a node that gets deploys, and with them the apps' env and
+secrets.
+
+`node rm` forgets a node. Its app instances are replaced on other nodes by the next
+reconcile, its sandboxes are marked lost, and its unfinished jobs end as failed with
+"whether the job finished is unknown" in their log. `rotate-join` prints a new join token
+and writes it to `join-token`; the old one stops working. Nodes that already joined keep
+working, since they authenticate with their own secret.
+
 ### Take a node out for maintenance
 
 ```sh
@@ -472,6 +505,10 @@ has are removed; deleting a sandbox while its node is away removes the VM once t
 node is back. A controller that was itself away (the Mac slept, the process was
 stopped) waits 20 s for heartbeats before it marks any node lost.
 
+A job on a lost node isn't started anywhere else. It keeps counting against its owner's
+cap and holds its schedule's next run until the node answers again or `node rm` removes
+the node.
+
 ### Edge limits and client addresses
 
 Server setup installs the edge as `rekcod edge serve --remote edge --listen <addr>:8080
@@ -486,6 +523,8 @@ rekcod edge serve --client-ip-header cf-connecting-ip
 rekcod edge serve --public-listen 0.0.0.0:8081 --proxy-protocol --proxy-protocol-from 10.0.0.2
 # Requests per client across all apps (IPv6 counts per /64).
 rekcod edge serve --rate 50/s --burst 100
+# A line per request: client, method, host and path, status, time.
+rekcod edge serve --access-log
 ```
 
 X-Forwarded-For is read from the right: the first address that isn't a trusted proxy is the
@@ -621,6 +660,15 @@ database is kept as `fleet.db.before-restore-<time>`, with the writes its WAL he
 Instances that were running when the backup was taken are marked lost, and the
 controller takes back the ones that still answer.
 
+A restore goes back to the time of that backup, up to an hour with the hourly ones:
+deploys, tokens, secrets and namespaces changed since are gone. From 10 minutes after the controller starts, nodes delete fleet sandboxes the
+database doesn't know, which includes sandboxes created after the backup.
+
+App and webhook secrets in a backup are sealed with a salt per namespace. Deleting a
+namespace with `rekcod ns rm` deletes its salt, but backups taken before still have it, so with
+`secret-key` they still open that namespace's secrets. Rotate those secrets where they're
+issued and delete the older backups from `rekcod-backups` and `--backup-dir`.
+
 ### Give people access
 
 The server's admin token is in `~/.rekcod/controller/admin-token`; `host add --server`
@@ -647,6 +695,23 @@ rekcod controller limit alice --max-sandboxes 20 --remote mini
 rekcod controller revoke alice --remote mini
 ```
 
+A namespace's quota is set with `ns create` or changed later; each limit is 0 to 100000 or
+`unlimited`. `ns use` sends this remote's app, sandbox and job commands to a namespace from
+then on, and `ns ls` lists the namespaces you're in with your role, quota and usage:
+
+```sh
+rekcod ns quota team --max-cpus 16 --max-memory 64 --max-apps 10 --remote mini   # memory in GiB
+rekcod ns use team --remote mini
+rekcod ns ls --remote mini
+rekcod node pool NODE_ID --ns team --remote mini
+rekcod ns rm team --force --remote mini
+```
+
+`node pool` dedicates a node to the namespaces named: their work goes only to their pooled
+nodes, and other namespaces' work goes only to nodes in no pool. Without `--ns` the node
+goes back to everyone. `ns rm` refuses while the namespace has apps, running sandboxes or
+unfinished jobs; `--force` destroys the apps and sandboxes and cancels the jobs.
+
 `--max-sandboxes` caps a person's sandboxes plus jobs across namespaces (0 to 100000, or
 `unlimited`); app instances count against the namespace quota instead. `revoke` deletes
 every token with that name and its memberships, deletes that person's schedules and
@@ -665,6 +730,60 @@ for a missing role or admin token, and bad tokens (one row per address per minut
 read all of it; a namespace's owners read it with `--ns`. Rows are kept 90 days. When a
 namespace is deleted, its rows move to `NAME (deleted TIME)`, so a namespace made later
 under the same name doesn't see them, its jobs or their logs.
+
+### What the fleet trusts
+
+The controller (`7700`), nodes (`7701` and a relay port per app instance), the edge
+(`8080`) and RustFS (`7710`) are meant for a private network: a tailnet, or a LAN you
+trust. Don't forward their ports to the internet. Public traffic comes in through
+Cloudflare Tunnel to the edge's `127.0.0.1:8081` listener.
+
+The controller serves https with a CA of its own. `rekcod controller ca`, run on the
+controller, prints that CA's fingerprint. `remote add`, `node join` and edge setup with
+`--ca-fingerprint` fetch `/ca.pem` once, accept it only if it's a single certificate with
+that SHA-256 fingerprint, and from then on trust only that certificate. Node certificates
+come from the separate node CA, which only the controller trusts, so a node can never pass
+for the controller to a CLI or an edge.
+
+What each credential lets its holder do:
+
+- The admin token does everything, including making tokens, approving nodes and reading
+  every namespace.
+- A person's token acts in the namespaces it's a member of, with the role it has there.
+- An edge token reads the route table for every app, private ones included, reports
+  traffic, adds bans and wakes sleeping apps. Nodes let an address that fetched routes
+  in the last 10 minutes connect to instance relays directly, so whoever holds an edge
+  (or admin) token can reach every app without going through the edge.
+- The join token registers nodes. An approved node, or any node on a controller started
+  with `--auto-approve`, receives the env and secrets of the apps placed on it.
+- An app's webhook secret signs deliveries the controller accepts, which deploy and
+  destroy that app's pull request previews.
+
+Traffic between the edge and the nodes' relays is plain HTTP over TCP. A relay accepts
+connections only from its own Mac, the controller and the addresses that fetched routes
+in the last 10 minutes, which keeps the rest of the network from skipping the edge's
+namespace and private-app checks. Anyone on the path between them can still read and
+change app traffic, so keep nodes and edges on a tailnet.
+
+A private app is reachable by anyone who can reach the edge's private listener. A LAN
+setup (`host add --server --lan`, or no Tailscale) listens on `0.0.0.0:8080`, so every
+device on the LAN can open every private app. An app that needs logins has to do them
+itself.
+
+A macOS sandbox created on a node has no network filter: it reaches the internet, the
+node's Mac and its LAN.
+
+### Fleet limitations
+
+- There is one controller. While it's down there are no deploys, wakes, replacements of
+  lost instances, jobs, schedules or webhook deliveries. Edges keep serving from their
+  last route table, which they also keep in `~/.rekcod/edge-routes.json` across restarts.
+- RustFS is one disk, usually the controller's. Release images, build caches, controller
+  backups and app buckets on it aren't replicated; copy them off the server yourself.
+- A restore goes back to its backup and deletes newer sandboxes, as described in
+  [Back up the controller](#back-up-the-controller).
+- A job on a node that stops answering isn't started elsewhere and holds its schedule's
+  next run until the node is back or removed.
 
 ## Run jobs on the server
 

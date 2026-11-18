@@ -258,12 +258,10 @@ mod tests {
 
     #[test]
     fn a_port_held_on_ipv6_loopback_isnt_free() {
-        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = v4.local_addr().unwrap().port();
-        drop(v4);
-        let v6 = TcpListener::bind(("::1", port)).unwrap();
+        // Bound on ::1 only, with 127.0.0.1 left free. Another test may take the port once
+        // it's dropped, so only the held case is asserted.
+        let v6 = TcpListener::bind(("::1", 0)).unwrap();
+        let port = v6.local_addr().unwrap().port();
         assert!(!port_free(port));
-        drop(v6);
-        assert!(port_free(port));
     }
 }

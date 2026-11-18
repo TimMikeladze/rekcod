@@ -34,8 +34,16 @@ impl Bans {
         *self.remote.write().unwrap_or_else(std::sync::PoisonError::into_inner) = nets;
     }
 
-    pub fn ban_for(&self, ip: IpAddr, d: Duration) {
-        self.local.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((IpNet::from(ip), Instant::now() + d));
+    /// Bans `net` here for `d`; banning it again replaces the earlier entry.
+    pub fn ban_for(&self, net: IpNet, d: Duration) {
+        let mut local = self.local.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        local.retain(|(n, _)| *n != net);
+        local.push((net, Instant::now() + d));
+    }
+
+    #[cfg(test)]
+    pub fn local_len(&self) -> usize {
+        self.local.lock().unwrap_or_else(std::sync::PoisonError::into_inner).len()
     }
 
     pub fn is_banned(&self, ip: IpAddr) -> bool {
@@ -62,9 +70,9 @@ mod tests {
         b.set_remote(vec![parse_net("10.0.0.0/8").unwrap()]);
         assert!(b.is_banned("10.9.9.9".parse().unwrap()));
         assert!(!b.is_banned("11.0.0.1".parse().unwrap()));
-        b.ban_for("11.0.0.1".parse().unwrap(), Duration::from_secs(60));
+        b.ban_for(parse_net("11.0.0.1").unwrap(), Duration::from_secs(60));
         assert!(b.is_banned("11.0.0.1".parse().unwrap()));
-        b.ban_for("11.0.0.2".parse().unwrap(), Duration::ZERO);
+        b.ban_for(parse_net("11.0.0.2").unwrap(), Duration::ZERO);
         assert!(!b.is_banned("11.0.0.2".parse().unwrap()));
     }
 }

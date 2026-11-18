@@ -75,6 +75,18 @@ pub fn send_within(
     body: &[u8],
     timeout: Option<Duration>,
 ) -> Result<(u16, BufReader<crate::tls::Stream>)> {
+    exchange(base, method, path, token, body, timeout).map(|(code, _, r)| (code, r))
+}
+
+/// `send_within`, plus the reply's `Content-Length` when it has one.
+fn exchange(
+    base: &str,
+    method: &str,
+    path: &str,
+    token: Option<&str>,
+    body: &[u8],
+    timeout: Option<Duration>,
+) -> Result<(u16, Option<u64>, BufReader<crate::tls::Stream>)> {
     let addr = authority(base)?;
     let sock = crate::bonjour::socket_addr(&addr)?;
     let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).with_context(|| format!("connect {base}"))?;
@@ -93,13 +105,19 @@ pub fn send_within(
     let mut line = String::new();
     r.read_line(&mut line)?;
     let code: u16 = line.split_whitespace().nth(1).and_then(|c| c.parse().ok()).ok_or_else(|| anyhow!("bad response from {base}"))?;
+    let mut len = None;
     loop {
         let mut h = String::new();
         if r.read_line(&mut h)? == 0 || h.trim().is_empty() {
             break;
         }
+        if let Some((k, v)) = h.split_once(':')
+            && k.trim().eq_ignore_ascii_case("content-length")
+        {
+            len = v.trim().parse().ok();
+        }
     }
-    Ok((code, r))
+    Ok((code, len, r))
 }
 
 /// JSON request; an error status becomes an error carrying the server's message.
@@ -109,9 +127,15 @@ pub fn call(base: &str, method: &str, path: &str, token: Option<&str>, body: &Va
 
 pub fn call_within(base: &str, method: &str, path: &str, token: Option<&str>, body: &Value, timeout: Duration) -> Result<Value> {
     let data = if body.is_null() { vec![] } else { serde_json::to_vec(body)? };
-    let (code, mut r) = send_within(base, method, path, token, &data, Some(timeout))?;
+    let (code, len, mut r) = exchange(base, method, path, token, &data, Some(timeout))?;
     let mut buf = Vec::new();
     r.read_to_end(&mut buf)?;
+    // A connection closed early (without TLS close_notify too) reads as a short body.
+    if let Some(n) = len
+        && (buf.len() as u64) < n
+    {
+        bail!("{method} {path}: reply cut short ({} of {n} bytes)", buf.len());
+    }
     let v: Value = serde_json::from_slice(&buf).unwrap_or_else(|_| json!({"text": String::from_utf8_lossy(&buf)}));
     if code >= 400 {
         bail!("{} ({code})", v["error"].as_str().map(String::from).unwrap_or_else(|| v.to_string()));
@@ -2677,6 +2701,18 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             let reason = body["reason"].as_str().unwrap_or("");
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             db.execute("delete from bans where until is not null and until <= ?1", &[&now()])?;
+            // An edge bans what its rate limit counted (an address, an IPv6 /64) for a while,
+            // and never replaces a ban an admin made.
+            if !who.admin {
+                let n = crate::edge::ban::parse_net(&net)?;
+                let narrow = n.prefix_len() >= if n.addr().is_ipv4() { 24 } else { 48 };
+                if !narrow || !body["secs"].as_i64().is_some_and(|s| (1..=86_400).contains(&s)) {
+                    bail!("an edge may ban an IPv4 /24 or an IPv6 /48 or narrower, for 1 to 86400 secs");
+                }
+                if db.query_opt("select 1 from bans where net = ?1 and by != ?2", &[&net, &who.name])?.is_some() {
+                    return Ok(json!({"banned": net, "kept": true}));
+                }
+            }
             db.execute(
                 "insert or replace into bans (net, reason, until, created, by) values (?1, ?2, ?3, ?4, ?5)",
                 &[&net, &reason, &until, &now(), &who.name],
@@ -6272,7 +6308,7 @@ mod tests {
             ("POST", "/join-token", json!({}), &["admin"]),
             ("POST", "/tokens", json!({"name": "z"}), &["admin"]),
             ("GET", "/routes", json!(null), &["admin", "edge"]),
-            ("POST", "/bans", json!({"net": "203.0.113.9"}), &["admin", "edge"]),
+            ("POST", "/bans", json!({"net": "203.0.113.9", "secs": 600}), &["admin", "edge"]),
             ("DELETE", "/bans", json!({"net": "203.0.113.9"}), &["admin"]),
             ("GET", "/backups", json!(null), &["admin"]),
             // In default each person only sees their own.
@@ -6305,6 +6341,34 @@ mod tests {
                 assert_eq!(got_in, allowed.contains(&who), "{who} {method} {path}: {r:?}");
             }
         }
+    }
+
+    #[test]
+    fn edge_tokens_ban_narrow_ranges_for_a_while() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        add_token(&c, "edge-t", "edge", false, "none", true, None);
+        let ban = |tok: &str, body: Value| call(&url, "POST", "/bans", Some(tok), &body);
+        for refused in [
+            json!({"net": "0.0.0.0/0", "secs": 600}),
+            json!({"net": "::/0", "secs": 600}),
+            json!({"net": "10.0.0.0/8", "secs": 600}),
+            json!({"net": "203.0.113.7"}),
+            json!({"net": "203.0.113.7", "secs": 86_401}),
+        ] {
+            let e = ban("edge-t", refused.clone()).unwrap_err().to_string();
+            assert!(e.contains("(400)") && e.contains("an edge may ban"), "{refused}: {e}");
+        }
+        ban("edge-t", json!({"net": "203.0.113.7", "secs": 600})).unwrap();
+        ban("edge-t", json!({"net": "2001:db8:0:1::/64", "secs": 600})).unwrap();
+        // An admin's permanent ban stays as it is.
+        ban("admin-t", json!({"net": "10.0.0.0/8"})).unwrap();
+        ban("admin-t", json!({"net": "198.51.100.1"})).unwrap();
+        assert_eq!(ban("edge-t", json!({"net": "198.51.100.1", "secs": 1})).unwrap()["kept"], true);
+        let until: Option<i64> =
+            c.db.lock().unwrap().query_opt("select until from bans where net = '198.51.100.1'", &[]).unwrap().unwrap().get(0);
+        assert_eq!(until, None);
+        assert!(call(&url, "DELETE", "/bans", Some("edge-t"), &json!({"net": "10.0.0.0/8"})).is_err());
     }
 
     #[test]

@@ -195,10 +195,13 @@ impl Edge {
             }
             Err(e) => eprintln!("rekcod: edge: routes: {e:#}"),
         }
+        // Only a list replaces the bans: anything else (an error page, a cut-off body, which
+        // never parses as an array) keeps the ones we have.
         match call_within(&r.url, "GET", "/bans", Some(&r.token), &Value::Null, QUICK) {
-            Ok(v) => self.bans.set_remote(
-                v.as_array().into_iter().flatten().filter_map(|b| b["net"].as_str().and_then(|n| ban::parse_net(n).ok())).collect(),
-            ),
+            Ok(Value::Array(list)) => {
+                self.bans.set_remote(list.iter().filter_map(|b| b["net"].as_str().and_then(|n| ban::parse_net(n).ok())).collect())
+            }
+            Ok(v) => eprintln!("rekcod: edge: bans: not a list: {:.200}", v.to_string()),
             Err(e) => eprintln!("rekcod: edge: bans: {e:#}"),
         }
         self.limits.prune();
@@ -256,17 +259,18 @@ impl Edge {
         }
     }
 
-    /// A 429 for `ip`; enough of them bans it here now and on every edge after the
-    /// controller has it.
+    /// An edge-wide 429 for `ip`; enough of them ban its address (its /64 for IPv6) here now
+    /// and on every edge after the controller has it.
     fn strike(&self, ip: IpAddr) {
         // Banning the tunnel would ban everyone behind it.
         if !self.limits.strike(ip) || self.trusts(ip) {
             return;
         }
-        eprintln!("rekcod: edge: banning {ip} for {}s ({} rate-limited requests in a minute)", AUTO_BAN.as_secs(), limit::STRIKES);
-        self.bans.ban_for(ip, AUTO_BAN);
+        let net = limit::ban_net(ip);
+        eprintln!("rekcod: edge: banning {net} for {}s ({} rate-limited requests in a minute)", AUTO_BAN.as_secs(), limit::STRIKES);
+        self.bans.ban_for(net, AUTO_BAN);
         if let Some(r) = self.remote.clone() {
-            let body = json!({"net": ip.to_string(), "secs": AUTO_BAN.as_secs(), "reason": "auto: rate limited"});
+            let body = json!({"net": net.to_string(), "secs": AUTO_BAN.as_secs(), "reason": "auto: rate limited"});
             tokio::task::spawn_blocking(move || {
                 if let Err(e) = call(&r.url, "POST", "/bans", Some(&r.token), &body) {
                     eprintln!("rekcod: edge: report ban: {e:#}");
@@ -513,11 +517,13 @@ async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: Ip
     let Some(route) = route else {
         return text(StatusCode::NOT_FOUND, format!("no app at {host}\n"));
     };
-    if let Err(wait) = edge.limits.check(client, host, &route.http) {
+    if let Err(refused) = edge.limits.check(client, host, &route.http) {
         edge.stats.limited(client);
-        edge.strike(client);
+        if refused.edge_wide {
+            edge.strike(client);
+        }
         let mut r = text(StatusCode::TOO_MANY_REQUESTS, "too many requests\n");
-        r.headers_mut().insert(header::RETRY_AFTER, wait.as_secs().max(1).into());
+        r.headers_mut().insert(header::RETRY_AFTER, refused.wait.as_secs().max(1).into());
         return r;
     }
     edge.seen.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(host.to_string());
@@ -751,18 +757,6 @@ mod tests {
         let mut s = dial(&addr).await;
         assert_eq!(get(&mut s, "a.test", "").await.0, 200);
         assert_eq!(get(&mut s, "a.test", "").await.0, 200);
-        assert_eq!(get(&mut s, "a.test", "").await.0, 429);
-
-        // A per-app rate applies on top of the edge's.
-        let edge = Edge::new(None, direct());
-        let http = HttpSettings { rate: Some("1/m".into()), burst: Some(1), max_body: None };
-        edge.table
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert("a.test".into(), Route { http, ..route(&[&a], false) });
-        let addr = edge_on(&edge, Listener::default()).await;
-        let mut s = dial(&addr).await;
-        assert_eq!(get(&mut s, "a.test", "").await.0, 200);
         for _ in 1..limit::STRIKES {
             assert_eq!(get(&mut s, "a.test", "").await.0, 429);
         }
@@ -775,6 +769,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_apps_own_rate_limit_never_bans() {
+        let a = instance("a").await;
+        let edge = Edge::new(None, direct());
+        let http = HttpSettings { rate: Some("1/m".into()), burst: Some(1), ..Default::default() };
+        edge.table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend([("a.test".to_string(), Route { http, ..route(&[&a], false) }), ("b.test".to_string(), route(&[&a], false))]);
+        let addr = edge_on(&edge, Listener::default()).await;
+        let mut s = dial(&addr).await;
+        assert_eq!(get(&mut s, "a.test", "").await.0, 200);
+        for _ in 0..limit::STRIKES + 5 {
+            assert_eq!(get(&mut s, "a.test", "").await.0, 429);
+        }
+        assert_eq!(get(&mut dial(&addr).await, "b.test", "").await.0, 200);
+        assert_eq!(edge.bans.local_len(), 0);
+    }
+
+    #[tokio::test]
     async fn forwarded_for_only_from_trusted_proxies() {
         let a = instance("a").await;
         let spoof = "X-Forwarded-For: 203.0.113.9\r\n";
@@ -784,9 +797,8 @@ mod tests {
         assert_eq!(get(&mut dial(&addr).await, "a.test", spoof).await.1, "a|127.0.0.1");
 
         // Loopback is trusted by default, as cloudflared on the same Mac.
-        let edge = Edge::new(None, fast());
-        let http = HttpSettings { rate: Some("1/m".into()), burst: Some(1), max_body: None };
-        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), Route { http, ..route(&[&a], true) });
+        let edge = Edge::new(None, Settings { rate: Duration::from_secs(60), burst: 1, ..Default::default() });
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], true));
         let tunnel = edge_on(&edge, Listener { public_only: true, ..Default::default() }).await;
         let mut s = dial(&tunnel).await;
         assert_eq!(get(&mut s, "a.test", spoof).await.1, "a|203.0.113.9, 127.0.0.1");
@@ -800,6 +812,61 @@ mod tests {
         assert_eq!(get(&mut s, "a.test", spoof).await.0, 403);
         assert!(!edge.bans.is_banned("127.0.0.1".parse().unwrap()));
         assert_eq!(get(&mut dial(&tunnel).await, "a.test", "X-Forwarded-For: 203.0.113.11\r\n").await.0, 200);
+
+        // A client's own X-Forwarded-For line ahead of the proxy's can't take the strikes.
+        let two = "X-Forwarded-For: 198.51.100.77\r\nX-Forwarded-For: 203.0.113.20\r\n";
+        for _ in 0..=limit::STRIKES {
+            get(&mut s, "a.test", two).await;
+        }
+        assert!(edge.bans.is_banned("203.0.113.20".parse().unwrap()));
+        assert_eq!(get(&mut s, "a.test", "X-Forwarded-For: 198.51.100.77\r\n").await.0, 200);
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_ban_covers_the_64_that_was_counted() {
+        let a = instance("a").await;
+        let edge = Edge::new(None, Settings { rate: Duration::from_secs(60), burst: 1, ..Default::default() });
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let addr = edge_on(&edge, Listener::default()).await;
+        let mut s = dial(&addr).await;
+        let from = |i: u32| format!("X-Forwarded-For: 2001:db8:0:1::{i:x}\r\n");
+        assert_eq!(get(&mut s, "a.test", &from(1000)).await.0, 200);
+        for i in 0..limit::STRIKES {
+            assert_eq!(get(&mut s, "a.test", &from(i)).await.0, 429);
+        }
+        assert_eq!(get(&mut s, "a.test", &from(0xbeef)).await.0, 403);
+        assert_eq!(edge.bans.local_len(), 1);
+    }
+
+    #[test]
+    fn bans_survive_a_reply_that_is_not_a_list() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            for (n, s) in l.incoming().enumerate() {
+                let mut r = std::io::BufReader::new(s.unwrap());
+                let mut first = String::new();
+                r.read_line(&mut first).unwrap();
+                let mut line = String::new();
+                while line != "\r\n" {
+                    line.clear();
+                    r.read_line(&mut line).unwrap();
+                }
+                // Each refresh asks for /routes, then /bans: an object, then a list cut short.
+                let (body, len) = match (first.contains("/bans"), n) {
+                    (false, _) => ("{}", 2),
+                    (true, n) if n < 2 => ("{}", 2),
+                    (true, _) => ("[]", 40),
+                };
+                let _ = write!(r.get_mut(), "HTTP/1.1 200 OK\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n{body}");
+            }
+        });
+        let edge = Edge::new(Some(Remote { url, token: "t".into(), ns: None, ca: None }), fast());
+        edge.bans.set_remote(vec![ban::parse_net("198.51.100.9").unwrap()]);
+        edge.refresh();
+        edge.refresh();
+        assert!(edge.bans.is_banned("198.51.100.9".parse().unwrap()));
     }
 
     /// An instance that answers with the request head it received, lowercased.

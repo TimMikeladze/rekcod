@@ -13,7 +13,7 @@ use governor::{DefaultKeyedRateLimiter, Quota, RateLimiter};
 
 use crate::fleet::HttpSettings;
 
-/// 429s from one IP within a minute before it's banned.
+/// 429s from the edge-wide limit for one IP within a minute before it's banned.
 pub const STRIKES: u32 = 100;
 pub const STRIKE_WINDOW: Duration = Duration::from_secs(60);
 
@@ -68,6 +68,22 @@ pub fn rate_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+/// What an auto ban covers: the /64 for IPv6, as the limits count it, else the address.
+pub fn ban_net(ip: IpAddr) -> ipnet::IpNet {
+    match rate_key(ip) {
+        IpAddr::V6(v6) => ipnet::IpNet::V6(ipnet::Ipv6Net::new(v6, 64).expect("valid prefix")),
+        v4 => ipnet::IpNet::from(v4),
+    }
+}
+
+/// A refused request: how long until the next token, and whether the edge-wide limit
+/// refused it (only those count toward a ban; an app's own limit stays with that app).
+#[derive(Debug)]
+pub struct Refused {
+    pub wait: Duration,
+    pub edge_wide: bool,
+}
+
 pub struct Limits {
     edge: DefaultKeyedRateLimiter<IpAddr>,
     /// Per app host: the settings its limiter was built from, so a changed rate rebuilds it.
@@ -80,11 +96,11 @@ impl Limits {
         Limits { edge: RateLimiter::keyed(quota(every, burst)), apps: Default::default(), strikes: Default::default() }
     }
 
-    /// `Err(wait)` when `ip` is over the edge's or the app's rate.
-    pub fn check(&self, ip: IpAddr, host: &str, http: &HttpSettings) -> Result<(), Duration> {
+    /// `Err` when `ip` is over the edge's or the app's rate.
+    pub fn check(&self, ip: IpAddr, host: &str, http: &HttpSettings) -> Result<(), Refused> {
         let ip = rate_key(ip);
         let clock = DefaultClock::default();
-        self.edge.check_key(&ip).map_err(|e| e.wait_time_from(clock.now()))?;
+        self.edge.check_key(&ip).map_err(|e| Refused { wait: e.wait_time_from(clock.now()), edge_wide: true })?;
         let Some(every) = http.rate.as_deref().and_then(|r| parse_rate(r).ok()) else { return Ok(()) };
         let lim = {
             let mut apps = self.apps.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -98,7 +114,7 @@ impl Limits {
                 }
             }
         };
-        lim.check_key(&ip).map_err(|e| e.wait_time_from(clock.now()))
+        lim.check_key(&ip).map_err(|e| Refused { wait: e.wait_time_from(clock.now()), edge_wide: false })
     }
 
     /// Counts a 429 for `ip`; true once it has had [`STRIKES`] within [`STRIKE_WINDOW`].
@@ -150,12 +166,22 @@ mod tests {
         let http = HttpSettings { rate: Some("1/m".into()), burst: Some(2), max_body: None };
         assert!(l.check(ip, "a.test", &http).is_ok());
         assert!(l.check(ip, "a.test", &http).is_ok());
-        let wait = l.check(ip, "a.test", &http).unwrap_err();
-        assert!(wait > Duration::from_secs(20), "{wait:?}");
+        let r = l.check(ip, "a.test", &http).unwrap_err();
+        assert!(r.wait > Duration::from_secs(20) && !r.edge_wide, "{r:?}");
         // Another client, and another app without a rate, aren't affected.
         assert!(l.check("192.0.2.2".parse().unwrap(), "a.test", &http).is_ok());
         assert!(l.check(ip, "b.test", &HttpSettings::default()).is_ok());
         assert!((1..STRIKES).all(|_| !l.strike(ip)));
         assert!(l.strike(ip));
+        let tight = Limits::new(Duration::from_secs(60), 1);
+        assert!(tight.check(ip, "b.test", &HttpSettings::default()).is_ok());
+        assert!(tight.check(ip, "b.test", &HttpSettings::default()).unwrap_err().edge_wide);
+    }
+
+    #[test]
+    fn bans_cover_what_was_counted() {
+        assert_eq!(ban_net("2001:db8:0:1::65".parse().unwrap()).to_string(), "2001:db8:0:1::/64");
+        assert_eq!(ban_net("::ffff:192.0.2.1".parse().unwrap()).to_string(), "192.0.2.1/32");
+        assert_eq!(ban_net("192.0.2.1".parse().unwrap()).to_string(), "192.0.2.1/32");
     }
 }

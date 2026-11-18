@@ -466,6 +466,7 @@ pub fn engine_entries(e: &Engine) -> Vec<Entry> {
     if !running {
         return out;
     }
+    out.extend(acts(&v["storage_actions"]));
     out.push(Entry::Separator);
     let s = |x: &Value, k: &str| x[k].as_str().unwrap_or("?").to_string();
     let section = |key: &str, title: &str, label: &dyn Fn(&Value) -> String| -> Option<Entry> {
@@ -487,6 +488,30 @@ pub fn engine_entries(e: &Engine) -> Vec<Entry> {
     }));
     out.extend(section("volumes", "Volumes", &|x| s(x, "name")));
     out.extend(section("networks", "Networks", &|n| format!("{}  ({})", s(n, "name"), s(n, "driver"))));
+    let projects: Vec<Entry> = v["projects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let mut items = acts(&p["actions"]);
+            let snaps = p["snapshots"].as_array().map(Vec::as_slice).unwrap_or_default();
+            if !snaps.is_empty() {
+                items.push(Entry::Separator);
+            }
+            for sn in snaps {
+                items.push(Entry::Submenu(format!("{}  ({})", s(sn, "name"), actions::age(sn["created"].as_u64())), acts(&sn["actions"])));
+            }
+            Entry::Submenu(s(p, "name"), items)
+        })
+        .collect();
+    if !projects.is_empty() {
+        out.push(Entry::Submenu("Projects & snapshots".into(), projects));
+    }
+    out.extend(section("sandboxes", "Agent sandboxes", &|x| {
+        let dot = if x["running"] == true { "●" } else { "○" };
+        let dir = x["project"].as_str().and_then(|p| p.rsplit('/').next()).unwrap_or_default();
+        format!("{dot} {}  ({dir})", x["name"].as_str().or(x["id"].as_str()).unwrap_or("?"))
+    }));
     let new = acts(&v["engine_actions"]);
     if !new.is_empty() {
         out.push(Entry::Submenu("New".into(), new));
@@ -1044,6 +1069,58 @@ mod tests {
         assert_eq!(old, vec![Entry::Label("Can't read mini: no answer in 20 s (read 10m ago)".into())]);
         let first = engine_entries(&Engine { name: "mini".into(), state: None, age: 0 });
         assert_eq!(first, vec![Entry::Label("Reading mini…".into())]);
+    }
+
+    /// A host's engine offers what its `rekcod host state` holds: every action kind in it is in
+    /// the submenu.
+    #[test]
+    fn engine_submenu_offers_every_action_in_a_hosts_state() {
+        use crate::actions::tests::*;
+        let (containers, ports, projects) = sample();
+        let full = Model {
+            running: true,
+            containers: containers.into_iter().chain([sample_storage()]).collect(),
+            ports,
+            projects,
+            sandboxes: vec![sample_sandbox()],
+            images: sample_images(),
+            volumes: sample_volumes(),
+            networks: sample_networks(),
+            ..Model::default()
+        };
+        let mut want = std::collections::BTreeSet::new();
+        let mut seen = Vec::new();
+        for m in [full, Model { socket_installed: false, ..Model::default() }] {
+            let mut v = crate::state::model_json(&m);
+            crate::state::check_remote(&mut v, "mini");
+            crate::host::rewrite(&mut v, "mini");
+            fn walk(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+                match v {
+                    Value::Object(o) if o.contains_key("argv") && o.contains_key("kind") => {
+                        out.insert(o["kind"].as_str().unwrap().to_string());
+                    }
+                    Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+                    Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                    _ => {}
+                }
+            }
+            walk(&v, &mut want);
+            let e = Engine { name: "mini".into(), state: Some(Ok(v)), age: 0 };
+            fn kinds(e: &[Entry], out: &mut Vec<String>) {
+                for e in e {
+                    match e {
+                        Entry::Action(a) => out.push(format!("{:?}", a.kind)),
+                        Entry::Submenu(_, c) => kinds(c, out),
+                        _ => {}
+                    }
+                }
+            }
+            kinds(&engine_entries(&e), &mut seen);
+        }
+        assert!(want.len() > 40, "{want:?}");
+        for k in &want {
+            assert!(seen.contains(k), "the Engine submenu lacks {k}");
+        }
     }
 
     #[test]

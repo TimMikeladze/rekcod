@@ -68,6 +68,103 @@ pub fn action_from_json(v: &Value) -> Option<Action> {
     })
 }
 
+/// Lists the dashboard's pages and the Engine submenu map over.
+const ENGINE_LISTS: &[&str] = &[
+    "containers",
+    "ports",
+    "projects",
+    "sandboxes",
+    "images",
+    "volumes",
+    "networks",
+    "vm_actions",
+    "storage_actions",
+    "engine_actions",
+    "disk_actions",
+];
+
+/// An action from a host's `rekcod state` this Mac will run: a kind this binary knows, string
+/// argv, inputs it can check, and no control character anywhere (a Terminal acts on those).
+fn remote_action_ok(o: &serde_json::Map<String, Value>) -> bool {
+    fn clean(v: &Value) -> bool {
+        match v {
+            Value::String(s) => !actions::has_control(s),
+            Value::Array(a) => a.iter().all(clean),
+            Value::Object(o) => o.iter().all(|(k, v)| !actions::has_control(k) && clean(v)),
+            _ => true,
+        }
+    }
+    let flag = |f: &Value| {
+        f.is_null()
+            || f.as_str().is_some_and(|f| {
+                let name = f.strip_prefix("--").or_else(|| f.strip_prefix('-')).unwrap_or_default();
+                name.starts_with(|c: char| c.is_ascii_alphabetic()) && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+    };
+    let input = |i: &Value| {
+        i["key"].is_string()
+            && i["label"].is_string()
+            && i["kind"].as_str().and_then(actions::InputKind::from_name).is_some()
+            && flag(&i["flag"])
+    };
+    o.get("kind").and_then(Value::as_str).and_then(actions::Kind::from_name).is_some()
+        && o.get("argv").and_then(Value::as_array).is_some_and(|a| a.iter().all(Value::is_string))
+        && o.get("dir").is_none_or(Value::is_string)
+        && o.get("confirm").is_none_or(|c| c.is_null() || c.is_string())
+        && o.get("inputs").is_none_or(|i| i.as_array().is_some_and(|a| a.iter().all(input)))
+        && o.values().all(clean)
+}
+
+/// A host's `rekcod state`, checked before anything here uses it (`host::engine_state` calls
+/// this before `rewrite`). Actions that fail `remote_action_ok` are dropped; the rest lose any
+/// URL and are interactive only when this binary runs that kind in Terminal. An export's label
+/// says it lands on `host`. The lists the pages read are made arrays of objects.
+pub fn check_remote(v: &mut Value, host: &str) {
+    fn walk(v: &mut Value, host: &str) {
+        match v {
+            Value::Array(a) => {
+                a.retain(|x| x.as_object().is_none_or(|o| !o.contains_key("kind") || !o.contains_key("label") || remote_action_ok(o)));
+                a.iter_mut().for_each(|x| walk(x, host));
+            }
+            Value::Object(o) if o.contains_key("kind") && o.contains_key("label") && o.contains_key("argv") => {
+                o.remove("url");
+                let kind = o["kind"].as_str().and_then(actions::Kind::from_name);
+                let interactive = o.get("interactive").and_then(Value::as_bool).unwrap_or(false);
+                o.insert("interactive".into(), (interactive && kind.is_some_and(actions::Kind::may_be_interactive)).into());
+                if kind == Some(actions::Kind::VolumeExport)
+                    && let Some(l) = o.get_mut("label")
+                {
+                    *l = format!("{} on {host}", l.as_str().unwrap_or_default()).into();
+                }
+            }
+            Value::Object(o) => {
+                for (k, x) in o.iter_mut() {
+                    if k == "actions" || k.ends_with("_actions") {
+                        match x {
+                            Value::Array(a) => {
+                                a.retain(|a| a.as_object().is_some_and(|o| o.contains_key("kind") && o.contains_key("label")))
+                            }
+                            _ => *x = json!([]),
+                        }
+                    }
+                    walk(x, host);
+                }
+            }
+            _ => {}
+        }
+    }
+    let Some(o) = v.as_object_mut() else { return };
+    for k in ENGINE_LISTS {
+        match o.get_mut(*k) {
+            Some(Value::Array(a)) => a.retain(Value::is_object),
+            _ => {
+                o.insert((*k).into(), json!([]));
+            }
+        }
+    }
+    walk(v, host);
+}
+
 fn actions_json(list: &[Action]) -> Value {
     Value::Array(list.iter().map(action_json).collect())
 }
@@ -401,6 +498,68 @@ mod tests {
         }
         let c = &model_json(&full)["containers"][0]["actions"][0];
         assert_eq!(c["argv"], json!(["stop", "web"]));
+    }
+
+    #[test]
+    fn a_hosts_state_is_checked_before_use() {
+        let mut v = json!({
+            "running": true,
+            "vm_actions": [
+                {"kind": "VmStop", "label": "Stop", "argv": ["stop", "\u{15}/usr/bin/touch /tmp/x\n#"], "interactive": true},
+                {"kind": "VmStop", "label": "Stop", "argv": ["stop"], "interactive": true, "url": "http://localhost:1"},
+                {"kind": "NewerKind", "label": "New", "argv": ["new"]},
+                {"kind": "Shell", "label": "Shell", "argv": ["shell"], "interactive": true},
+                {"label": "no kind"},
+            ],
+            "engine_actions": [
+                {"kind": "ImagePull", "label": "Pull", "argv": ["pull", "{image}"], "inputs": [{"key": "image", "label": "Image", "kind": "bogus"}]},
+                {"kind": "ImagePull", "label": "Pull", "argv": ["pull", "{image}"],
+                 "inputs": [{"key": "image", "label": "Image", "kind": "image", "flag": "--x;y"}]},
+                {"kind": "ImagePull", "label": "Pull", "argv": ["pull", "{image}"], "inputs": [null]},
+            ],
+            "volumes": [{"name": "pg", "actions": [{"kind": "VolumeExport", "label": "Export to ~/Downloads/pg.tar.gz", "argv": ["run"]}]},
+                        "not an object"],
+            "containers": {"not": "a list"},
+            "projects": [{"name": "shop", "actions": "not a list"}],
+        });
+        check_remote(&mut v, "mini");
+        assert_eq!(
+            v["vm_actions"],
+            json!([
+                {"kind": "VmStop", "label": "Stop", "argv": ["stop"], "interactive": false},
+                {"kind": "Shell", "label": "Shell", "argv": ["shell"], "interactive": true},
+            ])
+        );
+        assert_eq!(v["engine_actions"], json!([]));
+        assert_eq!(v["volumes"].as_array().unwrap().len(), 1);
+        assert_eq!(v["volumes"][0]["actions"][0]["label"], "Export to ~/Downloads/pg.tar.gz on mini");
+        assert_eq!(v["containers"], json!([]));
+        assert_eq!(v["networks"], json!([]));
+        assert_eq!(v["projects"][0]["actions"], json!([]));
+    }
+
+    /// Nothing this binary writes is dropped by the check a host's state goes through.
+    #[test]
+    fn check_remote_keeps_every_action_we_write() {
+        let (containers, ports, projects) = sample();
+        let m = Model {
+            running: true,
+            containers,
+            ports,
+            projects,
+            sandboxes: vec![sample_sandbox()],
+            images: sample_images(),
+            volumes: sample_volumes(),
+            networks: sample_networks(),
+            ..Default::default()
+        };
+        let count = |v: &Value| v.to_string().matches("\"kind\":").count();
+        let before = model_json(&m);
+        let mut after = before.clone();
+        check_remote(&mut after, "mini");
+        // OpenPort is a URL, which the check drops; everything with an argv stays.
+        let opens = before.to_string().matches("\"OpenPort\"").count();
+        assert_eq!(count(&after), count(&before) - opens);
     }
 
     #[test]

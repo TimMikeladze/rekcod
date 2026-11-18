@@ -565,7 +565,7 @@ impl Target {
             return;
         }
         if action.interactive {
-            in_terminal(&action.command_line());
+            in_terminal(&self.ivars().paths, action);
             return;
         }
         // Runs in the background; the next menu open shows the result.
@@ -682,13 +682,52 @@ fn open(target: &str) {
     }
 }
 
-/// Opens Terminal.app running `command`.
-fn in_terminal(command: &str) {
-    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell");
-    if let Ok(mut child) = Command::new("/usr/bin/osascript").args(["-e", &script]).spawn() {
-        std::thread::spawn(move || child.wait());
+/// Opens Terminal.app running `action` from a script file (`Action::terminal_script`).
+fn in_terminal(paths: &Paths, action: &Action) {
+    let opened = action
+        .terminal_script()
+        .context("the command has control characters")
+        .and_then(|script| write_terminal_script(&paths.home.join("run/terminal"), &script))
+        .and_then(|file| terminal_applescript(&file).context("the script's path has control characters"));
+    match opened {
+        Ok(script) => {
+            if let Ok(mut child) = Command::new("/usr/bin/osascript").args(["-e", &script]).spawn() {
+                std::thread::spawn(move || child.wait());
+            }
+        }
+        Err(e) => eprintln!("rekcod menubar: not opening Terminal for {}: {e:#}", action.label),
     }
+}
+
+/// `script` as a new 0700 file in `dir` (0700 too). The script deletes itself when it runs;
+/// ones older than a day are from Terminal windows that never ran them.
+pub fn write_terminal_script(dir: &Path, script: &str) -> Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let day = std::time::Duration::from_secs(86_400);
+    for e in std::fs::read_dir(dir)?.flatten() {
+        if e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day)) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let file = dir.join(format!("{}-{nanos}.sh", std::process::id()));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&file)?;
+    f.write_all(script.as_bytes())?;
+    Ok(file)
+}
+
+/// The AppleScript that opens a Terminal window running the script at `file`, or `None` when
+/// its path has a control character.
+pub fn terminal_applescript(file: &Path) -> Option<String> {
+    let line = actions::shell_quote(&file.display().to_string());
+    if actions::has_control(&line) {
+        return None;
+    }
+    let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!("tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell"))
 }
 
 pub fn run(paths: Paths) -> Result<()> {
@@ -918,6 +957,21 @@ mod tests {
         assert!(items.contains(&Entry::Submenu("Networks (1)".into(), vec![Entry::Label("bridge  (bridge)".into())])));
         let down = engine_entries(&Engine { name: "mini".into(), state: Err("ssh: connect timed out".into()) });
         assert_eq!(down, vec![Entry::Label("Can't read mini: ssh: connect timed out".into())]);
+    }
+
+    #[test]
+    fn terminal_is_handed_a_script_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rekcod-menubar-term-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = write_terminal_script(&dir.join("run/terminal"), "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(dir.join("run/terminal")).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "#!/bin/sh\nexit 0\n");
+        let script = terminal_applescript(Path::new("/Users/me/x y/\"a\".sh")).unwrap();
+        assert_eq!(script, "tell application \"Terminal\"\nactivate\ndo script \"'/Users/me/x y/\\\"a\\\".sh'\"\nend tell");
+        assert_eq!(terminal_applescript(Path::new("/tmp/\u{15}x.sh")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

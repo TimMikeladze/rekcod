@@ -184,6 +184,34 @@ impl Kind {
     pub fn from_name(name: &str) -> Option<Kind> {
         Kind::ALL.into_iter().find(|k| format!("{k:?}") == name)
     }
+
+    /// Kinds this binary ever runs in Terminal. A host's `rekcod state` can't make another
+    /// kind open one here (`state::check_remote`).
+    pub fn may_be_interactive(self) -> bool {
+        matches!(
+            self,
+            Kind::VmRepair
+                | Kind::Shell
+                | Kind::SocketInstall
+                | Kind::Doctor
+                | Kind::Upgrade
+                | Kind::Uninstall
+                | Kind::StorageEnv
+                | Kind::StorageUp
+                | Kind::ContainerLogs
+                | Kind::ContainerShell
+                | Kind::ImageHistory
+                | Kind::VolumeBrowse
+                | Kind::SandboxShell
+                | Kind::SandboxDiff
+                | Kind::AppLogs
+                | Kind::JobLogs
+                | Kind::HostForward
+                | Kind::HostRestart
+                | Kind::HostUninstall
+                | Kind::EdgeBan
+        )
+    }
 }
 
 /// What a value typed into an action's input must look like.
@@ -409,6 +437,20 @@ impl Action {
         }
     }
 
+    /// The script Terminal.app runs for an interactive action: `/bin/sh` (zsh would expand a
+    /// leading `=`), deleting itself first. Terminal is handed only the script's path, never this
+    /// text: typed into a line editor, a ^U or ^C inside quotes would start a new command line.
+    /// `None` when the command or its directory holds a control character.
+    pub fn terminal_script(&self) -> Option<String> {
+        let line = self.command_line();
+        let dir = self.dir.as_ref().map(|d| d.display().to_string());
+        if has_control(&line) || dir.as_deref().is_some_and(has_control) {
+            return None;
+        }
+        let cd = dir.map(|d| format!("cd {} || exit\n", shell_quote(&d))).unwrap_or_default();
+        Some(format!("#!/bin/sh\nrm -f -- \"$0\"\n{cd}exec {line}\n"))
+    }
+
     /// A non-interactive command, ready to spawn with captured output.
     pub fn command(&self) -> Command {
         let mut cmd = match &self.run {
@@ -429,6 +471,11 @@ impl Action {
         cmd.stdin(Stdio::null());
         cmd
     }
+}
+
+/// C0, DEL or C1: bytes a terminal acts on.
+pub fn has_control(s: &str) -> bool {
+    s.chars().any(char::is_control)
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -1828,6 +1875,28 @@ pub mod tests {
         }
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    /// `may_be_interactive` is exactly the kinds some list builds with `.interactive()`.
+    #[test]
+    fn interactive_kinds_are_listed() {
+        let all = reachable_kinds();
+        for k in Kind::ALL {
+            assert_eq!(all.iter().any(|a| a.kind == k && a.interactive), k.may_be_interactive(), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_gets_a_script_without_control_characters() {
+        let mut a = Action::rekcod(Kind::ContainerLogs, "Logs", &["logs", "it's", "=x"]).interactive();
+        a.dir = Some("/Users/me/my app".into());
+        let s = a.terminal_script().unwrap();
+        assert!(s.starts_with("#!/bin/sh\nrm -f -- \"$0\"\ncd '/Users/me/my app' || exit\nexec "), "{s}");
+        assert!(s.trim_end().ends_with(r" logs 'it'\''s' =x"), "{s:?}");
+        for bad in ["\u{15}touch x\n#", "\u{3}", "\u{7f}", "\u{9b}"] {
+            let a = Action::rekcod(Kind::ContainerLogs, "Logs", &["logs", bad]).interactive();
+            assert_eq!(a.terminal_script(), None, "{bad:?}");
+        }
     }
 
     #[test]

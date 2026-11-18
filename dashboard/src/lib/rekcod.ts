@@ -6,6 +6,7 @@ import { findOffered } from "./allow"
 import { engine } from "./server/engine"
 import { fakeEngine } from "./server/fixtures"
 import { staleBinary, staleMessage } from "./server/merge"
+import { appleScript, terminalScript, writeScript } from "./server/terminal"
 import type { Action, State } from "./types"
 
 // REKCOD_BIN picks the binary (`rekcod dashboard` sets it to itself); REKCOD_STATE_FILE serves
@@ -73,16 +74,14 @@ export async function offered(argv: unknown): Promise<Action | null> {
   return findOffered(await readEngine(name), argv)
 }
 
-/** Opens Terminal.app running the action's command line, as the menu bar does. */
-export function inTerminal(a: Action) {
-  const q = (s: string) => (/^[A-Za-z0-9_\-./:=@+,]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`)
-  let line = [BIN, ...(a.argv ?? [])].map(q).join(" ")
-  if (a.dir) line = `cd ${q(a.dir)} && ${line}`
-  const escaped = line.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
-  spawn(/*turbopackIgnore: true*/ "/usr/bin/osascript", ["-e", `tell application "Terminal"\nactivate\ndo script "${escaped}"\nend tell`], {
-    stdio: "ignore",
-    detached: true,
-  }).unref()
+/** Opens Terminal.app running the action's command line, as the menu bar does (server/terminal.ts). */
+export function inTerminal(a: Action): string | null {
+  const script = terminalScript(BIN, a.argv ?? [], a.dir)
+  if (!script) return "the command has control characters"
+  const as = appleScript(writeScript(script))
+  if (!as) return "the script's path has control characters"
+  spawn(/*turbopackIgnore: true*/ "/usr/bin/osascript", ["-e", as], { stdio: "ignore", detached: true }).unref()
+  return null
 }
 
 export { STREAMED } from "./kinds"

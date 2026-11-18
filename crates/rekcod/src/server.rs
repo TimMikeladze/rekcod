@@ -552,7 +552,7 @@ pub fn setup_edge(paths: &Paths, remote_name: &str, join_token: Option<&str>, ad
     Ok(())
 }
 
-pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_power: bool) -> Result<()> {
+pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_power: bool, backup_dir: Option<&Path>) -> Result<()> {
     let exe = std::env::current_exe()?.canonicalize()?;
     let net = pick_net(addr, lan);
     let l = layout(&net);
@@ -580,6 +580,11 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
     }
     if l.bonjour {
         args.push("--bonjour");
+    }
+    // launchd runs it from `/`: the path must not be relative.
+    let backup_dir = backup_dir.map(std::path::absolute).transpose()?.map(|d| d.display().to_string());
+    if let Some(d) = &backup_dir {
+        args.extend(["--backup-dir", d]);
     }
     args.push("--install");
     run(&exe, &args)?;

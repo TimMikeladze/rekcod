@@ -1262,6 +1262,10 @@ enum ServerCmd {
         /// Skip `sudo pmset`.
         #[arg(long)]
         no_power: bool,
+        /// Also copy the hourly controller backups here (another disk, a synced folder): the
+        /// copy that survives losing the server's disk.
+        #[arg(long, conflicts_with = "edge_only")]
+        backup_dir: Option<std::path::PathBuf>,
     },
     /// Remove the controller, node, edge, RustFS and VM jobs (data stays).
     Uninstall,
@@ -1499,7 +1503,7 @@ fn main() {
             let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker };
             host::add_server(&paths, &name, &dest, !no_use, &f)
         }
-        Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token }) => {
+        Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token, backup_dir }) => {
             if edge_only {
                 server::setup_edge(
                     &paths,
@@ -1510,7 +1514,14 @@ fn main() {
                     no_power,
                 )
             } else {
-                server::setup(&paths, domain.as_deref().context("server setup requires --domain")?, addr.as_deref(), lan, no_power)
+                server::setup(
+                    &paths,
+                    domain.as_deref().context("server setup requires --domain")?,
+                    addr.as_deref(),
+                    lan,
+                    no_power,
+                    backup_dir.as_deref(),
+                )
             }
         }
         Cmd::Server(ServerCmd::Uninstall) => server::uninstall(),

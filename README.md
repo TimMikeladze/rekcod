@@ -55,6 +55,9 @@ rekcod import --from orbstack        # OrbStack
 
 Import copies images and named volumes, leaving the originals at the source. Volumes
 still in use are skipped. Use `--images-only` or `--volumes-only` to limit the copy.
+When an image or volume fails to copy, import exits non-zero and names it. A volume
+that failed is incomplete on rekcod, since the copy empties it first; run the import
+again before removing the old engine.
 
 ## Run the project you already have
 
@@ -121,7 +124,15 @@ rekcod snap ls
 ```
 
 Before replacing data, a restore saves the current volumes as `pre-restore`.
-Run `rekcod snap restore pre-restore` to recover that previous state.
+Run `rekcod snap restore pre-restore` to recover that previous state. If the restore
+copy fails part way (the VM's disk fills up, say), rekcod copies `pre-restore` back
+before starting the containers again. If that fails too, the containers stay stopped
+and the error prints the command to run once there's room.
+
+Restore refuses while a project container is paused (`docker unpause` it first), and
+save refuses while one is restarting. Saves and restores of one project take turns,
+whatever the snapshot names, so a menu bar save waits for a terminal restore.
+
 Snapshots live in the VM; `save --push` and `restore --pull` also transfer them through
 S3-compatible storage.
 
@@ -387,10 +398,62 @@ rekcod controller backup --remote mini
 rekcod controller backups --remote mini
 ```
 
-These backups are stored on the server's RustFS disk. Copy them off the server for
-recovery from disk loss. Back up the server's `~/.rekcod/controller/secret-key` separately: it is
-needed to decrypt app secrets and is not included in the database backup. Application
-buckets need their own backups too.
+These backups are stored on the server's RustFS disk, so they're lost with it. To keep
+a second copy somewhere else, give setup a directory on another disk or a synced folder:
+
+```sh
+rekcod server setup --domain apps.example.com --backup-dir /Volumes/Backup/rekcod
+```
+
+A running controller takes `--backup-dir DIR` too. Each backup goes to RustFS and to
+the directory independently; when one fails, the other still gets it and the error
+names the one that failed. The copies are `fleet-<UTC time>.db`, mode 0600 in a 0700
+directory: they hold node secrets and the join token in plain text. Both places keep
+the newest 48 (two days of hourly backups), then the newest of each of the last 14
+days and 8 weeks.
+
+`GET /metrics` has `rekcod_last_backup_timestamp_seconds` (the last successful backup)
+and `rekcod_backup_failures_total`, so a Prometheus rule can catch backups that stopped
+working. `controller serve --alert-webhook URL` also posts a JSON line
+(`{"text": ...}`, which Slack and Discord accept) when a backup fails, a node is lost
+or a deploy fails.
+
+The database backup doesn't hold these files from `~/.rekcod` on the server; keep a
+copy of each:
+
+| File | Without it |
+| --- | --- |
+| `controller/secret-key` | App secrets and bucket keys in the backup can't be decrypted |
+| `controller/ca.pem`, `controller/ca.key` | Remotes, which pin the CA fingerprint, reject the controller |
+| `controller/node-ca.pem`, `controller/node-ca.key` | Nodes' certificates no longer verify |
+| `controller/admin-token` | A new admin token is made and the old one stops working |
+| `storage/credentials.json` | The RustFS root keys: the controller can't reach the buckets |
+
+Application buckets need their own backups too.
+
+### Restore the controller
+
+Stop the controller first; restore refuses while one has the database open. On a
+server set up with sudo it's a LaunchDaemon:
+
+```sh
+sudo launchctl bootout system/dev.rekcod.controller
+rekcod controller restore                    # the newest backup in RustFS
+rekcod controller restore fleet-20261118T090000Z.db
+rekcod controller restore --from /Volumes/Backup/rekcod/fleet-20261118T090000Z.db
+sudo launchctl bootstrap system /Library/LaunchDaemons/dev.rekcod.controller.plist
+```
+
+Without sudo the services are LaunchAgents: use `gui/$(id -u)/dev.rekcod.controller`
+and `~/Library/LaunchAgents/dev.rekcod.controller.plist` instead. `--from` takes a
+`--backup-dir` copy or a file you copied off the server, and needs neither RustFS nor
+its keys; use it on a new Mac after copying the files from the table above back into
+`~/.rekcod`. The file is copied, not changed.
+
+Restore checks the backup is a whole fleet database before replacing anything. The old
+database is kept as `fleet.db.before-restore-<time>`, with the writes its WAL held.
+Instances that were running when the backup was taken are marked lost, and the
+controller takes back the ones that still answer.
 
 ## Run jobs on the server
 
@@ -429,7 +492,25 @@ rekcod snap restore seeded --pull
 ```
 
 To use another S3-compatible store, set `S3_ENDPOINT`, `S3_BUCKET`,
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` before running the snapshot commands.
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` before running the snapshot commands,
+and `AWS_REGION` when the store checks it (the default is `us-east-1`):
+
+```sh
+export S3_ENDPOINT=https://s3.eu-west-1.amazonaws.com AWS_REGION=eu-west-1
+export S3_BUCKET=my-snaps AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+rekcod snap save seeded --push
+```
+
+`https://` endpoints are checked against the Mac's trusted certificates (`SSL_CERT_FILE`
+for a private CA). A plain `http://` endpoint must be on loopback or the tailnet, since
+volume archives would cross the network unencrypted; `REKCOD_INSECURE=1` allows one on
+a network you trust. Requests are path-style (`https://host/bucket/key`), and each
+volume archive is one PUT, so stores that cap a single upload at 5 GiB refuse bigger
+volumes.
+
+Two Macs can push the same snapshot. Whichever manifest is written last is what
+`--pull` gets; the other push's archives stay in the bucket until a later push is
+more than an hour newer.
 
 For a self-hosted app, add this to its `rekcod.toml` and deploy again:
 
@@ -442,6 +523,24 @@ The controller creates a bucket for the app and gives its instances `S3_ENDPOINT
 `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_REGION`.
 The credentials are scoped to that bucket. `rekcod app storage blog --remote mini`
 shows its connection settings; append `ls` to list its objects.
+
+```sh
+rekcod app storage blog url reports/march.pdf --expires 24h --remote mini
+rekcod app storage blog rotate --remote mini
+```
+
+`url` prints a presigned GET URL, signed with the app's own key, for at most 7 days.
+`rotate` gives the app a new key and redeploys the live release with it. The old key
+keeps working until the new release is live and the old instances have drained, then
+it's revoked, along with URLs signed with it. If the redeploy fails, the app keeps the
+old key. A destroy revokes the key and deletes the bucket, every object version in it
+included.
+
+On a LAN server (`--lan`, or `--addr` with an address outside the tailnet) RustFS
+listens on the server's loopback, because it speaks plain HTTP. Bucket apps then run
+only on the server Mac's own node, and nodes on other Macs build each release from git
+instead of loading it from RustFS. On a tailnet, RustFS listens on the tailnet address
+and every node can reach it.
 
 ## Run a self-hosted GitHub Actions runner
 

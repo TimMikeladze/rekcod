@@ -4598,7 +4598,7 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             let secs = b["secs"].as_u64().unwrap_or(3600);
             crate::s3::check_key(key)?;
             if !(1..=crate::s3::MAX_PRESIGN_SECS).contains(&secs) {
-                bail!("--expires is 1s to 7d");
+                bail!("--expires is 1s to 168h (7 days)");
             }
             // Signed with the app's own key: it reaches only the app's bucket, and a rotate
             // or destroy ends it.

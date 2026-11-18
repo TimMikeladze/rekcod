@@ -1,4 +1,4 @@
-//! This Mac as a server: a one-machine fleet that runs headless (docs/server.md).
+//! This Mac as a server: a one-machine fleet that runs headless (README.md, "Self-host apps on a Mac").
 //!
 //! `rekcod server setup` runs on the server; `rekcod host add --server` runs it over SSH from
 //! your Mac and adds the remote it prints.
@@ -473,7 +473,7 @@ fn pick_net(addr: Option<&str>, lan: bool) -> Net {
 fn prepare_services(paths: &Paths, exe: &Path, no_power: bool) -> Result<bool> {
     let dry = std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some();
     // LaunchDaemons start at boot with nobody logged in; they need root to install.
-    // Without it, LaunchAgents, which need a login (docs/server.md).
+    // Without it, LaunchAgents, which need a login.
     let daemons = !dry && crate::service::can_install_daemons();
     if daemons {
         // SAFETY: nothing else runs yet; the children `run` starts read it to install

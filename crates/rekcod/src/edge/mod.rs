@@ -1,4 +1,4 @@
-//! `rekcod edge serve` (docs/edge-http.md): routes `Host: <app>.<domain>` to live instances.
+//! `rekcod edge serve` (README.md, "Edge limits and client addresses"): routes `Host: <app>.<domain>` to live instances.
 //!
 //! hyper parses every request, so each one is routed on its own Host, even on a keep-alive
 //! connection a tunnel shares between hostnames. Upgrades (WebSockets) become a byte pipe

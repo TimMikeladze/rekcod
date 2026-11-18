@@ -106,6 +106,8 @@ jobs:
         with:
           bun-version: 1.4.4
       - run: bun install --frozen-lockfile
+      # Mermaid and Astro's runtime are served to visitors.
+      - run: bun audit --audit-level=high
       - run: bun test
       - run: bun run typecheck
       - run: bun run build

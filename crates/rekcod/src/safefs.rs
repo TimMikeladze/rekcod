@@ -92,6 +92,16 @@ fn stat_at(fd: RawFd, name: &OsStr) -> Option<libc::stat> {
     (unsafe { libc::fstatat(fd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0).then_some(st)
 }
 
+/// A name beside `name` for a file being written, unique in this process.
+fn temp_name(name: &OsStr) -> OsString {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut t = OsString::from(format!(".rekcod-{}-{n}-", std::process::id()));
+    // Room for the prefix within NAME_MAX.
+    t.push(OsStr::from_bytes(&name.as_bytes()[..name.len().min(200)]));
+    t
+}
+
 impl Dir {
     pub fn open(path: &Path) -> Result<Dir> {
         let c = cstr(path.as_os_str())?;
@@ -217,27 +227,52 @@ impl Dir {
             bail!("{} isn't a regular file", rel.display());
         }
         let mode = std::os::unix::fs::PermissionsExt::mode(&meta.permissions()) & 0o777;
+        self.write_from(rel, &mut input, mode)
+    }
+
+    /// Replaces `rel` with what `input` holds, at `mode`. The bytes go to a new file beside
+    /// it, synced, then renamed over `rel`: an error or a kill on the way leaves the old
+    /// file as it was, never a truncated one.
+    fn write_from(&self, rel: &Path, input: &mut dyn Read, mode: u32) -> Result<()> {
         let (dir, name) = self.parent(rel, true)?;
         self.guard_entry(&dir, &name, rel)?;
-        dir.unlink(&name, 0)?;
-        let c = cstr(&name)?;
+        let tmp = temp_name(&name);
+        let c = cstr(&tmp)?;
         let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
         let fd = unsafe { libc::openat(dir.fd.as_raw_fd(), c.as_ptr(), flags, mode as libc::c_uint) };
         if fd < 0 {
             return Err(last_err("create", rel.as_os_str()));
         }
         let mut out = std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) });
-        let mut buf = vec![0u8; 1 << 16];
-        loop {
-            let n = input.read(&mut buf)?;
-            if n == 0 {
-                break;
+        let written = (|| -> Result<()> {
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                let n = input.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                out.write_all(&buf[..n])?;
             }
-            out.write_all(&buf[..n])?;
+            // The umask may have narrowed the create mode.
+            if unsafe { libc::fchmod(out.as_raw_fd(), mode as libc::mode_t) } != 0 {
+                return Err(last_err("chmod", rel.as_os_str()));
+            }
+            out.sync_all()?;
+            self.rename_over(&dir, &tmp, &name, rel)
+        })();
+        if written.is_err() {
+            let _ = dir.unlink(&tmp, 0);
         }
-        // The umask may have narrowed the create mode.
-        if unsafe { libc::fchmod(out.as_raw_fd(), mode as libc::mode_t) } != 0 {
-            return Err(last_err("chmod", rel.as_os_str()));
+        written
+    }
+
+    /// Renames `tmp` over `name`, both in `dir`, once `name` is checked again against the
+    /// entries this base protects.
+    fn rename_over(&self, dir: &Dir, tmp: &OsStr, name: &OsStr, rel: &Path) -> Result<()> {
+        self.guard_entry(dir, name, rel)?;
+        let (t, n) = (cstr(tmp)?, cstr(name)?);
+        if unsafe { libc::renameat(dir.fd.as_raw_fd(), t.as_ptr(), dir.fd.as_raw_fd(), n.as_ptr()) } != 0 {
+            return Err(last_err("rename into place", rel.as_os_str()));
         }
         Ok(())
     }
@@ -249,12 +284,16 @@ impl Dir {
         }
         let (dir, name) = self.parent(rel, true)?;
         self.guard_entry(&dir, &name, rel)?;
-        dir.unlink(&name, 0)?;
-        let (t, n) = (cstr(target.as_os_str())?, cstr(&name)?);
+        let tmp = temp_name(&name);
+        let (t, n) = (cstr(target.as_os_str())?, cstr(&tmp)?);
         if unsafe { libc::symlinkat(t.as_ptr(), dir.fd.as_raw_fd(), n.as_ptr()) } != 0 {
             return Err(last_err("symlink", rel.as_os_str()));
         }
-        Ok(())
+        let r = self.rename_over(&dir, &tmp, &name, rel);
+        if r.is_err() {
+            let _ = dir.unlink(&tmp, 0);
+        }
+        r
     }
 
     /// Removes the file or symlink at `rel` (not a directory).
@@ -330,6 +369,7 @@ impl Dir {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("rekcod-safefs-{name}-{}", std::process::id()));
@@ -420,6 +460,29 @@ mod tests {
         assert!(d.write_symlink(Path::new(".git"), Path::new("x")).is_err());
         assert!(d.remove(Path::new(".git")).is_err());
         assert_eq!(std::fs::read_to_string(wt.join(".git")).unwrap(), "gitdir: /elsewhere");
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_old_file() {
+        struct Fails(bool);
+        impl Read for Fails {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                if std::mem::replace(&mut self.0, true) {
+                    return Err(std::io::Error::other("disk gone"));
+                }
+                b[..5].copy_from_slice(b"new!!");
+                Ok(5)
+            }
+        }
+        let base = tmp("atomic");
+        std::fs::write(base.join("f"), "old bytes").unwrap();
+        let d = Dir::open(&base).unwrap();
+        assert!(d.write_from(Path::new("f"), &mut Fails(false), 0o644).is_err());
+        assert_eq!(std::fs::read_to_string(base.join("f")).unwrap(), "old bytes");
+        assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
+        d.write_from(Path::new("f"), &mut &b"new"[..], 0o600).unwrap();
+        assert_eq!(std::fs::read_to_string(base.join("f")).unwrap(), "new");
+        assert_eq!(std::fs::metadata(base.join("f")).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     #[test]

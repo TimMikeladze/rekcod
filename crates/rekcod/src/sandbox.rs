@@ -1408,14 +1408,18 @@ fn apply_from(mut s: Sandbox, src: &Path, ch: Vec<Change>, check: bool) -> Resul
     }
     let mut dir = Dir::open(&s.meta.project)?;
     dir.protect(".git");
-    write_changes(&dir, &Dir::open(src)?, src, &ch, manifest.as_mut())?;
+    let written = write_changes(&dir, &Dir::open(src)?, src, &ch, manifest.as_mut());
+    // Saved after a failure too: what was written is ours, and a later apply mustn't call
+    // it a change made on the Mac.
     match &manifest {
         Some(m) => s.save_manifest(m)?,
-        None => {
+        None if written.is_ok() => {
             s.meta.created = now() + 1;
             s.save()?;
         }
+        None => {}
     }
+    written?;
     Ok(ch)
 }
 
@@ -1892,6 +1896,22 @@ mod tests {
         assert!(t0.elapsed() < std::time::Duration::from_millis(100));
         std::thread::sleep(std::time::Duration::from_millis(200));
         assert!(age() >= std::time::Duration::from_millis(150));
+    }
+
+    #[test]
+    fn a_failed_apply_records_what_it_wrote() {
+        let (paths, project, m, ws) = setup("partial", &[("keep", "k")]);
+        std::fs::write(ws.join("a"), "first").unwrap();
+        std::fs::write(ws.join("b"), "second").unwrap();
+        std::fs::set_permissions(ws.join("b"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let ch = changes(&project, &ws);
+        assert_eq!(paths_of(&ch), vec![('A', "a"), ('A', "b")]);
+        assert!(apply_from(find(&paths, &m.id).unwrap(), &ws, ch, false).is_err());
+        std::fs::set_permissions(ws.join("b"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read_to_string(project.join("a")).unwrap(), "first");
+        assert!(find(&paths, &m.id).unwrap().manifest().unwrap().contains_key("a"));
+        // So the retry writes b without calling a a conflict.
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('A', "b")]);
     }
 
     #[test]

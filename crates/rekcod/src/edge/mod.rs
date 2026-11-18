@@ -735,6 +735,11 @@ async fn forward(edge: &Arc<Edge>, mut req: Request<Incoming>, host: &str, clien
     // Twice: the second pass after a wake, for an app that went to sleep since the last
     // route refresh.
     for pass in 0..2 {
+        if edge.pool.all_full(&eps) {
+            let mut r = text(StatusCode::SERVICE_UNAVAILABLE, format!("{host} is busy\n"));
+            r.headers_mut().insert(header::RETRY_AFTER, 1.into());
+            return r;
+        }
         if let Some(mut lease) = edge.pool.lease(&eps).await {
             let (parts, body) = req.take().expect("sent once");
             // A pooled connection the instance closed as we sent on it: the request never got

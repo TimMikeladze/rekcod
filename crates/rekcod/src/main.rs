@@ -392,7 +392,7 @@ fn quota_value(s: &str) -> Result<i64, String> {
     }
 }
 
-/// `30m`, `2h`, `90s`, `0` (never).
+/// `30m`, `2h`, `90s`, `30d`, `0` (never).
 fn duration_secs(s: &str) -> Result<u64, String> {
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = n.parse().map_err(|_| format!("bad duration {s}"))?;
@@ -400,7 +400,8 @@ fn duration_secs(s: &str) -> Result<u64, String> {
         "" | "s" => Ok(n),
         "m" => Ok(n * 60),
         "h" => Ok(n * 3600),
-        _ => Err(format!("bad duration {s} (use s, m or h)")),
+        "d" => Ok(n * 86400),
+        _ => Err(format!("bad duration {s} (use s, m, h or d)")),
     }
 }
 
@@ -876,6 +877,24 @@ enum ControllerCmd {
         /// Stop working after this long (`30d`, `12h`).
         #[arg(long, value_parser = duration_secs)]
         expires: Option<u64>,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Every token: name, role, cap, expiry and namespaces, never the token itself (admin token).
+    Tokens {
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Who did what, newest first: admins see everything, a namespace's owners see it with --ns.
+    Audit {
+        #[arg(long)]
+        ns: Option<String>,
+        /// Only this far back (`30m`, `12h`, `7d`).
+        #[arg(long, value_parser = duration_secs)]
+        since: Option<u64>,
+        /// At most this many rows (up to 1000).
+        #[arg(long, default_value = "100")]
+        limit: u32,
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
@@ -1455,6 +1474,18 @@ fn main() {
             // The name in the body: it reaches names from before they were checked, too.
             remote_call(&paths, &remote, "DELETE", "/tokens", &serde_json::json!({"name": name}))
         }
+        Cmd::Controller(ControllerCmd::Tokens { remote }) => remote_call(&paths, &remote, "GET", "/tokens", &serde_json::Value::Null),
+        Cmd::Controller(ControllerCmd::Audit { ns, since, limit, remote }) => {
+            let mut q = vec![format!("limit={limit}")];
+            if let Some(n) = ns {
+                q.push(format!("ns={}", fleet::percent_encode(&n)));
+            }
+            if let Some(s) = since {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                q.push(format!("since={}", now.saturating_sub(s)));
+            }
+            remote_call(&paths, &remote, "GET", &format!("/audit?{}", q.join("&")), &serde_json::Value::Null)
+        }
         Cmd::Controller(ControllerCmd::Ca) => {
             let pem = std::fs::read_to_string(paths.home.join("controller/ca.pem"))
                 .map_err(|_| anyhow::anyhow!("no CA here; it's made when `rekcod controller serve` first starts"))?;
@@ -2007,6 +2038,7 @@ mod tests {
     fn quota_values() {
         assert_eq!(super::quota_value("unlimited"), Ok(-1));
         assert_eq!(super::quota_value("8"), Ok(8));
+        assert_eq!((super::duration_secs("30d"), super::duration_secs("90s")), (Ok(30 * 86400), Ok(90)));
         assert!(super::quota_value("-1").is_err() && super::quota_value("lots").is_err() && super::quota_value("100001").is_err());
     }
 

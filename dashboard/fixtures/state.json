@@ -3922,6 +3922,26 @@
       ],
       "interactive": false,
       "confirm": null
+    },
+    {
+      "kind": "ControllerTokens",
+      "label": "Tokens",
+      "argv": [
+        "controller",
+        "tokens"
+      ],
+      "interactive": true,
+      "confirm": null
+    },
+    {
+      "kind": "ControllerAudit",
+      "label": "Audit log",
+      "argv": [
+        "controller",
+        "audit"
+      ],
+      "interactive": true,
+      "confirm": null
     }
   ],
   "routes": {

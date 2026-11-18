@@ -68,6 +68,8 @@ pub enum Kind {
     NodeDrain,
     NodeUndrain,
     BackupNow,
+    ControllerTokens,
+    ControllerAudit,
     RemoteUse,
     DashboardOpen,
     VmRepair,
@@ -98,7 +100,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 79] = [
+    pub const ALL: [Kind; 81] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -153,6 +155,8 @@ impl Kind {
         Kind::NodeDrain,
         Kind::NodeUndrain,
         Kind::BackupNow,
+        Kind::ControllerTokens,
+        Kind::ControllerAudit,
         Kind::RemoteUse,
         Kind::DashboardOpen,
         Kind::VmRepair,
@@ -1527,7 +1531,11 @@ pub fn controller_actions(admin: bool) -> Vec<Action> {
     if !admin {
         return vec![];
     }
-    vec![Action::rekcod(Kind::BackupNow, "Back up the controller now", &["controller", "backup"])]
+    vec![
+        Action::rekcod(Kind::BackupNow, "Back up the controller now", &["controller", "backup"]),
+        Action::rekcod(Kind::ControllerTokens, "Tokens", &["controller", "tokens"]).interactive(),
+        Action::rekcod(Kind::ControllerAudit, "Audit log", &["controller", "audit"]).interactive(),
+    ]
 }
 
 /// Make another configured remote the default.

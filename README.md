@@ -426,6 +426,51 @@ recovery from disk loss. Back up the server's `~/.rekcod/controller/secret-key` 
 needed to decrypt app secrets and is not included in the database backup. Application
 buckets need their own backups too.
 
+### Give people access
+
+The server's admin token is in `~/.rekcod/controller/admin-token`; `host add --server`
+saves it in the `mini` remote. Make a token for each person instead of sharing it:
+
+```sh
+rekcod controller token alice --remote mini                       # member of default
+rekcod controller token ci --ns team --role member --expires 30d --remote mini
+rekcod controller token edge1 --edge --remote mini               # for `rekcod edge serve`
+rekcod controller tokens --remote mini
+```
+
+The token is printed once; the controller keeps only its hash. `controller tokens` lists
+each token's name, admin and edge flags, role in `default`, cap, expiry and namespaces.
+Names are 1 to 64 letters, digits, `.`, `_`, `@` and `-`. In `default` each person sees
+only their own apps, sandboxes and jobs. In other namespaces members share everything:
+viewers read, members deploy and run jobs, owners manage members.
+
+```sh
+rekcod ns create team --remote mini
+rekcod ns member add team alice --role owner --remote mini
+rekcod ns member rm team alice --remote mini
+rekcod controller limit alice --max-sandboxes 20 --remote mini
+rekcod controller revoke alice --remote mini
+```
+
+`--max-sandboxes` caps a person's sandboxes plus jobs across namespaces (0 to 100000, or
+`unlimited`); app instances count against the namespace quota instead. `revoke` deletes
+every token with that name and its memberships, deletes that person's schedules and
+cancels their running jobs. `ns member rm` does the same within the namespace. Both print
+the sandboxes and apps of theirs that keep running. A schedule also stops running once
+its owner's tokens have expired.
+
+```sh
+rekcod controller audit --remote mini --since 1d
+rekcod controller audit --remote mini --ns team
+```
+
+The audit log records deploys, destroys (with whether they worked), env and secret
+changes (names only), quota, pool, member, token and schedule changes, requests denied
+for a missing role or admin token, and bad tokens (one row per address per minute). Admins
+read all of it; a namespace's owners read it with `--ns`. Rows are kept 90 days. When a
+namespace is deleted, its rows move to `NAME (deleted TIME)`, so a namespace made later
+under the same name doesn't see them, its jobs or their logs.
+
 ## Run jobs on the server
 
 From a repository whose current commit has been pushed:

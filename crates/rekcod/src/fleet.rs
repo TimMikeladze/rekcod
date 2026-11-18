@@ -1752,6 +1752,17 @@ impl Controller {
         }))
     }
 
+    /// A request with a token that matched nothing: one row per address per minute, so
+    /// guessing leaves a trace without filling the table.
+    fn audit_bad_token(&self, peer: Option<IpAddr>, path: &str) {
+        let ip = peer.map_or("-".to_string(), |p| p.to_string());
+        let _ = self.db().execute(
+            "insert into audit (ts, who, action, target, ok, ns) select ?1, ?2, 'bad token', ?3, 0, '-'
+               where not exists(select 1 from audit where action = 'bad token' and who = ?2 and ts > ?1 - 60)",
+            &[&now(), &ip, &path],
+        );
+    }
+
     fn audit(&self, ns: &str, who: &str, action: &str, target: &str, ok: bool) {
         let _ = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
             "insert into audit (ts, who, action, target, ok, ns) values (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1783,7 +1794,10 @@ impl Controller {
     fn allow(&self, who: &Caller, ns: &str, need: Role) -> Result<()> {
         match self.role(who, ns)? {
             None => bail!("no namespace {ns}"),
-            Some(r) if r < need => bail!("{ns}: needs the {} role (you're a {})", need.name(), r.name()),
+            Some(r) if r < need => {
+                self.audit(ns, &who.name, &format!("denied: needs {}", need.name()), r.name(), false);
+                bail!("{ns}: needs the {} role (you're a {})", need.name(), r.name())
+            }
             Some(_) => Ok(()),
         }
     }
@@ -2417,6 +2431,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
     if !open {
         let bearer = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         if c.caller(bearer)?.is_none() {
+            c.audit_bad_token(peer, &req.path);
             return respond(r.get_mut(), 401, "application/json", br#"{"error":"bad token"}"#);
         }
     }
@@ -2584,9 +2599,16 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
     }
 
     let Some(who) = c.caller(&bearer)? else {
+        c.audit_bad_token(peer, &req.path);
         return respond(&mut w, 401, "application/json", br#"{"error":"bad token"}"#);
     };
-    let admin_only = || -> Result<()> { if who.admin { Ok(()) } else { bail!("admin token required") } };
+    let admin_only = || -> Result<()> {
+        if who.admin {
+            return Ok(());
+        }
+        c.audit("-", &who.name, "denied: admin token required", &format!("{} {}", req.method, req.path), false);
+        bail!("admin token required")
+    };
     // What an edge needs: its route table, bans (it adds automatic ones) and reporting traffic.
     let edge_or_admin = || -> Result<()> { if who.admin || who.edge { Ok(()) } else { bail!("admin or edge token required") } };
     if who.edge
@@ -2703,6 +2725,8 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             for n in &list {
                 db.execute("insert into node_pools values (?1, ?2)", &[id, n])?;
             }
+            drop(db);
+            c.audit("-", &who.name, &format!("pool {}", list.join(",")), id, true);
             Ok(json!({"node": id, "pool": list}))
         }),
         ("POST", ["tokens"]) => admin_only().and_then(|_| {
@@ -2749,6 +2773,50 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             c.audit("-", &who.name, &format!("max_sandboxes {max}"), name, true);
             Ok(json!({"name": name, "tokens": n, "max_sandboxes": limit(max)}))
         }),
+        // Never the hashes. Each row is one token; one person may have several.
+        ("GET", ["tokens"]) => admin_only().and_then(|_| {
+            let mut db = c.db();
+            let members = db.query("select who, ns, role from members order by ns", &[])?;
+            let rows = db.query("select name, admin, edge, default_role, max_sandboxes, expires from tokens order by name, rowid", &[])?;
+            Ok(json!(
+                rows.iter()
+                    .map(|r| {
+                        let name: String = r.get(0);
+                        let ns: serde_json::Map<String, Value> =
+                            members.iter().filter(|m| m.get::<String>(0) == name).map(|m| (m.get(1), json!(m.get::<String>(2)))).collect();
+                        let expires: Option<i64> = r.get(5);
+                        json!({
+                            "name": name, "admin": r.get::<bool>(1), "edge": r.get::<bool>(2),
+                            "default_role": Some(r.get::<String>(3)).filter(|d| d != "none"),
+                            "max_sandboxes": limit(r.get(4)), "expires": expires, "expired": expires.is_some_and(|e| e <= now()),
+                            "namespaces": ns,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            ))
+        }),
+        // Newest first. Admins read everything (or one namespace); a namespace's owners read it.
+        ("GET", ["audit"]) => (|| {
+            let arg = |k: &str| req.query.iter().find(|(q, _)| q == k).map(|(_, v)| v.as_str());
+            let only = arg("ns");
+            match only {
+                _ if who.admin => {}
+                Some(n) => c.allow(&who, n, Role::Owner)?,
+                None => admin_only()?,
+            }
+            let since = arg("since").map(|v| v.parse::<i64>().context("since is a unix time")).transpose()?.unwrap_or(0);
+            let limit = arg("limit").map(|v| v.parse::<i64>().context("limit is a number")).transpose()?.unwrap_or(100).clamp(1, 1000);
+            let rows = c.db().query(
+                "select ts, ns, who, action, target, ok from audit where (?1 is null or ns = ?1) and ts >= ?2 order by ts desc, rowid desc limit ?3",
+                &[&only, &since, &limit],
+            )?;
+            Ok(json!(
+                rows.iter()
+                    .map(|r| json!({"ts": r.get::<i64>(0), "ns": r.get::<String>(1), "who": r.get::<String>(2),
+                                    "action": r.get::<String>(3), "target": r.get::<String>(4), "ok": r.get::<bool>(5)}))
+                    .collect::<Vec<_>>()
+            ))
+        })(),
         // `?peek=1` (the dashboard) reads the table without becoming an edge nodes let in.
         ("GET", ["routes"]) => edge_or_admin().and_then(|_| {
             if let Some(ip) = peer.filter(|_| !req.query.iter().any(|(k, _)| k == "peek")) {
@@ -3050,7 +3118,13 @@ fn namespace_json(c: &Controller, name: &str, role: Option<Role>) -> Result<Valu
 }
 
 fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str], b: &Value) -> Result<Value> {
-    let admin_only = || -> Result<()> { if who.admin { Ok(()) } else { bail!("admin token required") } };
+    let admin_only = || -> Result<()> {
+        if who.admin {
+            return Ok(());
+        }
+        c.audit("-", &who.name, "denied: admin token required", &format!("{method} /{}", seg.join("/")), false);
+        bail!("admin token required")
+    };
     let quota_cols =
         [("max_sandboxes", "max_sandboxes"), ("max_cpus", "max_cpus"), ("max_memory_gib", "max_memory_gib"), ("max_apps", "max_apps")];
     match (method, seg) {
@@ -3112,6 +3186,8 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
                         .execute(&format!("update namespaces set {col} = ?2 where name = ?1"), &[n, &v])?;
                 }
             }
+            let set: Vec<String> = quota_cols.iter().filter_map(|(k, _)| b[k].as_i64().map(|v| format!("{k}={v}"))).collect();
+            c.audit(n, &who.name, &format!("quota {}", set.join(" ")), n, true);
             namespace_json(c, n, Some(Role::Owner))
         }
         ("POST", ["namespaces", n, "members"]) => {
@@ -4601,6 +4677,16 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             c.db.lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .execute(&format!("update apps set {col} = ?2 where name = ?1"), &[&app.name, &map.to_string()])?;
+            // Names only: values may be credentials.
+            let names = |k: &str| -> String {
+                let keys: Vec<&str> = match &b[k] {
+                    Value::Object(m) => m.keys().map(String::as_str).collect(),
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                    _ => vec![],
+                };
+                keys.join(",")
+            };
+            c.audit(ns, &who.name, &format!("{col} set [{}] unset [{}]", names("set"), names("unset")), name, true);
             let Some(commit) = live_commit(c, &app.name)? else { return Ok(json!({"updated": col})) };
             deploy(c, &load(name, Role::Member)?, Some(commit), &who.name)
         }
@@ -4721,8 +4807,9 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 && c.allow(who, ns, Role::Member).is_ok()
                 && can_touch(who, ns, &r.get::<String>(0))
             {
-                c.audit(ns, &who.name, "destroy", name, true);
-                destroy_app(c, &key)?;
+                let r = destroy_app(c, &key);
+                c.audit(ns, &who.name, "destroy", name, r.is_ok());
+                r?;
                 return Ok(json!({"destroyed": name, "ns": ns}));
             }
             let app = load(name, Role::Member)?;
@@ -4731,8 +4818,9 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             {
                 bail!("{name}'s bucket {} has {n} object(s); destroy --force deletes them too", app_bucket(&app.name));
             }
-            c.audit(ns, &who.name, "destroy", name, true);
-            destroy_app(c, &app.name)?;
+            let r = destroy_app(c, &app.name);
+            c.audit(ns, &who.name, "destroy", name, r.is_ok());
+            r?;
             Ok(json!({"destroyed": name, "ns": ns}))
         }
         _ => Err(anyhow!("no such endpoint")),
@@ -5060,6 +5148,8 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                  on conflict (name) do update set spec = ?3, every = ?4",
                 &[&key, &who.name, &b.to_string(), &every, &ns],
             )?;
+            drop(db);
+            c.audit(ns, &who.name, &format!("schedule every {every}s"), name, true);
             Ok(json!({"scheduled": name, "ns": ns, "every_secs": every}))
         }
         ("GET", ["jobs"]) => {
@@ -5146,6 +5236,7 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             if n == 0 {
                 bail!("no schedule {name}");
             }
+            c.audit(ns, &who.name, "unschedule", name, true);
             Ok(json!({"unscheduled": name}))
         }
         _ => Err(anyhow!("no such endpoint")),
@@ -7556,6 +7647,49 @@ mod tests {
         assert_eq!(kept, ["create namespace", "member viewer"], "only the new namespace's rows: {audit:?}");
         assert_eq!(audit.iter().filter(|(ns, _)| ns.starts_with("team (deleted ")).count(), 2, "{audit:?}");
         assert_eq!(db.query_one("select count(*) from traffic", &[]).unwrap().get::<i64>(0), 0);
+    }
+
+    #[test]
+    fn tokens_and_the_audit_log_are_readable_and_denials_are_recorded() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        add_token(&c, "olga-t", "olga", false, "none", false, Some(now() + 60));
+        call(&url, "POST", "/namespaces", Some("admin-t"), &json!({"name": "team"})).unwrap();
+        call(&url, "POST", "/namespaces", Some("admin-t"), &json!({"name": "other"})).unwrap();
+        call(&url, "POST", "/namespaces/team/members", Some("admin-t"), &json!({"who": "olga", "role": "owner"})).unwrap();
+
+        let tokens = call(&url, "GET", "/tokens", Some("admin-t"), &Value::Null).unwrap();
+        assert!(!tokens.to_string().contains(&hash_token("alice-t")), "{tokens}");
+        let olga = tokens.as_array().unwrap().iter().find(|t| t["name"] == "olga").unwrap().clone();
+        assert_eq!(
+            (olga["namespaces"].clone(), olga["default_role"].clone(), olga["expired"].clone()),
+            (json!({"team": "owner"}), Value::Null, json!(false))
+        );
+        for (who, path) in
+            [("alice-t", "/tokens"), ("olga-t", "/tokens"), ("alice-t", "/audit"), ("olga-t", "/audit"), ("olga-t", "/audit?ns=other")]
+        {
+            assert!(call(&url, "GET", path, Some(who), &Value::Null).is_err(), "{who} {path}");
+        }
+        // An env change on an app that was never deployed, and a quota change.
+        upsert_app(&c, "team", &Caller::system("olga"), &json!({"name": "web", "git": {"url": "u"}}), None).unwrap();
+        call(&url, "POST", "/ns/team/apps/web/env", Some("olga-t"), &json!({"set": {"LOG": "debug"}})).unwrap();
+        call(&url, "POST", "/namespaces/team/quota", Some("admin-t"), &json!({"max_cpus": 4})).unwrap();
+        let team = call(&url, "GET", "/audit?ns=team", Some("olga-t"), &Value::Null).unwrap();
+        let actions: Vec<&str> = team.as_array().unwrap().iter().filter_map(|r| r["action"].as_str()).collect();
+        assert!(actions.contains(&"env set [LOG] unset []") && actions.contains(&"quota max_cpus=4"), "{actions:?}");
+        assert!(!team.to_string().contains("debug"), "values stay out of the log");
+        call(&url, "POST", "/namespaces/team/members", Some("admin-t"), &json!({"who": "alice", "role": "viewer"})).unwrap();
+        assert!(call(&url, "POST", "/ns/team/apps/web/env", Some("alice-t"), &json!({"set": {"A": "1"}})).is_err());
+        // Two bad tokens from one address in a minute: one row.
+        for _ in 0..2 {
+            assert!(call(&url, "GET", "/apps", Some("guess"), &Value::Null).is_err());
+        }
+        let all = call(&url, "GET", "/audit?limit=1000", Some("admin-t"), &Value::Null).unwrap();
+        let count = |a: &str| all.as_array().unwrap().iter().filter(|r| r["action"].as_str().is_some_and(|x| x.starts_with(a))).count();
+        assert_eq!(count("bad token"), 1);
+        assert_eq!(count("denied: admin token required"), 4, "{all}");
+        assert_eq!(count("denied: needs member"), 1, "{all}");
     }
 
     #[test]

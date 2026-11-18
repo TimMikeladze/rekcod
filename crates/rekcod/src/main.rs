@@ -1859,11 +1859,20 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
         }
         AppCmd::Storage { name, cmd: Some(AppStorageCmd::Ls) } => {
             let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
-            let v = fleet::call(&r.url, "GET", &r.scoped(format!("/apps/{name}/storage")), Some(&r.token), &serde_json::Value::Null)?;
-            for o in v["list"].as_array().into_iter().flatten() {
-                println!("{:>12}  {}  {}", o["size"], o["modified"].as_str().unwrap_or(""), o["key"].as_str().unwrap_or(""));
+            // The controller answers a page at a time.
+            let mut after: Option<String> = None;
+            loop {
+                let q = after.as_deref().map(|a| format!("?after={}", fleet::percent_encode(a))).unwrap_or_default();
+                let v =
+                    fleet::call(&r.url, "GET", &r.scoped(format!("/apps/{name}/storage{q}")), Some(&r.token), &serde_json::Value::Null)?;
+                for o in v["list"].as_array().into_iter().flatten() {
+                    println!("{:>12}  {}  {}", o["size"], o["modified"].as_str().unwrap_or(""), o["key"].as_str().unwrap_or(""));
+                }
+                match v["next"].as_str() {
+                    Some(n) => after = Some(n.to_string()),
+                    None => return Ok(()),
+                }
             }
-            Ok(())
         }
         AppCmd::Storage { name, cmd: Some(AppStorageCmd::Url { key, expires }) } => {
             let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;

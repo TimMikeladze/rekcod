@@ -512,17 +512,25 @@ pub fn generated_dockerfile(dir: &Path, start: &str) -> Result<String> {
 /// Where a release's image is kept in RustFS (docs/rustfs.md): `<bucket>/<key>.tar.zst` is
 /// `docker save | zstd`, `<key>.json` the commit's rekcod.toml. Sent by the controller.
 /// Where a node keeps and finds a release's image, as presigned URLs: nodes never see the
-/// RustFS root keys, so one node can't read other apps' buckets or the backups.
+/// RustFS root keys, so one node can't read other apps' buckets or the backups. A stored
+/// release comes with the SHA-256 of both objects as the node that pushed them reported
+/// them, and no PUT URLs; only a release that isn't stored yet gets those.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct ReleaseStore {
     /// `bucket/key`, for logs.
     name: String,
     image_get: String,
-    image_put: String,
+    #[serde(default)]
+    image_put: Option<String>,
     toml_get: String,
-    toml_put: String,
+    #[serde(default)]
+    toml_put: Option<String>,
     /// Both objects are there: load them instead of cloning and building.
     cached: bool,
+    #[serde(default)]
+    image_sha256: Option<String>,
+    #[serde(default)]
+    toml_sha256: Option<String>,
     /// BuildKit's cache for the app: URLs, and whether one is stored yet.
     cache_get: Option<String>,
     cache_put: Option<String>,
@@ -530,17 +538,34 @@ struct ReleaseStore {
     cache_stored: bool,
 }
 
-/// The stored rekcod.toml of a cached release, if it can be read.
+fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::Digest;
+    let mut h = sha2::Sha256::new();
+    std::io::copy(&mut std::fs::File::open(path)?, &mut h)?;
+    Ok(hex(&h.finalize()))
+}
+
+/// The stored rekcod.toml of a cached release, if it can be read and has the SHA-256 the
+/// controller recorded.
 fn stored_toml(st: &ReleaseStore) -> Option<HashMap<String, String>> {
+    use sha2::Digest;
     let mut b = Vec::new();
     crate::s3::url_get(&st.toml_get, &mut b).map_err(|e| eprintln!("rekcod: {}: {e:#}", st.name)).ok()?;
+    let got = hex(&sha2::Sha256::digest(&b));
+    if st.toml_sha256.as_deref() != Some(got.as_str()) {
+        eprintln!("rekcod: {}: the stored rekcod.toml isn't the one that was pushed (SHA-256 {got}); building from git", st.name);
+        return None;
+    }
     serde_json::from_slice(&b).ok()
 }
 
 /// `docker save IMAGE | zstd` into the store, then the toml (its presence marks it complete).
-fn push_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore, toml: &HashMap<String, String>) -> Result<()> {
+/// Returns both objects' SHA-256, for the controller to record.
+fn push_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore, toml: &HashMap<String, String>) -> Result<(String, String)> {
+    use sha2::Digest;
+    let (Some(image_put), Some(toml_put)) = (&st.image_put, &st.toml_put) else { bail!("no upload URLs for {}", st.name) };
     let tmp = paths.home.join("remote-ws").join(format!("{}.tar.zst", sandbox::new_id()?));
-    let r = (|| -> Result<()> {
+    let r = (|| -> Result<(String, String)> {
         let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
         let mut child = d.args(["save", image]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let mut enc = zstd::Encoder::new(std::fs::File::create(&tmp)?, 3)?;
@@ -550,18 +575,26 @@ fn push_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore, toml: &Ha
         if !out.status.success() {
             bail!("docker save: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
-        crate::s3::url_put(&st.image_put, crate::s3::Body::File(&tmp))?;
-        crate::s3::url_put(&st.toml_put, crate::s3::Body::Bytes(&serde_json::to_vec(toml)?))
+        let image_sha256 = sha256_file(&tmp)?;
+        crate::s3::url_put(image_put, crate::s3::Body::File(&tmp))?;
+        let toml = serde_json::to_vec(toml)?;
+        crate::s3::url_put(toml_put, crate::s3::Body::Bytes(&toml))?;
+        Ok((image_sha256, hex(&sha2::Sha256::digest(&toml))))
     })();
     let _ = std::fs::remove_file(&tmp);
     r
 }
 
-/// Downloads a stored image into the sandbox's dockerd and tags it `image`.
+/// Downloads a stored image into the sandbox's dockerd and tags it `image`, once it has the
+/// SHA-256 the controller recorded when it was pushed.
 fn load_image(paths: &Paths, sb: &str, image: &str, st: &ReleaseStore) -> Result<()> {
     let tmp = paths.home.join("remote-ws").join(format!("{}.tar.zst", sandbox::new_id()?));
     let r = (|| -> Result<()> {
         crate::s3::url_get(&st.image_get, &mut std::fs::File::create(&tmp)?)?;
+        let got = sha256_file(&tmp)?;
+        if st.image_sha256.as_deref() != Some(got.as_str()) {
+            bail!("{}: the stored image isn't the one that was pushed (SHA-256 {got}, recorded {:?})", st.name, st.image_sha256);
+        }
         let (mut d, _) = sandbox::docker_cmd(paths, sb)?;
         let mut child = d.arg("load").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
         let mut stdin = child.stdin.take().context("no stdin")?;
@@ -732,16 +765,16 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
     };
     let meta = sandbox::create(paths, o)?;
     mark_fleet(paths, &meta.id);
-    let mut pushed = false;
+    let mut pushed: Option<(String, String)> = None;
     let result = (|| -> Result<Value> {
         let image = format!("rekcod-app-{app}:{release}");
         match (&stored, &store) {
             (Some(_), Some(st)) => load_image(paths, &meta.id, &image, st)?,
             _ => {
                 build_image(paths, &meta.id, &image, &dir, store.as_ref())?;
-                if let Some(st) = &store {
+                if let Some(st) = store.as_ref().filter(|st| st.image_put.is_some()) {
                     match push_image(paths, &meta.id, &image, st, &toml) {
-                        Ok(()) => pushed = true,
+                        Ok(sums) => pushed = Some(sums),
                         Err(e) => eprintln!("rekcod: {app} r{release}: push to {}: {e:#}", st.name),
                     }
                 }
@@ -769,7 +802,8 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         let ext = start_relay(ip, 0, hp)?;
         std::fs::write(sandbox::home(paths, &meta.id)?.join("instance.json"), json!({"hp": hp, "ext": ext}).to_string())?;
         let host = NODE_HOST.get().cloned().unwrap_or_else(|| ip.to_string());
-        Ok(json!({"sandbox": meta.id, "endpoint": format!("{host}:{ext}"), "health": toml.get("app.health"), "pushed": pushed}))
+        Ok(json!({"sandbox": meta.id, "endpoint": format!("{host}:{ext}"), "health": toml.get("app.health"), "pushed": pushed.is_some(),
+                  "stored": pushed.map(|(image, toml)| json!({"image_sha256": image, "toml_sha256": toml}))}))
     })();
     if result.is_err() {
         let _ = sandbox::rm(paths, std::slice::from_ref(&meta.id), false);
@@ -1406,6 +1440,13 @@ const MIGRATIONS: &[&str] = &[
     "update jobs set state = 'failed', log = coalesce(log, '') || 'rekcod: lost before an upgrade' || char(10)
        where state = 'lost' and finished is not null;
      create table if not exists leftover_storage (bucket text, storage_key text, app text not null, since integer not null);",
+    // `storage_key_prev`: the app key a rotation replaced, revoked once a release with the new
+    // one is live and the old instances drained. `releases.stored`: the SHA-256 of a release's
+    // image and rekcod.toml as the node that pushed them reported them; nodes check what they
+    // load against it.
+    "alter table apps add column storage_key_prev text;
+     alter table apps add column storage_secret_prev text;
+     alter table releases add column stored text;",
 ];
 
 pub struct Db(rusqlite::Connection);
@@ -2011,10 +2052,30 @@ fn cleanup(c: &Arc<Controller>) -> Result<()> {
             .iter()
             .map(|r| (r.get(0), r.get(1)))
             .collect();
+    // Names with no app and nothing left to a retry: images and cache of an app that's gone.
+    let known: std::collections::HashSet<String> =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select name from apps union select app from leftover_storage", &[])?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
     let mut by_app: HashMap<String, Vec<crate::s3::Object>> = HashMap::new();
     for o in s.list(RELEASES, "")? {
         if let Some((app, _)) = o.key.split_once('/') {
             by_app.entry(app.to_string()).or_default().push(o);
+        }
+    }
+    let orphans: Vec<String> = by_app.keys().filter(|a| !known.contains(*a)).cloned().collect();
+    for app in &orphans {
+        by_app.remove(app);
+        drop_release_store_in(s, app)?;
+    }
+    if s.bucket_exists(CACHE)? {
+        for o in s.list(CACHE, "")? {
+            if o.key.strip_suffix(".tar.zst").is_some_and(|a| !known.contains(a)) {
+                gone(s.delete(CACHE, &o.key))?;
+            }
         }
     }
     for (app, mut objs) in by_app {
@@ -3334,6 +3395,32 @@ fn register_instance(c: &Controller, app: &App, release: i32, node: &PlacementNo
     registered
 }
 
+/// Whether a node URL is on the controller's Mac (loopback).
+fn node_is_local(url: &str) -> bool {
+    authority(url).is_ok_and(|a| {
+        let host = a.rsplit_once(':').map_or(a.as_str(), |(h, _)| h).trim_matches(['[', ']']).to_string();
+        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    })
+}
+
+/// RustFS on the controller's loopback is reachable only from nodes on this Mac: a node on
+/// another Mac would dial its own loopback. Then a bucket app goes only to those nodes (an
+/// error when none is ready), and true says the release store is for them only.
+fn only_this_mac(c: &Controller, placement: &mut Placement, bucket: bool) -> Result<bool> {
+    let local = c.storage.as_ref().and_then(|s| authority(&s.endpoint).ok()).is_some_and(|a| node_is_local(&format!("http://{a}")));
+    if local && bucket {
+        for n in placement.nodes.iter_mut().filter(|n| !node_is_local(&n.url)) {
+            n.failed = true;
+        }
+        if placement.nodes.iter().all(|n| n.failed) {
+            bail!(
+                "its bucket is on RustFS on the controller's loopback, which only nodes on the controller's Mac reach, and none of them is ready"
+            );
+        }
+    }
+    Ok(local)
+}
+
 fn launch_instances(
     c: &Arc<Controller>,
     app: &App,
@@ -3349,6 +3436,7 @@ fn launch_instances(
         env[k] = v.clone();
     }
     let bucket = bucket_env(c, app)?;
+    let local_store = only_this_mac(c, &mut placement, !bucket.is_empty()).with_context(|| app.short.clone())?;
     let storage_endpoint = bucket.iter().find(|(k, _)| *k == "S3_ENDPOINT").map(|(_, v)| v.clone());
     for (k, v) in bucket {
         env[k] = json!(v);
@@ -3371,7 +3459,11 @@ fn launch_instances(
             let Some(i) = placement.pick(i64::from(app.memory_gib) * 1024, app.strict_spread) else { break };
             let n = &placement.nodes[i];
             log.push(format!("placing instance on {}", n.id));
-            let (url, secret, spec) = (n.url.clone(), n.secret.clone(), spec.clone());
+            let mut spec = spec.clone();
+            if local_store && !node_is_local(&n.url) {
+                spec["store"] = Value::Null;
+            }
+            let (url, secret) = (n.url.clone(), n.secret.clone());
             handles.push((i, std::thread::spawn(move || call(&url, "POST", "/instances", Some(&secret), &spec))));
         }
         if handles.is_empty() {
@@ -3386,8 +3478,20 @@ fn launch_instances(
                 .and_then(|v| register_instance(c, app, release, n, &v, who).map(|instance| (v, instance)));
             match launched {
                 Ok((v, instance)) => {
-                    if v["pushed"] == json!(true) {
-                        spec["store"]["cached"] = json!(true);
+                    if v["pushed"] == json!(true)
+                        && let (Some(i), Some(t)) = (v["stored"]["image_sha256"].as_str(), v["stored"]["toml_sha256"].as_str())
+                    {
+                        let stored = json!({"image_sha256": i, "toml_sha256": t});
+                        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+                            "update releases set stored = ?3 where app = ?1 and n = ?2",
+                            &[&app.name, &release, &stored.to_string()],
+                        )?;
+                        let st = &mut spec["store"];
+                        st["cached"] = json!(true);
+                        st["image_sha256"] = json!(i);
+                        st["toml_sha256"] = json!(t);
+                        st["image_put"] = Value::Null;
+                        st["toml_put"] = Value::Null;
                     }
                     if let Some(h) = v["health"].as_str().filter(|_| app.health == "/") {
                         result.health = h.to_string();
@@ -3615,6 +3719,11 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
         Some(c) => c,
         None => resolve(&app.git_url, &app.git_ref)?,
     };
+    // Stored images are keyed by it, and a rollback goes back to it: a branch name would
+    // mean different code each time.
+    if !matches!(commit.len(), 40 | 64) || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        bail!("{commit:?} isn't a commit SHA; deploy a branch or tag by name and it's resolved first");
+    }
     let n: i32 = {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let tx = db.0.transaction()?;
@@ -3685,11 +3794,15 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
     log.push(format!("live; draining {} old instance(s) for {}s", old.len(), c.drain_secs));
     log_shared_placement(c, &app.name, &mut log)?;
     finish("live", &log);
-    let (c2, drain) = (c.clone(), c.drain_secs);
+    let (c2, drain, name) = (c.clone(), c.drain_secs, app.name.clone());
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(drain));
         for (node, sb) in old {
             delete_instance(&c2, &node, &sb);
+        }
+        // This release has the app's current storage key; one a rotation replaced can go.
+        if let Err(e) = retire_prev_key(&c2, &name) {
+            eprintln!("rekcod: {e:#}");
         }
     });
     if health != app.health {
@@ -3744,8 +3857,9 @@ fn finish_destroy(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Va
     for r in rows {
         delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
     }
-    // Without --storage nothing can reach RustFS; the key and bucket are left for later.
-    let leftover = if c.storage.is_none() { leftover_storage(c, name)? } else { None };
+    // Without --storage nothing can reach RustFS; the key, bucket and stored images are left
+    // for later.
+    let leftover = if c.storage.is_none() { leftover_storage(c, name)? } else { vec![] };
     let storage = if c.storage.is_none() { Ok(()) } else { drop_bucket(c, name).and_then(|_| drop_release_store(c, name)) };
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Err(e) = storage {
@@ -3760,36 +3874,46 @@ fn finish_destroy(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Va
     for t in ["releases", "instances", "instance_logs", "traffic"] {
         tx.execute(&format!("delete from {t} where app = ?1"), [name])?;
     }
-    if let Some((bucket, key)) = &leftover {
+    for (bucket, key) in &leftover {
         tx.execute(
             "insert into leftover_storage (bucket, storage_key, app, since) values (?1, ?2, ?3, ?4)",
             rusqlite::params![bucket, key, name, now()],
         )?;
-        eprintln!("rekcod: {}: the controller has no --storage, so its bucket and key stay until one with storage runs", short_name(name));
+    }
+    if !leftover.is_empty() {
+        eprintln!(
+            "rekcod: {}: the controller has no --storage, so what it has in RustFS stays until one with storage runs",
+            short_name(name)
+        );
     }
     tx.execute("delete from apps where name = ?1 and generation = ?2", rusqlite::params![name, generation])?;
     tx.commit()?;
     Ok(json!({"destroyed": name}))
 }
 
-/// The bucket (unless another app owns that name) and key a destroyed app may have left in
-/// RustFS; None when it never had storage.
-fn leftover_storage(c: &Controller, app: &str) -> Result<Option<(Option<String>, Option<String>)>> {
+/// What a destroyed app may have left in RustFS, as `leftover_storage` rows: its bucket
+/// (unless another app owns that name) and key, a key a rotation replaced, and always one row
+/// for its stored release images and build cache, which any app may have.
+fn leftover_storage(c: &Controller, app: &str) -> Result<Vec<(Option<String>, Option<String>)>> {
     let r =
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query_opt("select bucket, storage_key from apps where name = ?1", &[&app])?;
-    let Some(r) = r else { return Ok(None) };
-    let (on, key): (bool, Option<String>) = (r.get(0), r.get(1));
-    if !on && key.is_none() {
-        return Ok(None);
+            .query_opt("select bucket, storage_key, storage_key_prev from apps where name = ?1", &[&app])?;
+    let Some(r) = r else { return Ok(vec![]) };
+    let (on, key, prev): (bool, Option<String>, Option<String>) = (r.get(0), r.get(1), r.get(2));
+    let bucket = if on || key.is_some() { bucket_owner(c, app)?.is_none().then(|| app_bucket(app)) } else { None };
+    let mut rows = vec![(bucket, key)];
+    if prev.is_some() {
+        rows.push((None, prev));
     }
-    let bucket = bucket_owner(c, app)?.is_none().then(|| app_bucket(app));
-    Ok(Some((bucket, key)))
+    Ok(rows)
 }
 
-/// Removes what `leftover_storage` noted, now that the controller has storage.
+/// Removes what `leftover_storage` noted, now that the controller has storage. One pass at a
+/// time: the reconcile thread starts this every 10 s, and a big bucket takes longer.
 fn drop_leftover_storage(c: &Controller, s: &crate::s3::S3) -> Result<()> {
+    static RUNNING: Mutex<()> = Mutex::new(());
+    let Ok(_one) = RUNNING.try_lock() else { return Ok(()) };
     let rows =
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -3804,7 +3928,8 @@ fn drop_leftover_storage(c: &Controller, s: &crate::s3::S3) -> Result<()> {
                 gone(s.remove_policy(b)).context("remove the bucket's policy")?;
                 s.delete_bucket(b, true)?;
             }
-            Ok(())
+            // Nothing new is stored under the name while this row exists (`release_store`).
+            drop_release_store_in(s, &app)
         })();
         match removed {
             Ok(()) => {
@@ -4343,8 +4468,10 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         }
         ("POST", ["apps", name, "deploy"]) => {
             let app = load(name, Role::Member)?;
+            // A branch or tag is resolved now: the release records the commit it ran.
+            let commit = b["ref"].as_str().map(|r| resolve(&app.git_url, r)).transpose()?;
             let _admitted = admit(c, &app, None)?;
-            deploy(c, &app, b["ref"].as_str().map(String::from), &who.name)
+            deploy(c, &app, commit, &who.name)
         }
         ("POST", ["apps", name, "rollback"]) => {
             let app = load(name, Role::Member)?;
@@ -4461,26 +4588,28 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             let commit = live_commit(c, &app.name)?.ok_or_else(|| anyhow!("{name} has no live release"))?;
             deploy(c, &app, Some(commit), &who.name)
         }
-        ("GET", ["apps", name, "storage"]) => app_storage(c, &load(name, Role::Viewer)?),
+        ("GET", ["apps", name, "storage"]) => {
+            let arg = |k: &str| q.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+            app_storage(c, &load(name, Role::Viewer)?, arg("prefix").unwrap_or(""), arg("after"))
+        }
         ("POST", ["apps", name, "storage", "url"]) => {
             let app = load(name, Role::Member)?;
             let key = b["key"].as_str().context("missing key")?;
             let secs = b["secs"].as_u64().unwrap_or(3600);
-            let (s, bucket) = app_s3(c, &app)?;
+            crate::s3::check_key(key)?;
+            if !(1..=crate::s3::MAX_PRESIGN_SECS).contains(&secs) {
+                bail!("--expires is 1s to 7d");
+            }
+            // Signed with the app's own key: it reaches only the app's bucket, and a rotate
+            // or destroy ends it.
+            let (s, bucket) = app_key_s3(c, &app)?;
             Ok(json!({"url": s.presign(&bucket, key, secs)?, "expires_secs": secs}))
         }
         ("POST", ["apps", name, "storage", "rotate"]) => {
             let app = load(name, Role::Member)?;
             app_s3(c, &app)?;
-            c.db.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execute("update apps set storage_secret = null where name = ?1", &[&app.name])?;
             c.audit(ns, &who.name, "rotate storage key", name, true);
-            let Some(commit) = live_commit(c, &app.name)? else {
-                bucket_env(c, &app)?;
-                return Ok(json!({"rotated": name}));
-            };
-            deploy(c, &app, Some(commit), &who.name)
+            rotate_storage_key(c, &app, &who.name)
         }
         ("DELETE", ["apps", name]) => {
             // Already being destroyed (its storage cleanup failed): try again now.
@@ -5685,18 +5814,41 @@ const STORE_URL_SECS: u64 = 6 * 3600;
 fn release_store(c: &Controller, app: &str, commit: &str) -> Value {
     let Some(s) = &c.storage else { return Value::Null };
     let r = (|| -> Result<Value> {
+        // An app destroyed without storage left its images under this name; a new app of the
+        // same name gets none of them, and no store until they're gone.
+        let leftover =
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_opt("select 1 from leftover_storage where app = ?1", &[&app])?;
+        if leftover.is_some() {
+            return Ok(Value::Null);
+        }
         s.create_bucket(RELEASES)?;
         s.create_bucket(CACHE)?;
         let key = format!("{app}/{commit}");
         let (image, toml, cache) = (format!("{key}.tar.zst"), format!("{key}.json"), format!("{app}.tar.zst"));
         let url = |m: &str, b: &str, k: &str| s.presign_method(m, b, k, STORE_URL_SECS);
+        // What the node that pushed it reported; a stored image nobody recorded is rebuilt.
+        let sums: Option<Value> =
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_opt(
+                    "select stored from releases where app = ?1 and commit_sha = ?2 and stored is not null order by n desc limit 1",
+                    &[&app, &commit],
+                )?
+                .and_then(|r| serde_json::from_str(&r.get::<String>(0)).ok());
+        let sum = |k: &str| sums.as_ref().and_then(|v| v[k].as_str()).map(String::from);
+        let cached = sum("image_sha256").is_some() && sum("toml_sha256").is_some() && s.exists(RELEASES, &toml)?;
         Ok(serde_json::to_value(ReleaseStore {
             name: format!("{RELEASES}/{key}"),
             image_get: url("GET", RELEASES, &image)?,
-            image_put: url("PUT", RELEASES, &image)?,
+            // Only for a release that isn't stored: nobody gets to replace a stored image.
+            image_put: (!cached).then(|| url("PUT", RELEASES, &image)).transpose()?,
             toml_get: url("GET", RELEASES, &toml)?,
-            toml_put: url("PUT", RELEASES, &toml)?,
-            cached: s.exists(RELEASES, &toml)?,
+            toml_put: (!cached).then(|| url("PUT", RELEASES, &toml)).transpose()?,
+            cached,
+            image_sha256: sum("image_sha256").filter(|_| cached),
+            toml_sha256: sum("toml_sha256").filter(|_| cached),
             cache_get: Some(url("GET", CACHE, &cache)?),
             cache_put: Some(url("PUT", CACHE, &cache)?),
             cache_stored: s.exists(CACHE, &cache)?,
@@ -5771,18 +5923,100 @@ fn app_s3(c: &Controller, app: &App) -> Result<(crate::s3::S3, String)> {
     Ok((c.storage_or_err()?.clone(), app_bucket(&app.name)))
 }
 
-fn app_storage(c: &Controller, app: &App) -> Result<Value> {
+/// Objects the storage view lists per request; `after` (the `next` it returned) continues.
+const STORAGE_PAGE: usize = 1000;
+
+fn app_storage(c: &Controller, app: &App, prefix: &str, after: Option<&str>) -> Result<Value> {
     let (s, bucket) = app_s3(c, app)?;
     let key: Option<String> =
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .query_one("select storage_key from apps where name = ?1", &[&app.name])?
             .get(0);
-    let objects = if s.bucket_exists(&bucket)? { s.list(&bucket, "")? } else { vec![] };
+    let (objects, next) = if s.bucket_exists(&bucket)? { s.list_page(&bucket, prefix, Some(STORAGE_PAGE), after)? } else { (vec![], None) };
     Ok(json!({
         "app": app.short, "endpoint": s.endpoint, "bucket": bucket, "access_key": key,
-        "objects": objects.len(), "bytes": objects.iter().map(|o| o.size).sum::<u64>(), "list": objects,
+        "objects": objects.len(), "bytes": objects.iter().map(|o| o.size).sum::<u64>(), "list": objects, "next": next,
     }))
+}
+
+/// The app's bucket with the app's own key and secret, for presigned URLs; an error before
+/// its first deploy made them.
+fn app_key_s3(c: &Controller, app: &App) -> Result<(crate::s3::S3, String)> {
+    let (root, bucket) = app_s3(c, app)?;
+    let r =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select storage_key, storage_secret from apps where name = ?1", &[&app.name])?;
+    let (Some(access_key), Some(sealed)): (Option<String>, Option<String>) = (r.get(0), r.get(1)) else {
+        bail!("{} has no storage key yet; deploy it once", app.short);
+    };
+    Ok((crate::s3::S3 { access_key, secret_key: c.open_sealed(&app.ns, &sealed)?, ..root }, bucket))
+}
+
+/// A new key for the app's bucket. The old key keeps working until a release that has the
+/// new one is live and the old instances drained (`retire_prev_key`); a redeploy that fails
+/// goes back to the old key and revokes the new one, so the live release never loses its
+/// bucket. Without a live release the old key goes at once.
+fn rotate_storage_key(c: &Arc<Controller>, app: &App, who: &str) -> Result<Value> {
+    let lock = c.app_lock(&app.name);
+    let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let s = c.storage_or_err()?;
+    let r =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select storage_key, storage_secret, storage_key_prev from apps where name = ?1", &[&app.name])?;
+    let (old_key, old_sealed, prev): (Option<String>, Option<String>, Option<String>) = (r.get(0), r.get(1), r.get(2));
+    if prev.is_some() {
+        bail!(
+            "{}'s last key rotation is still finishing: its old key goes once the old instances drain (a deploy finishes it after a controller restart)",
+            app.short
+        );
+    }
+    let (Some(old_key), Some(old_sealed)) = (old_key, old_sealed) else {
+        // Never deployed with its bucket: the first deploy makes a key.
+        return Ok(json!({"rotated": app.short}));
+    };
+    let bucket = app_bucket(&app.name);
+    let (key, secret_key) = (format!("app-{}", sandbox::new_id()?), secret()?);
+    s.add_bucket_user(&key, &secret_key, &bucket)?;
+    let set = |key: &str, sealed: &str, prev: Option<(&str, &str)>| {
+        c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+            "update apps set storage_key = ?2, storage_secret = ?3, storage_key_prev = ?4, storage_secret_prev = ?5 where name = ?1",
+            &[&app.name, &key, &sealed, &prev.map(|p| p.0), &prev.map(|p| p.1)],
+        )
+    };
+    set(&key, &c.seal(&app.ns, &secret_key)?, Some((&old_key, &old_sealed)))?;
+    let Some(commit) = live_commit(c, &app.name)? else {
+        retire_prev_key(c, &app.name)?;
+        return Ok(json!({"rotated": app.short}));
+    };
+    match deploy_locked(c, app, Some(commit), who) {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            set(&old_key, &old_sealed, None)?;
+            if let Err(e2) = gone(s.remove_user(&key)) {
+                eprintln!("rekcod: {}: revoke the unused new key {key}: {e2:#}", app.short);
+            }
+            Err(e.context("the key wasn't rotated; the live release keeps the old one"))
+        }
+    }
+}
+
+/// Revokes the key a rotation replaced, once nothing that was given it runs.
+fn retire_prev_key(c: &Controller, app: &str) -> Result<()> {
+    let prev: Option<String> =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_opt("select storage_key_prev from apps where name = ?1", &[&app])?
+            .and_then(|r| r.get(0));
+    let (Some(prev), Some(s)) = (prev, &c.storage) else { return Ok(()) };
+    gone(s.remove_user(&prev)).with_context(|| format!("revoke {}'s old storage key", short_name(app)))?;
+    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
+        "update apps set storage_key_prev = null, storage_secret_prev = null where name = ?1 and storage_key_prev = ?2",
+        &[&app, &prev],
+    )?;
+    Ok(())
 }
 
 /// Whether the app's bucket holds anything (one key is enough to say); None when it has no
@@ -5820,6 +6054,17 @@ fn drop_bucket(c: &Controller, app: &str) -> Result<()> {
         return Ok(());
     }
     let s = c.storage_or_err()?;
+    if let Some(p) =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select storage_key_prev from apps where name = ?1", &[&app])?
+            .get::<Option<String>>(0)
+    {
+        gone(s.remove_user(&p)).context("revoke the app's previous storage key")?;
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .execute("update apps set storage_key_prev = null, storage_secret_prev = null where name = ?1", &[&app])?;
+    }
     if let Some(k) = key {
         gone(s.remove_user(&k)).context("revoke the app's storage key")?;
         // `bucket = 1` keeps the policy and bucket on a retry's list without the key.
@@ -5837,10 +6082,17 @@ fn drop_bucket(c: &Controller, app: &str) -> Result<()> {
 
 /// The app's stored release images and build cache (`release_store`).
 fn drop_release_store(c: &Controller, app: &str) -> Result<()> {
-    let Some(s) = &c.storage else { return Ok(()) };
+    match &c.storage {
+        Some(s) => drop_release_store_in(s, app),
+        None => Ok(()),
+    }
+}
+
+fn drop_release_store_in(s: &crate::s3::S3, app: &str) -> Result<()> {
     if s.bucket_exists(RELEASES)? {
-        for o in s.list(RELEASES, &format!("{app}/"))? {
-            s.delete(RELEASES, &o.key)?;
+        let keys: Vec<(String, Option<String>)> = s.list(RELEASES, &format!("{app}/"))?.into_iter().map(|o| (o.key, None)).collect();
+        if !keys.is_empty() {
+            s.delete_many(RELEASES, &keys)?;
         }
     }
     gone(s.delete(CACHE, &format!("{app}.tar.zst")))
@@ -7222,6 +7474,144 @@ mod tests {
         let log = seen.lock().unwrap().clone();
         assert!(log.iter().any(|l| l.starts_with("DELETE /rustfs/admin/v3/remove-user?accessKey=app-k1")), "{log:?}");
         assert!(bucket_env(&sc, &app).is_ok());
+        // Its stored images and build cache went too, before the new app got a store.
+        assert!(log.iter().any(|l| l.starts_with("GET /rekcod-releases?") && l.contains("prefix=web/")), "{log:?}");
+        assert!(log.iter().any(|l| l.starts_with("DELETE /rekcod-cache/web.tar.zst")), "{log:?}");
+        assert!(!release_store(&sc, "web", &"a".repeat(40)).is_null());
+    }
+
+    #[test]
+    fn an_app_without_a_bucket_leaves_its_images_for_later_too() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}}), None).unwrap();
+        destroy_app(&c, "web").unwrap();
+        let (sc, _) = storage_controller(Default::default());
+        let sc = Arc::into_inner(sc).unwrap();
+        let sc = Controller { db: std::mem::replace(&mut *c.db.lock().unwrap(), Db::open(Path::new(":memory:")).unwrap()).into(), ..sc };
+        // A new `web` loads nothing the old one stored, until the leftovers are removed.
+        assert!(release_store(&sc, "web", &"a".repeat(40)).is_null());
+    }
+
+    #[test]
+    fn a_failed_rotation_keeps_the_live_key() {
+        let (c, seen) = storage_controller(Default::default());
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}, "bucket": true}), None).unwrap();
+        let sealed = c.seal("default", "old-secret").unwrap();
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("update apps set storage_key = 'app-old', storage_secret = ?1, live_release = 1 where name = 'web'", &[&sealed])
+                .unwrap();
+            // A release recorded under a branch name (FS-7): its redeploy is refused.
+            db.execute("insert into releases (app, n, commit_sha, state, created) values ('web', 1, 'main', 'live', 0)", &[]).unwrap();
+        }
+        let app = load_app_key(&c, "web").unwrap().unwrap();
+        seen.lock().unwrap().clear();
+        let e = format!("{:#}", rotate_storage_key(&c, &app, "alice").unwrap_err());
+        assert!(e.contains("isn't a commit SHA") && e.contains("keeps the old one"), "{e}");
+        let r = c.db.lock().unwrap().query_one("select storage_key, storage_key_prev from apps where name = 'web'", &[]).unwrap();
+        assert_eq!((r.get::<String>(0), r.get::<Option<String>>(1)), ("app-old".into(), None));
+        let log = seen.lock().unwrap().clone();
+        assert!(!log.iter().any(|l| l.contains("add-user?accessKey=app-old")), "the live key's secret changed: {log:?}");
+        let new_key = log.iter().find_map(|l| l.split("add-user?accessKey=").nth(1)).unwrap().to_string();
+        assert!(log.iter().any(|l| l.starts_with(&format!("DELETE /rustfs/admin/v3/remove-user?accessKey={new_key}"))), "{log:?}");
+
+        // No live release: the new key at once, the old one revoked.
+        c.db.lock().unwrap().execute("update apps set live_release = null where name = 'web'", &[]).unwrap();
+        rotate_storage_key(&c, &app, "alice").unwrap();
+        let key: String = c.db.lock().unwrap().query_one("select storage_key from apps where name = 'web'", &[]).unwrap().get(0);
+        assert_ne!(key, "app-old");
+        assert!(seen.lock().unwrap().iter().any(|l| l.starts_with("DELETE /rustfs/admin/v3/remove-user?accessKey=app-old")));
+    }
+
+    #[test]
+    fn presigned_app_urls_use_the_app_key() {
+        let (c, _) = storage_controller(Default::default());
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}, "bucket": true}), None).unwrap();
+        let url = |b: Value| apps_route(&c, &Caller::user("alice"), "default", "POST", &["apps", "web", "storage", "url"], &b, &[]);
+        assert!(url(json!({"key": "a"})).unwrap_err().to_string().contains("deploy it once"));
+        let sealed = c.seal("default", "app-secret").unwrap();
+        c.db.lock().unwrap().execute("update apps set storage_key = 'app-k1', storage_secret = ?1 where name = 'web'", &[&sealed]).unwrap();
+        let v = url(json!({"key": "reports/a.pdf", "secs": 600})).unwrap();
+        assert!(v["url"].as_str().unwrap().contains("X-Amz-Credential=app-k1%2F"), "{v}");
+        for bad in [
+            json!({"key": ""}),
+            json!({"key": "../rekcod-backups/fleet.db"}),
+            json!({"key": "a", "secs": 604_801}),
+            json!({"key": "a", "secs": 0}),
+        ] {
+            assert!(url(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn put_urls_only_for_releases_not_stored_yet() {
+        let (c, _) = storage_controller(Default::default());
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}}), None).unwrap();
+        let sha = "b".repeat(40);
+        // The mock has every object, but nobody recorded what was pushed: rebuilt and pushed.
+        let st: ReleaseStore = serde_json::from_value(release_store(&c, "web", &sha)).unwrap();
+        assert!(!st.cached && st.image_put.is_some() && st.toml_put.is_some());
+        let stored = json!({"image_sha256": "11", "toml_sha256": "22"}).to_string();
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into releases (app, n, commit_sha, state, created, stored) values ('web', 1, ?1, 'live', 0, ?2)",
+                &[&sha, &stored],
+            )
+            .unwrap();
+        let st: ReleaseStore = serde_json::from_value(release_store(&c, "web", &sha)).unwrap();
+        assert!(st.cached && st.image_put.is_none() && st.toml_put.is_none());
+        assert_eq!((st.image_sha256.as_deref(), st.toml_sha256.as_deref()), (Some("11"), Some("22")));
+    }
+
+    #[test]
+    fn a_stored_toml_must_be_the_one_pushed() {
+        use sha2::Digest;
+        let m = crate::s3::mock::start();
+        let toml = br#"{"app.port":"8080"}"#;
+        m.s3.put("rekcod-releases", "web/c.json", crate::s3::Body::Bytes(toml)).unwrap();
+        let mut st = ReleaseStore {
+            name: "rekcod-releases/web/c".into(),
+            image_get: String::new(),
+            image_put: None,
+            toml_get: m.s3.presign("rekcod-releases", "web/c.json", 60).unwrap(),
+            toml_put: None,
+            cached: true,
+            image_sha256: None,
+            toml_sha256: Some("0".repeat(64)),
+            cache_get: None,
+            cache_put: None,
+            cache_stored: false,
+        };
+        assert!(stored_toml(&st).is_none());
+        st.toml_sha256 = Some(hex(&sha2::Sha256::digest(toml)));
+        assert_eq!(stored_toml(&st).unwrap()["app.port"], "8080");
+    }
+
+    #[test]
+    fn bucket_apps_stay_on_the_mac_with_loopback_storage() {
+        let (c, _) = storage_controller(Default::default());
+        let node = |id: &str, url: &str| PlacementNode {
+            id: id.into(),
+            url: url.into(),
+            secret: String::new(),
+            zone: "z".into(),
+            free: 8192,
+            copies: 0,
+            failed: false,
+        };
+        let mk = || Placement {
+            nodes: vec![node("here", "http://127.0.0.1:7701"), node("there", "http://192.168.1.20:7701")],
+            zones: HashMap::from([("z".to_string(), 0)]),
+        };
+        let mut p = mk();
+        assert!(only_this_mac(&c, &mut p, true).unwrap());
+        assert_eq!(p.nodes.iter().filter(|n| !n.failed).map(|n| n.id.as_str()).collect::<Vec<_>>(), ["here"]);
+        // Without a bucket it may go anywhere; only the release store stays here.
+        let mut p = mk();
+        assert!(only_this_mac(&c, &mut p, false).unwrap() && p.nodes.iter().all(|n| !n.failed));
+        let mut p = Placement { nodes: vec![node("there", "http://192.168.1.20:7701")], zones: HashMap::from([("z".to_string(), 0)]) };
+        assert!(only_this_mac(&c, &mut p, true).unwrap_err().to_string().contains("loopback"));
     }
 
     #[test]
@@ -7265,7 +7655,7 @@ mod tests {
             )
             .unwrap();
         }
-        db.0.execute_batch(MIGRATIONS.last().unwrap()).unwrap();
+        db.0.execute_batch(MIGRATIONS.iter().find(|m| m.contains("lost before an upgrade")).unwrap()).unwrap();
         let mut state = |id: &str| db.query_one("select state from jobs where id = ?1", &[&id]).unwrap().get::<String>(0);
         assert_eq!((state("j-old"), state("j-new")), ("failed".into(), "lost".into()));
     }

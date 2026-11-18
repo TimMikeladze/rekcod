@@ -55,7 +55,7 @@ export async function readState(local = false): Promise<State> {
 
 /**
  * `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. rekcod gives
- * the read 40 s; past 45 s, or on `signal`, the whole process group goes, its ssh included.
+ * up after 20 s and reaps its ssh; past 45 s, or on `signal`, the whole process group goes.
  */
 export async function readEngine(name: string, signal?: AbortSignal): Promise<State> {
   if (FIXTURE) return fakeEngine(await readState(), name)

@@ -68,7 +68,9 @@ grep -q "gh couldn't check" "$t/out" || fail "gh unauthenticated: $(cat "$t/out"
 # A tarball that doesn't match SHA256SUMS: nothing installed.
 old_install "$p"
 cp "$t/rel/SHA256SUMS" "$t/sums"
-sed 's/^./0/' "$t/sums" > "$t/rel/SHA256SUMS"
+# Change each hash's first digit to a different one (a hash may already start with 0).
+awk '{ printf "%s%s\n", (substr($0, 1, 1) == "0" ? "1" : "0"), substr($0, 2) }' "$t/sums" > "$t/rel/SHA256SUMS"
+! cmp -s "$t/sums" "$t/rel/SHA256SUMS" || fail "the sums didn't change"
 if install "$p"; then fail "a checksum mismatch was installed"; fi
 is_old "$p" "checksum mismatch"
 cp "$t/sums" "$t/rel/SHA256SUMS"

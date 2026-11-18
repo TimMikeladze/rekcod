@@ -412,6 +412,11 @@ default; add `--detach` to print the job ID and return. Replace `JOB_ID` with th
 from `job ls` when reading logs later. `rekcod job cancel JOB_ID --remote mini`
 stops a job.
 
+`job run --name nightly --every 1d -- ./backup.sh` runs it on a schedule instead; the
+shortest interval is one minute. A run that can't start (no node with room, a full
+quota) shows in `job ls` as a failed job with the reason, and is tried again after
+5 minutes. A job's output on the node stops at 64 MiB; the command keeps running.
+
 ## Run S3-compatible storage
 
 For development on your Mac:

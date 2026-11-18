@@ -1098,7 +1098,7 @@ enum JobCmd {
         /// Kill it after this long (exit 124).
         #[arg(long, value_parser = duration_secs)]
         timeout: Option<u64>,
-        /// Run it on this schedule instead of once (needs --name).
+        /// Run it on this schedule instead of once (needs --name; at least 1m).
         #[arg(long, value_parser = duration_secs)]
         every: Option<u64>,
         #[arg(long)]

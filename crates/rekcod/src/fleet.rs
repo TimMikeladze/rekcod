@@ -1563,6 +1563,8 @@ const MIGRATIONS: &[&str] = &[
     // drained node that misses heartbeats comes back drained.
     "alter table nodes add column drained integer not null default 0;
      update nodes set drained = 1, state = 'ready' where state = 'drain';",
+    // Reconcile, routes and node lists look instances up by app and state every few seconds.
+    "create index if not exists instances_app_state on instances (app, state);",
 ];
 
 /// A node's state as shown: `drain` for a drained node that answers.
@@ -2215,16 +2217,43 @@ fn mark_lost_nodes(c: &Arc<Controller>) -> Result<()> {
 
 /// Releases kept in the store per app: rollbacks further back than this rebuild.
 const KEEP_RELEASES: usize = 10;
+/// Release rows kept per app; the live one and one still building are never deleted.
+const KEEP_RELEASE_ROWS: i64 = 50;
 
-/// Hourly: drops stored release images beyond the newest [`KEEP_RELEASES`] per app, and
-/// audit rows, finished jobs and old release logs past 90 days.
+/// Hourly: drops stored release images beyond the newest [`KEEP_RELEASES`] per app; audit
+/// rows, finished jobs and old release logs past 90 days; finished runs of a schedule
+/// beyond [`KEEP_SCHEDULE_RUNS`]; removed instances and sandboxes after a week; and old or
+/// failed release rows beyond [`KEEP_RELEASE_ROWS`] per app.
 fn cleanup(c: &Arc<Controller>) -> Result<()> {
     let cutoff = now() - 90 * 86400;
     {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         db.execute("delete from audit where ts < ?1", &[&cutoff])?;
         db.execute(&format!("delete from jobs where state not in {JOB_ACTIVE_SQL} and coalesce(finished, created) < ?1"), &[&cutoff])?;
+        db.execute(
+            &format!(
+                "delete from jobs where schedule is not null and state not in {JOB_ACTIVE_SQL} and id not in
+                   (select id from jobs j where j.schedule = jobs.schedule order by created desc limit ?1)"
+            ),
+            &[&KEEP_SCHEDULE_RUNS],
+        )?;
         db.execute("update releases set log = '' where state in ('old', 'failed') and created < ?1", &[&cutoff])?;
+        // Removed instances and sandboxes a week on. A VM a node still has is then unknown,
+        // which the orphan check deletes just as it would a removed one.
+        let week = now() - 7 * 86400;
+        db.execute(
+            "delete from instances where state = 'removed' and sandbox in (select id from sandboxes where state = 'removed' and created < ?1)",
+            &[&week],
+        )?;
+        db.execute(
+            "delete from sandboxes where state = 'removed' and created < ?1 and not exists(select 1 from instances i where i.sandbox = sandboxes.id)",
+            &[&week],
+        )?;
+        db.execute(
+            "delete from releases where state in ('old', 'failed') and n not in
+               (select n from releases r where r.app = releases.app order by n desc limit ?1)",
+            &[&KEEP_RELEASE_ROWS],
+        )?;
     }
     let Some(s) = &c.storage else { return Ok(()) };
     if !s.bucket_exists(RELEASES)? {
@@ -5155,7 +5184,7 @@ fn poll_jobs(c: &Controller) -> Result<()> {
 fn run_schedules(c: &Controller) -> Result<()> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         &format!(
-            "select s.name, s.owner, s.spec, coalesce(t.max_sandboxes, 10), s.ns from schedules s
+            "select s.name, s.owner, s.spec, coalesce(t.max_sandboxes, 10), s.ns, s.every from schedules s
                left join (select name, max(max_sandboxes) as max_sandboxes from tokens group by name) t on t.name = s.owner
              where s.last_run <= ?1 - s.every
                and not exists(select 1 from jobs j where (j.id = s.last_job or j.schedule = s.name) and j.state in {JOB_ACTIVE_SQL})"
@@ -5163,20 +5192,55 @@ fn run_schedules(c: &Controller) -> Result<()> {
         &[&now()],
     )?;
     for r in rows {
-        let (name, owner, spec, max, ns): (String, String, String, i32, String) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+        let (name, owner, spec, max, ns, every): (String, String, String, i32, String, i64) =
+            (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4), r.get(5));
+        let t = now();
         let spec: Value = serde_json::from_str(&spec)?;
-        // Marked as run even when it can't start, so a full fleet isn't retried every 5 s.
         let job = start_job(c, &ns, &owner, max, &spec, Some(&name));
-        let id = job.as_ref().ok().and_then(|v| v["id"].as_str().map(String::from));
+        let (id, last_run) = match &job {
+            Ok(v) => (v["id"].as_str().map(String::from), t),
+            Err(e) => {
+                eprintln!("rekcod: schedule {name}: {e:#}");
+                // A failed job row says why in `job ls`, unless the node refused one already
+                // stored. The next try comes after 5 minutes (or `every`), not a whole period.
+                let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let id = match db.query_opt("select id from jobs where schedule = ?1 and created >= ?2", &[&name, &t])? {
+                    Some(r) => r.get(0),
+                    None => {
+                        let id = format!("j-{}", sandbox::new_id()?);
+                        db.execute(
+                            "insert into jobs (id, owner, node, name, spec, state, created, finished, schedule, ns, log)
+                             values (?1, ?2, '', ?3, ?4, 'failed', ?5, ?5, ?6, ?7, ?8)",
+                            &[
+                                &id,
+                                &owner,
+                                &spec["name"].as_str(),
+                                &spec.to_string(),
+                                &t,
+                                &name,
+                                &ns,
+                                &format!("rekcod: not started: {e:#}\n"),
+                            ],
+                        )?;
+                        id
+                    }
+                };
+                (Some(id), t - every + every.min(SCHEDULE_RETRY_SECS))
+            }
+        };
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .execute("update schedules set last_run = ?2, last_job = ?3 where name = ?1", &[&name, &now(), &id])?;
-        if let Err(e) = job {
-            eprintln!("rekcod: schedule {name}: {e:#}");
-        }
+            .execute("update schedules set last_run = ?2, last_job = ?3 where name = ?1", &[&name, &last_run, &id])?;
     }
     Ok(())
 }
+
+/// A schedule whose run couldn't start is tried again after this, or `every` if shorter.
+const SCHEDULE_RETRY_SECS: i64 = 300;
+/// The shortest `every_secs`; each run keeps a job row with up to 64 KiB of output.
+const SCHEDULE_MIN_SECS: i64 = 60;
+/// Finished runs kept per schedule.
+const KEEP_SCHEDULE_RUNS: i64 = 100;
 
 fn job_json(r: &Row) -> Value {
     json!({
@@ -5210,6 +5274,9 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             let every = b["every_secs"].as_i64().unwrap_or(0);
             if every <= 0 {
                 return start_job(c, ns, &who.name, who.max, b, None);
+            }
+            if every < SCHEDULE_MIN_SECS {
+                bail!("schedules run at most every {SCHEDULE_MIN_SECS}s");
             }
             let name = b["name"].as_str().context("a schedule needs --name")?;
             if !valid_label(name) {
@@ -7971,6 +8038,56 @@ mod tests {
         let env: Value = serde_json::from_str(&r.get::<String>(0)).unwrap();
         assert_eq!(env, json!({"A": "2", "LOG_LEVEL": "debug", "WORKERS": "4"}));
         assert_eq!((r.get::<i64>(1), r.get::<i64>(2)), (2, 4));
+    }
+
+    #[test]
+    fn a_schedule_that_cant_start_leaves_a_failed_run_and_tries_again_soon() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        let mut b = json!({"name": "nightly", "every_secs": 30, "cmd": ["true"], "git": {"url": "https://example.invalid/r"}});
+        let e = call(&url, "POST", "/jobs", Some("alice-t"), &b).unwrap_err().to_string();
+        assert!(e.contains("at most every 60s"), "{e}");
+        b["every_secs"] = json!(86400);
+        call(&url, "POST", "/jobs", Some("alice-t"), &b).unwrap();
+        // No node has room at the tick.
+        run_schedules(&c).unwrap();
+        let mut db = c.db.lock().unwrap();
+        let job = db.query_one("select id, state, log from jobs where schedule = 'nightly'", &[]).unwrap();
+        assert_eq!(job.get::<String>(1), "failed");
+        assert!(job.get::<String>(2).contains("not started: no node"), "{}", job.get::<String>(2));
+        let s = db.query_one("select last_run, last_job from schedules", &[]).unwrap();
+        assert_eq!(s.get::<String>(1), job.get::<String>(0));
+        let next = s.get::<i64>(0) + 86400 - now();
+        assert!((295..=300).contains(&next), "next try in {next}s");
+    }
+
+    #[test]
+    fn cleanup_drops_removed_rows_after_a_week_and_release_rows_beyond_fifty() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        recovery_app(&c, 1);
+        {
+            let mut db = c.db.lock().unwrap();
+            for (sb, state, created) in [("gone-long-ago", "removed", 0), ("gone-today", "removed", now()), ("running", "running", 0)] {
+                db.execute(
+                    "insert into sandboxes (id, node, owner, state, created) values (?1, 'n1', 'a', ?2, ?3)",
+                    &[&sb, &state, &created],
+                )
+                .unwrap();
+                let st = if state == "running" { "live" } else { "removed" };
+                db.execute("insert into instances values ('web', 7, ?1, 'n1', 'ep', ?2)", &[&sb, &st]).unwrap();
+            }
+            for n in 8..=70 {
+                db.execute("insert into releases (app, n, commit_sha, state, created) values ('web', ?1, 'x', 'failed', 0)", &[&n])
+                    .unwrap();
+            }
+        }
+        cleanup(&c).unwrap();
+        let mut db = c.db.lock().unwrap();
+        let ids = db.query("select sandbox from instances order by sandbox", &[]).unwrap();
+        assert_eq!(ids.iter().map(|r| r.get::<String>(0)).collect::<Vec<_>>(), ["gone-today", "running"]);
+        assert_eq!(db.query_one("select count(*) from sandboxes", &[]).unwrap().get::<i64>(0), 2);
+        let r = db.query_one("select count(*), min(n), sum(state = 'live') from releases", &[]).unwrap();
+        assert_eq!((r.get::<i64>(0), r.get::<i64>(1), r.get::<i64>(2)), (51, 7, 1));
     }
 
     #[test]

@@ -69,9 +69,8 @@ pub struct Ivars {
 #[derive(Default)]
 pub struct Models {
     latest: std::sync::Mutex<Option<(std::time::Instant, Arc<Model>)>>,
-    /// Hosts' engines, read over SSH on their own thread so a slow host never holds the menu:
-    /// once at start, then each time the menu opens (`fresh`).
-    engines: std::sync::Mutex<Vec<Engine>>,
+    /// Hosts' engines, read over SSH once at start, then each time the menu opens (`fresh`).
+    engines: Arc<Engines>,
     engines_poke: std::sync::Mutex<bool>,
     engines_poked: std::sync::Condvar,
     loaded: std::sync::Condvar,
@@ -84,13 +83,10 @@ impl Models {
     fn run(self: Arc<Self>, paths: Paths) {
         let me = self.clone();
         std::thread::spawn(move || {
+            let read: Arc<ReadEngine> = Arc::new(|name: &str| crate::host::engine_state(name).map_err(|e| format!("{e:#}")));
             loop {
                 let (hosts, _) = crate::host::list();
-                let engines = hosts
-                    .iter()
-                    .map(|h| Engine { name: h.name.clone(), state: crate::host::engine_state(&h.name).map_err(|e| format!("{e:#}")) })
-                    .collect();
-                *me.engines.lock().unwrap() = engines;
+                me.engines.refresh(hosts.into_iter().map(|h| h.name).collect(), &read);
                 let poked = me.engines_poke.lock().unwrap();
                 let mut poked = me.engines_poked.wait_while(poked, |p| !*p).unwrap();
                 *poked = false;
@@ -99,7 +95,7 @@ impl Models {
         std::thread::spawn(move || {
             loop {
                 let mut m = Model::load(&paths);
-                m.engines = self.engines.lock().unwrap().clone();
+                m.engines = self.engines.snapshot();
                 let m = Arc::new(m);
                 *self.latest.lock().unwrap() = Some((std::time::Instant::now(), m));
                 self.loaded.notify_all();
@@ -120,6 +116,52 @@ impl Models {
         let latest = self.latest.lock().unwrap();
         let (latest, _) = self.loaded.wait_timeout_while(latest, wait, |l| l.as_ref().is_none_or(|(t, _)| *t < asked)).unwrap();
         latest.as_ref().map(|(_, m)| m.clone())
+    }
+}
+
+type ReadEngine = dyn Fn(&str) -> Result<Value, String> + Send + Sync;
+
+/// What the menu shows of each host's engine. Each host is read on a thread of its own, one
+/// read at a time, so a host that stalls holds only its own submenu, which says how old it is.
+#[derive(Default)]
+pub struct Engines {
+    slots: std::sync::Mutex<std::collections::BTreeMap<String, EngineSlot>>,
+}
+
+#[derive(Default)]
+struct EngineSlot {
+    state: Option<Result<Value, String>>,
+    at: Option<std::time::Instant>,
+    reading: bool,
+}
+
+impl Engines {
+    /// Forgets hosts that aren't in `hosts` and starts a read of each one that isn't being read.
+    fn refresh(self: &Arc<Self>, hosts: Vec<String>, read: &Arc<ReadEngine>) {
+        let mut slots = self.slots.lock().unwrap();
+        slots.retain(|name, _| hosts.contains(name));
+        for name in hosts {
+            let slot = slots.entry(name.clone()).or_default();
+            if slot.reading {
+                continue;
+            }
+            slot.reading = true;
+            let (me, read) = (self.clone(), read.clone());
+            std::thread::spawn(move || {
+                let state = read(&name);
+                if let Some(slot) = me.slots.lock().unwrap().get_mut(&name) {
+                    *slot = EngineSlot { state: Some(state), at: Some(std::time::Instant::now()), reading: false };
+                }
+            });
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Engine> {
+        let slots = self.slots.lock().unwrap();
+        slots
+            .iter()
+            .map(|(name, s)| Engine { name: name.clone(), state: s.state.clone(), age: s.at.map_or(0, |t| t.elapsed().as_secs()) })
+            .collect()
     }
 }
 
@@ -400,16 +442,26 @@ pub fn entries(m: &Model) -> Vec<Entry> {
 /// A host's engine from its `rekcod host state` JSON: the same sections as this Mac's, each
 /// action already rewritten to run there.
 pub fn engine_entries(e: &Engine) -> Vec<Entry> {
+    // Past a minute the read is older than any menu open would give, so say so.
+    let old = match e.age {
+        a if a < 60 => String::new(),
+        a if a < 7200 => format!(" (read {}m ago)", a / 60),
+        a => format!(" (read {}h ago)", a / 3600),
+    };
     let v = match &e.state {
-        Ok(v) => v,
-        Err(err) => return vec![Entry::Label(format!("Can't read {}: {err}", e.name))],
+        None => return vec![Entry::Label(format!("Reading {}…", e.name))],
+        Some(Ok(v)) => v,
+        Some(Err(err)) => return vec![Entry::Label(format!("Can't read {}: {err}{old}", e.name))],
     };
     let acts = |v: &Value| -> Vec<Entry> {
         v.as_array().into_iter().flatten().filter_map(crate::state::action_from_json).map(Entry::Action).collect()
     };
     let running = v["running"] == true;
-    let mut out =
-        vec![Entry::Label(if running { format!("rekcod running on {}", e.name) } else { format!("rekcod is stopped on {}", e.name) })];
+    let mut out = vec![Entry::Label(if running {
+        format!("rekcod running on {}{old}", e.name)
+    } else {
+        format!("rekcod is stopped on {}{old}", e.name)
+    })];
     out.extend(acts(&v["vm_actions"]));
     if !running {
         return out;
@@ -946,7 +998,7 @@ mod tests {
             "networks": [{"name": "bridge", "driver": "bridge", "actions": []}],
         });
         crate::host::rewrite(&mut state, "mini");
-        let e = entries(&Model { engines: vec![Engine { name: "mini".into(), state: Ok(state) }], ..Model::default() });
+        let e = entries(&Model { engines: vec![Engine { name: "mini".into(), state: Some(Ok(state)), age: 0 }], ..Model::default() });
         let Some(Entry::Submenu(title, items)) = e.iter().find(|x| matches!(x, Entry::Submenu(t, _) if t.starts_with("Engine:"))) else {
             panic!("no engine submenu in {e:?}")
         };
@@ -955,8 +1007,47 @@ mod tests {
         let Entry::Action(stop) = &items[1] else { panic!("{:?}", items[1]) };
         assert_eq!(stop.run, Run::Rekcod(["host", "exec", "mini", "--", "stop"].map(String::from).into()));
         assert!(items.contains(&Entry::Submenu("Networks (1)".into(), vec![Entry::Label("bridge  (bridge)".into())])));
-        let down = engine_entries(&Engine { name: "mini".into(), state: Err("ssh: connect timed out".into()) });
+        let down = engine_entries(&Engine { name: "mini".into(), state: Some(Err("ssh: connect timed out".into())), age: 0 });
         assert_eq!(down, vec![Entry::Label("Can't read mini: ssh: connect timed out".into())]);
+        let old = engine_entries(&Engine { name: "mini".into(), state: Some(Err("no answer in 20 s".into())), age: 600 });
+        assert_eq!(old, vec![Entry::Label("Can't read mini: no answer in 20 s (read 10m ago)".into())]);
+        let first = engine_entries(&Engine { name: "mini".into(), state: None, age: 0 });
+        assert_eq!(first, vec![Entry::Label("Reading mini…".into())]);
+    }
+
+    #[test]
+    fn a_stalled_host_holds_only_its_own_engine() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let n = reads.clone();
+        let read: Arc<ReadEngine> = Arc::new(move |name: &str| {
+            n.fetch_add(1, Ordering::SeqCst);
+            if name == "stuck" {
+                wait.lock().unwrap().recv().unwrap();
+            }
+            Ok(serde_json::json!({"running": true}))
+        });
+        let engines = Arc::new(Engines::default());
+        engines.refresh(vec!["ok".into(), "stuck".into()], &read);
+        let got = |name: &str| engines.snapshot().into_iter().find(|e| e.name == name).and_then(|e| e.state);
+        let t0 = std::time::Instant::now();
+        while got("ok").is_none() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "ok was never read");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got("stuck").is_none());
+        // A second menu open reads ok again but doesn't stack another read on stuck.
+        engines.refresh(vec!["ok".into(), "stuck".into()], &read);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        release.send(()).unwrap();
+        while got("stuck").is_none() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "stuck never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engines.refresh(vec!["ok".into()], &read);
+        assert_eq!(engines.snapshot().len(), 1, "a removed host is forgotten");
     }
 
     #[test]

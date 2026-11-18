@@ -617,7 +617,10 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub struct Engine {
     pub name: String,
-    pub state: Result<Value, String>,
+    /// `None` until the first read finishes.
+    pub state: Option<Result<Value, String>>,
+    /// Seconds since that read.
+    pub age: u64,
 }
 
 /// Everything the menu bar shows, loaded in one go.

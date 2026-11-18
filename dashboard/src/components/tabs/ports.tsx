@@ -48,7 +48,9 @@ function HttpCell({ p }: { p?: { status: number | null; note: string } }) {
 export function Ports({ q }: { q: string }) {
   const { state } = useDash()
   const list = state?.ports ?? []
-  const probe = useProbe(list.filter((p) => !p.udp && !p.error).map((p) => p.port))
+  // Another Mac's ports are forwarded there; probing them here would read this Mac's.
+  const there = state?.engine
+  const probe = useProbe(there ? [] : list.filter((p) => !p.udp && !p.error).map((p) => p.port))
   const owner = (name: string) => state?.containers.find((c) => c.name === name)
   const rows = list.filter((p) => match(q, p.port, p.container, p.error, owner(p.container)?.project, owner(p.container)?.service))
   if (!list.length) return <Empty>No published ports.</Empty>
@@ -84,9 +86,9 @@ export function Ports({ q }: { q: string }) {
               <TableCell className="hidden md:table-cell">
                 <Mono className="text-muted-foreground">{c?.project ? `${c.project}/${c.service ?? "?"}` : "–"}</Mono>
               </TableCell>
-              <TableCell>{p.error ? <State tone="bad">{p.error}</State> : <State tone="ok">localhost:{p.port}</State>}</TableCell>
+              <TableCell>{p.error ? <State tone="bad">{p.error}</State> : <State tone="ok">{there ?? "localhost"}:{p.port}</State>}</TableCell>
               <TableCell className="hidden sm:table-cell">
-                {p.udp ? <Mono className="text-muted-foreground">UDP</Mono> : p.error ? <Mono className="text-muted-foreground">–</Mono> : <HttpCell p={pr} />}
+                {p.udp ? <Mono className="text-muted-foreground">UDP</Mono> : p.error || there ? <Mono className="text-muted-foreground">–</Mono> : <HttpCell p={pr} />}
               </TableCell>
               <TableCell>
                 <Actions actions={p.actions} subject={`:${p.port}`} />

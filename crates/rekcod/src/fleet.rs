@@ -1585,10 +1585,32 @@ type Params<'a> = &'a [&'a dyn rusqlite::ToSql];
 
 impl Db {
     pub fn open(path: &Path) -> Result<Db> {
+        Self::open_keeping(path, true)
+    }
+
+    /// `keep`: copy the file before migrating it (not for a backup being restored).
+    fn open_keeping(path: &Path, keep: bool) -> Result<Db> {
         let c = rusqlite::Connection::open(path).with_context(|| format!("open {}", path.display()))?;
         c.busy_timeout(Duration::from_secs(5))?;
-        c.execute_batch(SCHEMA)?;
         let mut version: i64 = c.query_row("pragma user_version", [], |r| r.get(0))?;
+        let newest = MIGRATIONS.len() as i64 + 1;
+        // An older rekcod would run against columns and tables it doesn't know.
+        if version > newest {
+            bail!(
+                "{} has schema {version}, from a newer rekcod (this one reads up to {newest}); install that rekcod again",
+                path.display()
+            );
+        }
+        // A copy from before the migrations, for going back to the rekcod that wrote it.
+        if keep && (1..newest).contains(&version) && path.is_file() {
+            let keep = path.with_extension(format!("db.before-schema-{version}"));
+            if !keep.exists() {
+                c.execute("vacuum into ?1", [keep.to_string_lossy()])
+                    .with_context(|| format!("copy {} before migrating", path.display()))?;
+                eprintln!("rekcod: migrating {} from schema {version} to {newest}; the old one is at {}", path.display(), keep.display());
+            }
+        }
+        c.execute_batch(SCHEMA)?;
         if version < 1 {
             for m in LEGACY_MIGRATIONS {
                 let _ = c.execute(m, []);
@@ -5792,6 +5814,28 @@ mod job_and_node_tests {
     }
 
     #[test]
+    fn an_older_rekcod_refuses_a_newer_database_and_migrations_keep_a_copy() {
+        let dir = temp("schema");
+        let newer = dir.join("newer.db");
+        rusqlite::Connection::open(&newer).unwrap().execute_batch("pragma user_version = 99").unwrap();
+        let e = Db::open(&newer).map(|_| ()).unwrap_err().to_string();
+        assert!(e.contains("schema 99, from a newer rekcod"), "{e}");
+        let old = dir.join("fleet.db");
+        let c = rusqlite::Connection::open(&old).unwrap();
+        c.execute_batch(SCHEMA).unwrap();
+        for m in LEGACY_MIGRATIONS {
+            c.execute(m, []).unwrap();
+        }
+        c.execute_batch("pragma user_version = 1").unwrap();
+        drop(c);
+        drop(Db::open(&old).unwrap());
+        let copy = dir.join("fleet.db.before-schema-1");
+        let v: i64 = rusqlite::Connection::open(&copy).unwrap().query_row("pragma user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn restore_takes_only_a_whole_fleet_database() {
         let dir = temp("restore");
         let live = dir.join("live.db");
@@ -5818,6 +5862,12 @@ mod job_and_node_tests {
             assert!(e.contains(why) || (why == "damaged" && e.contains("malformed")), "{name}: {e}");
             assert_eq!(token(), "current", "{name} replaced the database");
         }
+        // Not while a controller runs on it.
+        let lock = controller_lock(&target).unwrap();
+        let e = controller_restore(&Paths { home: dir.clone() }, Some(target.clone()), Some("k"), None).unwrap_err().to_string();
+        assert!(e.contains("the controller is running"), "{e}");
+        assert!(controller_lock(&target).is_err(), "a second controller can't start on it");
+        drop(lock);
         restore_file(&backup, &target).unwrap();
         assert_eq!(token(), "from-backup");
         let state: String = Db::open(&target).unwrap().query_one("select state from instances", &[]).unwrap().get(0);
@@ -6241,6 +6291,10 @@ fn backup_due(c: &Controller) -> Result<()> {
 /// `rekcod controller restore`: puts a backup in place of fleet.db (the old file is kept
 /// next to it). The controller must be stopped; it needs the same `controller/secret-key`.
 pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>, creds: Option<PathBuf>) -> Result<()> {
+    let db = db.unwrap_or_else(|| paths.home.join("controller").join("fleet.db"));
+    std::fs::create_dir_all(db.parent().context("no parent")?)?;
+    // Held until the new file is in place: a controller can't start on it meanwhile.
+    let _lock = controller_lock(&db)?;
     let s = crate::storage::read_credentials(&creds.unwrap_or_else(|| crate::storage::credentials_file(paths)))?;
     let key = match key {
         Some(k) => k.to_string(),
@@ -6250,8 +6304,6 @@ pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>,
             all.pop().context("no backups in rekcod-backups")?
         }
     };
-    let db = db.unwrap_or_else(|| paths.home.join("controller").join("fleet.db"));
-    std::fs::create_dir_all(db.parent().context("no parent")?)?;
     let tmp = db.with_extension("restoring");
     let r = s.get(BACKUPS, &key, &mut std::fs::File::create(&tmp)?).and_then(|_| restore_file(&tmp, &db));
     if r.is_err() {
@@ -6262,6 +6314,23 @@ pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>,
     r.with_context(|| format!("{key}: nothing was replaced"))?;
     println!("restored {key} to {}; start the controller again", db.display());
     Ok(())
+}
+
+/// `fleet.lock` next to the database, locked by the controller using it for as long as it
+/// runs. A second controller, or a restore, on that database fails here.
+fn controller_lock(db: &Path) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = db.with_extension("lock");
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open {}", path.display()))?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        bail!("the controller is running on {} ({} is locked); stop it first", db.display(), path.display());
+    }
+    Ok(f)
 }
 
 /// Tables every controller's database has.
@@ -6309,7 +6378,7 @@ fn restore_file(tmp: &Path, db: &Path) -> Result<()> {
     check_backup(tmp)?;
     // Whatever ran when the backup was taken may not run now: the first reconcile checks
     // each instance and takes back the ones that answer.
-    Db::open(tmp)?.execute("update instances set state = 'lost' where state in ('live', 'sleeping', 'starting')", &[])?;
+    Db::open_keeping(tmp, false)?.execute("update instances set state = 'lost' where state in ('live', 'sleeping', 'starting')", &[])?;
     if db.exists() {
         let keep = db.with_extension(format!("db.before-restore-{}", now()));
         std::fs::rename(db, &keep)?;
@@ -6371,6 +6440,8 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     crate::daemon::raise_fd_limit();
     let db_path = o.db.clone().unwrap_or_else(|| dir.join("fleet.db"));
+    // Held for as long as this process runs.
+    let _lock = controller_lock(&db_path)?;
     let mut db = Db::open(&db_path)?;
     for (key, file) in [("join_token", "join-token"), ("webhook_secret", "webhook-secret")] {
         let v = match db.query_opt("select value from config where key = ?1", &[&key])? {

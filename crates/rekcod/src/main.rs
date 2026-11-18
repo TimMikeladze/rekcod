@@ -487,9 +487,10 @@ enum SandboxCmd {
         /// Only print what would change; exit 1 if anything would.
         #[arg(long)]
         check: bool,
-        /// Write the copy the last `diff` showed, not the workspace as it is now.
-        #[arg(long)]
-        reviewed: bool,
+        /// Write the copy the `diff` that printed REVIEW showed, not the workspace as it is
+        /// now. Refused once a later diff (yours or an agent's) has replaced that copy.
+        #[arg(long, value_name = "REVIEW")]
+        reviewed: Option<String>,
     },
     /// Save a macOS sandbox's screen as PNG.
     Screenshot {
@@ -1925,7 +1926,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         }
         SandboxCmd::Diff { id, stat } => sandbox::diff(paths, &id, stat),
         SandboxCmd::Apply { id, check, reviewed } => {
-            let ch = sandbox::apply(paths, &id, check, reviewed)?;
+            let ch = sandbox::apply(paths, &id, check, reviewed.as_deref())?;
             sandbox::print_changes(&ch);
             if check && !ch.is_empty() {
                 std::process::exit(1);

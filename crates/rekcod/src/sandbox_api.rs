@@ -261,16 +261,16 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             }
             serde_json::to_value(meta)?
         }
-        "diff" => {
-            let (changes, patch) = sandbox::patch(paths, &target()?)?;
-            json!({"changes": changes, "patch": patch})
+        "diff" => serde_json::to_value(sandbox::patch(paths, &target()?)?)?,
+        "apply" => {
+            let id = target()?;
+            let reviewed = match &args["reviewed"] {
+                Value::Null => None,
+                Value::String(r) => Some(r.as_str()),
+                _ => bail!("reviewed takes the review ID a diff returned"),
+            };
+            json!({"changes": sandbox::apply(paths, &id, args["check"].as_bool().unwrap_or(false), reviewed)?})
         }
-        "apply" => json!({"changes": sandbox::apply(
-            paths,
-            &target()?,
-            args["check"].as_bool().unwrap_or(false),
-            args["reviewed"].as_bool().unwrap_or(false)
-        )?}),
         "stop" => {
             let id = target()?;
             // An app instance stopped by the controller (idle) stays down across node restarts.
@@ -711,7 +711,8 @@ fn tools() -> Vec<Tool> {
         (
             "sandbox_diff",
             "diff",
-            "Changes in the sandbox's workspace compared with the real project, as a patch.",
+            "Changes in the sandbox's workspace compared with the real project, as a patch, and the review ID that \
+             sandbox_apply takes to write exactly what this diff showed. Replaces the copy any earlier diff froze.",
             false,
             json!({"id": id}),
             vec!["id"],
@@ -724,7 +725,7 @@ fn tools() -> Vec<Tool> {
             json!({
                 "id": id,
                 "check": {"type": "boolean", "description": "Only report what would change"},
-                "reviewed": {"type": "boolean", "description": "Write the copy the last sandbox_diff showed, not the workspace as it is now"}
+                "reviewed": {"type": "string", "description": "The review ID sandbox_diff returned: write the copy that diff showed, not the workspace as it is now; refused if a later diff replaced it"}
             }),
             vec!["id"],
         ),
@@ -755,7 +756,7 @@ pub fn mcp_reply(paths: &Paths, policy: &Policy, msg: &Value) -> Option<Value> {
             "name": name,
             "description": desc,
             "inputSchema": {"type": "object", "properties": props, "required": req},
-            "annotations": {"destructiveHint": destructive, "readOnlyHint": matches!(name, "sandbox_list" | "sandbox_read_file" | "sandbox_diff")}
+            "annotations": {"destructiveHint": destructive, "readOnlyHint": matches!(name, "sandbox_list" | "sandbox_read_file")}
         })).collect::<Vec<_>>()})),
         "tools/call" => {
             let name = msg["params"]["name"].as_str().unwrap_or("");
@@ -875,6 +876,9 @@ mod tests {
         assert_eq!(tools.len(), 12);
         let apply = tools.iter().find(|t| t["name"] == "sandbox_apply").unwrap();
         assert_eq!(apply["annotations"]["destructiveHint"], true);
+        // A diff replaces the reviewed copy, so a client mustn't run it without asking.
+        let diff = tools.iter().find(|t| t["name"] == "sandbox_diff").unwrap();
+        assert_eq!(diff["annotations"]["readOnlyHint"], false);
         assert!(mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "method": "notifications/initialized"})).is_none());
         let bad =
             mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "x"}}))
@@ -939,7 +943,7 @@ mod tests {
         let (_, list) = mcp_call(&paths, &pol, "sandbox_list", json!({}));
         assert!(!list.contains(&sb.id), "{list}");
         for (tool, args) in [
-            ("sandbox_apply", json!({"id": sb.id, "reviewed": true})),
+            ("sandbox_apply", json!({"id": sb.id, "reviewed": "0123"})),
             ("sandbox_apply", json!({"id": "bee"})),
             ("sandbox_diff", json!({"id": sb.id})),
             ("sandbox_exec", json!({"id": sb.id, "cmd": ["true"]})),
@@ -955,7 +959,7 @@ mod tests {
         assert!(paths.home.join("sb").join(&sb.id).exists());
         assert_eq!(http(&paths, &pol, "GET", "/sandboxes", ""), (200, "[]".into()));
         for (method, path, body) in [
-            ("POST", format!("/sandboxes/{}/apply", sb.id), r#"{"reviewed": true}"#),
+            ("POST", format!("/sandboxes/{}/apply", sb.id), r#"{"reviewed": "0123"}"#),
             ("POST", format!("/sandboxes/{}/exec", sb.id), r#"{"cmd": ["true"]}"#),
             ("GET", format!("/sandboxes/{}", sb.id), ""),
             ("DELETE", "/sandboxes/bee".into(), ""),

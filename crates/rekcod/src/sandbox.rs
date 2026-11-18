@@ -835,12 +835,66 @@ pub fn printable(text: &str) -> String {
         .collect()
 }
 
+/// What `diff` showed: the change list, the patch, and the review ID `apply --reviewed`
+/// takes to write exactly that.
+#[derive(Serialize)]
+pub struct Review {
+    pub changes: Vec<Change>,
+    pub patch: String,
+    pub review: String,
+}
+
+/// SHA-256 over the change list and, for each path written, its kind, mode and content (or
+/// link target) in the frozen copy `src`. Every field is length-prefixed: paths come from
+/// the sandbox. 128 bits, so finding two workspaces with one ID costs 2^64 hashes.
+fn review_id(src: &Path, ch: &[Change]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let from = Dir::open(src)?;
+    let mut h = Sha256::new();
+    let field = |h: &mut Sha256, b: &[u8]| {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b);
+    };
+    for c in ch {
+        field(&mut h, &[c.kind as u8]);
+        field(&mut h, c.path.as_bytes());
+        if c.kind == 'D' {
+            continue;
+        }
+        let rel = Path::new(&c.path);
+        let st = from.state(rel).with_context(|| format!("{} is gone from the reviewed copy", c.path))?;
+        field(&mut h, &[st.kind() as u8]);
+        field(&mut h, &st.3.unwrap_or(0).to_be_bytes());
+        if st.kind() == 'l' {
+            field(&mut h, from.read_link(rel)?.as_os_str().as_bytes());
+        } else {
+            let mut f = from.open_file(rel)?;
+            let mut content = Sha256::new();
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                content.update(&buf[..n]);
+            }
+            field(&mut h, &content.finalize());
+        }
+    }
+    Ok(h.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Unified diff of the workspace against the project (`git diff --no-index` per file). The
-/// workspace is frozen into `<sandbox>/reviewed`, which `apply --reviewed` writes back.
-pub fn patch(paths: &Paths, id: &str) -> Result<(Vec<Change>, String)> {
+/// workspace is frozen into `<sandbox>/reviewed`, which `apply --reviewed <review>` writes
+/// back. Any later diff replaces that copy, and the review ID with it.
+pub fn patch(paths: &Paths, id: &str) -> Result<Review> {
     let (s, _lock) = copy_sandbox(paths, id)?;
+    let _ = std::fs::remove_file(s.paths.home.join("reviewed.id"));
     let ws = freeze(&s, "reviewed")?;
     let ch = changes(&s.meta.project, &ws);
+    let review = review_id(&ws, &ch)?;
+    std::fs::write(s.paths.home.join("reviewed.id"), &review)?;
     let mut out = String::new();
     let null = PathBuf::from("/dev/null");
     for c in &ch {
@@ -859,21 +913,22 @@ pub fn patch(paths: &Paths, id: &str) -> Result<(Vec<Change>, String)> {
             .replace(&format!("b{}/", s.meta.project.display()), "b/");
         out.push_str(&text);
     }
-    Ok((ch, out))
+    Ok(Review { changes: ch, patch: out, review })
 }
 
 pub fn diff(paths: &Paths, id: &str, stat: bool) -> Result<()> {
-    let (ch, p) = patch(paths, id)?;
+    let r = patch(paths, id)?;
     if stat {
-        for c in &ch {
+        for c in &r.changes {
             println!("{} {}", c.kind, printable(&c.path));
         }
     } else {
-        print!("{}", printable(&p));
+        print!("{}", printable(&r.patch));
     }
-    if !ch.is_empty() {
+    if !r.changes.is_empty() {
         eprintln!(
-            "rekcod: `rekcod sandbox apply {id} --reviewed` writes exactly this; without --reviewed it takes the workspace as it is then"
+            "rekcod: `rekcod sandbox apply {id} --reviewed {}` writes exactly this; without --reviewed it takes the workspace as it is then",
+            r.review
         );
     }
     Ok(())
@@ -1095,28 +1150,36 @@ fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest:
 }
 
 /// Writes the workspace's changes into the real project. Returns what changed. With
-/// `reviewed`, writes the copy the last `diff` froze instead of the live workspace.
-pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: bool) -> Result<Vec<Change>> {
+/// `reviewed`, the review ID a `diff` printed, writes the copy that diff froze instead of
+/// the live workspace, and only while it is still exactly what was shown.
+pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: Option<&str>) -> Result<Vec<Change>> {
     let (s, _lock) = copy_sandbox(paths, id)?;
-    let src = if reviewed {
-        let r = s.paths.home.join("reviewed");
-        if !r.is_dir() {
-            bail!("nothing reviewed yet; run `rekcod sandbox diff {id}` first");
-        }
-        r
-    } else {
-        freeze(&s, "applying")?
-    };
-    let r = apply_from(s, &src, check);
-    if !reviewed {
+    let Some(want) = reviewed else {
+        let src = freeze(&s, "applying")?;
+        let ch = changes(&s.meta.project, &src);
+        let r = apply_from(s, &src, ch, check);
         let _ = std::fs::remove_dir_all(&src);
+        return r;
+    };
+    let src = s.paths.home.join("reviewed");
+    let stored = std::fs::read_to_string(s.paths.home.join("reviewed.id")).unwrap_or_default();
+    if !src.is_dir() || stored.is_empty() {
+        bail!("nothing reviewed yet; run `rekcod sandbox diff {id}` first");
     }
-    r
+    if stored.trim() != want {
+        bail!(
+            "review {want} is no longer the reviewed copy: another diff of sandbox {id} replaced it; run `rekcod sandbox diff {id}` again"
+        );
+    }
+    let ch = changes(&s.meta.project, &src);
+    if review_id(&src, &ch)? != want {
+        bail!("the project changed since review {want}, so apply would write something else; run `rekcod sandbox diff {id}` again");
+    }
+    apply_from(s, &src, ch, check)
 }
 
-/// `apply` from the frozen copy `src`, with the review lock held.
-fn apply_from(mut s: Sandbox, src: &Path, check: bool) -> Result<Vec<Change>> {
-    let ch = changes(&s.meta.project, src);
+/// `apply` of `ch` from the frozen copy `src`, with the review lock held.
+fn apply_from(mut s: Sandbox, src: &Path, ch: Vec<Change>, check: bool) -> Result<Vec<Change>> {
     let mut manifest = s.manifest();
     let bad = conflicts(&s.meta.project, manifest.as_ref(), s.meta.created, &ch);
     if !bad.is_empty() {
@@ -1465,11 +1528,12 @@ mod tests {
         std::fs::create_dir_all(ws.join(".g\u{200c}it")).unwrap();
         std::fs::write(ws.join(".g\u{200c}it/marker"), "hook").unwrap();
         std::fs::write(ws.join("f"), "y").unwrap();
-        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('M', "f")]);
-        assert_eq!(paths_of(&apply(&paths, &m.id, false, true).unwrap()), vec![('M', "f")]);
+        let r = patch(&paths, &m.id).unwrap();
+        assert_eq!(paths_of(&r.changes), vec![('M', "f")]);
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, Some(&r.review)).unwrap()), vec![('M', "f")]);
         std::fs::rename(ws.join(".GIT"), ws.join(".Git")).unwrap();
         std::fs::write(ws.join(".Git/marker2"), "hook").unwrap();
-        assert!(apply(&paths, &m.id, false, false).unwrap().is_empty());
+        assert!(apply(&paths, &m.id, false, None).unwrap().is_empty());
         assert!(!project.join(".git/marker").exists() && !project.join(".git/marker2").exists());
         assert!(std::fs::symlink_metadata(project.join(".g\u{200c}it")).is_err());
         assert_eq!(std::fs::read_to_string(project.join(".git/config")).unwrap(), "[core]");
@@ -1503,14 +1567,14 @@ mod tests {
         std::fs::write(project.parent().unwrap().join("outside-marker"), "outside").unwrap();
         symlink(".", ws.join("b")).unwrap();
         symlink("b/../outside-marker", ws.join("leak")).unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("leak") && e.contains("outside the project"), "{e}");
         assert!(std::fs::symlink_metadata(project.join("leak")).is_err() && std::fs::symlink_metadata(project.join("b")).is_err());
         // Split over two applies: the second link redirects the first.
         std::fs::remove_file(ws.join("b")).unwrap();
-        assert_eq!(paths_of(&apply(&paths, &m.id, false, false).unwrap()), vec![('A', "leak")]);
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('A', "leak")]);
         symlink(".", ws.join("b")).unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("leak"), "{e}");
         assert!(std::fs::symlink_metadata(project.join("b")).is_err());
         // Through a link in a directory apply leaves alone.
@@ -1518,7 +1582,7 @@ mod tests {
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
         symlink("../..", project.join("node_modules/up")).unwrap();
         symlink("node_modules/up/outside-marker", ws.join("x")).unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("refusing symlink x"), "{e}");
         // A chain that stays inside is written; one into .git isn't.
         std::fs::remove_file(ws.join("x")).unwrap();
@@ -1526,10 +1590,10 @@ mod tests {
         std::fs::write(ws.join("real/file"), "r").unwrap();
         symlink("real", ws.join("alias")).unwrap();
         symlink("alias/file", ws.join("via")).unwrap();
-        apply(&paths, &m.id, false, false).unwrap();
+        apply(&paths, &m.id, false, None).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("via")).unwrap(), "r");
         symlink("alias/../.GIT/hooks", ws.join("hooks")).unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("into .git"), "{e}");
     }
 
@@ -1537,21 +1601,37 @@ mod tests {
     fn apply_writes_exactly_what_was_reviewed() {
         let (paths, project, m, ws) = setup("review", &[("f", "old")]);
         std::fs::write(ws.join("f"), "reviewed-A").unwrap();
-        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('M', "f")]);
+        let a = patch(&paths, &m.id).unwrap();
+        assert_eq!(paths_of(&a.changes), vec![('M', "f")]);
         std::fs::write(ws.join("f"), "unreviewed-B").unwrap();
-        apply(&paths, &m.id, false, true).unwrap();
+        apply(&paths, &m.id, false, Some(&a.review)).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "reviewed-A");
+        // Someone else's diff (the agent's, through MCP) replaces the reviewed copy: the
+        // human's review ID no longer applies anything.
+        std::fs::write(project.join("f"), "old").unwrap();
+        let m = fake(&paths, &project, |_| {});
+        let ws = root(&paths).join(&m.id).join("ws");
+        std::fs::write(ws.join("f"), "reviewed-A").unwrap();
+        let human = patch(&paths, &m.id).unwrap();
+        std::fs::write(ws.join("f"), "unreviewed-B").unwrap();
+        let agent = patch(&paths, &m.id).unwrap();
+        assert_ne!(human.review, agent.review);
+        let e = apply(&paths, &m.id, false, Some(&human.review)).unwrap_err().to_string();
+        assert!(e.contains("another diff"), "{e}");
+        assert!(apply(&paths, &m.id, false, Some("0123")).is_err());
+        assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "old");
         // A diff waits for an apply (or another diff) holding the sandbox's lock.
         let home = root(&paths).join(&m.id);
         let lock = review_lock(&home).unwrap();
+        std::fs::write(ws.join("f"), "unreviewed-C").unwrap();
         let (p, id) = (paths.clone(), m.id.clone());
-        let t = std::thread::spawn(move || patch(&p, &id).map(|(ch, _)| ch.len()));
+        let t = std::thread::spawn(move || patch(&p, &id).map(|r| r.changes.len()));
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!t.is_finished());
-        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "reviewed-A");
+        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "unreviewed-B");
         drop(lock);
         assert_eq!(t.join().unwrap().unwrap(), 1);
-        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "unreviewed-B");
+        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "unreviewed-C");
         // The copy is read without following links: a directory swapped for a link, inside
         // the copy or out to a Mac path, is never read through.
         let (inside, outside) = (tmp("review-inside"), tmp("review-outside"));
@@ -1575,15 +1655,15 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let was = mode(&project.join("f"));
         std::fs::set_permissions(project.join("f"), std::fs::Permissions::from_mode(0o600)).unwrap();
-        let e = apply(&paths, &m.id, true, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, true, None).unwrap_err().to_string();
         assert!(e.ends_with("since the sandbox copied it: f"), "{e}");
         assert_eq!(mode(&project.join("f")), 0o600);
         std::fs::set_permissions(project.join("f"), std::fs::Permissions::from_mode(was)).unwrap();
-        assert!(apply(&paths, &m.id, true, false).unwrap().is_empty());
+        assert!(apply(&paths, &m.id, true, None).unwrap().is_empty());
         std::fs::set_permissions(ws.join("g"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(paths_of(&apply(&paths, &m.id, false, false).unwrap()), vec![('M', "g")]);
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('M', "g")]);
         assert_eq!(mode(&project.join("g")), 0o755);
-        assert!(apply(&paths, &m.id, true, false).unwrap().is_empty());
+        assert!(apply(&paths, &m.id, true, None).unwrap().is_empty());
     }
 
     #[test]
@@ -1597,27 +1677,28 @@ mod tests {
         std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
         std::fs::remove_dir_all(ws.join("a")).unwrap();
         std::fs::write(ws.join("a"), "a file now").unwrap();
-        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('A', "a"), ('D', "a/child"), ('D', "a/sub/deep")]);
-        apply(&paths, &m.id, false, true).unwrap();
+        let r = patch(&paths, &m.id).unwrap();
+        assert_eq!(paths_of(&r.changes), vec![('A', "a"), ('D', "a/child"), ('D', "a/sub/deep")]);
+        apply(&paths, &m.id, false, Some(&r.review)).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("a")).unwrap(), "a file now");
         // And back: the file replaced by a directory.
         std::fs::remove_file(ws.join("a")).unwrap();
         std::fs::create_dir(ws.join("a")).unwrap();
         std::fs::write(ws.join("a/x"), "dir again").unwrap();
-        apply(&paths, &m.id, false, false).unwrap();
+        apply(&paths, &m.id, false, None).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("a/x")).unwrap(), "dir again");
         // A conflict only when the Mac changed something under the directory.
         let (paths, project, m, ws) = setup("dir2file-host", &[("d/child", "x"), ("e/child", "x"), ("e/node_modules/pkg", "p")]);
         std::fs::remove_dir_all(ws.join("d")).unwrap();
         std::fs::write(ws.join("d"), "file").unwrap();
         std::fs::write(project.join("d/new"), "made on the Mac").unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.ends_with("since the sandbox copied it: d/new"), "{e}");
         std::fs::remove_file(project.join("d/new")).unwrap();
         // One holding what apply leaves alone (node_modules) is refused before anything is written.
         std::fs::remove_dir_all(ws.join("e")).unwrap();
         std::fs::write(ws.join("e"), "file").unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("e/node_modules"), "{e}");
         assert!(project.join("d/child").exists() && project.join("e/child").exists());
     }

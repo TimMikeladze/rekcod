@@ -343,15 +343,10 @@ const LS_REMOTE_DEADLINE: Duration = Duration::from_secs(60);
 /// A clone's fetch on a node; the controller allows the whole launch [`SLOW`].
 const FETCH_DEADLINE: Duration = Duration::from_secs(600);
 
-/// Runs `c` and collects its output; kills it and everything it started once `deadline`
-/// passes or `stop` returns true.
-fn output_within(mut c: Command, deadline: Duration, stop: &dyn Fn() -> bool) -> Result<std::process::Output> {
+/// Runs `c` (`what`, for errors) and collects its output; kills it and everything it
+/// started once `deadline` passes or `stop` returns true.
+fn output_within(what: &str, mut c: Command, deadline: Duration, stop: &dyn Fn() -> bool) -> Result<std::process::Output> {
     use std::os::unix::process::CommandExt;
-    let what = c
-        .get_args()
-        .find(|a| !a.to_string_lossy().starts_with('-') && !a.to_string_lossy().contains('='))
-        .map(|a| a.to_string_lossy().to_string());
-    let what = format!("{} {}", c.get_program().to_string_lossy(), what.unwrap_or_default());
     c.stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
     let mut child = c.spawn().with_context(|| format!("run {what}"))?;
     let read = |p: Option<Box<dyn Read + Send>>| {
@@ -397,7 +392,7 @@ fn clone_until(paths: &Paths, url: &str, rev: &str, stop: &dyn Fn() -> bool) -> 
     let git = |args: &[&str]| -> Result<()> {
         let mut c = git_cmd();
         c.arg("-C").arg(&dir).args(args);
-        let o = output_within(c, FETCH_DEADLINE, stop)?;
+        let o = output_within(&format!("git {}", args.first().unwrap_or(&"")), c, FETCH_DEADLINE, stop)?;
         if !o.status.success() {
             bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&o.stderr).trim());
         }
@@ -3393,7 +3388,7 @@ fn resolve_within(url: &str, rev: &str, deadline: Duration) -> Result<String> {
     check_git_source(url, rev)?;
     let mut c = git_cmd();
     c.args(["ls-remote", "--", url, rev]);
-    let o = output_within(c, deadline, &|| false)?;
+    let o = output_within("git ls-remote", c, deadline, &|| false)?;
     let text = String::from_utf8_lossy(&o.stdout);
     text.split_whitespace().next().map(String::from).ok_or_else(|| anyhow!("{url} has no ref {rev}"))
 }
@@ -8062,7 +8057,8 @@ mod tests {
         let mut sleep = Command::new("sleep");
         sleep.arg("30");
         let t0 = Instant::now();
-        let e = output_within(sleep, Duration::from_secs(60), &|| t0.elapsed() > Duration::from_millis(300)).unwrap_err().to_string();
+        let e =
+            output_within("sleep", sleep, Duration::from_secs(60), &|| t0.elapsed() > Duration::from_millis(300)).unwrap_err().to_string();
         assert!(e.contains("cancelled") && t0.elapsed() < Duration::from_secs(5), "{e}");
     }
 

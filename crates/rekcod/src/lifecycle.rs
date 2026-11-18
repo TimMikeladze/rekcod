@@ -338,6 +338,11 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
             "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/.rekcod/bin/rustfs-* && sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ~/.rekcod/bin/rustfs-*",
         );
     }
+    let left = crate::sandbox::leftovers(paths);
+    if !left.is_empty() {
+        let names: Vec<String> = left.iter().map(|p| p.display().to_string()).collect();
+        add("agent sandboxes", false, format!("left by a failed create or fork: {}", names.join(", ")), "rekcod sandbox prune");
+    }
     let certs = crate::fleet::cert_expiries(paths);
     if !certs.is_empty() {
         let soon = crate::fleet::expiring(&certs, crate::fleet::now());

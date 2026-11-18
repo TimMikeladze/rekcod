@@ -110,6 +110,12 @@ pub struct Meta {
     /// `IP:PORT`s on the Mac or LAN it may reach (an app instance's RustFS).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reach: Vec<String>,
+    /// The only Mac loopback ports its VM may listen on; None is any unprivileged port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<Vec<u16>>,
+    /// Ports its `--network host` containers listen on aren't forwarded to the Mac.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_autoports: bool,
 }
 
 pub struct CreateOptions {
@@ -127,6 +133,10 @@ pub struct CreateOptions {
     /// "macos" for a macOS guest; `image` then names the base image.
     pub os: Option<String>,
     pub reach: Vec<String>,
+    /// See [`Meta::publish`]; the fleet sets it, local sandboxes leave None.
+    pub publish: Option<Vec<u16>>,
+    /// See [`Meta::no_autoports`].
+    pub no_autoports: bool,
 }
 
 impl Default for CreateOptions {
@@ -145,6 +155,8 @@ impl Default for CreateOptions {
             ttl_secs: 30 * 60,
             os: None,
             reach: vec![],
+            publish: None,
+            no_autoports: false,
         }
     }
 }
@@ -263,29 +275,9 @@ impl Sandbox {
             }
             return Ok(());
         }
-        let m = &self.meta;
-        check_capacity(main, m.memory_gib)?;
+        check_capacity(main, self.meta.memory_gib)?;
         self.touch();
-        let allow = match (&m.allow, m.offline) {
-            (_, true) => Some(String::new()),
-            (Some(a), _) => Some(a.join(",")),
-            (None, _) => None,
-        };
-        let opts = crate::cli::BootOptions {
-            cpus: Some(m.cpus),
-            memory_gib: Some(m.memory_gib),
-            base_memory_gib: None,
-            disk_gib: DISK_GIB,
-            project: Some(m.project.clone()),
-            guest_dir: Some(main.guest_dir()?),
-            workspace: (m.mode == "copy").then(|| self.ws()),
-            allow,
-            reach: m.reach.clone(),
-            idle_ttl: (m.ttl_secs > 0).then_some(m.ttl_secs),
-            repair: false,
-            ..Default::default()
-        };
-        crate::cli::boot(&self.paths, &opts)?;
+        crate::cli::boot(&self.paths, &self.boot_options(main.guest_dir()?))?;
         // A restarted or forked VM: the workspace container comes back by its restart policy,
         // but a fork's copy may have been cloned while paused.
         let _ = self.docker()?.args(["unpause", WS]).stderr(Stdio::null()).stdout(Stdio::null()).status();
@@ -362,6 +354,34 @@ impl Sandbox {
         }
         a.extend([m.image.clone(), "sh".into(), "-c".into(), "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done".into()]);
         a
+    }
+
+    /// How the sandbox's VM boots. Its workspace container runs `--network host`, so the
+    /// ports it listens on are forwarded to the Mac's loopback (the daemon allows only
+    /// 127.0.0.1 and ::1); an offline sandbox has nothing to forward.
+    fn boot_options(&self, guest_dir: PathBuf) -> crate::cli::BootOptions {
+        let m = &self.meta;
+        let allow = match (&m.allow, m.offline) {
+            (_, true) => Some(String::new()),
+            (Some(a), _) => Some(a.join(",")),
+            (None, _) => None,
+        };
+        crate::cli::BootOptions {
+            cpus: Some(m.cpus),
+            memory_gib: Some(m.memory_gib),
+            base_memory_gib: None,
+            disk_gib: DISK_GIB,
+            project: Some(m.project.clone()),
+            guest_dir: Some(guest_dir),
+            workspace: (m.mode == "copy").then(|| self.ws()),
+            allow,
+            reach: m.reach.clone(),
+            idle_ttl: (m.ttl_secs > 0).then_some(m.ttl_secs),
+            repair: false,
+            // An offline sandbox has nothing to forward.
+            publish: m.publish.clone().or_else(|| m.offline.then(Vec::new)),
+            no_autoports: m.no_autoports || m.offline,
+        }
     }
 
     fn paused_marker(&self) -> PathBuf {
@@ -628,6 +648,8 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
             created: now(),
             os: if macos { "macos".into() } else { String::new() },
             reach: o.reach,
+            publish: o.publish,
+            no_autoports: o.no_autoports,
         },
         paths: sb,
     };
@@ -797,7 +819,7 @@ pub fn cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
         let ip = s.guest(paths)?;
         let remote = |a: &str| a.strip_prefix(&format!("{WS}:")).map(|p| format!("{}@{ip}:{p}", crate::macos::USER));
         let args: Vec<String> = args.iter().map(|a| remote(a).unwrap_or_else(|| a.clone())).collect();
-        let ok = crate::macos::scp_command(paths)?.args(&args).status()?.success();
+        let ok = crate::macos::scp_command(paths, &ip)?.args(&args).status()?.success();
         if !ok {
             bail!("scp failed");
         }
@@ -1841,19 +1863,28 @@ pub fn prune(paths: &Paths, older_than: u64, removed: &mut dyn FnMut(&str)) -> R
     }
     // Not one being made right now.
     let cutoff = now().saturating_sub(older_than.max(600));
-    for e in std::fs::read_dir(root(paths)).into_iter().flatten().flatten() {
-        let home = e.path();
-        if !home.is_dir() || Sandbox::meta_file(&home).exists() || secs(&home).is_none_or(|t| t >= cutoff) {
-            continue;
-        }
-        if crate::cli::running_pid(&Paths { home: home.clone() }).is_some() {
+    for home in leftovers(paths) {
+        if secs(&home).is_none_or(|t| t >= cutoff) {
             continue;
         }
         open_up(&home);
         std::fs::remove_dir_all(&home).with_context(|| format!("remove {}", home.display()))?;
-        removed(&e.file_name().to_string_lossy());
+        removed(&home.file_name().unwrap_or_default().to_string_lossy());
     }
     Ok(())
+}
+
+/// Directories under `sb/` with no meta.json and no VM running: what a create or fork that
+/// died left, invisible to `ls` and `rm --all`. One being made right now looks the same for
+/// a moment.
+pub fn leftovers(paths: &Paths) -> Vec<PathBuf> {
+    std::fs::read_dir(root(paths))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|h| h.is_dir() && !Sandbox::meta_file(h).exists() && crate::cli::running_pid(&Paths { home: h.clone() }).is_none())
+        .collect()
 }
 
 pub fn golden_build(paths: &Paths, name: &str, images: &[String]) -> Result<()> {
@@ -2009,6 +2040,8 @@ mod tests {
             created: 0,
             os: String::new(),
             reach: vec![],
+            publish: None,
+            no_autoports: false,
         };
         let o = ExecOptions { workdir: None, env: vec!["A=1".into()], timeout_secs: Some(5), tty: false, clean_env: false };
         let a = exec_args(&m, &o, &["npm".into(), "test".into()]).join(" ");
@@ -2394,6 +2427,7 @@ mod tests {
         std::fs::File::create(&used).unwrap().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
         let leftover = root(&paths).join("zzzzzzzz");
         std::fs::create_dir_all(leftover.join("vm")).unwrap();
+        assert_eq!(leftovers(&paths), vec![leftover.clone()]);
         let mut gone = vec![];
         prune(&paths, 3600, &mut |id| gone.push(id.to_string())).unwrap();
         // The leftover is new: one being made right now looks the same.
@@ -2425,6 +2459,33 @@ mod tests {
         assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('M', "l")]);
         assert_eq!(std::fs::read_link(project.join("l")).unwrap(), Path::new("g"));
         assert!(project.join(".rekcod-123-0-f").exists());
+    }
+
+    #[test]
+    fn a_sandboxs_forwarding_reaches_its_daemon() {
+        let (paths, project, _, _) = setup("fwd-meta", &[("f", "x")]);
+        let m = fake(&paths, &project, |m| (m.publish, m.no_autoports) = (Some(vec![]), true));
+        let s = find(&paths, &m.id).unwrap();
+        assert_eq!(crate::cli::forwarding_args(&s.boot_options(PathBuf::from("/g"))), vec!["--publish=", "--no-autoports"]);
+        let m = fake(&paths, &project, |m| m.publish = Some(vec![8080, 9000]));
+        let s = find(&paths, &m.id).unwrap();
+        assert_eq!(crate::cli::forwarding_args(&s.boot_options(PathBuf::from("/g"))), vec!["--publish=8080,9000"]);
+        // Saved and read back; a meta.json from before has neither.
+        assert_eq!(s.meta.publish, Some(vec![8080, 9000]));
+        let old: Meta = serde_json::from_str(&serde_json::to_string(&Meta { publish: None, ..s.meta.clone() }).unwrap()).unwrap();
+        assert_eq!((old.publish, old.no_autoports), (None, false));
+        let local = fake(&paths, &project, |_| {});
+        assert!(crate::cli::forwarding_args(&find(&paths, &local.id).unwrap().boot_options(PathBuf::from("/g"))).is_empty());
+    }
+
+    #[test]
+    fn offline_sandboxes_forward_nothing() {
+        let (paths, project, m, _) = setup("fwd", &[("f", "x")]);
+        let o = find(&paths, &m.id).unwrap().boot_options(PathBuf::from("/g"));
+        assert_eq!((o.publish, o.no_autoports), (None, false));
+        let off = fake(&paths, &project, |m| m.offline = true);
+        let o = find(&paths, &off.id).unwrap().boot_options(PathBuf::from("/g"));
+        assert_eq!((o.publish, o.no_autoports, o.allow.as_deref()), (Some(vec![]), true, Some("")));
     }
 
     #[test]
@@ -2582,6 +2643,8 @@ pub(crate) mod testing {
             created: now(),
             os: String::new(),
             reach: vec![],
+            publish: None,
+            no_autoports: false,
         };
         edit(&mut meta);
         let s = Sandbox { meta, paths: Paths { home } };

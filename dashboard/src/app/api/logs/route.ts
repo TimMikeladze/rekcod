@@ -1,4 +1,4 @@
-import { FIXTURE, spawnRekcod } from "@/lib/rekcod"
+import { FIXTURE, spawnRekcod, watcherEnv } from "@/lib/rekcod"
 import { onEngine } from "@/lib/server/engine"
 import { fakeLogLine, fakeLogs } from "@/lib/server/fixtures"
 import { bad, guarded } from "@/lib/server/readonly"
@@ -6,7 +6,8 @@ import { cappedStream, fakeStream } from "@/lib/server/stream"
 import { logsArgv } from "@/lib/server/validate"
 
 // Container logs with the sheet's options: `follow`, `timestamps`, `since` (1m, 10m, 1h, 6h,
-// 24h), always `--tail 1000`. Read-only, so not an action (docs/dashboard.md).
+// 24h), always `--tail 1000`. Read-only, so not an action. Docker passthrough boots a stopped
+// VM, so it runs with REKCOD_NO_BOOT like the followers.
 export async function GET(req: Request) {
   const g = await guarded(req)
   if ("no" in g) return g.no
@@ -16,5 +17,5 @@ export async function GET(req: Request) {
     const ts = a.argv.includes("--timestamps")
     return fakeStream(req, fakeLogs(ts), a.argv.includes("--follow") ? () => fakeLogLine(0, ts) : undefined)
   }
-  return cappedStream(req, () => spawnRekcod(onEngine(a.argv)))
+  return cappedStream(req, () => spawnRekcod(onEngine(a.argv, g.engine), undefined, watcherEnv()))
 }

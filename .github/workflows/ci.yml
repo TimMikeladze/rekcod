@@ -35,6 +35,10 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build --locked -p rekcod
       - run: REKCOD=target/debug/rekcod python3 scripts/e2e-edges.py
+      # host state and host exec through a stand-in ssh. No VM here, so it takes the stopped
+      # branch (REKCOD_NO_BOOT reaches the host); it needs a docker CLI for the host's context.
+      - run: command -v docker || brew install docker
+      - run: REKCOD=target/debug/rekcod REKCOD_HOME="$RUNNER_TEMP/rekcod-home" scripts/e2e-engines.sh
       - run: python3 -m unittest scripts/test_bump_versions.py
       - run: python3 .github/scripts/check_release_jobs.py
       - run: packaging/server/test.sh

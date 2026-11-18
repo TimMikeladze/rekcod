@@ -1,6 +1,6 @@
 // Every request the page makes to /api goes through `api()`, which adds the token. The token
-// lives in localStorage, which is per origin (scheme, host and port), so another localhost
-// server never sees it; a cookie would reach all of them (docs/dashboard.md).
+// lives in localStorage, which is per origin (scheme, host and port), so another server on
+// 127.0.0.1 never sees it; a cookie would reach every port (lib/auth.ts).
 
 /** The localStorage key `/auth` (proxy.ts) writes the token to. */
 export const TOKEN_KEY = "rekcod.token"

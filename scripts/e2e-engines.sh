@@ -4,6 +4,8 @@
 # the host's docker context, so your own contexts aren't touched.
 #   scripts/e2e-engines.sh            # with target/release/rekcod
 #   REKCOD=target/debug/rekcod scripts/e2e-engines.sh
+# With REKCOD_HOME set to an empty directory there is no VM, and only the stopped branch runs
+# (ci.yml does this); with a running VM it also runs a container there.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 REKCOD=$(cd "$(dirname "${REKCOD:-target/release/rekcod}")" && pwd)/$(basename "${REKCOD:-target/release/rekcod}")

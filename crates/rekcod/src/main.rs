@@ -299,13 +299,13 @@ enum Cmd {
         #[arg(long)]
         uninstall: bool,
     },
-    /// Everything the menu bar and dashboard show, with each item's actions, as JSON (docs/dashboard.md).
+    /// Everything the menu bar and dashboard show, with each item's actions, as JSON.
     State {
         /// Leave out everything that needs the fleet controller.
         #[arg(long)]
         local: bool,
     },
-    /// The web dashboard: start it (or find the running one) and open it (docs/dashboard.md).
+    /// The web dashboard: start it (or find the running one) and open it.
     Dashboard {
         /// Start it at login (LaunchAgent).
         #[arg(long, conflicts_with_all = ["uninstall", "foreground"])]
@@ -2094,6 +2094,8 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
                 ttl_secs: ttl,
                 os,
                 reach: vec![],
+                publish: None,
+                no_autoports: false,
             };
             let m = sandbox::create(paths, o)?;
             if json {

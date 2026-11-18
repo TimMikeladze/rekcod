@@ -301,6 +301,7 @@ pub fn local_volume(project: &Path, dir: &str) -> String {
     format!("rekcod-x_{}_{:08x}_{}", base.trim_matches('-'), hash as u32, dir.trim_matches('-'))
 }
 
+#[derive(Clone)]
 pub struct Options {
     pub image: Option<String>,
     pub publish: Vec<String>,
@@ -449,7 +450,7 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
     let target = if opts.sandbox {
         let sb = sandbox_paths(paths)?;
         let lock = users_lock(&sb)?;
-        let sb = sandbox_boot(paths, &project, &lock)?;
+        let sb = sandbox_boot(paths, &project, &forwarding(&opts)?, &lock)?;
         users = Some(lock);
         sb
     } else {
@@ -539,22 +540,69 @@ fn only_user(lock: &std::fs::File) -> bool {
     false
 }
 
-/// Boots the sandbox VM for `project`, replacing one running for another directory when no
-/// other `rekcod x --sandbox` uses it (`users` is this run's shared lock).
-fn sandbox_boot(paths: &Paths, project: &Path, users: &std::fs::File) -> Result<Paths> {
+/// What the sandbox VM's daemon forwards to the Mac's loopback for a run.
+#[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Default)]
+struct Forwarding {
+    /// The only Mac ports it may listen on; None is any unprivileged port.
+    publish: Option<Vec<u16>>,
+    /// Ports `--network host` containers listen on aren't forwarded.
+    no_autoports: bool,
+}
+
+/// `-p` and `--no-autoports` turn autoports off, and the VM may then listen only on the Mac
+/// ports `-p` names. `--offline` has nothing to forward.
+fn forwarding(opts: &Options) -> Result<Forwarding> {
+    if opts.offline {
+        return Ok(Forwarding { publish: Some(vec![]), no_autoports: true });
+    }
+    if opts.publish.is_empty() && !opts.no_autoports {
+        return Ok(Forwarding::default());
+    }
+    let ports = opts.publish.iter().map(|p| mac_port(p)).collect::<Result<Vec<u16>>>()?;
+    Ok(Forwarding { publish: Some(ports), no_autoports: true })
+}
+
+/// The Mac side of a `-p` spec: `PORT`, `HOST:CONTAINER` or `IP:HOST:CONTAINER`, with an
+/// optional `/tcp` or `/udp`.
+fn mac_port(spec: &str) -> Result<u16> {
+    let bare = spec.split('/').next().unwrap_or_default();
+    let parts: Vec<&str> = bare.split(':').collect();
+    let host = if parts.len() >= 2 { parts[parts.len() - 2] } else { parts[0] };
+    match host.parse::<u16>() {
+        Ok(p) if p > 0 => Ok(p),
+        _ => bail!("-p {spec}: with --sandbox, give a Mac port: PORT, HOST:CONTAINER or IP:HOST:CONTAINER"),
+    }
+}
+
+/// Where the forwarding the running sandbox VM was booted with is kept.
+fn forwarding_file(sb: &Paths) -> PathBuf {
+    sb.home.join("run/x-forwarding.json")
+}
+
+/// Boots the sandbox VM for `project` with `fwd`, replacing one running for another
+/// directory or with other forwarding when no other `rekcod x --sandbox` uses it (`users`
+/// is this run's shared lock).
+fn sandbox_boot(paths: &Paths, project: &Path, fwd: &Forwarding, users: &std::fs::File) -> Result<Paths> {
     let sb = sandbox_paths(paths)?;
     if crate::cli::running_pid(&sb).is_some() {
         let status: serde_json::Value =
             std::fs::read(sb.status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let running = status["project"].as_str().map(PathBuf::from);
-        if running.as_deref() == Some(project) {
+        let booted: Option<Forwarding> = std::fs::read(forwarding_file(&sb)).ok().and_then(|b| serde_json::from_slice(&b).ok());
+        let same_dir = running.as_deref() == Some(project);
+        if same_dir && booted.as_ref() == Some(fwd) {
             return Ok(sb);
         }
         if !only_user(users) {
-            bail!(
-                "the sandbox VM is running `rekcod x --sandbox` for {}; one directory at a time, so wait for that to finish",
-                running.map(|p| p.display().to_string()).unwrap_or_else(|| "another directory".into())
-            );
+            match same_dir {
+                true => bail!(
+                    "the sandbox VM is running another `rekcod x --sandbox` here with other port forwarding; use the same -p and --no-autoports, or wait for it to finish"
+                ),
+                false => bail!(
+                    "the sandbox VM is running `rekcod x --sandbox` for {}; one directory at a time, so wait for that to finish",
+                    running.map(|p| p.display().to_string()).unwrap_or_else(|| "another directory".into())
+                ),
+            }
         }
         eprintln!("rekcod: restarting the sandbox VM for {}", project.display());
         let stopped = crate::cli::stop_daemon(&sb);
@@ -563,17 +611,23 @@ fn sandbox_boot(paths: &Paths, project: &Path, users: &std::fs::File) -> Result<
     }
     let t0 = Instant::now();
     eprintln!("rekcod: starting a sandbox VM that sees only {}", project.display());
-    let opts = crate::cli::BootOptions {
+    crate::cli::boot(&sb, &sandbox_options(project, paths.guest_dir()?, fwd))?;
+    std::fs::write(forwarding_file(&sb), serde_json::to_vec(fwd)?)?;
+    eprintln!("rekcod: sandbox ready in {:.1}s", t0.elapsed().as_secs_f64());
+    Ok(sb)
+}
+
+fn sandbox_options(project: &Path, guest_dir: PathBuf, fwd: &Forwarding) -> crate::cli::BootOptions {
+    crate::cli::BootOptions {
         memory_gib: Some(4),
         disk_gib: 64,
         project: Some(project.to_path_buf()),
-        guest_dir: Some(paths.guest_dir()?),
+        guest_dir: Some(guest_dir),
         idle_ttl: Some(SANDBOX_IDLE),
+        publish: fwd.publish.clone(),
+        no_autoports: fwd.no_autoports,
         ..Default::default()
-    };
-    crate::cli::boot(&sb, &opts)?;
-    eprintln!("rekcod: sandbox ready in {:.1}s", t0.elapsed().as_secs_f64());
-    Ok(sb)
+    }
 }
 
 #[cfg(test)]
@@ -723,6 +777,30 @@ mod tests {
         let made = new_git_entries(&git, &git_entries(&dir, &["node_modules"]));
         assert_eq!(made, vec![PathBuf::from("new/.git"), PathBuf::from("sub/.git"), PathBuf::from("sub/vendor/.git")]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sandbox_forwarding_follows_publish_and_no_autoports() {
+        let base = Options {
+            image: None,
+            publish: vec![],
+            env: vec![],
+            no_autoports: false,
+            sandbox: true,
+            offline: false,
+            secrets: vec![],
+            keep: false,
+        };
+        let fwd = |o: Options| forwarding(&o).map(|f| (f.publish, f.no_autoports));
+        assert_eq!(fwd(Options { ..base.clone() }).unwrap(), (None, false));
+        let o = Options { publish: vec!["3000".into(), "8080:80".into(), "127.0.0.1:5433:5432/tcp".into()], ..base.clone() };
+        assert_eq!(fwd(o).unwrap(), (Some(vec![3000, 8080, 5433]), true));
+        assert_eq!(fwd(Options { no_autoports: true, ..base.clone() }).unwrap(), (Some(vec![]), true));
+        assert_eq!(fwd(Options { offline: true, ..base.clone() }).unwrap(), (Some(vec![]), true));
+        assert!(fwd(Options { publish: vec!["3000-3005".into()], ..base.clone() }).is_err());
+        let f = forwarding(&Options { publish: vec!["9000".into()], ..base }).unwrap();
+        let o = sandbox_options(Path::new("/Users/me/app"), PathBuf::from("/g"), &f);
+        assert_eq!((o.publish, o.no_autoports, o.project.as_deref()), (Some(vec![9000]), true, Some(Path::new("/Users/me/app"))));
     }
 
     #[test]

@@ -34,6 +34,10 @@ type H = {
   timer: ReturnType<typeof setInterval> | null
   lastAsk: number
   fs: { t: number; ops: Record<string, number> }[]
+  /** Bumped by `switchEngine`; a read started under another epoch is dropped. */
+  epoch: number
+  /** Aborts the selected host's `rekcod host state` (and its ssh) on a switch. */
+  engineRead: AbortController
 }
 
 const h = once<H>("hub", () => ({
@@ -50,6 +54,8 @@ const h = once<H>("hub", () => ({
   timer: null,
   lastAsk: 0,
   fs: [],
+  epoch: 0,
+  engineRead: new AbortController(),
 }))
 
 /** Fixture mode: counters that grow like a busy dev server's, an hour back from now. */
@@ -84,7 +90,7 @@ async function withEngine(local: State): Promise<State> {
   const name = engine()
   if (name === "local") return local
   try {
-    return mergeEngine(await readEngine(name), local, name)
+    return mergeEngine(await readEngine(name, h.engineRead.signal), local, name)
   } catch (e) {
     return unreachableEngine(local, name, (e as Error).message)
   }
@@ -92,39 +98,58 @@ async function withEngine(local: State): Promise<State> {
 
 /** A full `rekcod state`; concurrent callers share one run. */
 export function refreshFull(): Promise<State> {
-  h.fullInflight ??= readState(false)
+  if (h.fullInflight) return h.fullInflight
+  const epoch = h.epoch
+  const p: Promise<State> = readState(false)
     .then(async (st) => {
+      // This Mac's fleet parts, whichever engine is shown.
       h.full = st
       h.fullAt = Date.now()
       if (FIXTURE) fakeNodes(st)
       else recordNodes(st, h.fullAt)
-      const shown = await withEngine(st)
-      publish(shown)
-      return shown
+      return withEngine(st)
     })
-    .catch((e) => {
-      fail(e)
-      throw e
+    .then(
+      (shown) => settle(epoch, shown),
+      (e) => settle(epoch, e as Error),
+    )
+    .finally(() => {
+      if (h.fullInflight === p) h.fullInflight = null
     })
-    .finally(() => (h.fullInflight = null))
-  return h.fullInflight
+  h.fullInflight = p
+  return p
+}
+
+/**
+ * Publishes a read, or its failure, if the engine is still the one it was started for. A read
+ * from before a switch is dropped, and its callers get the new engine's read instead.
+ */
+function settle(epoch: number, r: State | Error): Promise<State> | State {
+  if (epoch !== h.epoch) return refreshFull()
+  if (r instanceof Error) {
+    fail(r)
+    throw r
+  }
+  publish(r)
+  return r
 }
 
 /** `rekcod state --local` merged with the last full state's fleet parts. */
 export function refreshLocal(): Promise<State> {
   if (FIXTURE || !h.full) return refreshFull()
+  if (h.inflight) return h.inflight
   const full = h.full
-  h.inflight ??= (engine() === "local" ? readState(true).then((st) => mergeLocal(st, full)) : withEngine(full))
-    .then((merged) => {
-      publish(merged)
-      return merged
+  const epoch = h.epoch
+  const p: Promise<State> = (engine() === "local" ? readState(true).then((st) => mergeLocal(st, full)) : withEngine(full))
+    .then(
+      (merged) => settle(epoch, merged),
+      (e) => settle(epoch, e as Error),
+    )
+    .finally(() => {
+      if (h.inflight === p) h.inflight = null
     })
-    .catch((e) => {
-      fail(e)
-      throw e
-    })
-    .finally(() => (h.inflight = null))
-  return h.inflight
+  h.inflight = p
+  return p
 }
 
 /** Refresh soon (after an action or an event); several calls in a row make one run. */
@@ -177,6 +202,10 @@ function loop() {
     h.timer = null
     h.events?.kill()
     h.events = null
+    // Nothing refreshes it now. A page that opens later must not act on it: it may still say
+    // running after `rekcod stop`, and a docker command would boot the VM again.
+    h.current = null
+    h.at = 0
     return
   }
   if (Date.now() - h.fullAt >= FULL_MS) refreshFull().catch(() => {})
@@ -199,16 +228,23 @@ export async function get(): Promise<State> {
 }
 
 /**
- * Shows another engine: the followers stop (they run on the old one), the cached engine parts
- * go, and a refresh starts. The fleet parts stay.
+ * Shows another engine: reads in flight are dropped (a host's is killed), the followers stop
+ * (they run on the old one), the cached engine parts and the file-sharing counters go, and a
+ * refresh starts. The fleet parts stay.
  */
 export function switchEngine(name: string): Promise<State> {
+  h.epoch++
+  h.engineRead.abort()
+  h.engineRead = new AbortController()
   setEngine(name)
   const old = h.events
   h.events = null
   old?.kill()
   h.current = null
   h.at = 0
+  h.fullInflight = null
+  h.inflight = null
+  h.fs = []
   return refreshFull()
 }
 

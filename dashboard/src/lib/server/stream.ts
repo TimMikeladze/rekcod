@@ -34,6 +34,13 @@ export function cappedStream(req: Request, start: () => ChildProcess): Response 
 export function textStream(req: Request, child: ChildProcess): Response {
   const outs = [child.stdout, child.stderr].filter((s): s is Readable => !!s)
   let closed = false
+  // Destroying the pipes too: a child that already exited with paused, full pipes never emits
+  // "close" otherwise, and its slot (cappedStream) would stay taken.
+  const stop = () => {
+    closed = true
+    child.kill()
+    for (const o of outs) o.destroy()
+  }
   const stream = new ReadableStream<Uint8Array>(
     {
       start(ctl) {
@@ -51,15 +58,19 @@ export function textStream(req: Request, child: ChildProcess): Response {
           })
         child.once("close", (code) => end(code ? `\n[exited ${code}]\n` : ""))
         child.once("error", (e) => end(`\n[${e.message}]\n`))
-        req.signal.addEventListener("abort", () => child.kill())
+        if (req.signal.aborted) {
+          stop()
+          ctl.close()
+          return
+        }
+        req.signal.addEventListener("abort", stop, { once: true })
       },
       // Runs when the client has read the queue down below HIGH_WATER.
       pull() {
         for (const o of outs) o.resume()
       },
       cancel() {
-        closed = true
-        child.kill()
+        stop()
       },
     },
     new ByteLengthQueuingStrategy({ highWaterMark: HIGH_WATER }),

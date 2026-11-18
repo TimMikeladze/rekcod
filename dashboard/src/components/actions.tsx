@@ -26,7 +26,7 @@ import {
 import { useRouter } from "next/navigation";
 import { useDash } from "@/hooks/dash-context";
 import { api } from "@/lib/api";
-import { DESTRUCTIVE, STREAMED } from "@/lib/kinds";
+import { destructive, STREAMED } from "@/lib/kinds";
 import type { Action } from "@/lib/types";
 import { Loader2, MoreHorizontal } from "lucide-react";
 
@@ -180,7 +180,7 @@ export function ActionProvider({
             <AlertDialogCancel>Cancel</AlertDialogCancel>
             <AlertDialogAction
               variant={
-                first && DESTRUCTIVE.has(first.a.kind)
+                first && destructive(first.a)
                   ? "destructive"
                   : "default"
               }
@@ -323,10 +323,10 @@ export function Actions({
 }) {
   const { trigger, pending } = useAction();
   const busy = actions.some((a) => a.argv && pending.has(JSON.stringify(a.argv)));
-  const safe = actions.filter((a) => !DESTRUCTIVE.has(a.kind));
+  const safe = actions.filter((a) => !destructive(a));
   const shown = safe.slice(0, inline);
   const rest = safe.slice(inline);
-  const danger = actions.filter((a) => DESTRUCTIVE.has(a.kind));
+  const danger = actions.filter(destructive);
   if (!actions.length) return null;
   return (
     <div
@@ -434,7 +434,7 @@ export function EngineBar({ kinds, note }: { kinds: string[]; note?: ReactNode }
 /** One action as a labelled button, for toolbars (prunes). Destructive ones are red and still confirm. */
 export function ActionButton({ action, subject }: { action: Action; subject: string }) {
   const { trigger, pending } = useAction()
-  const danger = DESTRUCTIVE.has(action.kind)
+  const danger = destructive(action)
   return (
     <Button
       size="sm"

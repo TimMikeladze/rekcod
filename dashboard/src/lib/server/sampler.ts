@@ -42,6 +42,8 @@ function spawnChild() {
   let buf = ""
   child.stdout?.setEncoding("utf8")
   child.stdout?.on("data", (chunk: string) => {
+    // Output still buffered from a child killed by an engine switch belongs to the old engine.
+    if (s.child !== child) return
     const [lines, rest] = splitLines(buf + chunk)
     buf = rest
     const now = Date.now()

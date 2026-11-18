@@ -2,24 +2,9 @@
 // The other interactive kinds (shells, sudo, prompts, `host forward`) open Terminal.app.
 export const STREAMED = new Set(["ContainerLogs", "AppLogs", "JobLogs", "SandboxDiff", "StorageEnv", "Doctor", "ImageHistory", "VolumeBrowse"])
 
-/** Shown in red and kept behind the row's menu. */
-export const DESTRUCTIVE = new Set([
-  "ContainerRemove",
-  "SnapRemove",
-  "SandboxRemove",
-  "AppDestroy",
-  "JobCancel",
-  "VmStop",
-  "VmForceStop",
-  "Uninstall",
-  "ProjectDown",
-  "ImageRemove",
-  "VolumeRemove",
-  "ImagePrune",
-  "VolumePrune",
-  "BuildCachePrune",
-  "NetworkRemove",
-  "NetworkPrune",
-  "SystemPrune",
-  "SandboxPrune",
-])
+/**
+ * Shown in red and kept behind the row's menu: the actions that ask first. `rekcod state` sets
+ * `confirm` on exactly the ones that destroy or overwrite something
+ * (actions::tests::destructive_actions_ask_first), so there's no second list to keep in step.
+ */
+export const destructive = (a: { confirm?: string | null }) => a.confirm != null

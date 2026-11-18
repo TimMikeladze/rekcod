@@ -643,6 +643,65 @@ pub(crate) fn spawn_limited<T: Send + 'static>(f: impl FnOnce() -> T + Send + 's
     });
 }
 
+/// Connection slots for the controller: at most `max` at once, at most `per_peer` per
+/// address (loopback exempt: on a one-Mac fleet the node, edge and CLI all connect from
+/// there), and `reserved` more past `max` for addresses that recently proved themselves as
+/// a node or edge, so heartbeats and route polls get through a full pool.
+pub(crate) struct Slots {
+    max: usize,
+    per_peer: usize,
+    reserved: usize,
+    open: std::sync::Mutex<(usize, std::collections::HashMap<std::net::IpAddr, usize>)>,
+}
+
+impl Slots {
+    pub(crate) fn new(max: usize, per_peer: usize, reserved: usize) -> std::sync::Arc<Slots> {
+        std::sync::Arc::new(Slots { max, per_peer, reserved, open: Default::default() })
+    }
+
+    /// Runs `f` on its own thread if a slot is free; otherwise drops it (closing the
+    /// connection it owns) and returns false.
+    pub(crate) fn spawn<T: Send + 'static>(
+        self: &std::sync::Arc<Self>,
+        peer: std::net::IpAddr,
+        trusted: bool,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> bool {
+        {
+            let mut open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mine = open.1.get(&peer).copied().unwrap_or(0);
+            let cap = if trusted { self.max + self.reserved } else { self.max };
+            if (!peer.is_loopback() && mine >= self.per_peer) || open.0 >= cap {
+                if open.0 >= cap {
+                    eprintln!("rekcod: {} connections open; refusing another", open.0);
+                }
+                return false;
+            }
+            open.0 += 1;
+            *open.1.entry(peer).or_default() += 1;
+        }
+        struct Done(std::sync::Arc<Slots>, std::net::IpAddr);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let mut open = self.0.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                open.0 -= 1;
+                if let Some(n) = open.1.get_mut(&self.1) {
+                    *n -= 1;
+                    if *n == 0 {
+                        open.1.remove(&self.1);
+                    }
+                }
+            }
+        }
+        let done = Done(self.clone(), peer);
+        std::thread::spawn(move || {
+            let _done = done;
+            f()
+        });
+        true
+    }
+}
+
 fn base64_decode(s: &str) -> Vec<u8> {
     let mut out = Vec::new();
     let (mut acc, mut bits) = (0u32, 0);

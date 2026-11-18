@@ -1537,6 +1537,8 @@ struct Controller {
     key: [u8; 32],
     /// Addresses that fetched `/routes` (edges) and when; nodes let them reach instances.
     edges: Mutex<HashMap<IpAddr, i64>>,
+    /// Addresses nodes heartbeat from, and when: they get reserved connection slots.
+    node_addrs: Mutex<HashMap<IpAddr, i64>>,
     /// RustFS with root keys (`--storage`): app buckets, release images, backups.
     storage: Option<crate::s3::S3>,
     /// Edge client reports by minute: (minute, ip) -> (requests, rate-limited). Ten minutes kept.
@@ -1678,6 +1680,7 @@ impl Controller {
             busy: Default::default(),
             key,
             edges: Default::default(),
+            node_addrs: Default::default(),
             storage: None,
             clients: Default::default(),
             auto_approve: true,
@@ -1718,6 +1721,14 @@ impl Controller {
                 let _ = child.wait();
             }
         });
+    }
+
+    /// A node or edge seen from `ip` in the last 10 minutes.
+    fn trusted(&self, ip: IpAddr) -> bool {
+        let recent = |m: &Mutex<HashMap<IpAddr, i64>>| {
+            m.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(&ip).is_some_and(|t| *t > now() - 600)
+        };
+        recent(&self.node_addrs) || recent(&self.edges)
     }
 
     /// The database. A thread that panicked holding it leaves it poisoned, which says
@@ -2403,7 +2414,14 @@ fn json_reply(w: &mut impl Write, r: Result<Value>) -> Result<()> {
     }
 }
 
+#[cfg(test)]
 fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + Write) -> Result<()> {
+    serve_request(c, peer, stream, &|| {})
+}
+
+/// One request. `head_read` is called once the request (head, and the body of routes that
+/// don't need a token) is in, which ends its deadline.
+fn serve_request(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + Write, head_read: &dyn Fn()) -> Result<()> {
     let mut r = BufReader::new(stream);
     let mut req = match crate::sandbox_api::read_head(&mut r) {
         Ok(req) => req,
@@ -2436,11 +2454,14 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             c.audit_bad_token(peer, &req.path);
             return respond(r.get_mut(), 401, "application/json", br#"{"error":"bad token"}"#);
         }
+        // A token holder's body (up to 64 MiB) gets the per-read timeout, not the deadline.
+        head_read();
     }
     let cap = if open { 8 << 20 } else { crate::sandbox_api::MAX_BODY };
     if let Err(e) = crate::sandbox_api::read_body(&mut r, &mut req, cap) {
         return respond(r.get_mut(), 413, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
     }
+    head_read();
     let mut w = r.into_inner();
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
     // `/ns/NS/apps/...`; the same paths without the prefix are the `default` namespace.
@@ -2535,6 +2556,11 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                 let (_, sec, state) = c.node(id)?;
                 if !crate::sandbox_api::ct_eq(sec.as_bytes(), bearer.as_bytes()) {
                     bail!("bad node secret");
+                }
+                if let Some(ip) = peer {
+                    let mut seen = c.node_addrs.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    seen.retain(|_, t| *t > now() - 600);
+                    seen.insert(ip, now());
                 }
                 // Never more than the node said it had when it joined: a node reporting more
                 // would be handed every deploy (placement sorts by free memory).
@@ -5581,6 +5607,65 @@ mod job_and_node_tests {
     }
 
     #[test]
+    fn idle_connections_are_closed_and_nodes_keep_a_way_in() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        c.db()
+            .execute("insert into nodes (id, url, secret, last_seen) values ('n-1', 'http://127.0.0.1:9', 'node-s', ?1)", &[&now()])
+            .unwrap();
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let conns = Conns::new(crate::sandbox_api::Slots::new(4, 32, 2), Duration::from_millis(400));
+        let cc = c.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                conns.serve(&cc, None, s);
+            }
+        });
+        let heartbeat = || call_within(&format!("http://{addr}"), "POST", "/nodes/n-1/heartbeat", Some("node-s"), &json!({}), QUICK);
+        heartbeat().unwrap();
+        // Four clients that never send a request fill the pool.
+        let idle: Vec<TcpStream> = (0..4).map(|_| TcpStream::connect(addr).unwrap()).collect();
+        std::thread::sleep(Duration::from_millis(100));
+        // The node heartbeated from this address, so it gets a reserved slot.
+        heartbeat().unwrap();
+        let t0 = Instant::now();
+        for mut s in idle {
+            s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut b = [0u8; 1];
+            assert!(matches!(s.read(&mut b), Ok(0) | Err(_)));
+        }
+        assert!(t0.elapsed() < Duration::from_secs(3), "closed at the head deadline, not the read timeout");
+        // Once they're gone anyone gets in again.
+        let mut s = TcpStream::connect(addr).unwrap();
+        write!(s, "GET /ca.pem HTTP/1.1\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        let _ = s.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 404"), "{reply}");
+    }
+
+    #[test]
+    fn connection_slots_cap_each_address_but_not_loopback() {
+        let slots = crate::sandbox_api::Slots::new(10, 2, 0);
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let rx = Arc::new(Mutex::new(rx));
+        let hold = || {
+            let rx = rx.clone();
+            move || {
+                let _ = rx.lock().unwrap().recv_timeout(Duration::from_secs(5));
+            }
+        };
+        let far: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(slots.spawn(far, false, hold()) && slots.spawn(far, false, hold()));
+        assert!(!slots.spawn(far, false, hold()), "a third from one address");
+        assert!(slots.spawn("10.0.0.2".parse().unwrap(), false, hold()));
+        let lo: IpAddr = "127.0.0.1".parse().unwrap();
+        assert!((0..3).all(|_| slots.spawn(lo, false, hold())));
+        for _ in 0..6 {
+            tx.send(()).unwrap();
+        }
+    }
+
+    #[test]
     fn schedules_stop_when_their_owner_loses_access() {
         let (url, c) = serve(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
         let token = |t: &str, name: &str, admin: bool, expires: Option<i64>| {
@@ -6513,21 +6598,73 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
         eprintln!("rekcod: startup sweep: {e:#}");
     }
     watchdog(c.clone());
+    let conns = Conns::new(crate::sandbox_api::Slots::new(256, 32, 64), HEAD_DEADLINE);
     for s in l.incoming().flatten() {
         if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
             break;
         }
+        conns.serve(&c, tls.clone(), s);
+    }
+    Ok(())
+}
+
+/// How long a client has for the TLS handshake and its request head (and the body, on the
+/// routes that don't need a token) before the connection is closed.
+const HEAD_DEADLINE: Duration = Duration::from_secs(10);
+
+/// The controller's connections: [`crate::sandbox_api::Slots`] and the head deadline. Slow
+/// clients without a token used to hold all 256 threads, and nodes then went lost for want
+/// of a heartbeat (audit FA-3).
+struct Conns {
+    slots: Arc<crate::sandbox_api::Slots>,
+    head: Duration,
+    /// Connections still sending their head, and when they must be done.
+    pending: Arc<Mutex<HashMap<u64, (TcpStream, Instant)>>>,
+    next: std::sync::atomic::AtomicU64,
+}
+
+impl Conns {
+    /// Starts the thread that closes connections past their head deadline.
+    fn new(slots: Arc<crate::sandbox_api::Slots>, head: Duration) -> Conns {
+        let pending: Arc<Mutex<HashMap<u64, (TcpStream, Instant)>>> = Default::default();
+        let p = pending.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep((head / 4).min(Duration::from_secs(1)));
+                p.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|_, (s, until)| {
+                    let late = *until <= Instant::now();
+                    if late {
+                        let _ = s.shutdown(std::net::Shutdown::Both);
+                    }
+                    !late
+                });
+            }
+        });
+        Conns { slots, head, pending, next: Default::default() }
+    }
+
+    fn serve(&self, c: &Arc<Controller>, tls: Option<Arc<rustls::ServerConfig>>, s: TcpStream) {
+        let Ok(peer) = s.peer_addr().map(|a| a.ip()) else { return };
         let _ = s.set_read_timeout(Some(crate::sandbox_api::READ_TIMEOUT));
-        let (c, tls) = (c.clone(), tls.clone());
-        crate::sandbox_api::spawn_limited(move || {
-            let peer = s.peer_addr().ok().map(|a| a.ip());
-            let r = crate::tls::accept(tls.as_ref(), s).and_then(|stream| controller_handle(&c, peer, stream));
+        let _ = s.set_write_timeout(Some(Duration::from_secs(60)));
+        let ticket = self.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let Ok(watch) = s.try_clone() else { return };
+        self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(ticket, (watch, Instant::now() + self.head));
+        let (cc, pending) = (c.clone(), self.pending.clone());
+        let started = self.slots.spawn(peer, c.trusted(peer), move || {
+            let done = || {
+                pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&ticket);
+            };
+            let r = crate::tls::accept(tls.as_ref(), s).and_then(|stream| serve_request(&cc, Some(peer), stream, &done));
+            done();
             if let Err(e) = r {
                 eprintln!("rekcod: controller: {e:#}");
             }
         });
+        if !started {
+            self.pending.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&ticket);
+        }
     }
-    Ok(())
 }
 
 /// Set on SIGTERM: stop taking connections, let deploys in flight finish, then exit.

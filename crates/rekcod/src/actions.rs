@@ -283,11 +283,12 @@ impl Input {
 }
 
 /// Why `v` isn't a valid `kind` value, or `None` when it is. The dashboard checks the
-/// same rules (lib/inputs.ts) before anything runs.
+/// same rules (lib/inputs.ts) before anything runs; dashboard/fixtures/input-vectors.json holds
+/// both to the same answers.
 pub fn invalid(kind: InputKind, v: &str) -> Option<String> {
     let max = if kind == InputKind::Env { 4096 } else { 255 };
     if v.is_empty() || v.len() > max {
-        return Some(format!("must be 1 to {max} characters"));
+        return Some(format!("must be 1 to {max} bytes"));
     }
     if v.starts_with('-') || v.chars().any(|c| c.is_control()) {
         return Some("can't start with - or contain control characters".into());
@@ -297,7 +298,8 @@ pub fn invalid(kind: InputKind, v: &str) -> Option<String> {
             && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
             && s.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
     };
-    let port = |s: &str| s.parse::<u16>().is_ok_and(|p| p > 0);
+    // `parse` alone would take "+80".
+    let port = |s: &str| (1..=5).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u16>().is_ok_and(|p| p > 0);
     let ok = match kind {
         InputKind::Image => {
             v.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -1961,6 +1963,17 @@ pub mod tests {
             filled.last().is_some_and(|s| s.starts_with(r#"[ -z "$(ls -A /to)" ] || {"#) && s.ends_with("cp -a /v/. /to/")),
             "{filled:?}"
         );
+    }
+
+    /// The cases the dashboard's `invalid` (lib/inputs.ts) is held to as well.
+    #[test]
+    fn input_values_match_the_dashboards() {
+        let rows: Vec<(String, String, bool)> =
+            serde_json::from_str(include_str!("../../../dashboard/fixtures/input-vectors.json")).unwrap();
+        assert!(rows.len() > 20);
+        for (k, v, valid) in rows {
+            assert_eq!(invalid(InputKind::from_name(&k).unwrap(), &v).is_none(), valid, "{k} {v:?}");
+        }
     }
 
     #[test]

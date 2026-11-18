@@ -1,12 +1,13 @@
 // The dashboard's copy of `actions::invalid` and `actions::fill` (crates/rekcod/src/actions.rs).
 // /api/run fills an offered action's `{key}` slots with values checked here; the form checks
-// the same rules as you type. Keep the two in step.
+// the same rules as you type. fixtures/input-vectors.json holds both to the same answers.
 import type { Input, InputKind } from "./types"
 
 const NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/
 const IMAGE = /^[A-Za-z0-9][A-Za-z0-9._/:@-]*$/
 const ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/
-const IPV4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/
+// Octets without a leading zero, as Rust's `Ipv4Addr` parses them.
+const IPV4 = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/
 
 const port = (s: string) => /^\d{1,5}$/.test(s) && Number(s) > 0 && Number(s) <= 65535
 const ipv4 = (s: string) => IPV4.test(s) && s.split(".").every((p) => Number(p) <= 255)
@@ -19,12 +20,16 @@ const WHY: Record<InputKind, string> = {
   mount: "use VOLUME:/path or /mac/path:/path, optionally :ro",
 }
 
+const bytes = (v: string) => new TextEncoder().encode(v).length
+
 /** Why `v` isn't a valid `kind` value, or null when it is. */
 export function invalid(kind: InputKind, v: string): string | null {
+  if (!(kind in WHY)) return "isn't a kind of value this dashboard can check"
   const max = kind === "env" ? 4096 : 255
-  if (!v.length || v.length > max) return `must be 1 to ${max} characters`
-  if (v.startsWith("-") || /[\u0000-\u001f\u007f]/.test(v)) return "can't start with - or contain control characters"
-  let ok: boolean
+  if (!v.length || bytes(v) > max) return `must be 1 to ${max} bytes`
+  // C0, DEL and C1, as Rust's `char::is_control`.
+  if (v.startsWith("-") || /[\u0000-\u001f\u007f-\u009f]/.test(v)) return "can't start with - or contain control characters"
+  let ok = false
   switch (kind) {
     case "image":
       ok = IMAGE.test(v)
@@ -85,7 +90,8 @@ export function fill(argv: string[], inputs: Input[], values: Values): { argv: s
     if (inner) {
       const v = checked.get(inner.key)![0]
       if (v == null) return { error: `${inner.label} is required` }
-      out.push(t.replace(slot(inner), v))
+      // split/join: `replace` would expand `$&` and `$'` in the value, and fill only the first slot.
+      out.push(t.split(slot(inner)).join(v))
       continue
     }
     out.push(t)

@@ -463,6 +463,8 @@ struct Facts {
     switch_to: Option<String>,
     rekcod_context: bool,
     host_contexts: Vec<String>,
+    /// No docker CLI: contexts are read and changed in `~/.docker` directly.
+    offline: bool,
 }
 
 /// Machine-wide state (the `rekcod` context, `~/.zshenv`, firewall, pmset, the ssh
@@ -556,15 +558,28 @@ fn facts(paths: &Paths, keep_data: bool) -> Facts {
     let default_home = paths.is_default_home();
     let jobs = AGENTS.iter().copied().filter(|a| crate::service::installed_here(paths, a)).collect();
     let mut f = Facts { default_home, keep_data, jobs, socket: crate::syssock::present(paths), ..Default::default() };
-    if default_home && crate::docker::available() {
-        f.rekcod_context = crate::docker::context_exists(crate::docker::CONTEXT);
-        f.host_contexts = crate::host::contexts();
-        let current = crate::docker::current_context().unwrap_or_default();
+    if default_home {
+        let current = if crate::docker::available() {
+            f.rekcod_context = crate::docker::context_exists(crate::docker::CONTEXT);
+            f.host_contexts = crate::host::contexts();
+            crate::docker::current_context().unwrap_or_default()
+        } else {
+            // No docker CLI left: read its contexts off disk, so a removed Docker Desktop
+            // doesn't leave `currentContext` pointing at rekcod's dead socket.
+            f.offline = true;
+            let stored = crate::docker::stored::contexts();
+            f.rekcod_context = stored.iter().any(|(n, _)| n == crate::docker::CONTEXT);
+            f.host_contexts = stored.into_iter().filter(|(n, d)| crate::host::owned(n, d)).map(|(n, _)| n).collect();
+            crate::docker::stored::current()
+        };
         let leaving = current == crate::docker::CONTEXT || (!keep_data && f.host_contexts.contains(&current));
         if leaving {
             let prev = std::fs::read_to_string(paths.prev_context()).unwrap_or_default().trim().to_string();
             let ours = prev == crate::docker::CONTEXT || prev.starts_with("rekcod-");
-            f.switch_to = Some(if !prev.is_empty() && !ours && crate::docker::context_exists(&prev) { prev } else { "default".into() });
+            let exists = |c: &str| {
+                if f.offline { crate::docker::stored::contexts().iter().any(|(n, _)| n == c) } else { crate::docker::context_exists(c) }
+            };
+            f.switch_to = Some(if !prev.is_empty() && !ours && exists(&prev) { prev } else { "default".into() });
         }
     }
     f
@@ -614,7 +629,9 @@ pub fn uninstall(paths: &Paths, keep_data: bool, yes: bool) -> Result<()> {
         Step::StopVm => one("stop the VM".into(), crate::cli::stop(paths, true, false)),
         Step::RemoveJob(j) => one(format!("remove {}", crate::service::label(j)), crate::service::uninstall(j)),
         Step::HandBackSocket => one("hand back /var/run/docker.sock".into(), crate::syssock::uninstall(paths)),
+        Step::SwitchContext(to) if f.offline => one(format!("switch docker context to {to}"), crate::docker::stored::use_context(to)),
         Step::SwitchContext(to) => one(format!("switch docker context to {to}"), crate::docker::use_context(to)),
+        Step::RemoveContext(c) if f.offline => one(format!("remove docker context {c}"), crate::docker::stored::remove(c)),
         Step::RemoveContext(c) => one(format!("remove docker context {c}"), crate::docker::run_ok(&["context", "rm", "-f", c]).map(|_| ())),
         Step::System => crate::server::undo_system(paths),
         Step::RemoveInclude => one("remove rekcod's Include from ~/.ssh/config".into(), crate::sshkey::remove_include()),
@@ -1169,6 +1186,7 @@ mod tests {
             switch_to: Some("default".into()),
             rekcod_context: true,
             host_contexts: vec!["rekcod-mini".into()],
+            offline: false,
         }
     }
 

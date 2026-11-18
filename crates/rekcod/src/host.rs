@@ -206,6 +206,11 @@ pub fn contexts() -> Vec<String> {
     owned_contexts(&String::from_utf8_lossy(&o.stdout))
 }
 
+/// Whether a context named `name` with `description` is one `host add` made.
+pub fn owned(name: &str, description: &str) -> bool {
+    name.starts_with(PREFIX) && description.starts_with(DESCRIPTION)
+}
+
 fn owned_contexts(raw: &str) -> Vec<String> {
     raw.lines()
         .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())

@@ -5907,7 +5907,9 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 Some(s) if method == "GET" => c.open_sealed(ns, &s)?,
                 _ => {
                     let s = secret()?;
-                    c.db().execute("update apps set webhook_secret = ?2 where name = ?1", &[&app.name, &c.seal(ns, &s)?])?;
+                    // Sealed first: `seal` reads the namespace salt, and `c.db()` isn't reentrant.
+                    let sealed = c.seal(ns, &s)?;
+                    c.db().execute("update apps set webhook_secret = ?2 where name = ?1", &[&app.name, &sealed])?;
                     c.audit(ns, &who.name, "webhook secret", name, true);
                     s
                 }
@@ -9261,6 +9263,24 @@ mod tests {
         }
         let r = c.db().query_one("select owner, preview_of from apps where name = 'foo-pr-4'", &[]).unwrap();
         assert_eq!((r.get::<String>(0), r.get::<Option<String>>(1)), ("alice".into(), Some("foo".into())));
+    }
+
+    #[test]
+    fn app_webhook_makes_keeps_and_rotates_its_secret() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "foo", "git": {"url": "https://github.com/a/foo"}}), None)
+            .unwrap();
+        let hook = |m: &str| {
+            apps_route(&c, &Caller::user("alice"), "default", m, &["apps", "foo", "webhook"], &json!({}), &[]).unwrap()["secret"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let first = hook("GET");
+        assert_eq!(hook("GET"), first, "a second GET returns the stored secret");
+        let rotated = hook("POST");
+        assert_ne!(rotated, first);
+        assert_eq!(hook("GET"), rotated);
     }
 
     #[test]

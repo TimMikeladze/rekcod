@@ -98,7 +98,7 @@ s2=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.2
 check "drained node gets no new sandboxes" sh -c '"$0" sandbox ls --remote alice | grep -A1 "\"$1\"" | grep "\"node\"" | grep -vq "$2" || "$0" sandbox ls --remote alice | grep -B3 "\"$1\"" | grep "\"node\"" | grep -vq "$2"' "$R" "$s2" "$first"
 check "quota (2) refuses a third" sh -c '! "$0" sandbox create --remote alice --git "$1" --ref main --image alpine:3.24' "$R" "$url"
 check "remote rm" sh -c '"$0" sandbox rm --remote alice "$1" "$2"' "$R" "$s1" "$s2"
-sqlite3 "$C/controller/fleet.db" "update nodes set state = 'ready'"
+cr node undrain "$first" --remote admin >/dev/null
 
 echo "apps"
 REKCOD_HOME=$C "$R" edge serve --remote edge --listen 127.0.0.1:18088 --public-listen 127.0.0.1:18089 >"$C/edge.log" 2>&1 &
@@ -206,11 +206,16 @@ check "detached job starts" test -n "$jid"
 sleep 4
 check "another user can't read it" sh -c '! "$0" job logs --remote bob "$1"' "$R" "$jid"
 check "job cancel" cr job cancel --remote alice "$jid"
-check "cancelled in job ls" sh -c '"$0" job ls --remote alice | grep -A8 "\"$1\"" | grep -q cancelled' "$R" "$jid"
-check "schedule every 3s" job --name tick --every 3s -- echo tick
-sleep 25
-check "schedule ran at least twice" sh -c 'test "$("$0" job ls --remote alice | grep -c "\"schedule\": \"tick\"")" -ge 2' "$R"
+# `cancelling` until the node confirms the command is gone.
+check "cancelled in job ls" sh -c 'for _ in $(seq 20); do "$0" job ls --remote alice | grep -A8 "\"$1\"" | grep -q cancelled && exit 0; sleep 1; done; exit 1' "$R" "$jid"
+check "schedules under 60s are refused" sh -c '! "$0" job run --remote alice --git "$1" --ref "$2" --image alpine:3.24 --name tick --every 3s -- echo tick' "$R" "$url" "$v1"
+check "schedule every 60s" job --name tick --every 60s -- echo tick
+# The first run starts on the watchdog's next tick.
+for _ in $(seq 30); do "$R" job ls --remote alice | grep -q '"schedule": "tick"' && break; sleep 1; done
+check "schedule ran" sh -c '"$0" job ls --remote alice | grep -q "\"schedule\": \"tick\""' "$R"
 check "unschedule" cr job unschedule --remote alice tick
+# Active jobs count against alice's cap of 2, which the namespace checks below need.
+for _ in $(seq 60); do "$R" job ls --remote alice | grep -qE '"state": "(pending|running|cancelling)"' || break; sleep 1; done
 
 echo "namespaces"
 check "ns create (4 CPUs, 4 GiB)" cr ns create team --max-cpus 4 --max-memory 4 --remote admin

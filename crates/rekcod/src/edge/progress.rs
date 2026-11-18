@@ -3,6 +3,8 @@
 //! instead of counting it.
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -31,13 +33,31 @@ pub struct Progress {
     sleep: Pin<Box<Sleep>>,
     /// Dropped when the body has ended (or is dropped itself), which the receiver sees.
     done: Option<oneshot::Sender<()>>,
+    watch: Arc<Watch>,
+}
+
+/// What [`Progress`] tells the request that sends it.
+pub struct Watch {
+    /// When the last chunk went through, or the body was first asked for.
+    last: std::sync::Mutex<tokio::time::Instant>,
+    /// The instance asked for more and the client hasn't sent it yet.
+    waiting: AtomicBool,
+}
+
+impl Watch {
+    /// The instance stopped taking the body: nothing asked for a chunk for `idle`. (A client
+    /// that stops sending is the body's own 408.)
+    pub fn instance_stalled(&self, idle: Duration) -> bool {
+        !self.waiting.load(Ordering::Relaxed) && self.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner).elapsed() >= idle
+    }
 }
 
 impl Progress {
-    pub fn new(inner: Body, idle: Duration) -> (Progress, oneshot::Receiver<()>) {
+    pub fn new(inner: Body, idle: Duration) -> (Progress, oneshot::Receiver<()>, Arc<Watch>) {
         let (tx, rx) = oneshot::channel();
         let done = (!inner.is_end_stream()).then_some(tx);
-        (Progress { inner, idle, sleep: Box::pin(tokio::time::sleep(idle)), done }, rx)
+        let watch = Arc::new(Watch { last: std::sync::Mutex::new(tokio::time::Instant::now()), waiting: AtomicBool::new(false) });
+        (Progress { inner, idle, sleep: Box::pin(tokio::time::sleep(idle)), done, watch: watch.clone() }, rx, watch)
     }
 }
 
@@ -53,17 +73,22 @@ impl HttpBody for Progress {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(f)) => {
-                let deadline = tokio::time::Instant::now() + this.idle;
-                this.sleep.as_mut().reset(deadline);
+                let now = tokio::time::Instant::now();
+                this.sleep.as_mut().reset(now + this.idle);
+                *this.watch.last.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = now;
+                this.watch.waiting.store(false, Ordering::Relaxed);
                 if this.inner.is_end_stream() {
                     this.done = None;
                 }
                 Poll::Ready(Some(f))
             }
-            Poll::Pending => match this.sleep.as_mut().poll(cx) {
-                Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(Stalled)))),
-                Poll::Pending => Poll::Pending,
-            },
+            Poll::Pending => {
+                this.watch.waiting.store(true, Ordering::Relaxed);
+                match this.sleep.as_mut().poll(cx) {
+                    Poll::Ready(()) => Poll::Ready(Some(Err(Box::new(Stalled)))),
+                    Poll::Pending => Poll::Pending,
+                }
+            }
         }
     }
 

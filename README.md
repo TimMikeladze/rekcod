@@ -379,8 +379,8 @@ the private edge on the configured tailnet or LAN.
 
 ### Edge limits and client addresses
 
-Server setup installs the edge as `rekcod edge serve --listen <addr>:8080 --public-listen
-127.0.0.1:8081 --install`. The options that change what it accepts:
+Server setup installs the edge as `rekcod edge serve --remote edge --listen <addr>:8080
+--public-listen 127.0.0.1:8081 --install`. The options that change what it accepts:
 
 ```sh
 # Peers whose X-Forwarded-For names the client. Default: loopback, where cloudflared runs.
@@ -394,9 +394,9 @@ rekcod edge serve --rate 50/s --burst 100
 ```
 
 X-Forwarded-For is read from the right: the first address that isn't a trusted proxy is the
-client. CF-Connecting-IP is ignored unless `--client-ip-header` names it, because only
-Cloudflare overwrites it; through cloudflared the X-Forwarded-For path gives the same
-address. The app gets `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`
+client. CF-Connecting-IP is removed from the request unless `--client-ip-header` names it,
+because only Cloudflare overwrites it. Through cloudflared that's fine: Cloudflare appends the
+address it saw to X-Forwarded-For, so the rightmost entry is the visitor. The app gets `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`
 and `X-Request-Id` from the edge; `Forwarded`, `True-Client-IP`, `X-Client-IP`,
 `X-Forwarded-Port` and `X-Forwarded-Server` from the client are removed.
 

@@ -37,7 +37,7 @@ pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
 /// From the first byte of a request head until it's complete.
-const HEADER_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(150) } else { Duration::from_secs(10) };
+const HEADER_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(100) } else { Duration::from_secs(10) };
 /// How long an instance has to answer once the request body is in; `[http] timeout` changes it.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 /// A request body that sends nothing for this long is cut off with a 408.
@@ -289,7 +289,7 @@ impl Edge {
                     let (tx, done) = tokio::sync::watch::channel(None);
                     let waiters = Arc::new(tokio::sync::Semaphore::new(WAKE_WAITERS));
                     waking.insert(host.to_string(), Waking { done: done.clone(), waiters: waiters.clone() });
-                    tokio::spawn(self.clone().run_wake(r, host.to_string(), route.clone(), tx));
+                    tokio::spawn(self.clone().run_wake(r, host.to_string(), route.clone(), failed.to_vec(), tx));
                     (done, waiters)
                 }
             }
@@ -302,7 +302,14 @@ impl Edge {
     }
 
     /// The controller call behind [`Edge::wake`]; it may take minutes when the app is rebuilt.
-    async fn run_wake(self: Arc<Self>, r: Remote, host: String, route: Route, tx: tokio::sync::watch::Sender<Option<Vec<String>>>) {
+    async fn run_wake(
+        self: Arc<Self>,
+        r: Remote,
+        host: String,
+        route: Route,
+        failed: Vec<String>,
+        tx: tokio::sync::watch::Sender<Option<Vec<String>>>,
+    ) {
         let ns = if route.ns.is_empty() { "default".to_string() } else { route.ns.clone() };
         let app = route.app.clone();
         let path = format!("/ns/{ns}/apps/{app}/wake");
@@ -319,7 +326,9 @@ impl Edge {
         {
             r.endpoints = eps.clone();
         }
-        if eps.is_empty() {
+        // Nothing new (an app that crashed rather than slept comes back with the endpoints
+        // that just failed) is a failed wake too, or every request would ask again.
+        if eps.iter().all(|e| failed.contains(e)) {
             self.wake_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(host.clone(), Instant::now());
         }
         self.waking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&host);
@@ -645,21 +654,30 @@ fn caused_by<T: std::error::Error + 'static>(e: &hyper::Error) -> bool {
 }
 
 /// Sends `req` on `lease` and waits for the response head: while the body uploads it has to
-/// keep moving, then the instance has `answer_within`. `Err(None)` when it took too long.
+/// keep moving both ways, then the instance has `answer_within`. `Err(None)` when it took
+/// too long.
 async fn send(
     lease: &mut balance::Lease,
     parts: Parts,
     body: Body,
     answer_within: Duration,
 ) -> Result<Response<Incoming>, Option<hyper::Error>> {
-    let (body, mut uploaded) = progress::Progress::new(body, BODY_IDLE);
+    let (body, mut uploaded, watch) = progress::Progress::new(body, BODY_IDLE);
     let sending = lease.sender().send_request(Request::from_parts(parts, body.boxed_unsync()));
     tokio::pin!(sending);
-    let sent = tokio::select! {
-        r = &mut sending => Ok(r),
-        _ = &mut uploaded => tokio::time::timeout(answer_within, &mut sending).await,
-    };
-    match sent {
+    let mut tick = tokio::time::interval(BODY_IDLE / 4);
+    loop {
+        tokio::select! {
+            r = &mut sending => return r.map_err(Some),
+            _ = &mut uploaded => break,
+            _ = tick.tick() => {
+                if watch.instance_stalled(BODY_IDLE) {
+                    return Err(None);
+                }
+            }
+        }
+    }
+    match tokio::time::timeout(answer_within, &mut sending).await {
         Ok(r) => r.map_err(Some),
         Err(_) => Err(None),
     }
@@ -737,7 +755,7 @@ async fn forward(edge: &Arc<Edge>, mut req: Request<Incoming>, host: &str, clien
                 sent = send(&mut lease, parts, empty, answer_within).await;
             }
             return match sent {
-                Err(None) => text(StatusCode::GATEWAY_TIMEOUT, format!("{host} took over {}s to answer\n", answer_within.as_secs())),
+                Err(None) => text(StatusCode::GATEWAY_TIMEOUT, format!("{host} took too long to take the request or answer it\n")),
                 Err(Some(e)) if caused_by::<http_body_util::LengthLimitError>(&e) => {
                     text(StatusCode::PAYLOAD_TOO_LARGE, format!("request body over {max_body} bytes\n"))
                 }
@@ -1234,7 +1252,8 @@ mod tests {
         let mut s = dial(&addr).await;
         s.get_mut().write_all(b"GET / HTTP/1.1\r\nHost: a.te").await.unwrap();
         let mut buf = Vec::new();
-        let closed = tokio::time::timeout(HEADER_TIMEOUT * 2, s.read_to_end(&mut buf)).await;
+        // Well before the idle timeout would close it.
+        let closed = tokio::time::timeout(IDLE_TIMEOUT, s.read_to_end(&mut buf)).await;
         assert!(matches!(closed, Ok(Ok(_))), "{closed:?}");
     }
 
@@ -1286,11 +1305,11 @@ mod tests {
             s.read_line(&mut line).await.unwrap();
             line
         };
-        // Ten chunks 150 ms apart: longer than the 1 s timeout, never quiet for BODY_IDLE.
+        // Chunks 50 ms apart for longer than the 1 s timeout, never quiet for BODY_IDLE.
         let mut s = dial(&addr).await;
         s.get_mut().write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
-        for _ in 0..10 {
-            tokio::time::sleep(Duration::from_millis(150)).await;
+        for _ in 0..25 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
             s.get_mut().write_all(b"1\r\nx\r\n").await.unwrap();
         }
         s.get_mut().write_all(b"0\r\n\r\n").await.unwrap();
@@ -1301,6 +1320,50 @@ mod tests {
         s.get_mut().write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n").await.unwrap();
         let line = status(s).await;
         assert!(line.starts_with("HTTP/1.1 408"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn an_instance_that_stops_reading_the_upload_gets_a_504() {
+        // Reads the head, then nothing.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut r = BufReader::new(s);
+                    let mut line = String::new();
+                    while line != "\r\n" {
+                        line.clear();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_secs(30)).await;
+                });
+            }
+        });
+        let edge = Edge::new(None, fast());
+        let http = HttpSettings { timeout: Some(1), ..Default::default() };
+        edge.table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("a.test".into(), Route { http, ..route(&[&a], false) });
+        let addr = edge_on(&edge, Listener::default()).await;
+        let (rd, mut wr) = TcpStream::connect(&addr).await.unwrap().into_split();
+        let size = 32 << 20;
+        tokio::spawn(async move {
+            wr.write_all(format!("POST / HTTP/1.1\r\nHost: a.test\r\nContent-Length: {size}\r\n\r\n").as_bytes()).await.unwrap();
+            let chunk = vec![b'x'; 64 << 10];
+            for _ in 0..size / chunk.len() {
+                if wr.write_all(&chunk).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let mut line = String::new();
+        let got = tokio::time::timeout(Duration::from_secs(5), BufReader::new(rd).read_line(&mut line)).await;
+        assert!(got.is_ok() && line.starts_with("HTTP/1.1 504"), "{line:?}");
     }
 
     /// An instance that answers the first request on each connection and closes on the second.
@@ -1477,6 +1540,19 @@ mod tests {
         assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
         // The wake itself goes on: a second request joins it rather than starting another.
         assert_eq!(get(&mut dial(&addr).await, "a.test", "").await.0, 503);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_wake_that_names_the_dead_endpoints_again_backs_off() {
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
+        let (remote, wakes) = controller(Duration::ZERO, 200, format!(r#"{{"endpoints":["{dead}"]}}"#)).await;
+        let edge = Edge::new(Some(remote), fast());
+        sleeping(&edge, &[&dead]);
+        let addr = edge_on(&edge, Listener::default()).await;
+        for _ in 0..5 {
+            assert_eq!(get(&mut dial(&addr).await, "a.test", "").await.0, 503);
+        }
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
     }
 

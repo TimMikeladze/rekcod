@@ -14,13 +14,13 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSImage, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSBorderType, NSCellImagePosition, NSImage, NSMenu,
+    NSMenuDelegate, NSMenuItem, NSScrollView, NSStatusBar, NSStatusItem, NSTextField, NSTextView, NSVariableStatusItemLength, NSView,
 };
 use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 use serde_json::Value;
 
-use crate::actions::{self, Action, Engine, InputKind, Model, Run};
+use crate::actions::{self, Action, Engine, Model, Run};
 use crate::paths::Paths;
 
 const LABEL: &str = "dev.rekcod.menubar";
@@ -498,9 +498,9 @@ pub fn engine_entries(e: &Engine) -> Vec<Entry> {
     out
 }
 
-/// One field's text as values: split at commas for repeatable inputs. An env value may hold
-/// commas, so a piece that isn't `KEY=...` joins the one before it.
-pub fn split_values(kind: InputKind, multiple: bool, text: &str) -> Vec<String> {
+/// One field's text as values: one per line for repeatable inputs, as the dashboard's text
+/// area takes them. Commas aren't separators: an env value may hold `,NAME=...`.
+pub fn split_values(multiple: bool, text: &str) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
         return vec![];
@@ -508,19 +508,17 @@ pub fn split_values(kind: InputKind, multiple: bool, text: &str) -> Vec<String> 
     if !multiple {
         return vec![text.to_string()];
     }
-    let mut out: Vec<String> = Vec::new();
-    for piece in text.split(',') {
-        let starts_new = kind != InputKind::Env || actions::invalid(InputKind::Env, piece.trim()).is_none();
-        match out.last_mut() {
-            Some(last) if !starts_new => {
-                last.push(',');
-                last.push_str(piece);
-            }
-            _ => out.push(piece.trim().to_string()),
-        }
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+/// The question asked before an action with inputs runs: its own, if any, then the filled
+/// command, which the input alert couldn't show.
+pub fn filled_question(action: &Action, argv: &[String]) -> String {
+    let line = argv.iter().map(|a| actions::shell_quote(a)).collect::<Vec<_>>().join(" ");
+    match &action.confirm {
+        Some(q) => format!("{q}\n\nrekcod {line}"),
+        None => format!("rekcod {line}"),
     }
-    out.retain(|v| !v.is_empty());
-    out
 }
 
 impl Target {
@@ -607,6 +605,7 @@ impl Target {
         let mut action = action.clone();
         if !action.inputs.is_empty() {
             let Some(argv) = self.ask_inputs(&action) else { return };
+            action.confirm = Some(filled_question(&action, &argv));
             action.run = Run::Rekcod(argv);
             action.inputs.clear();
         }
@@ -662,12 +661,19 @@ impl Target {
         }
     }
 
-    /// One alert with a field per input; asks again (keeping what was typed) until the values
-    /// pass `actions::fill` or it's cancelled. The filled argv, or `None`.
+    /// One alert with a field per input (a text box, one value per line, for repeatable ones);
+    /// asks again, keeping what was typed, until the values pass `actions::fill` or it's
+    /// cancelled. The filled argv, or `None`.
     fn ask_inputs(&self, action: &Action) -> Option<Vec<String>> {
+        enum Field {
+            Line(Retained<NSTextField>),
+            Lines(Retained<NSTextView>),
+        }
         let mtm = self.mtm();
         let Run::Rekcod(argv) = &action.run else { return None };
-        let (w, row) = (340.0, 48.0);
+        let (w, label_h, line_h, lines_h) = (340.0, 22.0, 26.0, 66.0);
+        let height = |i: &actions::Input| label_h + if i.multiple { lines_h } else { line_h };
+        let total: f64 = action.inputs.iter().map(height).sum();
         let mut typed: Vec<String> = vec![String::new(); action.inputs.len()];
         let mut problem: Option<String> = None;
         loop {
@@ -680,35 +686,60 @@ impl Target {
             alert.setInformativeText(&NSString::from_str(&hint));
             alert.addButtonWithTitle(&NSString::from_str(&action.label));
             alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-            let n = action.inputs.len() as f64;
-            let view = NSView::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, row * n)));
+            let view = NSView::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, total)));
             let mut fields = Vec::new();
+            let mut top = total;
             for (k, i) in action.inputs.iter().enumerate() {
-                let y = (n - 1.0 - k as f64) * row;
                 let mut text = i.label.clone();
                 if i.optional {
                     text.push_str(" (optional)");
                 }
                 if i.multiple {
-                    text.push_str(", comma-separated");
+                    text.push_str(&format!(", one per line, e.g. {}", i.placeholder));
                 }
+                top -= label_h;
                 let label = NSTextField::labelWithString(&NSString::from_str(&text), mtm);
-                label.setFrame(NSRect::new(NSPoint::new(0.0, y + 26.0), NSSize::new(w, 18.0)));
-                let field = NSTextField::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, y + 2.0), NSSize::new(w, 22.0)));
-                field.setPlaceholderString(Some(&NSString::from_str(&i.placeholder)));
-                field.setStringValue(&NSString::from_str(&typed[k]));
+                label.setFrame(NSRect::new(NSPoint::new(0.0, top + 2.0), NSSize::new(w, 18.0)));
                 view.addSubview(&label);
-                view.addSubview(&field);
-                fields.push(field);
+                if i.multiple {
+                    top -= lines_h;
+                    let frame = NSRect::new(NSPoint::new(0.0, top + 4.0), NSSize::new(w, lines_h - 6.0));
+                    let scroll = NSScrollView::initWithFrame(mtm.alloc(), frame);
+                    scroll.setHasVerticalScroller(true);
+                    scroll.setBorderType(NSBorderType::BezelBorder);
+                    let tv = NSTextView::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+                    tv.setRichText(false);
+                    tv.setString(&NSString::from_str(&typed[k]));
+                    scroll.setDocumentView(Some(&tv));
+                    view.addSubview(&scroll);
+                    fields.push(Field::Lines(tv));
+                } else {
+                    top -= line_h;
+                    let field = NSTextField::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, top + 2.0), NSSize::new(w, 22.0)));
+                    field.setPlaceholderString(Some(&NSString::from_str(&i.placeholder)));
+                    field.setStringValue(&NSString::from_str(&typed[k]));
+                    view.addSubview(&field);
+                    fields.push(Field::Line(field));
+                }
             }
             alert.setAccessoryView(Some(&view));
-            alert.window().setInitialFirstResponder(fields.first().map(|f| &**f as &NSView));
+            let first: Option<&NSView> = fields.first().map(|f| match f {
+                Field::Line(t) => &**t as &NSView,
+                Field::Lines(t) => &**t as &NSView,
+            });
+            alert.window().setInitialFirstResponder(first);
             NSApplication::sharedApplication(mtm).activate();
             if alert.runModal() != NSAlertFirstButtonReturn {
                 return None;
             }
-            typed = fields.iter().map(|f| f.stringValue().to_string()).collect();
-            let values = action.inputs.iter().zip(&typed).map(|(i, t)| (i.key.clone(), split_values(i.kind, i.multiple, t))).collect();
+            typed = fields
+                .iter()
+                .map(|f| match f {
+                    Field::Line(t) => t.stringValue().to_string(),
+                    Field::Lines(t) => t.string().to_string(),
+                })
+                .collect();
+            let values = action.inputs.iter().zip(&typed).map(|(i, t)| (i.key.clone(), split_values(i.multiple, t))).collect();
             match actions::fill(argv, &action.inputs, &values) {
                 Ok(filled) => return Some(filled),
                 Err(e) => problem = Some(e),
@@ -1066,11 +1097,23 @@ mod tests {
     }
 
     #[test]
-    fn typed_values_split_at_commas() {
-        assert_eq!(split_values(InputKind::Publish, true, " 80:80, 443:443 "), ["80:80", "443:443"]);
-        assert_eq!(split_values(InputKind::Env, true, "A=1,B=x,y,C=2"), ["A=1", "B=x,y", "C=2"]);
-        assert_eq!(split_values(InputKind::Name, false, "a,b"), ["a,b"]);
-        assert!(split_values(InputKind::Mount, true, "  ").is_empty());
+    fn typed_values_are_one_per_line() {
+        assert_eq!(split_values(true, " 80:80\n\n443:443 "), ["80:80", "443:443"]);
+        assert_eq!(
+            split_values(true, "DATABASE_URL=postgres://h/db?a=1,sslmode=require\nB=x,y"),
+            ["DATABASE_URL=postgres://h/db?a=1,sslmode=require", "B=x,y"]
+        );
+        assert_eq!(split_values(false, " a,b "), ["a,b"]);
+        assert!(split_values(true, "  ").is_empty());
+    }
+
+    #[test]
+    fn the_filled_command_is_shown_before_it_runs() {
+        let run = actions::engine_actions(true).into_iter().find(|a| a.kind == actions::Kind::ImageRun).unwrap();
+        let argv: Vec<String> = ["run", "-d", "-e", "A=x y", "nginx"].map(String::from).into();
+        assert_eq!(filled_question(&run, &argv), "rekcod run -d -e 'A=x y' nginx");
+        let confirm = actions::Action { confirm: Some("Push it?".into()), ..run };
+        assert_eq!(filled_question(&confirm, &argv), "Push it?\n\nrekcod run -d -e 'A=x y' nginx");
     }
 
     #[test]

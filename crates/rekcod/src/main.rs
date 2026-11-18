@@ -144,7 +144,7 @@ enum Cmd {
     },
     /// Show VM state, versions, forwarded ports, disk and file-cache stats.
     Status {
-        /// Machine-readable output (the scriptable API, docs/phase5.md §8).
+        /// Machine-readable output.
         #[arg(long)]
         json: bool,
     },
@@ -233,13 +233,13 @@ enum Cmd {
     /// macOS guests: base images for `rekcod sandbox create --os macos`.
     #[command(subcommand)]
     Macos(MacosCmd),
-    /// Fleet controllers this CLI talks to (docs/platform.md).
+    /// Fleet controllers this CLI talks to.
     #[command(subcommand)]
     Remote(RemoteCmd),
-    /// Another Mac's rekcod as your docker engine, over SSH (docs/remote-docker.md).
+    /// Another Mac's rekcod as your docker engine, over SSH.
     #[command(subcommand)]
     Host(HostCmd),
-    /// This Mac as a headless one-machine fleet (docs/server.md); `host add --server` runs it over SSH.
+    /// This Mac as a headless one-machine fleet; `host add --server` runs it over SSH.
     #[command(subcommand)]
     Server(ServerCmd),
     /// Run this Mac as a fleet node.
@@ -251,7 +251,7 @@ enum Cmd {
     /// HTTP ingress for apps: routes <app>.<domain> to live instances.
     #[command(subcommand)]
     Edge(EdgeCmd),
-    /// S3 storage (RustFS): the fleet's bucket, or one in the local VM for development (docs/rustfs.md).
+    /// S3 storage (RustFS): the fleet's bucket, or one in the local VM for development.
     #[command(subcommand)]
     Storage(StorageCmd),
     /// Apps hosted on the fleet: deploy, rollback, scale, env, logs.
@@ -272,7 +272,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: JobCmd,
     },
-    /// Namespaces on the fleet: apps, sandboxes and jobs shared by a team (docs/namespaces.md).
+    /// Namespaces on the fleet: apps, sandboxes and jobs shared by a team.
     Ns {
         #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
@@ -655,10 +655,10 @@ enum MacosCmd {
         #[arg(default_value = "default")]
         name: String,
     },
+    /// Base images.
     Ls,
-    Rm {
-        name: String,
-    },
+    /// Delete a base image.
+    Rm { name: String },
     #[command(hide = true)]
     Run {
         home: std::path::PathBuf,
@@ -687,14 +687,12 @@ enum RemoteCmd {
         #[arg(long)]
         ca_fingerprint: Option<String>,
     },
+    /// Remotes; * marks the default.
     Ls,
-    Rm {
-        name: String,
-    },
+    /// Forget a remote.
+    Rm { name: String },
     /// Make NAME the default remote.
-    Use {
-        name: String,
-    },
+    Use { name: String },
 }
 
 #[derive(Subcommand)]
@@ -815,6 +813,7 @@ enum NsCmd {
 
 #[derive(Subcommand)]
 enum NsMember {
+    /// Add a token name to a namespace with a role.
     Add {
         ns: String,
         who: String,
@@ -822,10 +821,8 @@ enum NsMember {
         #[arg(long, default_value = "member")]
         role: String,
     },
-    Rm {
-        ns: String,
-        who: String,
-    },
+    /// Take a token name out of a namespace; stops their schedules and running jobs there.
+    Rm { ns: String, who: String },
 }
 
 #[derive(Subcommand)]
@@ -872,7 +869,7 @@ enum ControllerCmd {
         #[arg(long = "tls-name")]
         tls_names: Vec<String>,
         /// Advertise over Bonjour, so a remote `https://rekcod-<fingerprint>.bonjour` finds it
-        /// whatever its LAN address or name (docs/lan-discovery.md).
+        /// whatever its LAN address or name.
         #[arg(long)]
         bonjour: bool,
     },
@@ -1016,6 +1013,7 @@ enum EdgeCmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
+    /// Lift a ban on every edge.
     Unban {
         net: String,
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
@@ -1055,15 +1053,12 @@ enum AppCmd {
         #[arg(long, value_parser = duration_secs)]
         recycle: Option<u64>,
     },
+    /// Apps and their state.
     Ls,
     /// Start a sleeping app's instances now.
-    Wake {
-        name: String,
-    },
+    Wake { name: String },
     /// Replace the instances with fresh VMs (a zero-downtime redeploy of the live commit).
-    Recycle {
-        name: String,
-    },
+    Recycle { name: String },
     /// The app's GitHub webhook: the payload URL and secret for the repository's settings
     /// (pull request events deploy previews). Made the first time; `--rotate` makes a new secret.
     Webhook {
@@ -1072,30 +1067,20 @@ enum AppCmd {
         rotate: bool,
     },
     /// Serve an app on the edge's public listener.
-    Public {
-        name: String,
-    },
+    Public { name: String },
     /// Take an app off the public listener (it stays on the private one).
-    Private {
-        name: String,
-    },
+    Private { name: String },
     /// Releases, instances, env and URL.
-    Status {
-        name: String,
-    },
+    Status { name: String },
     /// Go back to an earlier good release (default: the one before the live one).
-    Rollback {
-        name: String,
-        release: Option<i64>,
-    },
-    Scale {
-        name: String,
-        instances: i64,
-    },
+    Rollback { name: String, release: Option<i64> },
+    /// Set the number of instances.
+    Scale { name: String, instances: i64 },
     #[command(subcommand)]
     Env(AppVars),
     #[command(subcommand)]
     Secret(AppVars),
+    /// The app's logs.
     Logs {
         name: String,
         /// One instance's logs (its sandbox ID from `app status`).
@@ -1103,13 +1088,9 @@ enum AppCmd {
         instance: Option<String>,
     },
     /// One release: commit, who deployed it, when it finished, and its deploy log.
-    Release {
-        name: String,
-        n: i64,
-    },
-    Open {
-        name: String,
-    },
+    Release { name: String, n: i64 },
+    /// Open the app's URL in a browser and print it.
+    Open { name: String },
     /// Delete the app; a non-empty bucket needs --force (asked for on a terminal).
     Destroy {
         name: String,
@@ -1210,29 +1191,19 @@ enum JobCmd {
         follow: bool,
     },
     /// Run a finished job's command again (same repo, commit and settings) as a new job.
-    Rerun {
-        id: String,
-    },
-    Cancel {
-        id: String,
-    },
+    Rerun { id: String },
+    /// Stop a job.
+    Cancel { id: String },
     /// Delete a schedule (its running job keeps going).
-    Unschedule {
-        name: String,
-    },
+    Unschedule { name: String },
 }
 
 #[derive(Subcommand)]
 enum AppVars {
     /// KEY=VALUE...; redeploys the live release.
-    Set {
-        name: String,
-        vars: Vec<String>,
-    },
-    Unset {
-        name: String,
-        keys: Vec<String>,
-    },
+    Set { name: String, vars: Vec<String> },
+    /// KEY...; redeploys the live release.
+    Unset { name: String, keys: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -1244,10 +1215,10 @@ enum Golden {
         #[arg(long = "image")]
         images: Vec<String>,
     },
+    /// Golden disks.
     Ls,
-    Rm {
-        name: String,
-    },
+    /// Delete a golden disk.
+    Rm { name: String },
 }
 
 #[derive(Subcommand)]
@@ -1259,7 +1230,7 @@ enum HostCmd {
         /// Create the context without switching to it.
         #[arg(long)]
         no_use: bool,
-        /// Also make DEST a server: a fleet you deploy apps to, running headless (docs/server.md).
+        /// Also make DEST a server: a fleet you deploy apps to, running headless.
         #[arg(long, requires = "domain")]
         server: bool,
         /// Apps are served at <app>.<domain> (with --server).
@@ -1343,7 +1314,7 @@ enum ServerCmd {
         #[arg(long, conflicts_with = "lan")]
         addr: Option<String>,
         /// No fixed address: loopback inside, found over Bonjour from other Macs (the
-        /// default without Tailscale; docs/lan-discovery.md).
+        /// default without Tailscale).
         #[arg(long)]
         lan: bool,
         /// Skip `sudo pmset`.
@@ -1381,7 +1352,7 @@ enum Socket {
     Uninstall,
 }
 
-/// Phase 6 prototypes (docs/research.md). The daemon must run with REKCOD_RESEARCH=1.
+/// Phase 6 prototypes. The daemon must run with REKCOD_RESEARCH=1.
 #[derive(Subcommand)]
 enum Research {
     /// Cold lstat latency: host metadata server over vsock vs virtio-fs.
@@ -2303,6 +2274,29 @@ mod tests {
         assert_eq!(duration_secs("0"), Ok(0));
         assert!(duration_secs("99999999999999999h").is_err());
         assert!(duration_secs("3w").is_err());
+    }
+
+    /// Every command `--help` lists appears in the README as `rekcod <path>` (its command
+    /// reference, at least), so a new one can't ship undocumented.
+    #[test]
+    fn every_command_is_in_the_readme() {
+        use clap::CommandFactory;
+        fn walk(c: &clap::Command, path: &str, out: &mut Vec<String>) {
+            for s in c.get_subcommands().filter(|s| !s.is_hide_set() && s.get_name() != "help") {
+                let p = format!("{path} {}", s.get_name());
+                out.push(p.clone());
+                walk(s, &p, out);
+            }
+        }
+        let readme = include_str!("../../../README.md");
+        let mut paths = Vec::new();
+        walk(&Args::command(), "rekcod", &mut paths);
+        assert!(paths.len() > 100, "{paths:?}");
+        let named = |p: &str| {
+            readme.match_indices(p).any(|(i, m)| !readme[i + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric() || c == '-'))
+        };
+        let missing: Vec<&String> = paths.iter().filter(|p| !named(p)).collect();
+        assert!(missing.is_empty(), "not in README.md (add them to its command reference): {missing:?}");
     }
 
     #[test]

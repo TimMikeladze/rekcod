@@ -12,7 +12,7 @@ use rekcod_proto::{
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader, copy_bidirectional};
 use tokio::net::{TcpListener, TcpStream, UdpSocket, UnixStream};
 use tokio::sync::{mpsc, oneshot};
-use tokio_vsock::{VMADDR_CID_ANY, VMADDR_CID_HOST, VsockAddr, VsockListener, VsockStream};
+use tokio_vsock::{VMADDR_CID_ANY, VsockAddr, VsockListener, VsockStream};
 
 const DOCKER_SOCK: &str = "/var/run/docker.sock";
 /// Ignore clock corrections smaller than this to avoid needless jumps.
@@ -50,6 +50,13 @@ pub fn run() -> Result<()> {
     })
 }
 
+/// VMADDR_CID_LOCAL: a loopback connection's peer.
+const CID_LOCAL: u32 = 1;
+
+fn from_this_guest(peer: u32, ours: Option<u32>) -> bool {
+    peer == CID_LOCAL || Some(peer) == ours
+}
+
 /// One failed accept (EMFILE, say) mustn't end the agent: that would drop every session,
 /// forward and the DNS channel at once. Log it and wait a moment instead.
 async fn accept_failed(port: u32, e: std::io::Error) {
@@ -73,9 +80,10 @@ where
                 continue;
             }
         };
-        // Only the Mac. A guest-local connect (a container allowed AF_VSOCK, with a loopback
-        // transport loaded) would otherwise reach dockerd and the control port as root.
-        if peer.cid() != VMADDR_CID_HOST {
+        // Not from inside the guest. A guest-local connect (a container allowed AF_VSOCK, with
+        // a loopback transport loaded) would otherwise reach dockerd and the control port as
+        // root. Such a peer has the guest's own CID, or VMADDR_CID_LOCAL.
+        if from_this_guest(peer.cid(), stream.local_addr().map(|a| a.cid()).ok()) {
             for l in refused.lines(format!("rekcod-agent: port {port}: refused a connection from CID {}", peer.cid()), Instant::now()) {
                 eprintln!("{l}");
             }
@@ -847,6 +855,15 @@ mod tests {
         let r = refused(&p[..24]);
         assert_eq!((r[3] & 0x0f, &r[6..12]), (5, &[0u8; 6][..]));
         assert_eq!(r.len(), 24, "header and question");
+    }
+
+    #[test]
+    fn vsock_peers_inside_the_guest_are_refused() {
+        // The Mac is CID 2; this guest has some CID of its own (3 and up).
+        assert!(!from_this_guest(2, Some(3)));
+        assert!(from_this_guest(3, Some(3)));
+        assert!(from_this_guest(1, Some(3)));
+        assert!(from_this_guest(1, None));
     }
 
     #[test]

@@ -35,17 +35,34 @@ use crate::paths::Paths;
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
-const HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// From the first byte of a request head until it's complete.
+const HEADER_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(150) } else { Duration::from_secs(10) };
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
 const DEFAULT_MAX_BODY: u64 = 100 << 20;
+/// Client connections across both listeners, at most; fewer when descriptors are short.
 const MAX_CONNS: usize = 10_000;
 /// Upgraded connections (WebSockets) open at once, and how long one may sit silent.
 const MAX_TUNNELS: usize = 5_000;
 const TUNNEL_IDLE: Duration = Duration::from_secs(3600);
-static TUNNELS: std::sync::LazyLock<Arc<tokio::sync::Semaphore>> =
-    std::sync::LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_TUNNELS)));
+/// Per client address (IPv6 /64) that isn't a trusted proxy.
+const CLIENT_CONNS: usize = 200;
+const CLIENT_TUNNELS: usize = 100;
+/// Concurrent requests on one HTTP/2 connection; each takes an instance connection.
+const H2_STREAMS: u32 = 100;
 const AUTO_BAN: Duration = Duration::from_secs(600);
+/// A connection that moves no bytes for this long is closed, also mid-response.
 const IDLE_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(400) } else { Duration::from_secs(90) };
+/// How long a stopping edge waits for requests in flight. Under launchd's default exit
+/// timeout (20 s), after which it sends SIGKILL.
+const DRAIN: Duration = Duration::from_secs(15);
+
+/// Connection and tunnel caps for a descriptor limit: each takes two descriptors (client
+/// and instance), with some left for the process, idle instance connections and the log.
+fn caps(fds: u64) -> (usize, usize) {
+    let budget = (fds.saturating_sub(64) / 2).max(16) as usize;
+    let tunnels = (budget / 3).min(MAX_TUNNELS);
+    ((budget - tunnels).min(MAX_CONNS), tunnels)
+}
 
 pub struct Options {
     pub listen: String,
@@ -70,6 +87,8 @@ pub struct Settings {
     pub proxy_protocol_from: Vec<ipnet::IpNet>,
     /// How long a request for a sleeping app waits for it to wake.
     pub wake_wait: Duration,
+    pub max_conns: usize,
+    pub max_tunnels: usize,
 }
 
 impl Default for Settings {
@@ -84,6 +103,8 @@ impl Default for Settings {
             client_ip_header: None,
             proxy_protocol_from: vec![],
             wake_wait: Duration::from_secs(120),
+            max_conns: MAX_CONNS,
+            max_tunnels: MAX_TUNNELS,
         }
     }
 }
@@ -118,6 +139,13 @@ pub struct Edge {
     waking: Mutex<HashMap<String, Waking>>,
     /// How long a request waits for a wake before it gets a 503.
     wake_wait: Duration,
+    max_conns: usize,
+    conns: Arc<tokio::sync::Semaphore>,
+    tunnels: Arc<tokio::sync::Semaphore>,
+    client_conns: Arc<limit::PerClient>,
+    client_tunnels: Arc<limit::PerClient>,
+    /// Set once on SIGTERM: listeners stop accepting and connections finish what they have.
+    stop: tokio::sync::watch::Sender<bool>,
     /// When a host's last wake failed: it gets 503s, not another wake, for [`WAKE_BACKOFF`].
     wake_failed: Mutex<HashMap<String, std::time::Instant>>,
 }
@@ -156,6 +184,12 @@ impl Edge {
             cache: None,
             waking: Default::default(),
             wake_wait: s.wake_wait,
+            max_conns: s.max_conns,
+            conns: Arc::new(tokio::sync::Semaphore::new(s.max_conns)),
+            tunnels: Arc::new(tokio::sync::Semaphore::new(s.max_tunnels)),
+            client_conns: limit::PerClient::new(CLIENT_CONNS.min(s.max_conns)),
+            client_tunnels: limit::PerClient::new(CLIENT_TUNNELS.min(s.max_tunnels)),
+            stop: tokio::sync::watch::channel(false).0,
             wake_failed: Default::default(),
         })
     }
@@ -314,6 +348,20 @@ impl Edge {
         }
     }
 
+    /// Stops the listeners and asks every connection to finish; then waits up to `limit`
+    /// for them. True when they all did.
+    pub async fn shutdown(&self, limit: Duration) -> bool {
+        self.stop.send_replace(true);
+        let t = Instant::now();
+        while self.conns.available_permits() < self.max_conns {
+            if t.elapsed() >= limit {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        true
+    }
+
     fn request_id(&self) -> String {
         format!("{}-{:x}", self.id_prefix, self.request_ids.fetch_add(1, Ordering::Relaxed))
     }
@@ -325,8 +373,11 @@ fn minute_now() -> i64 {
 
 /// `rekcod edge serve`. `listen` routes every app (for the tailnet); `public_listen` only
 /// apps marked public (point cloudflared or another tunnel at it).
-pub fn serve(paths: &Paths, remote_name: Option<&str>, o: Options) -> Result<()> {
+pub fn serve(paths: &Paths, remote_name: Option<&str>, mut o: Options) -> Result<()> {
     crate::lifecycle::trim_log_hourly(paths.home.join("logs/edge.log"));
+    let fds = crate::lifecycle::raise_fd_limit();
+    (o.settings.max_conns, o.settings.max_tunnels) = caps(fds);
+    eprintln!("rekcod: edge: {fds} descriptors: up to {} connections, {} WebSockets", o.settings.max_conns, o.settings.max_tunnels);
     let edge = Edge::new(Some(fleet::remote(paths, remote_name)?), o.settings).with_cache(paths.home.join("edge-routes.json"));
     let e = edge.clone();
     std::thread::spawn(move || {
@@ -344,15 +395,33 @@ pub fn serve(paths: &Paths, remote_name: Option<&str>, o: Options) -> Result<()>
         }
         let l = TcpListener::bind(&o.listen).await.with_context(|| format!("bind {}", o.listen))?;
         eprintln!("rekcod: edge (all apps) on http://{}", o.listen);
-        run(l, edge, Listener::default()).await;
-        Ok(())
+        tokio::spawn(run(l, edge.clone(), Listener::default()));
+        let (mut term, mut int) = (
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?,
+        );
+        tokio::select! {
+            _ = term.recv() => {}
+            _ = int.recv() => {}
+        }
+        eprintln!("rekcod: edge: stopping; waiting up to {}s for requests in flight", DRAIN.as_secs());
+        if !edge.shutdown(DRAIN).await {
+            eprintln!("rekcod: edge: requests still in flight; exiting anyway");
+        }
+        // Not a runtime shutdown: that would wait on a wake's blocking controller call.
+        std::process::exit(0)
     })
 }
 
+/// Accepts until [`Edge::shutdown`].
 pub async fn run(l: TcpListener, edge: Arc<Edge>, opts: Listener) {
-    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNS));
+    let mut stop = edge.stop.subscribe();
     loop {
-        let (s, peer) = match l.accept().await {
+        let accepted = tokio::select! {
+            a = l.accept() => a,
+            _ = stop.wait_for(|s| *s) => return,
+        };
+        let (s, peer) = match accepted {
             Ok(c) => c,
             Err(e) => {
                 // Out of file descriptors, usually; don't spin.
@@ -361,7 +430,7 @@ pub async fn run(l: TcpListener, edge: Arc<Edge>, opts: Listener) {
                 continue;
             }
         };
-        let Ok(slot) = slots.clone().try_acquire_owned() else { continue };
+        let Ok(slot) = edge.conns.clone().try_acquire_owned() else { continue };
         let edge = edge.clone();
         tokio::spawn(async move {
             let _ = conn(s, peer, edge, opts).await;
@@ -388,6 +457,16 @@ async fn conn(mut s: TcpStream, peer: SocketAddr, edge: Arc<Edge>, opts: Listene
     if !edge.trusts(peer) && edge.bans.is_banned(peer) {
         return Ok(());
     }
+    // One address can't hold every slot; the tunnel carries everyone, so it isn't counted.
+    let _held = if edge.trusts(peer) {
+        None
+    } else {
+        match edge.client_conns.take(peer) {
+            Some(h) => Some(h),
+            None => return Ok(()),
+        }
+    };
+    let mut stop = edge.stop.subscribe();
     let activity = Arc::new(idle::Activity::new());
     let a = activity.clone();
     let svc = hyper::service::service_fn(move |req| {
@@ -398,19 +477,34 @@ async fn conn(mut s: TcpStream, peer: SocketAddr, edge: Arc<Edge>, opts: Listene
         }
     });
     let mut b = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new());
-    b.http1().timer(TokioTimer::new()).header_read_timeout(HEADER_TIMEOUT);
+    // hyper starts this timer when a keep-alive connection goes idle, so it's the idle
+    // timeout; the head's own limit is checked below.
+    b.http1().timer(TokioTimer::new()).header_read_timeout(IDLE_TIMEOUT);
+    b.http2().max_concurrent_streams(H2_STREAMS);
     let conn = b.serve_connection_with_upgrades(TokioIo::new(idle::Tracked { io: s, activity: activity.clone() }), svc);
     tokio::pin!(conn);
-    let mut tick = tokio::time::interval(IDLE_TIMEOUT / 4);
+    let mut tick = tokio::time::interval(IDLE_TIMEOUT.min(HEADER_TIMEOUT) / 4);
     let mut closing = false;
     loop {
         tokio::select! {
             r = conn.as_mut() => return r.map_err(|e| anyhow::anyhow!(e)),
-            _ = tick.tick(), if !closing => {
+            _ = tick.tick() => {
+                if activity.head_overdue(HEADER_TIMEOUT) {
+                    return Ok(());
+                }
                 if activity.idle() >= IDLE_TIMEOUT {
+                    // graceful_shutdown only ends keep-alive; a response nobody reads (or an
+                    // instance that stopped sending) would hold the connection for good.
+                    if closing {
+                        return Ok(());
+                    }
                     closing = true;
                     conn.as_mut().graceful_shutdown();
                 }
+            }
+            _ = stop.wait_for(|s| *s), if !closing => {
+                closing = true;
+                conn.as_mut().graceful_shutdown();
             }
         }
     }
@@ -568,6 +662,20 @@ async fn forward(edge: &Arc<Edge>, mut req: Request<Incoming>, host: &str, clien
         return text(StatusCode::PAYLOAD_TOO_LARGE, format!("request body over {max_body} bytes\n"));
     }
     let upgrade = is_upgrade(req.headers());
+    // A tunnel's slots are taken before the instance sees the request, so a client is never
+    // told 101 and then dropped.
+    let tunnel_slots = if upgrade {
+        match (edge.tunnels.clone().try_acquire_owned(), edge.client_tunnels.take(client)) {
+            (Ok(all), Some(mine)) => Some((all, mine)),
+            _ => {
+                let mut r = text(StatusCode::SERVICE_UNAVAILABLE, "too many open WebSockets\n");
+                r.headers_mut().insert(header::RETRY_AFTER, 5.into());
+                return r;
+            }
+        }
+    } else {
+        None
+    };
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
     let (mut parts, body) = req.into_parts();
     prepare(edge, &mut parts, client, peer, upgrade, host);
@@ -592,29 +700,30 @@ async fn forward(edge: &Arc<Edge>, mut req: Request<Incoming>, host: &str, clien
                 Ok(Ok(mut resp)) => {
                     if resp.status() == StatusCode::SWITCHING_PROTOCOLS
                         && let Some(down) = client_upgrade
+                        && let Some(slots) = tunnel_slots
                     {
                         let up = hyper::upgrade::on(&mut resp);
                         // The connection's slot is freed once it's upgraded, so tunnels have
-                        // their own cap, and close after an hour with no bytes either way.
-                        if let Ok(slot) = TUNNELS.clone().try_acquire_owned() {
-                            tokio::spawn(async move {
-                                if let (Ok(a), Ok(b)) = tokio::join!(down, up) {
-                                    let act = Arc::new(idle::Activity::new());
-                                    let mut a = idle::Tracked { io: TokioIo::new(a), activity: act.clone() };
-                                    let mut b = idle::Tracked { io: TokioIo::new(b), activity: act.clone() };
-                                    let watch = async {
-                                        while act.idle() < TUNNEL_IDLE {
-                                            tokio::time::sleep(Duration::from_secs(60)).await;
-                                        }
-                                    };
-                                    tokio::select! {
-                                        _ = tokio::io::copy_bidirectional(&mut a, &mut b) => {}
-                                        _ = watch => {}
+                        // their own cap. They close after an hour with no bytes either way, and
+                        // within a minute of the client being banned.
+                        let edge = edge.clone();
+                        tokio::spawn(async move {
+                            if let (Ok(a), Ok(b)) = tokio::join!(down, up) {
+                                let act = Arc::new(idle::Activity::new());
+                                let mut a = idle::Tracked { io: TokioIo::new(a), activity: act.clone() };
+                                let mut b = idle::Tracked { io: TokioIo::new(b), activity: act.clone() };
+                                let watch = async {
+                                    while act.idle() < TUNNEL_IDLE && !edge.bans.is_banned(client) {
+                                        tokio::time::sleep(Duration::from_secs(60)).await;
                                     }
+                                };
+                                tokio::select! {
+                                    _ = tokio::io::copy_bidirectional(&mut a, &mut b) => {}
+                                    _ = watch => {}
                                 }
-                                drop(slot);
-                            });
-                        }
+                            }
+                            drop(slots);
+                        });
                         lease.done(false);
                     } else {
                         strip_hop(resp.headers_mut(), false);
@@ -1003,6 +1112,117 @@ mod tests {
                 assert!(buf.is_empty(), "{body}");
             }
         }
+    }
+
+    /// An instance that waits `delay`, then answers a `size`-byte body; reports when the
+    /// edge closes the connection (a write fails, or a read ends) instead of keeping it.
+    async fn slow_instance(delay: Duration, size: usize) -> (String, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut r = BufReader::new(s);
+                    let mut line = String::new();
+                    while line != "\r\n" {
+                        line.clear();
+                        if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                    }
+                    tokio::time::sleep(delay).await;
+                    let s = r.get_mut();
+                    let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {size}\r\n\r\n");
+                    let chunk = vec![b'x'; 64 << 10];
+                    let mut res = s.write_all(head.as_bytes()).await;
+                    let mut left = size;
+                    while res.is_ok() && left > 0 {
+                        let n = left.min(chunk.len());
+                        res = s.write_all(&chunk[..n]).await;
+                        left -= n;
+                    }
+                    let mut b = [0u8; 1];
+                    if res.is_err() || matches!(s.read(&mut b).await, Ok(0) | Err(_)) {
+                        let _ = tx.send(());
+                    }
+                });
+            }
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn a_response_nobody_reads_is_closed() {
+        let (a, mut failed) = slow_instance(Duration::ZERO, 8 << 20).await;
+        let edge = Edge::new(None, fast());
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let addr = edge_on(&edge, Listener::default()).await;
+        let mut s = dial(&addr).await;
+        s.get_mut().write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+        // The client reads nothing; the edge must let go of both sides.
+        let closed = tokio::time::timeout(IDLE_TIMEOUT * 5, failed.recv()).await;
+        assert!(matches!(closed, Ok(Some(()))), "the instance kept writing");
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn keep_alive_outlives_the_header_timeout_but_a_slow_head_does_not() {
+        let a = instance("a").await;
+        let edge = Edge::new(None, fast());
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let addr = edge_on(&edge, Listener::default()).await;
+        let mut s = dial(&addr).await;
+        assert_eq!(get(&mut s, "a.test", "").await.0, 200);
+        tokio::time::sleep(HEADER_TIMEOUT * 2).await;
+        assert_eq!(get(&mut s, "a.test", "").await.0, 200);
+
+        let mut s = dial(&addr).await;
+        s.get_mut().write_all(b"GET / HTTP/1.1\r\nHost: a.te").await.unwrap();
+        let mut buf = Vec::new();
+        let closed = tokio::time::timeout(HEADER_TIMEOUT * 2, s.read_to_end(&mut buf)).await;
+        assert!(matches!(closed, Ok(Ok(_))), "{closed:?}");
+    }
+
+    #[tokio::test]
+    async fn no_101_without_a_tunnel_slot() {
+        let a = instance("a").await;
+        let edge = Edge::new(None, Settings { max_tunnels: 1, ..fast() });
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let addr = edge_on(&edge, Listener::default()).await;
+        let upgrade = "GET /ws HTTP/1.1\r\nHost: a.test\r\nConnection: Upgrade\r\nUpgrade: echo\r\n\r\n";
+        let mut first = dial(&addr).await;
+        first.get_mut().write_all(upgrade.as_bytes()).await.unwrap();
+        let mut line = String::new();
+        first.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("HTTP/1.1 101"), "{line}");
+        let mut second = dial(&addr).await;
+        second.get_mut().write_all(upgrade.as_bytes()).await.unwrap();
+        line.clear();
+        second.read_line(&mut line).await.unwrap();
+        assert!(line.starts_with("HTTP/1.1 503"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn shutdown_finishes_requests_in_flight() {
+        let (a, _) = slow_instance(Duration::from_millis(300), 2).await;
+        let edge = Edge::new(None, fast());
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let addr = edge_on(&edge, Listener::default()).await;
+        let mut s = dial(&addr).await;
+        let req = tokio::spawn(async move { get(&mut s, "a.test", "").await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(edge.shutdown(Duration::from_secs(5)).await);
+        assert_eq!(req.await.unwrap(), (200, "xx".to_string()));
+        assert!(TcpStream::connect(&addr).await.is_err(), "still accepting");
+    }
+
+    #[test]
+    fn caps_follow_the_descriptor_limit() {
+        assert_eq!(caps(256), (64, 32));
+        assert_eq!(caps(1 << 20), (MAX_CONNS, MAX_TUNNELS));
     }
 
     #[tokio::test]

@@ -84,6 +84,48 @@ pub struct Refused {
     pub edge_wide: bool,
 }
 
+/// Things one client holds at once (connections, tunnels), counted per [`rate_key`].
+pub struct PerClient {
+    cap: usize,
+    held: Mutex<HashMap<IpAddr, usize>>,
+}
+
+/// One of a client's slots, given back on drop.
+pub struct Held {
+    owner: Arc<PerClient>,
+    key: IpAddr,
+}
+
+impl PerClient {
+    pub fn new(cap: usize) -> Arc<PerClient> {
+        Arc::new(PerClient { cap, held: Default::default() })
+    }
+
+    /// `None` when `ip` already holds `cap`.
+    pub fn take(self: &Arc<Self>, ip: IpAddr) -> Option<Held> {
+        let key = rate_key(ip);
+        let mut held = self.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = held.entry(key).or_default();
+        if *n >= self.cap {
+            return None;
+        }
+        *n += 1;
+        Some(Held { owner: self.clone(), key })
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        let mut held = self.owner.held.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = held.get_mut(&self.key) {
+            *n -= 1;
+            if *n == 0 {
+                held.remove(&self.key);
+            }
+        }
+    }
+}
+
 pub struct Limits {
     edge: DefaultKeyedRateLimiter<IpAddr>,
     /// Per app host: the settings its limiter was built from, so a changed rate rebuilds it.
@@ -176,6 +218,18 @@ mod tests {
         let tight = Limits::new(Duration::from_secs(60), 1);
         assert!(tight.check(ip, "b.test", &HttpSettings::default()).is_ok());
         assert!(tight.check(ip, "b.test", &HttpSettings::default()).unwrap_err().edge_wide);
+    }
+
+    #[test]
+    fn per_client_slots() {
+        let p = PerClient::new(2);
+        let (a, b) = ("2001:db8::1".parse().unwrap(), "2001:db8::2".parse().unwrap());
+        let one = p.take(a).unwrap();
+        let _two = p.take(b).unwrap();
+        assert!(p.take(a).is_none(), "same /64");
+        assert!(p.take("192.0.2.1".parse().unwrap()).is_some());
+        drop(one);
+        assert!(p.take(a).is_some());
     }
 
     #[test]

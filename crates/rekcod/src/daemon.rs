@@ -113,7 +113,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     // Held until we exit: a second daemon on the same disk fails here.
     let _pid_lock = paths.hold_pid_file()?;
     let _ = std::fs::remove_file(paths.last_exit());
-    raise_fd_limit();
+    crate::lifecycle::raise_fd_limit();
     crate::lifecycle::trim_log_hourly(paths.daemon_log());
     let guest = paths.guest_dir()?;
     let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
@@ -345,21 +345,6 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
 /// Tells `rekcod start --foreground` (the login agent) that this stop was on purpose.
 fn clean_exit(paths: &Paths) {
     let _ = std::fs::write(paths.last_exit(), b"clean");
-}
-
-/// launchd starts agents with a soft limit of 256 descriptors; every forwarded connection
-/// and docker client takes two.
-fn raise_fd_limit() {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-        return;
-    }
-    let per_proc = crate::cli::sysctl_u64("kern.maxfilesperproc").unwrap_or(10240) as libc::rlim_t;
-    let want = lim.rlim_max.min(per_proc);
-    if want > lim.rlim_cur {
-        lim.rlim_cur = want;
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
-    }
 }
 
 /// After a failed accept (EMFILE, ENFILE), wait before the next one instead of spinning.

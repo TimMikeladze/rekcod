@@ -1180,6 +1180,7 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, options: Nod
 pub fn node_serve(paths: &Paths) -> Result<()> {
     let cfg: NodeConfig = serde_json::from_slice(&std::fs::read(paths.home.join("node.json")).context("not joined; `rekcod node join`")?)?;
     let addr: SocketAddr = cfg.listen.parse()?;
+    crate::lifecycle::raise_fd_limit();
     graceful_exit(None);
     if let Some(ca) = &cfg.ca {
         crate::tls::trust_by_default(ca)?;
@@ -5925,6 +5926,7 @@ fn secret_key(path: &Path, sealed_values: i64) -> Result<[u8; 32]> {
 
 /// Starts the controller; on first run creates the schema, an admin token and a join token.
 pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
+    crate::lifecycle::raise_fd_limit();
     let dir = paths.home.join("controller");
     std::fs::create_dir_all(&dir)?;
     let db_path = o.db.clone().unwrap_or_else(|| dir.join("fleet.db"));

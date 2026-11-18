@@ -287,6 +287,23 @@ fn other_home(paths: &Paths, name: &str) -> Option<String> {
     (!owns(paths, recorded.as_deref())).then(|| recorded.map_or("~/.rekcod".into(), |h| h.display().to_string()))
 }
 
+/// The command that restarts job `name` on the binary its plist names.
+pub fn kickstart_line(name: &str) -> String {
+    let target = format!("{}/{}", domain_of(name), label(name));
+    if is_daemon(name) { format!("sudo launchctl kickstart -k {target}") } else { format!("launchctl kickstart -k {target}") }
+}
+
+/// Restarts job `name` now (`kickstart -k`): it comes back on the binary its plist names.
+pub fn restart(name: &str) -> Result<()> {
+    let target = format!("{}/{}", domain_of(name), label(name));
+    let out =
+        if is_daemon(name) { root(&["/bin/launchctl", "kickstart", "-k", &target])? } else { launchctl(&["kickstart", "-k", &target])? };
+    if !out.status.success() {
+        bail!("launchctl kickstart -k {target}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 /// Starts the job now if it isn't running (no-op otherwise).
 pub fn kickstart(name: &str) {
     let target = format!("{}/{}", domain_of(name), label(name));

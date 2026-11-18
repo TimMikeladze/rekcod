@@ -132,8 +132,16 @@ jobs:
           (cd dashboard && npm sbom --omit=dev --sbom-format cyclonedx) > "out/release/rekcod-dashboard-$v.cdx.json"
 
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        id: attest
         with:
           subject-path: out/release/*
+
+      # The attestation as a release asset too: install.sh and `rekcod upgrade` hand it to
+      # `gh attestation verify --bundle` instead of fetching it from GitHub's API.
+      - name: attach the provenance bundle
+        env:
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: cp "$BUNDLE" out/release/rekcod.sigstore.json
 
       - env:
           GH_TOKEN: ${{ github.token }}

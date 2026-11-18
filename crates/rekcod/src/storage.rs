@@ -67,7 +67,7 @@ pub fn ensure_binary(paths: &Paths) -> Result<PathBuf> {
     let r = (|| -> Result<()> {
         eprintln!("rekcod: downloading RustFS {RUSTFS_VERSION}");
         let zip = tmp.join("rustfs.zip");
-        if !Command::new("curl").args(["-fsSL", "-o"]).arg(&zip).arg(RUSTFS_ZIP).status()?.success() {
+        if !crate::fetch::download_cmd(RUSTFS_ZIP, &zip, true).arg("-sS").status()?.success() {
             bail!("could not download {RUSTFS_ZIP}");
         }
         let out = Command::new("shasum").args(["-a", "256"]).arg(&zip).output()?;

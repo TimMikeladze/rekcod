@@ -24,12 +24,27 @@ pub fn compatible(a: &str, b: &str) -> bool {
     a.0 == b.0 && (a.0 > 0 || a.1 == b.1)
 }
 
+/// The GitHub API call: small, so a total cap is fine here.
 fn curl(args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("curl").args(["-fsSL", "--max-time", "60"]).args(args).output().context("run curl")?;
+    let out = Command::new("curl")
+        .args(["-fsSL", "--proto", "=https", "--tlsv1.2", "--connect-timeout", "15", "--max-time", "60"])
+        .args(args)
+        .output()
+        .context("run curl")?;
     if !out.status.success() {
         bail!("curl {}: {}", args.last().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(out.stdout)
+}
+
+/// A release file into `dest`, without a cap on the whole transfer (the tarball carries
+/// the dashboard; a slow link still finishes), giving up on a stalled one.
+fn download(url: &str, dest: &Path, https_only: bool) -> Result<()> {
+    let out = crate::fetch::download_cmd(url, dest, https_only).arg("-sS").output().context("run curl")?;
+    if !out.status.success() {
+        bail!("download {url}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
 }
 
 fn latest_version() -> Result<String> {
@@ -38,25 +53,87 @@ fn latest_version() -> Result<String> {
     v["tag_name"].as_str().map(|t| t.trim_start_matches('v').to_string()).ok_or_else(|| anyhow!("no tag in GitHub's latest release"))
 }
 
-fn release_base(version: &str) -> String {
+/// The release base, and whether it's GitHub's (https only): `REKCOD_RELEASE_URL` may
+/// point at a local server or a file:// mirror.
+fn release_base(version: &str) -> (String, bool) {
     match std::env::var("REKCOD_RELEASE_URL") {
-        Ok(b) => b.trim_end_matches('/').to_string(),
-        Err(_) => format!("https://github.com/{REPO}/releases/download/v{version}"),
+        Ok(b) => (b.trim_end_matches('/').to_string(), false),
+        Err(_) => (format!("https://github.com/{REPO}/releases/download/v{version}"), true),
     }
 }
 
-/// `rekcod upgrade [--check]`.
-pub fn upgrade(check: bool) -> Result<()> {
-    let current = env!("CARGO_PKG_VERSION");
-    let latest = latest_version()?;
-    if parse_version(&latest) <= parse_version(current) {
-        println!("rekcod {current} is the latest");
-        return Ok(());
+/// `upgrade --check`'s exit code: 0 up to date, 1 a newer release exists, 2 couldn't tell.
+fn check_code(latest: &Result<String>, current: &str) -> i32 {
+    match latest {
+        Ok(l) if parse_version(l) > parse_version(current) => 1,
+        Ok(_) => 0,
+        Err(_) => 2,
     }
-    if check {
-        println!("rekcod {latest} is out (this is {current}); `rekcod upgrade` installs it");
-        std::process::exit(1);
+}
+
+/// The Sigstore bundle the release workflow publishes beside the tarball (since 0.3.1).
+const BUNDLE: &str = "rekcod.sigstore.json";
+const SIGNER_WORKFLOW: &str = "TimMikeladze/rekcod/.github/workflows/release.yml";
+
+#[derive(Debug, PartialEq, Eq)]
+enum Provenance {
+    Verified,
+    /// gh couldn't check (not logged in, no network): said, not refused.
+    Unchecked(String),
+}
+
+/// `gh attestation verify` on the tarball: the build provenance GitHub's release workflow
+/// signed, which whoever can replace a release asset can't forge. A failed verification
+/// refuses the download; gh being unable to check is reported.
+fn attestation(gh: &Path, tarball: &Path, bundle: Option<&Path>) -> Result<Provenance> {
+    let mut c = Command::new(gh);
+    c.args(["attestation", "verify"]).arg(tarball).args(["--repo", REPO, "--signer-workflow", SIGNER_WORKFLOW]);
+    if let Some(b) = bundle {
+        c.arg("--bundle").arg(b);
     }
+    let out = c.stdin(Stdio::null()).output().context("run gh")?;
+    if out.status.success() {
+        return Ok(Provenance::Verified);
+    }
+    let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let lower = err.to_lowercase();
+    if ["gh auth login", "authentication", "not logged", "http 401", "could not resolve", "no such host", "timeout"]
+        .iter()
+        .any(|m| lower.contains(m))
+    {
+        return Ok(Provenance::Unchecked(err.lines().last().unwrap_or_default().to_string()));
+    }
+    bail!("{} has no valid build provenance from {REPO}'s release workflow; not installing it\n{err}", tarball.display())
+}
+
+/// The Developer ID team that signed `bin`, if one did (`TeamIdentifier=` in `codesign -dv`).
+fn team_of(bin: &Path) -> Option<String> {
+    let out = Command::new("/usr/bin/codesign").arg("-dv").arg(bin).output().ok()?;
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .find_map(|l| l.strip_prefix("TeamIdentifier="))
+        .filter(|t| *t != "not set")
+        .map(String::from)
+}
+
+/// Whether `bin` carries a valid signature from Developer ID team `team`.
+fn signed_by(bin: &Path, team: &str) -> bool {
+    let req = format!("=anchor apple generic and certificate leaf[subject.OU] = \"{team}\"");
+    Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", "-R", &req])
+        .arg(bin)
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// `.rekcod.previous` beside the binary: what the last upgrade replaced.
+fn previous_of(exe: &Path) -> PathBuf {
+    exe.with_file_name(".rekcod.previous")
+}
+
+/// The binary `upgrade` replaces, or why it won't.
+fn upgradable_exe() -> Result<PathBuf> {
     let exe = std::env::current_exe()?.canonicalize()?;
     if exe.components().any(|c| c.as_os_str() == "Cellar") {
         bail!("this rekcod came from Homebrew; `brew upgrade rekcod`");
@@ -64,18 +141,104 @@ pub fn upgrade(check: bool) -> Result<()> {
     let dir = exe.parent().context("binary has no directory")?;
     let probe = dir.join(".rekcod-upgrade-probe");
     if std::fs::write(&probe, b"").is_err() {
-        bail!("can't write to {}; run `sudo rekcod upgrade`", dir.display());
+        bail!("can't write to {}; run it with sudo", dir.display());
     }
     let _ = std::fs::remove_file(&probe);
+    Ok(exe)
+}
+
+/// Whether `upgrade --rollback` has something to go back to.
+pub fn rollback_available() -> bool {
+    std::env::current_exe().and_then(|e| e.canonicalize()).is_ok_and(|e| previous_of(&e).is_file())
+}
+
+/// `rekcod upgrade --rollback`: the binary the last upgrade replaced goes back in place, and
+/// the current one becomes `.rekcod.previous` (a second rollback goes forward again). The
+/// dashboard stays as the upgrade left it.
+pub fn rollback() -> Result<()> {
+    let exe = upgradable_exe()?;
+    let prev = previous_of(&exe);
+    if !prev.is_file() {
+        bail!("nothing to roll back to: {} doesn't exist (an upgrade keeps the binary it replaces there)", prev.display());
+    }
+    swap_binaries(&exe, &prev)?;
+    let v = Command::new(&exe).arg("--version").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    println!("{} is {v} again; {} is the one it replaced", exe.display(), prev.display());
+    restart_note(false)
+}
+
+/// `exe` and `other` trade places, each move a rename so a running daemon keeps its inode.
+fn swap_binaries(exe: &Path, other: &Path) -> Result<()> {
+    let tmp = exe.with_file_name(".rekcod.swap");
+    let _ = std::fs::remove_file(&tmp);
+    std::fs::hard_link(exe, &tmp).context("keep the current binary")?;
+    if let Err(e) = std::fs::rename(other, exe) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("put {} in place", other.display()));
+    }
+    std::fs::rename(&tmp, other).context("keep the replaced binary")?;
+    Ok(())
+}
+
+/// The fleet services keep running the old binary until they restart: restart them
+/// (`--restart-services`), or say how. The VM is left alone: a restart stops containers.
+fn restart_note(restart: bool) -> Result<()> {
+    let paths = Paths::new()?;
+    let jobs: Vec<&str> = AGENTS.iter().copied().filter(|j| *j != "vm" && crate::service::installed_here(&paths, j)).collect();
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    if restart {
+        for j in &jobs {
+            match crate::service::restart(j) {
+                Ok(()) => println!("restarted {j}"),
+                Err(e) => println!("couldn't restart {j}: {e:#}"),
+            }
+        }
+    } else {
+        println!("{} still run the old binary. Restart them with `rekcod upgrade --restart-services`, or:", jobs.join(", "));
+        for j in &jobs {
+            println!("  {}", crate::service::kickstart_line(j));
+        }
+    }
+    Ok(())
+}
+
+/// `rekcod upgrade [--check] [--restart-services]`.
+pub fn upgrade(check: bool, restart_services: bool) -> Result<()> {
+    let current = env!("CARGO_PKG_VERSION");
+    let latest = latest_version();
+    if check {
+        let code = check_code(&latest, current);
+        match &latest {
+            Ok(l) if code == 1 => println!("rekcod {l} is out (this is {current}); `rekcod upgrade` installs it"),
+            Ok(_) => println!("rekcod {current} is the latest"),
+            Err(e) => eprintln!("rekcod: couldn't check for a newer release: {e:#}"),
+        }
+        std::process::exit(code);
+    }
+    let latest = latest?;
+    if parse_version(&latest) <= parse_version(current) {
+        println!("rekcod {current} is the latest");
+        if restart_services {
+            restart_note(true)?;
+        }
+        return Ok(());
+    }
+    let exe = upgradable_exe()?;
+    let dir = exe.parent().context("binary has no directory")?.to_path_buf();
     let work = std::env::temp_dir().join(format!("rekcod-upgrade-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(work.join("x"))?;
+    let mut checked: Vec<String> = Vec::new();
     let r = (|| -> Result<()> {
-        let base = release_base(&latest);
+        let (base, https_only) = release_base(&latest);
         eprintln!("rekcod: downloading {latest}");
         let tar = work.join(TARBALL);
-        std::fs::write(&tar, curl(&[&format!("{base}/{TARBALL}")])?)?;
-        let sums = String::from_utf8(curl(&[&format!("{base}/SHA256SUMS")])?)?;
+        download(&format!("{base}/{TARBALL}"), &tar, https_only)?;
+        let sums_file = work.join("SHA256SUMS");
+        download(&format!("{base}/SHA256SUMS"), &sums_file, https_only)?;
+        let sums = std::fs::read_to_string(&sums_file)?;
         let want =
             sums.lines().find(|l| l.ends_with(TARBALL)).and_then(|l| l.split_whitespace().next()).context("SHA256SUMS lists no tarball")?;
         let got =
@@ -85,8 +248,30 @@ pub fn upgrade(check: bool) -> Result<()> {
         if !got.eq_ignore_ascii_case(want) {
             bail!("checksum mismatch: SHA256SUMS says {want}, the download is {got}; not installing it");
         }
+        // The checksum comes from the same place as the tarball; these don't.
+        match which("gh") {
+            Some(gh) => {
+                let bundle = work.join(BUNDLE);
+                let bundle = download(&format!("{base}/{BUNDLE}"), &bundle, https_only).is_ok().then_some(bundle);
+                match attestation(&gh, &tar, bundle.as_deref())? {
+                    Provenance::Verified => checked.push(format!("build provenance from {REPO}'s release workflow")),
+                    Provenance::Unchecked(why) => eprintln!("rekcod: gh couldn't check the build provenance ({why})"),
+                }
+            }
+            None => eprintln!("rekcod: no gh, so the build provenance wasn't checked (`brew install gh` adds that check)"),
+        }
         if !Command::new("tar").arg("-xzf").arg(&tar).arg("-C").arg(work.join("x")).status()?.success() {
             bail!("couldn't unpack {TARBALL}");
+        }
+        let new_bin = work.join("x/bin/rekcod");
+        if let Some(team) = team_of(&exe) {
+            if !signed_by(&new_bin, &team) {
+                bail!("the new binary isn't signed by Developer ID team {team}, which signed this one; not installing it");
+            }
+            checked.push(format!("Developer ID signature of team {team}"));
+        }
+        if checked.is_empty() {
+            eprintln!("rekcod: only the checksum was checked, and it comes from the same release as the download");
         }
         // Staged before anything is replaced: a failed copy leaves both the old binary and
         // the old dashboard.
@@ -98,9 +283,13 @@ pub fn upgrade(check: bool) -> Result<()> {
             None
         };
         // Next to the old one, then renamed over it: a VM daemon running from the old file
-        // keeps its inode.
+        // keeps its inode. The old one stays as .rekcod.previous for `--rollback`.
         let new = dir.join(".rekcod.new");
-        if let Err(e) = std::fs::copy(work.join("x/bin/rekcod"), &new).and_then(|_| std::fs::rename(&new, &exe)) {
+        let prev = previous_of(&exe);
+        let _ = std::fs::remove_file(&prev);
+        let installed_bin =
+            std::fs::copy(&new_bin, &new).and_then(|_| std::fs::hard_link(&exe, &prev)).and_then(|_| std::fs::rename(&new, &exe));
+        if let Err(e) = installed_bin {
             let _ = std::fs::remove_file(&new);
             if let Some(s) = &staged {
                 let _ = std::fs::remove_dir_all(s);
@@ -115,8 +304,19 @@ pub fn upgrade(check: bool) -> Result<()> {
     let _ = std::fs::remove_dir_all(&work);
     r?;
     let _ = Command::new("xattr").args(["-d", "com.apple.quarantine"]).arg(&exe).stderr(Stdio::null()).status();
-    println!("rekcod {latest} installed at {}. A running VM keeps {current} until `rekcod stop && rekcod start`", exe.display());
-    Ok(())
+    if !checked.is_empty() {
+        println!("verified: {}", checked.join(", "));
+    }
+    println!(
+        "rekcod {latest} installed at {}; {current} is kept as {} (`rekcod upgrade --rollback`). A running VM keeps {current} until `rekcod stop && rekcod start`",
+        exe.display(),
+        previous_of(&exe).display()
+    );
+    restart_note(restart_services)
+}
+
+fn which(bin: &str) -> Option<PathBuf> {
+    std::env::split_paths(&std::env::var_os("PATH")?).map(|d| d.join(bin)).find(|p| p.is_file())
 }
 
 /// What `rekcod dashboard` runs from a build (dashboard.rs); a copy without them isn't installed.
@@ -572,6 +772,62 @@ pub fn trim_log(log: &Path, max: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_exit_codes() {
+        assert_eq!(check_code(&Ok("0.4.0".into()), "0.3.0"), 1);
+        assert_eq!(check_code(&Ok("0.3.0".into()), "0.3.0"), 0);
+        // A network error is not "a newer release exists".
+        assert_eq!(check_code(&Err(anyhow!("could not resolve api.github.com")), "0.3.0"), 2);
+    }
+
+    /// A stand-in gh: verified, refused, or unable to check.
+    #[test]
+    fn provenance_refuses_only_a_failed_verification() {
+        let dir = std::env::temp_dir().join(format!("rekcod-gh-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gh = dir.join("gh");
+        let fake = |script: &str| {
+            std::fs::write(&gh, format!("#!/bin/sh\n{script}\n")).unwrap();
+            std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+            attestation(&gh, Path::new("/x.tar.gz"), Some(Path::new("/b.json")))
+        };
+        let args = dir.join("args");
+        let ok = fake(&format!("echo \"$@\" > {}; exit 0", args.display())).unwrap();
+        assert_eq!(ok, Provenance::Verified);
+        let a = std::fs::read_to_string(&args).unwrap();
+        assert!(a.contains("--repo TimMikeladze/rekcod") && a.contains("--signer-workflow") && a.contains("--bundle /b.json"), "{a}");
+        assert!(fake("echo 'Error: verifying with issuer \"sigstore.dev\": no matching attestations' >&2; exit 1").is_err());
+        assert!(matches!(
+            fake("echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4").unwrap(),
+            Provenance::Unchecked(_)
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The test binary is ad-hoc signed, like a binary someone swapped into a release
+    /// without the team's key: it isn't accepted as the team's.
+    #[test]
+    fn a_binary_not_signed_by_the_team_is_refused() {
+        let me = std::env::current_exe().unwrap();
+        assert_eq!(team_of(&me), None);
+        assert!(!signed_by(&me, "ABCDE12345"));
+    }
+
+    #[test]
+    fn rollback_swaps_and_swaps_back() {
+        let t = std::env::temp_dir().join(format!("rekcod-rollback-{}", std::process::id()));
+        std::fs::create_dir_all(&t).unwrap();
+        let (exe, prev) = (t.join("rekcod"), previous_of(&t.join("rekcod")));
+        std::fs::write(&exe, "new").unwrap();
+        std::fs::write(&prev, "old").unwrap();
+        swap_binaries(&exe, &prev).unwrap();
+        assert_eq!((std::fs::read_to_string(&exe).unwrap(), std::fs::read_to_string(&prev).unwrap()), ("old".into(), "new".into()));
+        swap_binaries(&exe, &prev).unwrap();
+        assert_eq!(std::fs::read_to_string(&exe).unwrap(), "new");
+        assert!(!t.join(".rekcod.swap").exists());
+        std::fs::remove_dir_all(&t).unwrap();
+    }
 
     #[test]
     fn versions() {

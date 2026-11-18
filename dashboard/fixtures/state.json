@@ -72,6 +72,16 @@
       ],
       "interactive": false,
       "confirm": null
+    },
+    {
+      "kind": "UpgradeRollback",
+      "label": "Go back to the previous version",
+      "argv": [
+        "upgrade",
+        "--rollback"
+      ],
+      "interactive": true,
+      "confirm": "Put back the rekcod binary the last upgrade replaced? A running VM keeps its version until it restarts."
     }
   ],
   "storage_actions": [

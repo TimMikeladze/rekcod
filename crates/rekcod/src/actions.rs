@@ -75,6 +75,7 @@ pub enum Kind {
     VmAutostartOff,
     Doctor,
     Upgrade,
+    UpgradeRollback,
     Uninstall,
     ImagePull,
     ImageRun,
@@ -97,7 +98,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 78] = [
+    pub const ALL: [Kind; 79] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -159,6 +160,7 @@ impl Kind {
         Kind::VmAutostartOff,
         Kind::Doctor,
         Kind::Upgrade,
+        Kind::UpgradeRollback,
         Kind::Uninstall,
         Kind::ImagePull,
         Kind::ImageRun,
@@ -589,6 +591,8 @@ pub struct Model {
     pub socket_installed: bool,
     /// The VM starts at login (`rekcod start --install`).
     pub autostart: bool,
+    /// An upgrade kept the binary it replaced (`rekcod upgrade --rollback`).
+    pub rollback: bool,
     /// Agent sandboxes (`rekcod sandbox ls`).
     pub sandboxes: Vec<AgentSandbox>,
     /// Apps on the default fleet remote (`rekcod app ls`), if one is configured.
@@ -845,6 +849,7 @@ impl Model {
             sandbox,
             socket_installed,
             autostart: crate::cli::autostart_installed(),
+            rollback: crate::lifecycle::rollback_available(),
             sandboxes,
             apps: rd.apps,
             jobs: rd.jobs,
@@ -1113,7 +1118,7 @@ fn git_branch(dir: &std::path::Path) -> Option<String> {
 
 // -------------------------------------------------------------- actions
 
-pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool) -> Vec<Action> {
+pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool, rollback: bool) -> Vec<Action> {
     let mut out = if !running {
         vec![
             Action::rekcod(Kind::VmStart, "Start rekcod", &["start"]),
@@ -1146,6 +1151,13 @@ pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool) -> Vec
     out.push(Action::rekcod(Kind::DashboardOpen, "Open the dashboard", &["dashboard"]));
     out.push(Action::rekcod(Kind::Doctor, "Check for problems", &["doctor"]).interactive());
     out.push(Action::rekcod(Kind::Upgrade, "Check for updates", &["upgrade"]).interactive());
+    if rollback {
+        out.push(
+            Action::rekcod(Kind::UpgradeRollback, "Go back to the previous version", &["upgrade", "--rollback"])
+                .confirm("Put back the rekcod binary the last upgrade replaced? A running VM keeps its version until it restarts.".into())
+                .interactive(),
+        );
+    }
     out.push(
         Action::rekcod(Kind::Uninstall, "Uninstall rekcod", &["uninstall", "--yes"])
             .confirm("Uninstall rekcod? This stops it, removes its login agents and docker context, and deletes ~/.rekcod with every VM disk, volume and snapshot.".into())
@@ -1737,8 +1749,8 @@ pub mod tests {
     /// Every action kind comes out of the lists the menu bar renders.
     pub fn reachable_kinds() -> Vec<Action> {
         let (containers, ports, projects) = sample();
-        let mut all = vm_actions(true, false, false);
-        all.extend(vm_actions(false, true, true));
+        let mut all = vm_actions(true, false, false, false);
+        all.extend(vm_actions(false, true, true, true));
         all.extend(storage_actions(true, &[]));
         all.extend(storage_actions(true, &[sample_storage()]));
         for c in &containers {
@@ -1805,6 +1817,7 @@ pub mod tests {
                     | Kind::SandboxApply
                     | Kind::SandboxRemove
                     | Kind::AppRollback
+                    | Kind::UpgradeRollback
                     | Kind::AppDestroy
                     | Kind::AppPublic
                     | Kind::JobCancel

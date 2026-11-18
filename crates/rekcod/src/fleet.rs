@@ -330,6 +330,8 @@ fn git_cmd() -> Command {
     let mut c = Command::new("git");
     let protocols = if std::env::var_os(ALLOW_LOCAL_GIT).is_some() { "https:ssh:http:file" } else { "https:ssh:http" };
     c.env("GIT_ALLOW_PROTOCOL", protocols).env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null());
+    // A remote that stops sending would hold the deploy until the controller's timeout.
+    c.args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60"]);
     c
 }
 
@@ -5437,7 +5439,7 @@ fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Res
                 let body = json!({"body": format!("Preview: {}", v["url"].as_str().unwrap_or(""))}).to_string();
                 // The header goes in on stdin: on argv, `ps` would show the token to every user.
                 if let Ok(mut child) = Command::new("curl")
-                    .args(["-sf", "-X", "POST", "-H", "@-", "-d", &body, api])
+                    .args(["-sf", "-m", "10", "-X", "POST", "-H", "@-", "-d", &body, api])
                     .stdin(Stdio::piped())
                     .stdout(Stdio::null())
                     .spawn()

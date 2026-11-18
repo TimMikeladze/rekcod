@@ -219,7 +219,7 @@ pub fn model_json(m: &Model) -> Value {
         "sandbox_vm": m.sandbox,
         "socket_installed": m.socket_installed,
         "autostart": m.autostart,
-        "vm_actions": actions_json(&actions::vm_actions(m.running, m.socket_installed, m.autostart)),
+        "vm_actions": actions_json(&actions::vm_actions(m.running, m.socket_installed, m.autostart, m.rollback)),
         "storage_actions": actions_json(&actions::storage_actions(m.running, &m.containers)),
         "containers": containers,
         "local_errors": m.local_errors,
@@ -394,7 +394,7 @@ mod tests {
             ..Default::default()
         };
         collect(&model_json(&full));
-        collect(&model_json(&Model { socket_installed: false, ..Default::default() }));
+        collect(&model_json(&Model { socket_installed: false, rollback: true, ..Default::default() }));
         collect(&model_json(&Model { running: true, autostart: true, containers: vec![sample_storage()], ..Default::default() }));
         for kind in actions::Kind::ALL {
             assert!(seen.contains(&format!("{kind:?}")), "{kind:?} is missing from `rekcod state`");

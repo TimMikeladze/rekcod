@@ -192,11 +192,22 @@ enum Cmd {
     },
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp(ApiPolicyArgs),
-    /// Install the latest release over this binary (the VM keeps running the old one until restarted).
+    /// Install the latest release over this binary (the VM keeps running the old one until
+    /// restarted). The replaced binary stays as .rekcod.previous beside it. Checks the
+    /// release's build provenance with gh when it's installed, and a Developer ID signature
+    /// by the team that signed this binary.
     Upgrade {
-        /// Only say whether a newer release exists; exit 1 if one does.
-        #[arg(long)]
+        /// Only say whether a newer release exists: exit 0 if not, 1 if one does, 2 if it
+        /// couldn't tell (no network).
+        #[arg(long, conflicts_with = "rollback")]
         check: bool,
+        /// Put back the binary the last upgrade replaced.
+        #[arg(long, conflicts_with = "restart_services")]
+        rollback: bool,
+        /// Also restart the controller, node, edge, storage, dashboard and menu bar jobs on
+        /// the new binary (the VM is never restarted).
+        #[arg(long)]
+        restart_services: bool,
     },
     /// Stop rekcod and remove everything it set up: launchd jobs, the socket route, the
     /// docker contexts, the ~/.zshenv block, firewall exceptions, pmset (as `server setup`
@@ -1342,7 +1353,8 @@ fn main() {
         Cmd::Sandbox { remote: None, ns: Some(_), .. } => Err(anyhow::anyhow!("--ns is for fleet sandboxes; add --remote")),
         Cmd::Sandbox { remote: None, cmd, .. } => run_sandbox(&paths, cmd),
         Cmd::Mcp(policy) => sandbox_api::mcp(paths, policy.policy()?),
-        Cmd::Upgrade { check } => lifecycle::upgrade(check),
+        Cmd::Upgrade { rollback: true, .. } => lifecycle::rollback(),
+        Cmd::Upgrade { check, restart_services, .. } => lifecycle::upgrade(check, restart_services),
         Cmd::Uninstall { keep_data, yes } => lifecycle::uninstall(&paths, keep_data, yes),
         Cmd::Doctor { bundle } => lifecycle::doctor(&paths, bundle),
         Cmd::Macos(MacosCmd::Fetch) => macos::fetch(&paths),

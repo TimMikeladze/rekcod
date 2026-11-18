@@ -357,6 +357,15 @@ impl Dir {
         Ok(out)
     }
 
+    /// `rel`'s device and inode, without following a final symlink. Two names the
+    /// filesystem takes as one (`README.md` and `readme.md` on case-insensitive APFS) have
+    /// the same.
+    pub fn identity(&self, rel: &Path) -> Option<(u64, u64)> {
+        let (dir, name) = self.parent(rel, false).ok()?;
+        let st = stat_at(dir.fd.as_raw_fd(), &name)?;
+        Some((st.st_dev as u64, st.st_ino))
+    }
+
     /// `rel`'s state, or None if it doesn't exist or can't be reached without a symlink.
     pub fn state(&self, rel: &Path) -> Option<State> {
         let (dir, name) = self.parent(rel, false).ok()?;

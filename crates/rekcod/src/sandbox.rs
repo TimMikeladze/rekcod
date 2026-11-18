@@ -1037,7 +1037,9 @@ fn side(dir: &Dir, rel: &Path) -> Result<Side> {
 fn render(old: &Dir, new: &Dir, c: &Change) -> Result<String> {
     use std::fmt::Write;
     let rel = Path::new(&c.path);
-    let (a, b) = (side(old, rel)?, side(new, rel)?);
+    // An added name can resolve to a deleted one on the Mac (a case-only rename).
+    let a = if c.kind == 'A' { Side::None } else { side(old, rel)? };
+    let b = if c.kind == 'D' { Side::None } else { side(new, rel)? };
     let name = printable_name(&c.path);
     let (an, bn) = (format!("a/{name}"), format!("b/{name}"));
     let mode = |s: &Side| match s {
@@ -1219,6 +1221,12 @@ fn was_dir(m: &Manifest, p: &str) -> bool {
 /// unpacked archive) or a `chmod` counts.
 fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Change]) -> Vec<String> {
     let dir = Dir::open(project).ok();
+    // A case-only or normalization-only rename: on the Mac the added name is the deleted one,
+    // so it's judged by what the sandbox copied under the old name. Deletions go first.
+    let deleted: std::collections::HashMap<(u64, u64), &str> = match &dir {
+        Some(d) => ch.iter().filter(|c| c.kind == 'D').filter_map(|c| Some((d.identity(Path::new(&c.path))?, c.path.as_str()))).collect(),
+        None => Default::default(),
+    };
     ch.iter()
         .filter(|c| match (manifest, &dir) {
             (Some(m), Some(d)) => {
@@ -1226,7 +1234,11 @@ fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Chan
                 // A directory the workspace replaced with a file or link. What was in it
                 // shows up as deletions, each checked on its own.
                 let replaced = c.kind != 'D' && now.is_some_and(|s| s.kind() == 'd') && was_dir(m, &c.path);
-                !replaced && !unchanged(now, m.get(&c.path).copied())
+                let was = match d.identity(Path::new(&c.path)).and_then(|i| deleted.get(&i)) {
+                    Some(old) if c.kind == 'A' => *old,
+                    _ => c.path.as_str(),
+                };
+                !replaced && !unchanged(now, m.get(was).copied())
             }
             _ => std::fs::symlink_metadata(project.join(&c.path))
                 .is_ok_and(|m| std::os::unix::fs::MetadataExt::ctime(&m) >= 0 && std::os::unix::fs::MetadataExt::ctime(&m) as u64 > since),
@@ -1912,6 +1924,24 @@ mod tests {
         assert!(find(&paths, &m.id).unwrap().manifest().unwrap().contains_key("a"));
         // So the retry writes b without calling a a conflict.
         assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('A', "b")]);
+    }
+
+    #[test]
+    fn a_case_or_normalization_rename_applies() {
+        for (from, to) in [("readme.md", "README.md"), ("caf\u{e9}.txt", "cafe\u{301}.txt")] {
+            let (paths, project, m, ws) = setup("rename", &[(from, "doc"), ("other", "o")]);
+            if !project.join(to).exists() {
+                continue; // a case- or normalization-sensitive volume: two separate names
+            }
+            std::fs::rename(ws.join(from), ws.join(to)).unwrap();
+            std::fs::write(ws.join("other"), "o2").unwrap();
+            let r = patch(&paths, &m.id).unwrap();
+            assert!(r.changes.iter().any(|c| c.kind == 'A' && c.path == to), "{:?}", r.changes);
+            apply(&paths, &m.id, false, Some(&r.review)).unwrap();
+            let names: Vec<String> = std::fs::read_dir(&project).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            assert!(names.contains(&to.to_string()) && !names.contains(&from.to_string()), "{names:?}");
+            assert_eq!(std::fs::read_to_string(project.join("other")).unwrap(), "o2");
+        }
     }
 
     #[test]

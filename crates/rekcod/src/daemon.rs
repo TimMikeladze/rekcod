@@ -73,6 +73,20 @@ pub struct Options {
     pub repair: bool,
     /// Main VM: the daemon's userspace network instead of NAT (`rekcod start --network user`).
     pub network_user: bool,
+    /// Sandbox VM: the only Mac ports it may listen on, comma-separated; None is any
+    /// unprivileged port.
+    pub publish: Option<String>,
+    /// Sandbox VM: don't forward the ports its autoports containers listen on.
+    pub no_autoports: bool,
+}
+
+/// `--publish`: ports, comma-separated; empty is none.
+fn publish_ports(s: &str) -> Result<BTreeSet<u16>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u16>().ok().filter(|&p| p > 0).with_context(|| format!("--publish {p}: not a port")))
+        .collect()
 }
 
 /// `IP:PORT,...` checked, so nothing else lands on the kernel command line (boot.sh reads it).
@@ -112,9 +126,16 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let t0 = Instant::now();
     // Held until we exit: a second daemon on the same disk fails here.
     let _pid_lock = paths.hold_pid_file()?;
+    // A stop request goes through `shutdown` (or force stop), also while booting:
+    // left at its default, SIGTERM would end the daemon with the VM and its disks mid-write.
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    // `rekcod sandbox rm`, `rekcod stop --force`: skip the graceful shutdown.
+    let mut kill = signal(SignalKind::user_defined1())?;
     let _ = std::fs::remove_file(paths.last_exit());
-    raise_fd_limit();
-    crate::lifecycle::trim_log_hourly(paths.daemon_log());
+    crate::lifecycle::raise_fd_limit();
+    // Every minute: what a sandbox's guest does reaches this log, limited but not silenced.
+    crate::lifecycle::trim_log_every(paths.daemon_log(), Duration::from_secs(60));
     let guest = paths.guest_dir()?;
     let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
     let fresh = paths.data_fresh().exists();
@@ -150,6 +171,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         .map(|a| a.split(',').map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect())
         .filter(|a: &Vec<String>| !a.iter().any(|h| h == "*"));
     let reach = reach_addrs(opts.reach.as_deref().unwrap_or(""))?;
+    let scope = PortScope { sandbox: opts.project.is_some(), allowed: opts.publish.as_deref().map(publish_ports).transpose()? };
     let resolved = Arc::new(netstack::Resolved::default());
     let mut host_net = None;
     let mut main_user_net = false;
@@ -195,16 +217,23 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         data_disk: paths.data_disk(),
         mac_address: std::fs::read_to_string(paths.mac_address())?.trim().to_string(),
         console_log: paths.console_log(),
+        console_rate: opts.project.is_some().then_some(SANDBOX_CONSOLE_RATE),
+        conn_budget: opts.project.is_some().then_some(SANDBOX_CONN_BUDGET),
         shares,
         net,
     };
     let vm = Vm::create(&cfg)?;
     // The VM holds its own copy of its end.
     cfg.net = Net::None;
-    let dns_filter = match (&opts.project, &allow) {
-        (Some(_), Some(a)) => Some(Arc::new(DnsFilter { allow: a.clone(), resolved: resolved.clone() })),
-        _ => None,
-    };
+    let dns = Arc::new(DnsPolicy {
+        sandbox: opts.project.is_some(),
+        filter: match (&opts.project, &allow) {
+            (Some(_), Some(a)) => Some(DnsFilter { allow: a.clone(), resolved: resolved.clone() }),
+            _ => None,
+        },
+        limit: Mutex::new(rekcod_proto::LogLimit::new(Duration::from_secs(10), 20, "rekcod-egress: ")),
+        log: Arc::new(|line| log!("{line}")),
+    });
     let _net = match host_net {
         Some(fd) => {
             let policy =
@@ -214,20 +243,46 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         None => None,
     };
     log!("kernel command line: {}", cfg.cmdline);
-    vm.start().await?;
-    vm.map_elastic();
-    log!("VM started ({} CPUs, {} MiB + {} MiB elastic, rosetta={})", cfg.cpus, cfg.memory_mib, cfg.elastic_mib, vm.rosetta);
-
-    // Docker socket first so `rekcod start` can poll it while the guest boots.
-    let sock = paths.socket();
-    let _ = std::fs::remove_file(&sock);
-    let listener = crate::paths::with_umask(0o077, || UnixListener::bind(&sock)).with_context(|| format!("bind {}", sock.display()))?;
-    tokio::spawn(docker_proxy(vm.clone(), listener));
-    if fresh {
-        tokio::spawn(forget_fresh_disk(vm.clone(), paths.data_fresh()));
-    }
-
-    let caps = wait_for_agent(&vm).await?;
+    let boot = async {
+        vm.start().await?;
+        vm.map_elastic();
+        log!("VM started ({} CPUs, {} MiB + {} MiB elastic, rosetta={})", cfg.cpus, cfg.memory_mib, cfg.elastic_mib, vm.rosetta);
+        // Docker socket first so `rekcod start` can poll it while the guest boots.
+        let sock = paths.socket();
+        let _ = std::fs::remove_file(&sock);
+        let listener = crate::paths::with_umask(0o077, || UnixListener::bind(&sock)).with_context(|| format!("bind {}", sock.display()))?;
+        tokio::spawn(docker_proxy(vm.clone(), listener));
+        if fresh {
+            tokio::spawn(forget_fresh_disk(vm.clone(), paths.data_fresh()));
+        }
+        wait_for_agent(&vm, opts.repair, &paths.console_log()).await
+    };
+    let stop = tokio::select! {
+        caps = boot => match caps {
+            Ok(caps) => Ok(caps),
+            Err(e) => {
+                cleanup(&paths);
+                return Err(e);
+            }
+        },
+        _ = term.recv() => Err(false),
+        _ = int.recv() => Err(false),
+        _ = kill.recv() => Err(true),
+    };
+    let caps = match stop {
+        Ok(caps) => caps,
+        Err(force) => {
+            log!("asked to stop while booting");
+            if force {
+                force_stop(&vm).await;
+            } else {
+                shutdown(&vm, &mut kill).await;
+            }
+            cleanup(&paths);
+            clean_exit(&paths);
+            return Ok(());
+        }
+    };
     let fs_cache = caps.split_whitespace().any(|c| c == CAP_FS_NOTIFY);
     log!("guest agent up after {:.2}s (cached file sharing: {fs_cache})", t0.elapsed().as_secs_f64());
 
@@ -267,15 +322,17 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     for line in watch.set_roots(Default::default()) {
         log!("{line}");
     }
-    let status = Arc::new(Status::new(
-        paths.clone(),
-        cfg.cpus,
-        (cfg.memory_mib, cfg.elastic_mib),
-        fs_cache,
-        watch,
-        opts.project.clone(),
-        network_name,
-    ));
+    let role = Role {
+        project: opts.project.clone(),
+        network: network_name,
+        ports: scope,
+        watch: match (&opts.project, &opts.workspace) {
+            (None, _) => WatchScope::All,
+            (Some(dir), None) => WatchScope::Within(dir.clone()),
+            (Some(_), Some(_)) => WatchScope::Nothing,
+        },
+    };
+    let status = Arc::new(Status::new(paths.clone(), cfg.cpus, (cfg.memory_mib, cfg.elastic_mib), fs_cache, watch, role));
     status.write();
     let ctl = paths.control_socket();
     let _ = std::fs::remove_file(&ctl);
@@ -295,21 +352,16 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     if fs_cache {
         tokio::spawn(warm_recent(vm.clone(), paths.warm_paths()));
     }
-    tokio::spawn(dns_bridge(vm.clone(), dns_filter));
-    tokio::spawn(port_forwarder(vm.clone(), status.clone()));
+    tokio::spawn(dns_bridge(vm.clone(), dns));
+    tokio::spawn(port_forwarder(vm.clone(), status.clone(), !opts.no_autoports));
 
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    // `rekcod sandbox rm`: nothing on the disk is kept, so skip the graceful shutdown.
-    let mut kill = signal(SignalKind::user_defined1())?;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
         tokio::select! {
             _ = term.recv() => break,
             _ = int.recv() => break,
             _ = kill.recv() => {
-                log!("force stop");
-                let _ = vm.force_stop().await;
+                force_stop(&vm).await;
                 cleanup(&paths);
                 clean_exit(&paths);
                 return Ok(());
@@ -322,11 +374,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
                     log!("idle for {ttl}s, stopping");
                     break;
                 }
-                // vm.state() waits on the VM's dispatch queue, which a stuck VM can hold.
-                let probe = vm.clone();
-                let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(move || probe.state())).await else {
-                    continue;
-                };
+                let Some(s) = probe_state(&vm).await else { continue };
                 if matches!(s, State::Stopped | State::Error) {
                     log!("guest stopped on its own ({s:?})");
                     cleanup(&paths);
@@ -336,30 +384,33 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             }
         }
     }
-    shutdown(&vm).await;
+    shutdown(&vm, &mut kill).await;
     cleanup(&paths);
     clean_exit(&paths);
     Ok(())
 }
 
+/// The VM's state, or None if its dispatch queue (which `vm.state()` waits on) didn't
+/// answer within 2 s: a stuck VM can hold it.
+async fn probe_state(vm: &Vm) -> Option<State> {
+    let probe = vm.clone();
+    tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(move || probe.state())).await.ok()?.ok()
+}
+
+/// Powers the VM off now. Bounded: when the VM's queue is stuck the daemon exits anyway,
+/// which ends the VM with it.
+async fn force_stop(vm: &Vm) {
+    log!("force stop");
+    match tokio::time::timeout(Duration::from_secs(10), vm.force_stop()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log!("force stop failed: {e:#}"),
+        Err(_) => log!("force stop did not answer within 10s; exiting"),
+    }
+}
+
 /// Tells `rekcod start --foreground` (the login agent) that this stop was on purpose.
 fn clean_exit(paths: &Paths) {
     let _ = std::fs::write(paths.last_exit(), b"clean");
-}
-
-/// launchd starts agents with a soft limit of 256 descriptors; every forwarded connection
-/// and docker client takes two.
-fn raise_fd_limit() {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-        return;
-    }
-    let per_proc = crate::cli::sysctl_u64("kern.maxfilesperproc").unwrap_or(10240) as libc::rlim_t;
-    let want = lim.rlim_max.min(per_proc);
-    if want > lim.rlim_cur {
-        lim.rlim_cur = want;
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
-    }
 }
 
 /// After a failed accept (EMFILE, ENFILE), wait before the next one instead of spinning.
@@ -374,24 +425,33 @@ fn cleanup(paths: &Paths) {
     }
 }
 
-async fn shutdown(vm: &Vm) {
+/// Asks the guest to power off and waits up to 30 s, then forces it. SIGUSR1 while it
+/// waits forces it at once.
+async fn shutdown(vm: &Vm, kill: &mut tokio::signal::unix::Signal) {
     log!("shutting down guest");
-    let asked = control(vm, Control::Shutdown).await;
-    if let Err(e) = &asked {
-        log!("graceful shutdown request failed: {e:#}");
-    }
-    // The guest waits up to 18 s for dockerd (which gives containers 10 s), then unmounts.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while asked.is_ok() && Instant::now() < deadline {
-        if matches!(vm.state(), State::Stopped | State::Error) {
-            log!("guest powered off");
-            return;
+    let graceful = async {
+        if let Err(e) = control(vm, Control::Shutdown).await {
+            log!("graceful shutdown request failed: {e:#}");
+            return false;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    log!("forcing VM stop");
-    if let Err(e) = vm.force_stop().await {
-        log!("force stop failed: {e:#}");
+        // The guest waits up to 18 s for dockerd (which gives containers 10 s), then unmounts.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if matches!(probe_state(vm).await, Some(State::Stopped | State::Error)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    };
+    let done = tokio::select! {
+        done = graceful => done,
+        _ = kill.recv() => false,
+    };
+    if done {
+        log!("guest powered off");
+    } else {
+        force_stop(vm).await;
     }
 }
 
@@ -401,7 +461,7 @@ async fn shutdown(vm: &Vm) {
 async fn forget_fresh_disk(vm: Vm, marker: PathBuf) {
     loop {
         if let Ok(c) = vm.connect(DOCKER_PORT).await
-            && http::get(c, "/_ping").await.is_ok_and(|b| b == b"OK")
+            && tokio::time::timeout(Duration::from_secs(5), http::get(c, "/_ping")).await.is_ok_and(|b| b.is_ok_and(|b| b == b"OK"))
         {
             let _ = std::fs::remove_file(&marker);
             return;
@@ -410,17 +470,48 @@ async fn forget_fresh_disk(vm: Vm, marker: PathBuf) {
     }
 }
 
-/// Waits for the agent; returns its capabilities (the rest of the ping reply).
-async fn wait_for_agent(vm: &Vm) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(90);
+/// Unread guest bytes all of a sandbox VM's connections may hold together. The main VM's
+/// limits are sized for your own `docker logs`; a sandbox's guest may write to a connection
+/// the daemon isn't reading on purpose.
+const SANDBOX_CONN_BUDGET: u64 = 256 << 20;
+
+/// A sandbox's console output kept per second; the rest is dropped.
+const SANDBOX_CONSOLE_RATE: u64 = 64 << 10;
+
+/// Longest any boot waits, `--repair` included: e2fsck -fy may run from every backup superblock.
+pub(crate) const BOOT_WAIT_MAX: Duration = Duration::from_secs(1800);
+
+/// Whether a boot that has waited `waited`, `checking` of it while the guest ran e2fsck
+/// on its data disk, has run out of its `limit`. The disk check doesn't count: it takes as
+/// long as the disk needs, and stopping the VM in the middle of it helps nobody.
+pub(crate) fn boot_wait_over(waited: Duration, checking: Duration, limit: Duration) -> bool {
+    waited > BOOT_WAIT_MAX || waited.saturating_sub(checking) > limit
+}
+
+/// Waits for the agent; returns its capabilities (the rest of the ping reply). 90 s,
+/// plus the time the guest spends checking its data disk; `repair` waits up to
+/// [`BOOT_WAIT_MAX`], as `rekcod start --repair` does.
+async fn wait_for_agent(vm: &Vm, repair: bool, console_log: &std::path::Path) -> Result<String> {
+    let limit = if repair { BOOT_WAIT_MAX } else { Duration::from_secs(90) };
+    let (start, mut checking, mut in_check, mut looked) = (Instant::now(), Duration::ZERO, false, Instant::now());
     loop {
+        let before = Instant::now();
         match control(vm, Control::Ping).await {
             Ok(reply) if reply.starts_with("pong") => return Ok(reply.trim_start_matches("pong").trim().to_string()),
             Ok(reply) => bail!("unexpected ping reply {reply:?}"),
-            Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
-            Err(e) => return Err(e.context("guest agent did not come up (see ~/.rekcod/logs/console.log)")),
+            Err(e) if boot_wait_over(start.elapsed(), checking, limit) => {
+                return Err(e.context("guest agent did not come up (see ~/.rekcod/logs/console.log)"));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
-        if matches!(vm.state(), State::Stopped | State::Error) {
+        if looked.elapsed() >= Duration::from_secs(1) {
+            looked = Instant::now();
+            in_check = crate::vm::checking_disk(console_log);
+        }
+        if in_check {
+            checking += before.elapsed();
+        }
+        if matches!(probe_state(vm).await, Some(State::Stopped | State::Error)) {
             bail!("guest stopped during boot (see ~/.rekcod/logs/console.log)");
         }
     }
@@ -431,12 +522,37 @@ async fn control(vm: &Vm, cmd: Control) -> Result<String> {
 }
 
 async fn control_within(vm: &Vm, cmd: Control, timeout: Duration) -> Result<String> {
-    let stream = vm.connect(CONTROL_PORT).await?;
+    ask(vm.connect(CONTROL_PORT).await?, &cmd, timeout).await
+}
+
+/// Sends `cmd` on a fresh control connection and reads the one-line reply.
+async fn ask<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(stream: S, cmd: &Control, timeout: Duration) -> Result<String> {
     let mut stream = BufReader::new(stream);
     stream.get_mut().write_all(cmd.encode().as_bytes()).await?;
     let mut reply = String::new();
-    tokio::time::timeout(timeout, stream.read_line(&mut reply)).await??;
+    tokio::time::timeout(timeout, read_line_max(&mut stream, &mut reply)).await??;
     Ok(reply.trim_end().to_string())
+}
+
+/// Longest reply line read from the guest agent.
+const REPLY_MAX: u64 = 64 << 10;
+
+/// `read_line`, but a line that hasn't ended within [`REPLY_MAX`] is an error: a sandbox's
+/// guest decides what it sends, and would otherwise grow the daemon's memory at will.
+async fn read_line_max<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R, line: &mut String) -> Result<usize> {
+    let mut buf = Vec::new();
+    let n = (&mut *r).take(REPLY_MAX).read_until(b'\n', &mut buf).await?;
+    if n as u64 == REPLY_MAX && buf.last() != Some(&b'\n') {
+        bail!("guest reply over {} KiB without a line end", REPLY_MAX >> 10);
+    }
+    line.push_str(std::str::from_utf8(&buf).context("guest reply is not UTF-8")?);
+    Ok(n)
+}
+
+/// Returns once the client has closed its end (anything it sends is ignored).
+async fn closed<R: tokio::io::AsyncRead + Unpin>(r: &mut R) {
+    let mut buf = [0u8; 256];
+    while matches!(r.read(&mut buf).await, Ok(n) if n > 0) {}
 }
 
 /// `~/.rekcod/run/control.sock`: one command line in, the agent's reply out.
@@ -457,16 +573,23 @@ async fn control_server(vm: Vm, listener: UnixListener) {
             if conn.read_line(&mut line).await.is_err() {
                 return;
             }
-            let reply = match Control::parse(&line) {
-                Some(Control::Stats) => {
-                    let reply =
-                        control_within(&vm, Control::Stats, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"));
-                    with_elastic_held(reply, vm.elastic_held())
+            let relay = async {
+                match Control::parse(&line) {
+                    Some(Control::Stats) => {
+                        let reply =
+                            control_within(&vm, Control::Stats, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"));
+                        with_elastic_held(reply, vm.elastic_held())
+                    }
+                    Some(cmd @ (Control::Trim | Control::BenchMeta(_))) => {
+                        control_within(&vm, cmd, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"))
+                    }
+                    _ => format!("error: unsupported command {:?}", line.trim_end()),
                 }
-                Some(cmd @ (Control::Trim | Control::BenchMeta(_))) => {
-                    control_within(&vm, cmd, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"))
-                }
-                _ => format!("error: unsupported command {:?}", line.trim_end()),
+            };
+            // A client that gave up (the CLI waits 5 s for stats) takes the guest side with it.
+            let reply = tokio::select! {
+                reply = relay => reply,
+                () = closed(&mut conn) => return,
             };
             let _ = conn.get_mut().write_all(format!("{reply}\n").as_bytes()).await;
         });
@@ -608,7 +731,7 @@ async fn notify_guest(vm: &Vm, conn: &NotifyConn, changed: &[String]) -> Result<
             let mut reply = String::new();
             for _ in changed {
                 reply.clear();
-                if stream.read_line(&mut reply).await? == 0 {
+                if read_line_max(stream, &mut reply).await? == 0 {
                     bail!("control connection closed");
                 }
             }
@@ -660,39 +783,67 @@ struct DnsFilter {
     resolved: Arc<netstack::Resolved>,
 }
 
-impl DnsFilter {
+/// What the DNS bridge answers. Sandboxes get standard queries for one plain name only
+/// ([`rekcod_proto::dns_plain_query`]), whether or not they have an allowlist.
+struct DnsPolicy {
+    sandbox: bool,
+    filter: Option<DnsFilter>,
+    /// Refusals are logged through this: a guest can send them as fast as it likes.
+    limit: Mutex<rekcod_proto::LogLimit>,
+    log: netstack::Logger,
+}
+
+impl DnsPolicy {
     async fn answer(&self, query: &[u8]) -> Option<Vec<u8>> {
-        match dns::query_name(query) {
-            Some(name) if rekcod_proto::host_allowed(&self.allow, &name) => {
-                let answer = resolve(query).await?;
-                for (ip, ttl) in dns::answer_a(&answer) {
-                    self.resolved.record(ip, ttl);
-                }
-                Some(answer)
+        let name = dns::query_name(query);
+        let refuse = if self.sandbox && !rekcod_proto::dns_plain_query(query) {
+            true
+        } else if let Some(f) = &self.filter {
+            !name.as_deref().is_some_and(|n| rekcod_proto::host_allowed(&f.allow, n))
+        } else {
+            false
+        };
+        if refuse {
+            let line = format!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain query)"));
+            let lines = self.limit.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lines(line, Instant::now());
+            for l in lines {
+                (self.log)(l);
             }
-            name => {
-                log!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain question)"));
-                dns::refused(query)
+            return dns::refused(query);
+        }
+        let answer = resolve(query).await?;
+        if let Some(f) = &self.filter {
+            for (ip, ttl) in dns::answer_a(&answer) {
+                f.resolved.record(ip, ttl);
             }
         }
+        Some(answer)
     }
 }
 
 /// Answers the guest's DNS queries with the Mac's current resolvers.
-async fn dns_bridge(vm: Vm, filter: Option<Arc<DnsFilter>>) {
+async fn dns_bridge(vm: Vm, policy: Arc<DnsPolicy>) {
     loop {
-        if let Err(e) = dns_session(&vm, &filter).await {
+        let session = async { dns_session(vm.connect(DNS_PORT).await?, &policy).await };
+        if let Err(e) = session.await {
             log!("dns bridge: {e:#}");
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
-    let (mut rd, mut wr) = tokio::io::split(vm.connect(DNS_PORT).await?);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    // Queries resolving at once; more wait, so a flood can't spawn tasks without limit.
-    let in_flight = Arc::new(tokio::sync::Semaphore::new(256));
+/// Queries answered at once, and answers waiting for the guest to read them. A guest that
+/// sends without reading fills both and then isn't read either, so its answers can't pile
+/// up on the Mac.
+const DNS_IN_FLIGHT: usize = 256;
+
+async fn dns_session<S>(stream: S, policy: &Arc<DnsPolicy>) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(DNS_IN_FLIGHT);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(DNS_IN_FLIGHT));
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if wr.write_all(&frame).await.is_err() {
@@ -707,16 +858,13 @@ async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
             let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
-            let filter = filter.clone();
+            let policy = policy.clone();
             let permit = in_flight.clone().acquire_owned().await?;
             tokio::spawn(async move {
+                // Held until the answer is queued.
                 let _permit = permit;
-                let answer = match &filter {
-                    Some(f) => f.answer(&query).await,
-                    None => resolve(&query).await,
-                };
-                if let Some(frame) = answer.as_deref().and_then(frame) {
-                    let _ = tx.send(frame);
+                if let Some(frame) = policy.answer(&query).await.as_deref().and_then(frame) {
+                    let _ = tx.send(frame).await;
                 }
             });
         }
@@ -752,25 +900,23 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
         servers = dns::nameservers(&resolv, dns::if_index);
     }
     for server in servers {
-        let local: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
-        let Ok(sock) = UdpSocket::bind(local).await else { continue };
-        if sock.send_to(query, server).await.is_err() {
-            continue;
-        }
-        let mut buf = vec![0u8; 4096];
-        if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
-            buf.truncate(n);
-            // Truncated (TC): the full answer only comes over TCP.
-            if buf.len() > 2
-                && buf[2] & 0x02 != 0
-                && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
-            {
-                return Some(full);
-            }
-            return Some(buf);
+        if let Some(answer) = ask_resolver(query, server, Duration::from_secs(2)).await {
+            return Some(answer);
         }
     }
     None
+}
+
+/// One resolver's answer to `query` ([`dns::ask_udp`]); a truncated one is asked again over TCP.
+async fn ask_resolver(query: &[u8], server: SocketAddr, wait: Duration) -> Option<Vec<u8>> {
+    let answer = dns::ask_udp(query, server, wait).await?;
+    // Truncated (TC): the full answer only comes over TCP.
+    if answer[2] & 0x02 != 0
+        && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
+    {
+        return Some(full);
+    }
+    Some(answer)
 }
 
 async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
@@ -780,6 +926,9 @@ async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
     tcp.read_exact(&mut len).await?;
     let mut answer = vec![0u8; u16::from_be_bytes(len) as usize];
     tcp.read_exact(&mut answer).await?;
+    if !dns::answers(query, &answer) {
+        bail!("the resolver's answer is for another query");
+    }
     Ok(answer)
 }
 
@@ -796,7 +945,11 @@ async fn docker_proxy(vm: Vm, listener: UnixListener) {
         tokio::spawn(async move {
             match vm.connect(DOCKER_PORT).await {
                 Ok(guest) => {
-                    let _ = crate::proxy::pipe(client, guest).await;
+                    if let Err(e) = crate::proxy::pipe(client, guest).await
+                        && e.downcast_ref::<crate::proxy::ClientGone>().is_none()
+                    {
+                        log!("docker proxy: {e:#}");
+                    }
                 }
                 Err(e) => log!("docker proxy: {e:#}"),
             }
@@ -863,23 +1016,107 @@ struct Status {
     autoport: Mutex<Vec<(String, String)>>,
     /// Ports those containers listen on (from the agent).
     listening: Mutex<BTreeMap<Binding, String>>,
+    scope: PortScope,
+    watch_scope: WatchScope,
+    /// One `apply_forwards` at a time: it waits for closed listeners between deciding and binding.
+    applying: tokio::sync::Mutex<()>,
+    /// Bindings `scope` refused at the last apply, so each is logged once.
+    refused: Mutex<BTreeSet<Binding>>,
+}
+
+/// Most Mac ports one sandbox VM may listen on.
+const SANDBOX_PORTS_MAX: usize = 64;
+
+/// Which Mac listeners a VM may open. The main VM gets what its Docker publishes. A
+/// sandbox runs code nobody vetted and its guest reports the ports, so it gets loopback
+/// only (a wildcard becomes 127.0.0.1 and ::1, any other address is refused), the ports the
+/// host side allowed (or any from 1024 up), and at most [`SANDBOX_PORTS_MAX`] of them.
+#[derive(Default)]
+struct PortScope {
+    sandbox: bool,
+    allowed: Option<BTreeSet<u16>>,
+}
+
+impl PortScope {
+    /// The listeners to open: Docker's published ports, then the autoports ones (on ports
+    /// nothing publishes), narrowed to what this VM may open; and the bindings refused.
+    fn apply(
+        &self,
+        published: BTreeMap<Binding, String>,
+        mut listening: BTreeMap<Binding, String>,
+    ) -> (BTreeMap<Binding, String>, BTreeSet<Binding>) {
+        if !self.sandbox {
+            listening.extend(published);
+            return (listening, BTreeSet::new());
+        }
+        let (mut out, mut refused, mut ports) = (BTreeMap::new(), BTreeSet::new(), BTreeSet::new());
+        // Published first, so a guest listening on many ports can't crowd them out of the cap.
+        for (b, name) in published.into_iter().chain(listening) {
+            let addrs: Vec<std::net::IpAddr> = if b.addr.is_unspecified() {
+                vec![std::net::Ipv4Addr::LOCALHOST.into(), std::net::Ipv6Addr::LOCALHOST.into()]
+            } else if b.addr.is_loopback() {
+                vec![b.addr]
+            } else {
+                vec![]
+            };
+            let port_ok = self.allowed.as_ref().map_or(b.port >= 1024, |a| a.contains(&b.port));
+            if addrs.is_empty() || !port_ok || (!ports.contains(&b.port) && ports.len() >= SANDBOX_PORTS_MAX) {
+                refused.insert(b);
+                continue;
+            }
+            ports.insert(b.port);
+            for addr in addrs {
+                out.entry(Binding { addr, ..b }).or_insert_with(|| name.clone());
+            }
+        }
+        (out, refused)
+    }
+}
+
+/// Mac directories whose bind mounts get file events and cache warming.
+enum WatchScope {
+    /// The main VM: every bind source under the shared roots.
+    All,
+    /// A sandbox sharing the live project: bind sources inside it. Its guest decides
+    /// what `/containers/json` says, so a source outside would hand it events (names,
+    /// sizes, times) for Mac files it can't otherwise see.
+    Within(PathBuf),
+    /// A sandbox sharing a copy: its files change only from inside the guest.
+    Nothing,
+}
+
+impl WatchScope {
+    fn filter(&self, binds: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+        match self {
+            WatchScope::All => binds,
+            WatchScope::Nothing => BTreeSet::new(),
+            // Resolved first: a symlink inside the project may point anywhere.
+            WatchScope::Within(root) => {
+                let Ok(root) = std::fs::canonicalize(root) else { return BTreeSet::new() };
+                binds.into_iter().filter(|p| std::fs::canonicalize(p).is_ok_and(|c| c.starts_with(&root))).collect()
+            }
+        }
+    }
+}
+
+/// What this daemon's VM is: for the status file, and for what its guest may ask of the Mac.
+struct Role {
+    /// A sandbox's shared directory.
+    project: Option<PathBuf>,
+    network: &'static str,
+    ports: PortScope,
+    watch: WatchScope,
 }
 
 impl Status {
-    fn new(
-        paths: Paths,
-        cpus: usize,
-        (base_mib, elastic_mib): (u64, u64),
-        fs_cache: bool,
-        watch: Arc<Watch>,
-        project: Option<PathBuf>,
-        network: &str,
-    ) -> Status {
+    fn new(paths: Paths, cpus: usize, (base_mib, elastic_mib): (u64, u64), fs_cache: bool, watch: Arc<Watch>, role: Role) -> Status {
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let Role { project, network, ports: scope, watch: watch_scope } = role;
         Status {
             paths,
             network: network.to_string(),
             watch,
+            watch_scope,
             started_at,
             cpus,
             memory_mib: base_mib + elastic_mib,
@@ -892,6 +1129,9 @@ impl Status {
             published: Mutex::default(),
             autoport: Mutex::default(),
             listening: Mutex::default(),
+            scope,
+            applying: tokio::sync::Mutex::new(()),
+            refused: Mutex::default(),
         }
     }
 
@@ -935,9 +1175,14 @@ impl Status {
 }
 
 const EVENTS_PATH: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D";
+/// How long one Docker API round trip in the guest may take before the port forwarder
+/// gives up on it and starts over.
+const GUEST_API_TIMEOUT: Duration = Duration::from_secs(30);
 
-async fn port_forwarder(vm: Vm, status: Arc<Status>) {
-    tokio::spawn(autoports(vm.clone(), status.clone()));
+async fn port_forwarder(vm: Vm, status: Arc<Status>, autoports_on: bool) {
+    if autoports_on {
+        tokio::spawn(autoports(vm.clone(), status.clone()));
+    }
     loop {
         if let Err(e) = watch_events(&vm, &status).await {
             log!("port forwarder: {e:#}");
@@ -948,7 +1193,8 @@ async fn port_forwarder(vm: Vm, status: Arc<Status>) {
 
 async fn watch_events(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     reconcile(vm, status).await?;
-    let mut events = http::Lines::open(vm.connect(DOCKER_PORT).await?, EVENTS_PATH).await?;
+    let open = async { http::Lines::open(vm.connect(DOCKER_PORT).await?, EVENTS_PATH).await };
+    let mut events = tokio::time::timeout(GUEST_API_TIMEOUT, open).await.context("the guest's /events did not answer")??;
     while let Some(line) = events.next().await? {
         let Ok(ev) = serde_json::from_slice::<serde_json::Value>(&line) else { continue };
         let action = ev["Action"].as_str().unwrap_or_default();
@@ -964,10 +1210,11 @@ async fn watch_events(vm: &Vm, status: &Arc<Status>) -> Result<()> {
 
 async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     // all=1: created containers too, so a bind source is warmed before `start`.
-    let body = http::get(vm.connect(DOCKER_PORT).await?, "/containers/json?all=1").await?;
+    let list = async { http::get(vm.connect(DOCKER_PORT).await?, "/containers/json?all=1").await };
+    let body = tokio::time::timeout(GUEST_API_TIMEOUT, list).await.context("the guest's /containers/json did not answer")??;
     *status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ports::desired(&body)?;
     *status.autoport.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ports::autoport_containers(&body)?;
-    let binds = watch::bind_sources(&body)?;
+    let binds = status.watch_scope.filter(watch::bind_sources(&body)?);
     if status.fs_cache {
         let new: Vec<PathBuf> = binds
             .difference(&status.binds.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
@@ -990,7 +1237,7 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     for err in status.watch.set_roots(binds) {
         log!("{err}");
     }
-    apply_forwards(vm, status, true);
+    apply_forwards(vm, status, true).await;
     Ok(())
 }
 
@@ -1021,32 +1268,77 @@ async fn autoports(vm: Vm, status: Arc<Status>) {
             changed
         };
         if changed {
-            apply_forwards(&vm, &status, false);
+            apply_forwards(&vm, &status, false).await;
         }
     }
 }
 
 /// Opens and closes Mac listeners to match published + auto-detected ports.
 /// `retry_failed`: try again on ports that couldn't be bound before.
-fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
-    let mut want = status.listening.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    want.extend(status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
-    let mut changed = false;
+/// What to do with a forward already in place, given the container that wants its binding now.
+#[derive(Debug, PartialEq)]
+enum Next {
+    Keep,
+    /// Same binding, another container name (`docker rename`, a swap seen in one step): the
+    /// tunnel goes by protocol and port, so the listener stays and only the name changes.
+    Rename(String),
+    Close,
+}
+
+fn next(fwd: &Forward, wanted: Option<&String>, retry_failed: bool) -> Next {
+    match wanted {
+        Some(name) if fwd.task.is_some() && *name == fwd.container => Next::Keep,
+        Some(name) if fwd.task.is_some() => Next::Rename(name.clone()),
+        Some(name) if *name == fwd.container && !retry_failed => Next::Keep,
+        _ => Next::Close,
+    }
+}
+
+async fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
+    let _one = status.applying.lock().await;
+    let listening = status.listening.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let published = status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let (want, refused) = status.scope.apply(published, listening);
     {
+        let mut last = status.refused.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for b in refused.difference(&last) {
+            log!("port {}:{}/{:?}: not opened, outside what this sandbox may listen on", b.addr, b.port, b.proto);
+        }
+        *last = refused;
+    }
+    let mut changed = false;
+    let mut closing = Vec::new();
+    // Ports our listeners hold now, including ones closed below.
+    let ours: BTreeSet<u16> = {
         let mut active = status.forwards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Ports our listeners hold now, including ones closed below (abort is asynchronous).
-        let ours: BTreeSet<u16> = active.iter().filter(|(_, f)| f.task.is_some()).map(|(b, _)| b.port).collect();
-        active.retain(|binding, fwd| {
-            let keep = want.get(binding) == Some(&fwd.container) && (fwd.task.is_some() || !retry_failed);
-            if !keep {
+        let ours = active.iter().filter(|(_, f)| f.task.is_some()).map(|(b, _)| b.port).collect();
+        active.retain(|binding, fwd| match next(fwd, want.get(binding), retry_failed) {
+            Next::Keep => true,
+            Next::Rename(name) => {
+                log!("port {}:{}/{:?} -> {name} (was {})", binding.addr, binding.port, binding.proto, fwd.container);
+                fwd.container = name;
+                changed = true;
+                true
+            }
+            Next::Close => {
                 if let Some(task) = fwd.task.take() {
                     task.abort();
+                    closing.push(task);
                     log!("port {}:{}/{:?} closed", binding.addr, binding.port, binding.proto);
                 }
                 changed = true;
+                false
             }
-            keep
         });
+        ours
+    };
+    // Abort is asynchronous: the socket is free once the task has ended, and a listener for
+    // another address on the same port binds only then.
+    for task in closing {
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+    {
+        let mut active = status.forwards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (binding, container) in want {
             if active.contains_key(&binding) {
                 continue;
@@ -1382,8 +1674,10 @@ mod tests {
     }
 
     /// Runs the guest's `data_disk_ready` (data-disk.sh) on a scratch image with stub
-    /// `blkid`, `mkfs.ext4` and `e2fsck`; nothing real is formatted. Returns whether it
-    /// left an ext4 disk, and the tools it ran.
+    /// `blkid`, `mkfs.ext4` and `e2fsck`; nothing real is formatted. The stubs work on the
+    /// image's bytes: blkid reports ext4 when the superblock magic (0xEF53 at byte 1080) is
+    /// there, mkfs writes it, and e2fsck writes it when `recoverable` (a backup superblock
+    /// it could use). Returns whether it left an ext4 disk, and the tools it ran.
     fn data_disk_ready(image: &[u8], cmdline: &str, ext4: bool, recoverable: bool) -> (bool, String) {
         use std::os::unix::fs::PermissionsExt;
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1391,19 +1685,20 @@ mod tests {
         let t = std::env::temp_dir().join(format!("rekcod-data-disk-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         std::fs::create_dir_all(t.join("bin")).unwrap();
-        std::fs::write(t.join("vdb"), image).unwrap();
-        for (flag, on) in [("ext4", ext4), ("recoverable", recoverable)] {
-            if on {
-                std::fs::write(t.join(flag), b"").unwrap();
-            }
+        let mut image = image.to_vec();
+        if ext4 {
+            image[1080..1082].copy_from_slice(&[0x53, 0xef]);
         }
-        // blkid sees ext4 once $T/ext4 exists; mkfs makes it, and so does e2fsck on a disk
-        // whose backup superblock is intact.
-        let stubs = [
-            ("blkid", r#"[ -e "$T/ext4" ] && echo "$1: LABEL=\"rekcod-data\" TYPE=\"ext4\"""#),
-            ("mkfs.ext4", r#"echo "mkfs.ext4 $*" >>"$T/ran"; touch "$T/ext4""#),
-            ("e2fsck", r#"echo "e2fsck $*" >>"$T/ran"; [ -e "$T/recoverable" ] && touch "$T/ext4"; exit 8"#),
-        ];
+        std::fs::write(t.join("vdb"), &image).unwrap();
+        if recoverable {
+            std::fs::write(t.join("recoverable"), b"").unwrap();
+        }
+        // The device is the last argument of each tool.
+        let magic = r#"for d; do :; done; printf '\123\357' | dd of="$d" bs=1 seek=1080 conv=notrunc 2>/dev/null"#;
+        let blkid = r#"[ "$(dd if="$1" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 53ef ] && echo "$1: LABEL=\"rekcod-data\" TYPE=\"ext4\"""#;
+        let mkfs = format!(r#"echo "mkfs.ext4 $*" >>"$T/ran"; {magic}"#);
+        let e2fsck = format!(r#"echo "e2fsck $*" >>"$T/ran"; [ -e "$T/recoverable" ] && {{ {magic}; exit 1; }}; exit 8"#);
+        let stubs = [("blkid", blkid.to_string()), ("mkfs.ext4", mkfs), ("e2fsck", e2fsck)];
         for (name, body) in stubs {
             let p = t.join("bin").join(name);
             std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -1420,7 +1715,10 @@ mod tests {
             .status()
             .unwrap();
         let ran = std::fs::read_to_string(t.join("ran")).unwrap_or_default();
+        let after = std::fs::read(t.join("vdb")).unwrap();
         std::fs::remove_dir_all(&t).unwrap();
+        // What the script decided is what the disk now says.
+        assert_eq!(status.success(), after[1080..1082] == [0x53, 0xef], "{ran}");
         (status.success(), ran)
     }
 
@@ -1457,7 +1755,14 @@ mod tests {
 
     #[tokio::test]
     async fn removing_a_udp_port_frees_it_with_a_flow_open() {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Below macOS's ephemeral range, so another test's `bind(:0)` can't take it while it's free.
+        let mut port = 20_000 + (std::process::id() % 20_000) as u16;
+        let sock = loop {
+            match UdpSocket::bind(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) => port += 1,
+            }
+        };
         let addr = sock.local_addr().unwrap();
         let (guests_tx, mut guests) = mpsc::unbounded_channel();
         let connect = move || {
@@ -1481,9 +1786,181 @@ mod tests {
         // What apply_forwards does when the port goes away.
         task.abort();
         let _ = task.await;
-        UdpSocket::bind(addr).await.expect("the port is free right away");
+        // A process another test spawns at the wrong moment can inherit the socket (macOS
+        // sets close-on-exec after socket()); it lets go within moments. A flow holding it
+        // would keep it as long as the guest end stays open.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Err(e) = UdpSocket::bind(addr).await {
+            assert!(Instant::now() < deadline, "the port is still taken: {e}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let closed = tokio::time::timeout(Duration::from_secs(5), guest.read(&mut buf)).await;
         assert!(matches!(closed, Ok(Ok(0))), "the flow ended with it: {closed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_renamed_container_keeps_its_listener() {
+        let open = || Forward { container: "web".into(), task: Some(tokio::spawn(async {})), error: None };
+        let failed = Forward { container: "web".into(), task: None, error: Some("in use".into()) };
+        let (web, api) = ("web".to_string(), "api".to_string());
+        assert_eq!(next(&open(), Some(&web), true), Next::Keep);
+        assert_eq!(next(&open(), Some(&api), true), Next::Rename("api".into()), "docker rename");
+        assert_eq!(next(&open(), None, true), Next::Close);
+        assert_eq!(next(&failed, Some(&web), false), Next::Keep, "not retried between docker events");
+        assert_eq!(next(&failed, Some(&web), true), Next::Close, "retried on the next event");
+        assert_eq!(next(&failed, Some(&api), false), Next::Close);
+    }
+
+    #[test]
+    fn a_sandbox_listens_on_loopback_ports_it_was_allowed() {
+        let b = |addr: &str, port: u16| Binding { proto: Proto::Tcp, addr: addr.parse().unwrap(), port };
+        let want: BTreeMap<Binding, String> =
+            [b("::", 8080), b("192.168.1.5", 9000), b("0.0.0.0", 22), b("127.0.0.1", 5432)].into_iter().map(|b| (b, "x".into())).collect();
+        let none = BTreeMap::new;
+        let main = PortScope::default();
+        assert_eq!(main.apply(want.clone(), none()).0, want, "the main VM opens what Docker publishes");
+
+        let sandbox = PortScope { sandbox: true, allowed: None };
+        let (open, refused) = sandbox.apply(want.clone(), none());
+        assert_eq!(open.keys().copied().collect::<Vec<_>>(), [b("127.0.0.1", 5432), b("127.0.0.1", 8080), b("::1", 8080)]);
+        assert_eq!(refused, [b("0.0.0.0", 22), b("192.168.1.5", 9000)].into());
+
+        let fleet = PortScope { sandbox: true, allowed: Some([5432].into()) };
+        assert_eq!(fleet.apply(want, none()).0.keys().copied().collect::<Vec<_>>(), [b("127.0.0.1", 5432)]);
+
+        // A guest that listens on everything gets a few ports, not the Mac's loopback, and
+        // the port Docker publishes still opens.
+        let many: BTreeMap<Binding, String> = (2000..3000).map(|p| (b("127.0.0.1", p), "x".into())).collect();
+        let web: BTreeMap<Binding, String> = [(b("127.0.0.1", 9999), "web".into())].into();
+        let (open, refused) = sandbox.apply(web, many);
+        assert_eq!((open.len(), refused.len()), (SANDBOX_PORTS_MAX, 1001 - SANDBOX_PORTS_MAX));
+        assert!(open.contains_key(&b("127.0.0.1", 9999)));
+        assert!(publish_ports("3000, 8080").is_ok_and(|p| p == [3000, 8080].into()));
+        assert!(publish_ports("").is_ok_and(|p| p.is_empty()));
+        assert!(publish_ports("0").is_err() && publish_ports("http").is_err());
+    }
+
+    #[test]
+    fn a_sandbox_watches_only_inside_its_live_project() {
+        let t = std::env::temp_dir().join(format!("rekcod-watch-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (app, docs) = (t.join("app"), t.join("Documents"));
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        std::os::unix::fs::symlink(&docs, app.join("link")).unwrap();
+        let t = t.canonicalize().unwrap();
+        let (app, docs) = (t.join("app"), t.join("Documents"));
+        let binds: BTreeSet<PathBuf> = [app.clone(), app.join("src"), docs.clone(), app.join("link"), app.join("../Documents")].into();
+
+        assert_eq!(WatchScope::All.filter(binds.clone()), binds);
+        assert_eq!(WatchScope::Within(app.clone()).filter(binds.clone()), [app.clone(), app.join("src")].into());
+        assert!(WatchScope::Nothing.filter(binds).is_empty(), "a copy-mode sandbox watches nothing");
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    fn dns_query(id: u16, name: &str, flags: u8) -> Vec<u8> {
+        let mut q = vec![(id >> 8) as u8, id as u8, flags, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for l in name.split('.') {
+            q.push(l.len() as u8);
+            q.extend_from_slice(l.as_bytes());
+        }
+        q.extend_from_slice(&[0, 0, 1, 0, 1]);
+        q
+    }
+
+    #[tokio::test]
+    async fn a_guest_that_never_reads_dns_answers_stops_being_read() {
+        let logged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let l = logged.clone();
+        let policy = Arc::new(DnsPolicy {
+            sandbox: true,
+            filter: Some(DnsFilter { allow: vec!["npmjs.org".into()], resolved: Arc::default() }),
+            limit: Mutex::new(rekcod_proto::LogLimit::new(Duration::from_secs(10), 20, "rekcod-egress: ")),
+            log: Arc::new(move |_| {
+                l.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        });
+        let (ours, mut guest) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move { dns_session(ours, &policy).await });
+        let flood = async {
+            for i in 0..10_000u16 {
+                // Refused at once: a name off the list, or an UPDATE.
+                let q = if i % 2 == 0 { dns_query(i, &format!("n{i}.evil.example"), 1) } else { dns_query(i, "npmjs.org", 0x28) };
+                guest.write_all(&frame(&q).unwrap()).await.unwrap();
+            }
+        };
+        assert!(tokio::time::timeout(Duration::from_secs(3), flood).await.is_err(), "the bridge kept reading");
+        assert!(logged.load(std::sync::atomic::Ordering::Relaxed) <= 20, "{logged:?} lines");
+    }
+
+    #[tokio::test]
+    async fn a_resolver_answer_comes_from_the_resolver_and_answers_the_query() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let query = dns_query(0x1234, "npmjs.org", 1);
+        let q = query.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, client) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], &q[..]);
+            // Someone else races the resolver, then the resolver sends a stale answer first.
+            let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut fake = q.clone();
+            fake[2] |= 0x80;
+            forger.send_to(&fake, client).await.unwrap();
+            let mut stale = fake.clone();
+            stale[1] ^= 1;
+            server.send_to(&stale, client).await.unwrap();
+            fake[3] = 3; // NXDOMAIN, from the real resolver this time
+            server.send_to(&fake, client).await.unwrap();
+        });
+        let answer = ask_resolver(&query, addr, Duration::from_secs(5)).await.unwrap();
+        assert_eq!((answer[1], answer[3]), (0x34, 3));
+    }
+
+    #[tokio::test]
+    async fn guest_replies_have_a_size_limit() {
+        let (ours, mut guest) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let junk = vec![b'x'; 1 << 16];
+            for _ in 0..16 {
+                if guest.write_all(&junk).await.is_err() {
+                    return;
+                }
+            }
+            let _ = guest.write_all(b"\n").await;
+        });
+        let err = ask(ours, &Control::Ping, Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.to_string().contains("over 64 KiB"), "{err}");
+
+        let (ours, mut guest) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move { guest.write_all(b"pong fs-notify\n").await });
+        assert_eq!(ask(ours, &Control::Ping, Duration::from_secs(5)).await.unwrap(), "pong fs-notify");
+    }
+
+    #[test]
+    fn a_boot_waits_out_the_disk_check() {
+        let s = Duration::from_secs;
+        assert!(!boot_wait_over(s(80), s(0), s(90)));
+        assert!(boot_wait_over(s(91), s(0), s(90)));
+        assert!(!boot_wait_over(s(400), s(350), s(90)), "e2fsck ran for most of it");
+        assert!(boot_wait_over(s(400), s(250), s(90)));
+        assert!(!boot_wait_over(s(1200), s(0), BOOT_WAIT_MAX), "--repair");
+        assert!(boot_wait_over(s(1801), s(1801), s(90)), "never past the cap");
+
+        let t = std::env::temp_dir().join(format!("rekcod-console-{}", std::process::id()));
+        let line = |m: &str| format!("rekcod-boot: [1.2s] {m}\n");
+        for (lines, want) in [
+            (vec![line("init"), line("checking data disk"), "e2fsck 1.47: /dev/vdb: 12/400 files\n".into()], true),
+            (vec![line("checking data disk"), line("data disk mounted")], false),
+            (vec![line("data disk has no readable ext4 superblock; trying the backup"), line("trying backup superblock 98304")], true),
+            (vec![line("checking data disk"), line("data disk error: e2fsck found errors")], false),
+            (vec![line("init")], false),
+        ] {
+            std::fs::write(&t, lines.concat()).unwrap();
+            assert_eq!(crate::vm::checking_disk(&t), want, "{lines:?}");
+        }
+        std::fs::remove_file(&t).unwrap();
     }
 
     #[test]

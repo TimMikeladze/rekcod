@@ -62,6 +62,9 @@ sleep 2
 "$R" remote add admin http://127.0.0.1:17720 --token "$(cat "$C/controller/admin-token")"
 cr() { "$R" "$@" --remote admin; }
 s3() { curl -s -m 10 --aws-sigv4 "aws:amz:us-east-1:s3" --user "$1" "${@:2}"; }
+root() { printf '%s:%s' "$(sed -n 's/.*"access_key": "\(.*\)".*/\1/p' "$C/storage/credentials.json")" "$(sed -n 's/.*"secret_key": "\(.*\)".*/\1/p' "$C/storage/credentials.json")"; }
+# Waits up to 30 s for `sh -c SCRIPT ARGS...` to succeed.
+eventually() { for _ in $(seq 60); do sh -c "$@" >/dev/null 2>&1 && return 0; sleep 0.5; done; sh -c "$@"; }
 
 echo "app buckets"
 check "deploy with [storage] bucket = true, 2 instances" sh -c 'cd "$1" && "$0" app deploy --remote admin --name hello --instances 2' "$R" "$repo/w"
@@ -94,11 +97,20 @@ check "rolled back to v1" sh -c 'curl -s -m 3 "http://$0/" | head -1 | grep -qx 
 
 echo "rotate and destroy"
 check "app storage rotate" cr app storage hello rotate
-check "the old secret stops working" sh -c 'test "$(curl -s -o /dev/null -w "%{http_code}" -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" http://127.0.0.1:17710/app-hello/x.txt)" = 403' "$key:$sec"
+# The old key goes once the old instances drained (--drain 1s).
+check "the old secret stops working" eventually 'test "$(curl -s -o /dev/null -w "%{http_code}" -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" http://127.0.0.1:17710/app-hello/x.txt)" = 403' "$key:$sec"
 check "destroy refuses a non-empty bucket" sh -c '! "$0" app destroy --remote admin hello </dev/null 2>&1 | grep -q destroyed' "$R"
 check "destroy --force" cr app destroy hello --force
-check "bucket is gone" sh -c 'test "$(curl -s -o /dev/null -w "%{http_code}" -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" -I http://127.0.0.1:17710/app-hello)" = 404' \
+# The bucket goes on a thread of its own after the request returns.
+check "bucket is gone" eventually 'test "$(curl -s -o /dev/null -w "%{http_code}" -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" -I http://127.0.0.1:17710/app-hello)" = 404' \
   "$(sed -n 's/.*"access_key": "\(.*\)".*/\1/p' "$C/storage/credentials.json"):$(sed -n 's/.*"secret_key": "\(.*\)".*/\1/p' "$C/storage/credentials.json")"
+
+echo "versioning and a lost policy (RD-13)"
+# What a tenant's S3 library may do with its own key: versioning on, overwrites, a delete
+# marker. The destroy must remove every version, or RustFS answers the bucket DELETE with 409.
+check "app key turns on versioning" sh -c 'printf "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>" | curl -sf -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" -T - "http://127.0.0.1:17710/app-other?versioning"' "$key2:$sec2"
+for v in a b; do echo "$v" >"$repo/obj"; s3 "$key2:$sec2" -sf -T "$repo/obj" http://127.0.0.1:17710/app-other/v.txt; done
+s3 "$key2:$sec2" -sf -X DELETE http://127.0.0.1:17710/app-other/v.txt
 
 echo "backups"
 check "controller backup" cr controller backup
@@ -109,7 +121,11 @@ check "controller restore" "$R" controller restore
 pids+=($!)
 sleep 2
 check "restored controller has the app and remembers storage" sh -c '"$0" app ls --remote admin | grep -q "\"other\"" && grep -c "storage on" "$1" | grep -q 2' "$R" "$C/controller.log"
+# Someone removed the bucket's policy by hand: the destroy treats it as already gone.
+check "remove other's policy by hand" s3 "$(root)" -sf -X DELETE "http://127.0.0.1:17710/rustfs/admin/v3/remove-canned-policy?name=bucket-app-other"
 check "destroy other" cr app destroy other --force
+check "versioned bucket is gone" eventually 'test "$(curl -s -o /dev/null -w "%{http_code}" -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" -I http://127.0.0.1:17710/app-other)" = 404' "$(root)"
+check "and so is the app row" eventually '! "$0" app status other --remote admin' "$R"
 
 echo
 if [[ $failures -eq 0 ]]; then echo "all storage checks passed"; else echo "$failures storage check(s) failed"; exit 1; fi

@@ -139,33 +139,37 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  		/* Store outarg for fuse_finish_open() */
  		struct fuse_open_out *outargp = &ff->args->open_outarg;
  		int err;
-@@ -186,6 +195,25 @@
+@@ -186,6 +195,29 @@
  	return ff;
  }
  
-+u64 fuse_file_fh(struct fuse_file *ff)
++int fuse_file_open_lazy(struct fuse_file *ff)
 +{
 +	struct fuse_open_out outarg = {};
++	int err = 0;
 +
 +	if (likely(!fuse_file_lazy(ff)))
-+		return ff->fh;
++		return 0;
 +
 +	mutex_lock(&ff->rekcod_mutex);
-+	if (ff->rekcod_lazy &&
-+	    !fuse_send_open(ff->fm, ff->nodeid, ff->rekcod_flags,
-+			    ff->rekcod_isdir ? FUSE_OPENDIR : FUSE_OPEN, &outarg)) {
-+		ff->fh = outarg.fh;
-+		smp_store_release(&ff->rekcod_lazy, false);
++	if (ff->rekcod_lazy) {
++		err = fuse_send_open(ff->fm, ff->nodeid, ff->rekcod_flags,
++				     ff->rekcod_isdir ? FUSE_OPENDIR : FUSE_OPEN,
++				     &outarg);
++		if (!err) {
++			ff->fh = outarg.fh;
++			smp_store_release(&ff->rekcod_lazy, false);
++		}
 +	}
-+	/* On failure fh stays 0 and the host rejects the request (EBADF). */
++	/* On failure the file stays lazy: no request goes out with fh 0. */
 +	mutex_unlock(&ff->rekcod_mutex);
-+	return ff->fh;
++	return err;
 +}
 +
  int fuse_do_open(struct fuse_mount *fm, u64 nodeid, struct file *file,
  		 bool isdir)
  {
-@@ -385,7 +413,8 @@
+@@ -385,7 +417,8 @@
  	 * before commencing with fs shutdown doesn't work if submounts are
  	 * used.
  	 */
@@ -175,7 +179,7 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  }
  
  void fuse_release_common(struct file *file, bool isdir)
-@@ -488,7 +517,7 @@
+@@ -488,7 +521,7 @@
  		return err;
  
  	err = 0;
@@ -184,51 +188,148 @@ diff --color -ruN -x rekcod.c a/file.c b/file.c
  		goto inval_attr_out;
  
  	memset(&inarg, 0, sizeof(inarg));
-@@ -527,7 +556,7 @@
+@@ -525,7 +558,10 @@
+ 	struct fuse_file *ff = file->private_data;
+ 	FUSE_ARGS(args);
  	struct fuse_fsync_in inarg;
++	int err = fuse_file_open_lazy(ff);
  
++	if (err)
++		return err;
  	memset(&inarg, 0, sizeof(inarg));
--	inarg.fh = ff->fh;
-+	inarg.fh = fuse_file_fh(ff);
+ 	inarg.fh = ff->fh;
  	inarg.fsync_flags = datasync ? FUSE_FSYNC_FDATASYNC : 0;
- 	args.opcode = opcode;
- 	args.nodeid = get_node_id(inode);
-@@ -593,7 +622,7 @@
+@@ -593,6 +629,8 @@
  	struct fuse_file *ff = file->private_data;
  	struct fuse_args *args = &ia->ap.args;
  
--	ia->read.in.fh = ff->fh;
-+	ia->read.in.fh = fuse_file_fh(ff);
++	/* rekcod: every caller has run fuse_file_open_lazy() */
++	WARN_ON_ONCE(fuse_file_lazy(ff));
+ 	ia->read.in.fh = ff->fh;
  	ia->read.in.offset = pos;
  	ia->read.in.size = count;
- 	ia->read.in.flags = file->f_flags;
-@@ -2488,7 +2517,7 @@
+@@ -798,7 +836,10 @@
+ 	struct file *file = ia->io->iocb->ki_filp;
  	struct fuse_file *ff = file->private_data;
+ 	struct fuse_mount *fm = ff->fm;
++	int err = fuse_file_open_lazy(ff);
  
++	if (err)
++		return err;
+ 	fuse_read_args_fill(ia, file, pos, count, FUSE_READ);
+ 	if (owner != NULL) {
+ 		ia->read.in.read_flags |= FUSE_READ_LOCKOWNER;
+@@ -868,6 +909,9 @@
+ 	if (pos + (desc.length - 1) == LLONG_MAX)
+ 		desc.length--;
+ 
++	res = fuse_file_open_lazy(file->private_data);
++	if (res)
++		return res;
+ 	fuse_read_args_fill(&ia, file, pos, desc.length, FUSE_READ);
+ 	res = fuse_simple_request(fm, &ia.ap.args);
+ 	if (res < 0)
+@@ -1106,6 +1150,9 @@
+ 
+ 	if (fuse_is_bad(inode))
+ 		return;
++	/* rekcod: the host open failed; read_folio will return its error */
++	if (fuse_file_open_lazy(rac->file->private_data))
++		return;
+ 
+ 	iomap_readahead(&fuse_iomap_ops, &ctx, NULL);
+ 	if (data.ia)
+@@ -2479,14 +2526,17 @@
+ 	return 0;
+ }
+ 
+-static void fuse_lk_fill(struct fuse_args *args, struct file *file,
+-			 const struct file_lock *fl, int opcode, pid_t pid,
+-			 int flock, struct fuse_lk_in *inarg)
++static int fuse_lk_fill(struct fuse_args *args, struct file *file,
++			const struct file_lock *fl, int opcode, pid_t pid,
++			int flock, struct fuse_lk_in *inarg)
+ {
+ 	struct inode *inode = file_inode(file);
+ 	struct fuse_conn *fc = get_fuse_conn(inode);
+ 	struct fuse_file *ff = file->private_data;
++	int err = fuse_file_open_lazy(ff);
+ 
++	if (err)
++		return err;
  	memset(inarg, 0, sizeof(*inarg));
--	inarg->fh = ff->fh;
-+	inarg->fh = fuse_file_fh(ff);
+ 	inarg->fh = ff->fh;
  	inarg->owner = fuse_lock_owner_id(fc, fl->c.flc_owner);
- 	inarg->lk.start = fl->fl_start;
- 	inarg->lk.end = fl->fl_end;
-@@ -2629,7 +2658,7 @@
+@@ -2501,6 +2551,7 @@
+ 	args->in_numargs = 1;
+ 	args->in_args[0].size = sizeof(*inarg);
+ 	args->in_args[0].value = inarg;
++	return 0;
+ }
+ 
+ static int fuse_getlk(struct file *file, struct file_lock *fl)
+@@ -2512,7 +2563,9 @@
+ 	struct fuse_lk_out outarg;
+ 	int err;
+ 
+-	fuse_lk_fill(&args, file, fl, FUSE_GETLK, 0, 0, &inarg);
++	err = fuse_lk_fill(&args, file, fl, FUSE_GETLK, 0, 0, &inarg);
++	if (err)
++		return err;
+ 	args.out_numargs = 1;
+ 	args.out_args[0].size = sizeof(outarg);
+ 	args.out_args[0].value = &outarg;
+@@ -2539,7 +2592,9 @@
+ 		return -ENOLCK;
+ 	}
+ 
+-	fuse_lk_fill(&args, file, fl, opcode, pid_nr, flock, &inarg);
++	err = fuse_lk_fill(&args, file, fl, opcode, pid_nr, flock, &inarg);
++	if (err)
++		return err;
+ 	err = fuse_simple_request(fm, &args);
+ 
+ 	/* locking is restartable */
+@@ -2629,7 +2684,6 @@
  	struct fuse_file *ff = file->private_data;
  	FUSE_ARGS(args);
  	struct fuse_lseek_in inarg = {
 -		.fh = ff->fh,
-+		.fh = fuse_file_fh(ff),
  		.offset = offset,
  		.whence = whence
  	};
-@@ -2838,7 +2867,7 @@
- 	struct fuse_mount *fm = ff->fm;
+@@ -2639,6 +2693,10 @@
+ 	if (fm->fc->no_lseek)
+ 		goto fallback;
+ 
++	err = fuse_file_open_lazy(ff);
++	if (err)
++		return err;
++	inarg.fh = ff->fh;
+ 	args.opcode = FUSE_LSEEK;
+ 	args.nodeid = ff->nodeid;
+ 	args.in_numargs = 1;
+@@ -2941,7 +2999,6 @@
+ 	struct fuse_conn *fc = fm->fc;
  	FUSE_ARGS(args);
- 	struct fuse_fallocate_in inarg = {
--		.fh = ff->fh,
-+		.fh = fuse_file_fh(ff),
- 		.offset = offset,
- 		.length = length,
- 		.mode = mode
+ 	struct fuse_copy_file_range_in inarg = {
+-		.fh_in = ff_in->fh,
+ 		.off_in = pos_in,
+ 		.nodeid_out = ff_out->nodeid,
+ 		.fh_out = ff_out->fh,
+@@ -2963,6 +3020,12 @@
+ 
+ 	if (file_inode(file_in)->i_sb != file_inode(file_out)->i_sb)
+ 		return -EXDEV;
++
++	/* rekcod: a read-only source may not be open on the host yet */
++	err = fuse_file_open_lazy(ff_in);
++	if (err)
++		return err;
++	inarg.fh_in = ff_in->fh;
+ 
+ 	inode_lock(inode_in);
+ 	err = fuse_writeback_range(inode_in, pos_in, pos_in + len - 1);
 diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
 --- a/fuse_i.h	2026-11-08 19:52:11
 +++ b/fuse_i.h	2026-11-08 19:52:11
@@ -267,7 +368,7 @@ diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
  	/** @no_setxattr: Is setxattr not implemented by fs? */
  	unsigned no_setxattr:1;
  
-@@ -1049,6 +1063,26 @@
+@@ -1049,6 +1063,29 @@
  void fuse_invalidate_atime(struct inode *inode);
  
  u64 fuse_time_to_jiffies(u64 sec, u32 nsec);
@@ -284,8 +385,11 @@ diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
 +		rekcod_drop_case_aliases(entry->d_parent, &entry->d_name);
 +}
 +
-+/* rekcod lazy open: the host file handle, opening on the host first if needed */
-+u64 fuse_file_fh(struct fuse_file *ff);
++/*
++ * rekcod lazy open: open on the host now if that was deferred. 0, or the open's error,
++ * which the caller returns; ff->fh is valid only after 0.
++ */
++int fuse_file_open_lazy(struct fuse_file *ff);
 +
 +static inline bool fuse_file_lazy(struct fuse_file *ff)
 +{
@@ -295,18 +399,28 @@ diff --color -ruN -x rekcod.c a/fuse_i.h b/fuse_i.h
  	fuse_time_to_jiffies((o)->attr_valid, (o)->attr_valid_nsec)
  
 diff --color -ruN -x rekcod.c a/ioctl.c b/ioctl.c
---- a/ioctl.c	2026-11-08 19:52:11
-+++ b/ioctl.c	2026-11-08 19:52:11
-@@ -221,7 +221,7 @@
+--- a/ioctl.c	2026-11-18 11:41:48
++++ b/ioctl.c	2026-11-18 11:44:11
+@@ -221,7 +221,6 @@
  	struct fuse_file *ff = file->private_data;
  	struct fuse_mount *fm = ff->fm;
  	struct fuse_ioctl_in inarg = {
 -		.fh = ff->fh,
-+		.fh = fuse_file_fh(ff),
  		.cmd = cmd,
  		.arg = arg,
  		.flags = flags
-@@ -427,6 +427,16 @@
+@@ -236,6 +235,10 @@
+ 	struct iov_iter ii;
+ 	struct fuse_args_pages ap = {};
+ 
++	err = fuse_file_open_lazy(ff);
++	if (err)
++		return err;
++	inarg.fh = ff->fh;
+ #if BITS_PER_LONG == 32
+ 	inarg.flags |= FUSE_IOCTL_32BIT;
+ #else
+@@ -427,6 +430,16 @@
  
  long fuse_file_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
  {
@@ -323,30 +437,58 @@ diff --color -ruN -x rekcod.c a/ioctl.c b/ioctl.c
  	return fuse_ioctl_common(file, cmd, arg, 0);
  }
  
-@@ -446,7 +456,7 @@
+@@ -445,6 +458,9 @@
+ 	FUSE_ARGS(args);
  	int err;
  
++	err = fuse_file_open_lazy(ff);
++	if (err)
++		return err;
  	memset(&inarg, 0, sizeof(inarg));
--	inarg.fh = ff->fh;
-+	inarg.fh = fuse_file_fh(ff);
+ 	inarg.fh = ff->fh;
  	inarg.cmd = cmd;
- 
- #if BITS_PER_LONG == 32
 diff --color -ruN -x rekcod.c a/poll.c b/poll.c
 --- a/poll.c	2026-11-08 19:52:11
 +++ b/poll.c	2026-11-08 19:52:11
-@@ -75,7 +75,7 @@
+@@ -75,13 +75,16 @@
  {
  	struct fuse_file *ff = file->private_data;
  	struct fuse_mount *fm = ff->fm;
 -	struct fuse_poll_in inarg = { .fh = ff->fh, .kh = ff->kh };
-+	struct fuse_poll_in inarg = { .fh = fuse_file_fh(ff), .kh = ff->kh };
++	struct fuse_poll_in inarg = { .kh = ff->kh };
  	struct fuse_poll_out outarg;
  	FUSE_ARGS(args);
  	int err;
+ 
+ 	if (fm->fc->no_poll)
+ 		return DEFAULT_POLLMASK;
++	if (fuse_file_open_lazy(ff))
++		return EPOLLERR;
++	inarg.fh = ff->fh;
+ 
+ 	poll_wait(file, &ff->poll_wait, wait);
+ 	inarg.events = mangle_poll(poll_requested_events(wait));
+diff --color -ruN -x rekcod.c a/readdir.c b/readdir.c
+--- a/readdir.c	2026-11-08 19:52:11
++++ b/readdir.c	2026-11-08 19:52:11
+@@ -649,8 +649,12 @@
+ 	err = UNCACHED;
+ 	if (ff->open_flags & FOPEN_CACHE_DIR)
+ 		err = fuse_readdir_cached(file, ctx);
+-	if (err == UNCACHED)
+-		err = fuse_readdir_uncached(file, ctx);
++	if (err == UNCACHED) {
++		/* rekcod: a lazy dir is opened on the host only when the cache can't answer */
++		err = fuse_file_open_lazy(ff);
++		if (!err)
++			err = fuse_readdir_uncached(file, ctx);
++	}
+ 
+ 	return err;
+ }
 diff --color -ruN -x rekcod.c a/virtio_fs.c b/virtio_fs.c
---- a/virtio_fs.c	2026-11-08 19:52:11
-+++ b/virtio_fs.c	2026-11-08 19:52:11
+--- a/virtio_fs.c	2026-11-18 11:42:02
++++ b/virtio_fs.c	2026-11-18 11:42:05
 @@ -78,6 +78,9 @@
  	void *window_kaddr;
  	phys_addr_t window_phys_addr;

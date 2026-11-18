@@ -25,6 +25,7 @@ pub fn run() -> Result<()> {
             writer: Mutex::default(),
             pending: Mutex::default(),
             next_id: AtomicU16::new(1),
+            denied: Mutex::new(rekcod_proto::LogLimit::new(Duration::from_secs(10), 20, "rekcod-egress: ")),
             egress: Egress::from_cmdline(&std::fs::read_to_string("/proc/cmdline").unwrap_or_default()),
         });
         let (stub, tcp_stub) = (dns.clone(), dns.clone());
@@ -49,6 +50,13 @@ pub fn run() -> Result<()> {
     })
 }
 
+/// VMADDR_CID_LOCAL: a loopback connection's peer.
+const CID_LOCAL: u32 = 1;
+
+fn from_this_guest(peer: u32, ours: Option<u32>) -> bool {
+    peer == CID_LOCAL || Some(peer) == ours
+}
+
 /// One failed accept (EMFILE, say) mustn't end the agent: that would drop every session,
 /// forward and the DNS channel at once. Log it and wait a moment instead.
 async fn accept_failed(port: u32, e: std::io::Error) {
@@ -63,14 +71,24 @@ where
 {
     let listener = VsockListener::bind(VsockAddr::new(VMADDR_CID_ANY, port)).with_context(|| format!("bind vsock port {port}"))?;
     eprintln!("rekcod-agent: listening on vsock port {port}");
+    let mut refused = rekcod_proto::LogLimit::new(Duration::from_secs(10), 5, "rekcod-agent: ");
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, peer) = match listener.accept().await {
             Ok(c) => c,
             Err(e) => {
                 accept_failed(port, e).await;
                 continue;
             }
         };
+        // Not from inside the guest. A guest-local connect (a container allowed AF_VSOCK, with
+        // a loopback transport loaded) would otherwise reach dockerd and the control port as
+        // root. Such a peer has the guest's own CID, or VMADDR_CID_LOCAL.
+        if from_this_guest(peer.cid(), stream.local_addr().map(|a| a.cid()).ok()) {
+            for l in refused.lines(format!("rekcod-agent: port {port}: refused a connection from CID {}", peer.cid()), Instant::now()) {
+                eprintln!("{l}");
+            }
+            continue;
+        }
         let task = handler(stream);
         tokio::spawn(async move {
             if let Err(e) = task.await {
@@ -555,6 +573,8 @@ struct Dns {
     /// Our query id -> (client's id, client, sent at).
     pending: Mutex<HashMap<u16, (u16, Client, Instant)>>,
     next_id: AtomicU16,
+    /// Denied names are logged through this; the console is the Mac's disk.
+    denied: Mutex<rekcod_proto::LogLimit>,
     egress: Option<Egress>,
 }
 
@@ -624,28 +644,10 @@ fn skip_name(p: &[u8], mut i: usize) -> Option<usize> {
     }
 }
 
-/// The question's name, dotted. None unless the query has exactly one question and its
-/// name has no compression pointer: the whole packet goes upstream, so the name checked
-/// has to be the only one in it. The daemon applies the same rule (`dns::query_name`).
+/// The question's name, dotted ([`rekcod_proto::dns_question`]). The daemon applies the
+/// same rule.
 fn query_name(p: &[u8]) -> Option<String> {
-    if p.get(4..6)? != [0, 1] {
-        return None;
-    }
-    let mut i = 12;
-    let mut labels = Vec::new();
-    loop {
-        let len = *p.get(i)? as usize;
-        if len == 0 {
-            break;
-        }
-        if len & 0xc0 != 0 {
-            return None;
-        }
-        labels.push(String::from_utf8_lossy(p.get(i + 1..i + 1 + len)?).into_owned());
-        i += 1 + len;
-    }
-    p.get(i + 1..i + 5)?; // type and class
-    Some(labels.join("."))
+    rekcod_proto::dns_question(p).map(|(name, _)| name)
 }
 
 /// IPv4 addresses in an answer's answer section.
@@ -673,13 +675,9 @@ fn answer_ipv4s(p: &[u8]) -> Vec<std::net::Ipv4Addr> {
     out
 }
 
-/// `query` with RCODE REFUSED and no records.
+/// `query` answered REFUSED: its header and question only.
 fn refused(query: &[u8]) -> Vec<u8> {
-    let mut out = query.to_vec();
-    out[2] |= 0x80; // QR
-    out[3] = (out[3] & 0xf0) | 5;
-    out[6..12].fill(0);
-    out
+    rekcod_proto::dns_refused(query).unwrap_or_default()
 }
 
 enum Client {
@@ -700,7 +698,10 @@ impl Dns {
         if let Some(eg) = &self.egress {
             let name = query_name(query);
             if !name.as_deref().is_some_and(|n| rekcod_proto::host_allowed(&eg.allow, n)) {
-                eprintln!("rekcod-egress: denied {}", name.as_deref().unwrap_or("(not one plain question)"));
+                let line = format!("rekcod-egress: denied {}", name.as_deref().unwrap_or("(not one plain question)"));
+                for l in self.denied.lock().unwrap().lines(line, Instant::now()) {
+                    eprintln!("{l}");
+                }
                 let answer = refused(query);
                 match client {
                     Client::Tcp(tx) => {
@@ -853,6 +854,16 @@ mod tests {
         assert_eq!(answer_ipv4s(&p), vec![std::net::Ipv4Addr::new(93, 184, 216, 34)]);
         let r = refused(&p[..24]);
         assert_eq!((r[3] & 0x0f, &r[6..12]), (5, &[0u8; 6][..]));
+        assert_eq!(r.len(), 24, "header and question");
+    }
+
+    #[test]
+    fn vsock_peers_inside_the_guest_are_refused() {
+        // The Mac is CID 2; this guest has some CID of its own (3 and up).
+        assert!(!from_this_guest(2, Some(3)));
+        assert!(from_this_guest(3, Some(3)));
+        assert!(from_this_guest(1, Some(3)));
+        assert!(from_this_guest(1, None));
     }
 
     #[test]

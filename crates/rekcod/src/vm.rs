@@ -6,6 +6,7 @@
 
 use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
@@ -37,6 +38,12 @@ pub struct VmConfig {
     pub data_disk: PathBuf,
     pub mac_address: String,
     pub console_log: PathBuf,
+    /// Console bytes per second kept; the rest is dropped (sandboxes: the guest may be
+    /// hostile and the file is on the Mac's disk). None keeps everything.
+    pub console_rate: Option<u64>,
+    /// Sandboxes: unread guest bytes all of the VM's connections may hold together, in
+    /// memory and spilled to `$TMPDIR` (see [`Conn`]). None: each connection's own limits.
+    pub conn_budget: Option<u64>,
     /// Name in the guest's `mac` virtio-fs share -> host directory.
     pub shares: Vec<(String, PathBuf)>,
     pub net: Net,
@@ -75,6 +82,8 @@ pub struct Vm {
     pub rosetta: bool,
     /// The elastic-memory device, kept for the VM's lifetime.
     elastic: Option<Arc<crate::elastic::Elastic>>,
+    /// What its vsock connections may hold unread.
+    limits: Limits,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -100,7 +109,11 @@ impl Vm {
             vm = Some(OnQueue(unsafe { VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config.get(), q.get()) }));
         });
         let vm = vm.expect("exec_sync ran the closure");
-        Ok(Vm { queue: queue.clone(), vm: Arc::new(vm), rosetta, elastic: elastic.map(Arc::new) })
+        let limits = match cfg.conn_budget {
+            Some(max) => Limits { spill: max, budget: Some(Arc::new(Budget { used: AtomicU64::new(0), max })), ..LIMITS },
+            None => LIMITS,
+        };
+        Ok(Vm { queue: queue.clone(), vm: Arc::new(vm), rosetta, elastic: elastic.map(Arc::new), limits })
     }
 
     /// A VM from a ready configuration (macOS guests, `macos.rs`).
@@ -112,7 +125,7 @@ impl Vm {
         queue.exec_sync(|| {
             vm = Some(OnQueue(unsafe { VZVirtualMachine::initWithConfiguration_queue(VZVirtualMachine::alloc(), config.get(), q.get()) }));
         });
-        Vm { queue: queue.clone(), vm: Arc::new(vm.expect("exec_sync ran the closure")), rosetta: false, elastic: None }
+        Vm { queue: queue.clone(), vm: Arc::new(vm.expect("exec_sync ran the closure")), rosetta: false, elastic: None, limits: LIMITS }
     }
 
     /// Runs `f` with the VM on its queue.
@@ -197,9 +210,12 @@ impl Vm {
     }
 
     /// Opens a vsock connection to `port` in the guest. See [`Conn`] for why
-    /// it is always drained.
+    /// it is always drained. Gives up after 10 s: a stuck VM queue never answers.
     pub async fn connect(&self, port: u32) -> Result<Conn> {
-        Ok(Conn::new(self.connect_raw(port).await?))
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(10), self.connect_raw(port))
+            .await
+            .map_err(|_| anyhow!("vsock connect to port {port} timed out"))??;
+        Ok(Conn::with_limits(raw, self.limits.clone()))
     }
 
     async fn connect_raw(&self, port: u32) -> Result<UnixStream> {
@@ -362,13 +378,20 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
             )]));
         }
 
-        // Kernel console (hvc0) appends to the console log.
+        // Kernel console (hvc0): a pipe a thread copies to the console log, so the file
+        // can be rotated while the VM runs (the guest writes it as fast as it likes).
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&cfg.console_log)
             .with_context(|| format!("open {}", cfg.console_log.display()))?;
-        let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), log.into_raw_fd(), true);
+        let (read, write) = pipe().context("console pipe")?;
+        let (path, rate) = (cfg.console_log.clone(), cfg.console_rate);
+        std::thread::Builder::new()
+            .name("console".into())
+            .spawn(move || copy_console(std::fs::File::from(read), log, &path, CONSOLE_MAX, rate))
+            .context("start the console thread")?;
+        let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), write.into_raw_fd(), true);
         let attachment = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
             VZFileHandleSerialPortAttachment::alloc(),
             None,
@@ -383,6 +406,95 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
     }
 }
 
+/// A pipe whose ends close on exec.
+fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [fds[0], fds[1]] {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Ok(pair)
+}
+
+/// `console.log` is rotated past this, keeping one `.1`.
+const CONSOLE_MAX: u64 = 20 << 20;
+
+/// Copies the guest's console from `read` to `file` (open on `path`) until the VM closes
+/// it. Past `max` bytes the file becomes `path.1` and a new one starts. With `rate`, bytes
+/// over that many per second are dropped, with one line saying so. It always reads: the
+/// guest's console writes wait on this pipe.
+fn copy_console(mut read: impl std::io::Read, mut file: std::fs::File, path: &Path, max: u64, rate: Option<u64>) {
+    use std::io::Write;
+    let mut size = file.metadata().map_or(0, |m| m.len());
+    let mut buf = vec![0u8; 64 << 10];
+    let (mut window, mut used, mut dropped) = (std::time::Instant::now(), 0u64, 0u64);
+    loop {
+        let n = match read.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        let mut data = &buf[..n];
+        if let Some(rate) = rate {
+            if window.elapsed() >= std::time::Duration::from_secs(1) {
+                if dropped > 0 {
+                    let _ = writeln!(file, "\nrekcod: dropped {dropped} bytes of console output (over {rate} bytes/s)");
+                }
+                (window, used, dropped) = (std::time::Instant::now(), 0, 0);
+            }
+            let keep = (rate.saturating_sub(used) as usize).min(data.len());
+            dropped += (data.len() - keep) as u64;
+            used += keep as u64;
+            data = &data[..keep];
+        }
+        if data.is_empty() {
+            continue;
+        }
+        if size + data.len() as u64 > max {
+            let mut old = path.as_os_str().to_owned();
+            old.push(".1");
+            let reopened = std::fs::rename(path, &old).and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(path));
+            if let Ok(f) = reopened {
+                (file, size) = (f, 0);
+            }
+        }
+        if file.write_all(data).is_ok() {
+            size += data.len() as u64;
+        }
+    }
+}
+
+/// Lines the guest's boot logs around its data disk check (boot.sh, data-disk.sh).
+const DISK_CHECK_START: [&str; 3] = ["checking data disk", "data disk has no readable ext4 superblock", "trying backup superblock"];
+const DISK_CHECK_END: [&str; 2] = ["data disk mounted", "data disk error"];
+
+/// Whether the console log's last word on the data disk is that e2fsck is running on it
+/// (only the log's last 64 KiB are read).
+pub fn checking_disk(console_log: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(console_log) else { return false };
+    let len = f.metadata().map_or(0, |m| m.len());
+    let mut tail = Vec::new();
+    if f.seek(SeekFrom::Start(len.saturating_sub(64 << 10))).is_err() || f.take(64 << 10).read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&tail);
+    let last = text.lines().rev().filter(|l| l.contains("rekcod-boot:")).find_map(|l| {
+        if DISK_CHECK_START.iter().any(|m| l.contains(m)) {
+            Some(true)
+        } else if DISK_CHECK_END.iter().any(|m| l.contains(m)) {
+            Some(false)
+        } else {
+            None
+        }
+    });
+    last == Some(true)
+}
+
 /// Unread bytes a connection keeps in memory for a slow reader; past this it spills to files.
 const CONN_BUFFER_MAX: usize = 64 << 20;
 /// Unread bytes it may have spilled before the reader gets an error instead.
@@ -392,17 +504,46 @@ const CONN_SPILL_MAX: u64 = 16 << 30;
 const CONN_SPILL_FILE: u64 = 256 << 20;
 
 /// Where a connection's unread bytes go. Parameters so tests can scale them down.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Limits {
     read: usize,
     memory: usize,
     spill: u64,
     file: u64,
     open_spill: fn() -> std::io::Result<std::fs::File>,
+    /// Shared by every connection of one VM.
+    budget: Option<Arc<Budget>>,
 }
 
-const LIMITS: Limits =
-    Limits { read: 256 * 1024, memory: CONN_BUFFER_MAX, spill: CONN_SPILL_MAX, file: CONN_SPILL_FILE, open_spill: open_spill_file };
+const LIMITS: Limits = Limits {
+    read: 256 * 1024,
+    memory: CONN_BUFFER_MAX,
+    spill: CONN_SPILL_MAX,
+    file: CONN_SPILL_FILE,
+    open_spill: open_spill_file,
+    budget: None,
+};
+
+/// Unread bytes, in memory and spilled, that all of a VM's connections hold.
+struct Budget {
+    used: AtomicU64,
+    max: u64,
+}
+
+impl Budget {
+    fn take(&self, n: u64) -> bool {
+        let before = self.used.fetch_add(n, Ordering::Relaxed);
+        if before + n > self.max {
+            self.used.fetch_sub(n, Ordering::Relaxed);
+            return false;
+        }
+        true
+    }
+
+    fn give(&self, n: u64) {
+        self.used.fetch_sub(n, Ordering::Relaxed);
+    }
+}
 
 enum Seg {
     Mem {
@@ -429,6 +570,16 @@ struct Queue {
     /// After the last segment: `Ok` for a clean EOF, or the error that ended the stream.
     end: Option<std::io::Result<()>>,
     waker: Option<std::task::Waker>,
+    /// The VM's shared budget, which the unread bytes count against.
+    budget: Option<Arc<Budget>>,
+}
+
+impl Drop for Queue {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budget {
+            b.give(self.memory as u64 + self.spilled);
+        }
+    }
 }
 
 impl Queue {
@@ -471,7 +622,9 @@ fn open_spill_file() -> std::io::Result<std::fs::File> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = std::env::temp_dir().join(format!("rekcod-conn-{}-{n}", std::process::id()));
-    let f = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&path)?;
+    // 0600: with TMPDIR unset this is /tmp, and the file exists until the unlink below.
+    let f =
+        std::os::unix::fs::OpenOptionsExt::mode(std::fs::OpenOptions::new().read(true).write(true).create_new(true), 0o600).open(&path)?;
     std::fs::remove_file(&path)?;
     Ok(f)
 }
@@ -486,6 +639,13 @@ fn spill_failed(e: std::io::Error) -> std::io::Error {
 fn push(queue: &Mutex<Queue>, data: &[u8], limits: &Limits) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     let n = data.len() as u64;
+    if limits.budget.as_ref().is_some_and(|b| !b.take(n)) {
+        eprintln!(
+            "rekcod: a sandbox's vsock readers fell {} MiB behind; dropping a connection",
+            limits.budget.as_ref().map_or(0, |b| b.max >> 20)
+        );
+        return Err(std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rekcod: the VM's unread data is over its limit"));
+    }
     let (file, off) = {
         let mut q = Queue::lock(queue);
         if q.memory + data.len() <= limits.memory {
@@ -497,6 +657,9 @@ fn push(queue: &Mutex<Queue>, data: &[u8], limits: &Limits) -> std::io::Result<(
             return Ok(());
         }
         if q.spilled + n > limits.spill {
+            if let Some(b) = &limits.budget {
+                b.give(n);
+            }
             eprintln!("rekcod: vsock reader fell {} MiB behind; dropping the connection", (limits.memory as u64 + limits.spill) >> 20);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionReset,
@@ -504,13 +667,26 @@ fn push(queue: &Mutex<Queue>, data: &[u8], limits: &Limits) -> std::io::Result<(
             ));
         }
         if q.file.as_ref().is_none_or(|(_, len)| len + n > limits.file) {
-            q.file = Some((Arc::new((limits.open_spill)().map_err(spill_failed)?), 0));
+            match (limits.open_spill)() {
+                Ok(f) => q.file = Some((Arc::new(f), 0)),
+                Err(e) => {
+                    if let Some(b) = &limits.budget {
+                        b.give(n);
+                    }
+                    return Err(spill_failed(e));
+                }
+            }
         }
         let (f, len) = q.file.as_mut().expect("just set");
         *len += n;
         (f.clone(), *len - n)
     };
-    file.write_all_at(data, off).map_err(spill_failed)?;
+    if let Err(e) = file.write_all_at(data, off) {
+        if let Some(b) = &limits.budget {
+            b.give(n);
+        }
+        return Err(spill_failed(e));
+    }
     update(queue, |q| {
         q.spilled += n;
         match q.segs.back_mut() {
@@ -543,13 +719,11 @@ async fn pump<R: tokio::io::AsyncRead + Unpin>(mut read: R, queue: Arc<Mutex<Que
 }
 
 impl Conn {
-    fn new(stream: UnixStream) -> Conn {
-        Conn::with_limits(stream, LIMITS)
-    }
-
     fn with_limits<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Sync + 'static>(stream: S, limits: Limits) -> Conn {
         let (read, write) = tokio::io::split(stream);
-        let queue: Arc<Mutex<Queue>> = Arc::default();
+        let mut q = Queue::default();
+        q.budget = limits.budget.clone();
+        let queue = Arc::new(Mutex::new(q));
         let pump = tokio::spawn(pump(read, queue.clone(), limits));
         Conn { queue, write: Box::new(write), pump }
     }
@@ -582,6 +756,9 @@ impl tokio::io::AsyncRead for Conn {
                     q.segs.pop_front();
                 }
                 q.memory -= n;
+                if let Some(b) = &q.budget {
+                    b.give(n as u64);
+                }
                 return Poll::Ready(Ok(()));
             }
             Some(Seg::Spill { file, off, len }) => (file.clone(), *off, (*len).min(out.remaining() as u64).min(1 << 20) as usize),
@@ -619,6 +796,9 @@ impl tokio::io::AsyncRead for Conn {
             }
         }
         q.spilled -= n as u64;
+        if let Some(b) = &q.budget {
+            b.give(n as u64);
+        }
         if q.spilled == 0 {
             // Everything spilled has been read; closing the unlinked file frees its space.
             q.file = None;
@@ -648,10 +828,33 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    #[test]
+    fn console_log_is_rotated_and_keeps_the_latest_lines() {
+        let dir = std::env::temp_dir().join(format!("rekcod-console-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.log");
+        let open = || std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let mut input: Vec<u8> = (0..700_000).flat_map(|i| format!("line {i:070}\n").into_bytes()).collect();
+        input.extend_from_slice(b"the last line\n");
+        assert!(input.len() > 50 << 20);
+        copy_console(&input[..], open(), &path, CONSOLE_MAX, None);
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let old = dir.join("console.log.1");
+        assert!(size(&path) + size(&old) <= 2 * CONSOLE_MAX, "{} + {}", size(&path), size(&old));
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("the last line\n"));
+
+        // A sandbox past its rate keeps what fits in each second and says what it dropped.
+        std::fs::remove_file(&path).unwrap();
+        copy_console(&input[..1 << 20], open(), &path, CONSOLE_MAX, Some(4096));
+        assert_eq!(size(&path), 4096);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn a_stalled_reader_gets_every_byte_in_order() {
         let (guest, host) = UnixStream::pair().unwrap();
-        let mut conn = Conn::new(host);
+        let mut conn = Conn::with_limits(host, LIMITS);
         // More than the memory cap, written while nobody reads: the rest spills to a file.
         let total = CONN_BUFFER_MAX + (8 << 20);
         let writer = tokio::spawn(async move {
@@ -749,7 +952,36 @@ mod tests {
 
     /// 1 KiB in memory, 4 KiB in spill files of 2 KiB, read 256 bytes at a time.
     fn small(open_spill: fn() -> std::io::Result<std::fs::File>) -> Limits {
-        Limits { read: 256, memory: 1024, spill: 4096, file: 2048, open_spill }
+        Limits { read: 256, memory: 1024, spill: 4096, file: 2048, open_spill, budget: None }
+    }
+
+    #[tokio::test]
+    async fn a_sandboxs_connections_share_one_budget() {
+        let budget = Arc::new(Budget { used: AtomicU64::new(0), max: 3072 });
+        let limits = Limits { budget: Some(budget.clone()), ..small(open_spill_file) };
+        let (mut g1, h1) = UnixStream::pair().unwrap();
+        let (mut g2, h2) = UnixStream::pair().unwrap();
+        let mut first = Conn::with_limits(h1, limits.clone());
+        let mut second = Conn::with_limits(h2, limits);
+        let mut sent = 0;
+        // The first connection holds 3 KiB unread (2 KiB spilled), all of the budget.
+        g1.write_all(&pattern(&mut sent, 3072)).await.unwrap();
+        queued(&first, 3072).await;
+        g2.write_all(&[7u8; 256]).await.unwrap();
+        let (got, end) = drain(&mut second).await;
+        assert!(got.is_empty());
+        assert_eq!(end.unwrap_err().kind(), std::io::ErrorKind::ConnectionReset);
+        // Read, the bytes go back to the budget, and so do a dropped connection's.
+        let mut got = vec![0u8; 1024];
+        first.read_exact(&mut got).await.unwrap();
+        assert_eq!(budget.used.load(Ordering::Relaxed), 2048);
+        drop(first);
+        drop(g1);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(open_spill_file().unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     /// The next `n` bytes of a stream whose byte `k` is `k % 251`.

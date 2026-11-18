@@ -2,12 +2,18 @@
 # Usage: cp .env.example .env, fill it in, then `rekcod compose up -d`.
 services:
   runner:
-    image: myoung34/github-runner:latest
+    # Third-party image, pinned by digest: it holds the token below. Moving to a newer
+    # runner means checking the image and changing both the tag and the digest.
+    image: myoung34/github-runner:2.338.2@sha256:7cc183492366138ace1c9c74296fd2c6240916d98178696c38bc78e6d5810ee8
     restart: unless-stopped
     environment:
       REPO_URL: ${REPO_URL}
-      # Personal access token (repo scope). The image swaps it for a fresh
-      # registration token on every start, so restarts don't need a new one.
+      # A fine-grained personal access token for this one repository with only
+      # "Administration: read and write" (what runner registration needs). The image swaps
+      # it for a fresh registration token on every start, so restarts don't need a new one.
+      # Every job can read it (docker inspect on this container, or /proc/1/environ), so
+      # don't use a classic token with repo scope: that covers every repository you can
+      # write to.
       ACCESS_TOKEN: ${ACCESS_TOKEN}
       RUNNER_NAME: rekcod
       LABELS: rekcod,linux,arm64
@@ -15,7 +21,10 @@ services:
       # Re-register after each job so state doesn't leak between jobs.
       EPHEMERAL: "true"
     volumes:
-      # The VM's dockerd runs the job's containers.
+      # The VM's dockerd runs the job's containers. Through it a job can start a container
+      # with any Mac folder the VM shares (-v /Users:/mac) and reach the Mac's loopback
+      # services; run trusted workflows only, or give the runner its own VM (REKCOD_HOME
+      # pointing at a separate home) so this isn't the socket your own containers use.
       - /var/run/docker.sock:/var/run/docker.sock
       # Must be the same path on both sides: dockerd resolves bind mounts
       # from `container:` jobs and Docker actions in the VM, not in this container.

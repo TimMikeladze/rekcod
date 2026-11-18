@@ -9,6 +9,7 @@ pub mod ban;
 mod client_ip;
 mod idle;
 pub mod limit;
+mod progress;
 mod stats;
 
 use std::collections::{HashMap, HashSet};
@@ -37,7 +38,10 @@ pub type Body = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
 
 /// From the first byte of a request head until it's complete.
 const HEADER_TIMEOUT: Duration = if cfg!(test) { Duration::from_millis(150) } else { Duration::from_secs(10) };
+/// How long an instance has to answer once the request body is in; `[http] timeout` changes it.
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+/// A request body that sends nothing for this long is cut off with a 408.
+const BODY_IDLE: Duration = if cfg!(test) { Duration::from_millis(300) } else { Duration::from_secs(30) };
 const DEFAULT_MAX_BODY: u64 = 100 << 20;
 /// Client connections across both listeners, at most; fewer when descriptors are short.
 const MAX_CONNS: usize = 10_000;
@@ -628,16 +632,37 @@ async fn handle(edge: Arc<Edge>, req: Request<Incoming>, peer: IpAddr, opts: Lis
     resp
 }
 
-/// Whether the request failed because its body went over `max_body`.
-fn over_limit(e: &hyper::Error) -> bool {
+/// Whether `T` is behind the error: the body went over `max_body`, or stalled.
+fn caused_by<T: std::error::Error + 'static>(e: &hyper::Error) -> bool {
     let mut cause = std::error::Error::source(e);
     while let Some(c) = cause {
-        if c.is::<http_body_util::LengthLimitError>() {
+        if c.is::<T>() {
             return true;
         }
         cause = c.source();
     }
     false
+}
+
+/// Sends `req` on `lease` and waits for the response head: while the body uploads it has to
+/// keep moving, then the instance has `answer_within`. `Err(None)` when it took too long.
+async fn send(
+    lease: &mut balance::Lease,
+    parts: Parts,
+    body: Body,
+    answer_within: Duration,
+) -> Result<Response<Incoming>, Option<hyper::Error>> {
+    let (body, mut uploaded) = progress::Progress::new(body, BODY_IDLE);
+    let sending = lease.sender().send_request(Request::from_parts(parts, body.boxed_unsync()));
+    tokio::pin!(sending);
+    let sent = tokio::select! {
+        r = &mut sending => Ok(r),
+        _ = &mut uploaded => tokio::time::timeout(answer_within, &mut sending).await,
+    };
+    match sent {
+        Ok(r) => r.map_err(Some),
+        Err(_) => Err(None),
+    }
 }
 
 async fn forward(edge: &Arc<Edge>, mut req: Request<Incoming>, host: &str, client: IpAddr, peer: IpAddr, opts: Listener) -> Response<Body> {
@@ -679,6 +704,8 @@ async fn forward(edge: &Arc<Edge>, mut req: Request<Incoming>, host: &str, clien
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
     let (mut parts, body) = req.into_parts();
     prepare(edge, &mut parts, client, peer, upgrade, host);
+    let id = parts.headers.get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    let answer_within = route.http.timeout.map_or(RESPONSE_TIMEOUT, Duration::from_secs);
     // A chunked body can't be checked up front: it's cut off at the limit and the client gets a 413.
     let mut req = Some((parts, Limited::new(body, max_body as usize).boxed_unsync()));
 
@@ -692,12 +719,37 @@ async fn forward(edge: &Arc<Edge>, mut req: Request<Incoming>, host: &str, clien
     for pass in 0..2 {
         if let Some(mut lease) = edge.pool.lease(&eps).await {
             let (parts, body) = req.take().expect("sent once");
-            let sent = tokio::time::timeout(RESPONSE_TIMEOUT, lease.sender().send_request(Request::from_parts(parts, body))).await;
+            // A pooled connection the instance closed as we sent on it: the request never got
+            // there, so one without a body that's safe to repeat goes again on a new one.
+            let again = (lease.pooled
+                && !upgrade
+                && hyper::body::Body::is_end_stream(&body)
+                && matches!(parts.method, hyper::Method::GET | hyper::Method::HEAD | hyper::Method::OPTIONS))
+            .then(|| (parts.method.clone(), parts.uri.clone(), parts.headers.clone()));
+            let mut sent = send(&mut lease, parts, body, answer_within).await;
+            if let (Err(Some(_)), Some((method, uri, headers))) = (&sent, again)
+                && let Some(fresh) = edge.pool.fresh(&lease.endpoint).await
+            {
+                lease = fresh;
+                let mut parts = Request::new(()).into_parts().0;
+                (parts.method, parts.uri, parts.headers) = (method, uri, headers);
+                let empty = http_body_util::Empty::new().map_err(|e| match e {}).boxed_unsync();
+                sent = send(&mut lease, parts, empty, answer_within).await;
+            }
             return match sent {
-                Err(_) => text(StatusCode::GATEWAY_TIMEOUT, format!("{host} took over {}s to answer\n", RESPONSE_TIMEOUT.as_secs())),
-                Ok(Err(e)) if over_limit(&e) => text(StatusCode::PAYLOAD_TOO_LARGE, format!("request body over {max_body} bytes\n")),
-                Ok(Err(e)) => text(StatusCode::BAD_GATEWAY, format!("{host} ({}): {e}\n", lease.endpoint)),
-                Ok(Ok(mut resp)) => {
+                Err(None) => text(StatusCode::GATEWAY_TIMEOUT, format!("{host} took over {}s to answer\n", answer_within.as_secs())),
+                Err(Some(e)) if caused_by::<http_body_util::LengthLimitError>(&e) => {
+                    text(StatusCode::PAYLOAD_TOO_LARGE, format!("request body over {max_body} bytes\n"))
+                }
+                Err(Some(e)) if caused_by::<progress::Stalled>(&e) => {
+                    text(StatusCode::REQUEST_TIMEOUT, format!("request body sent nothing for {}s\n", BODY_IDLE.as_secs()))
+                }
+                Err(Some(e)) => {
+                    // The instance's address and the error stay in the edge's log.
+                    eprintln!("rekcod: edge: {host} {id}: {}: {e}", lease.endpoint);
+                    text(StatusCode::BAD_GATEWAY, format!("bad gateway (request {id})\n"))
+                }
+                Ok(mut resp) => {
                     if resp.status() == StatusCode::SWITCHING_PROTOCOLS
                         && let Some(down) = client_upgrade
                         && let Some(slots) = tunnel_slots
@@ -1217,6 +1269,100 @@ mod tests {
         assert!(edge.shutdown(Duration::from_secs(5)).await);
         assert_eq!(req.await.unwrap(), (200, "xx".to_string()));
         assert!(TcpStream::connect(&addr).await.is_err(), "still accepting");
+    }
+
+    #[tokio::test]
+    async fn the_response_timer_starts_after_the_upload() {
+        let a = instance("a").await;
+        let edge = Edge::new(None, fast());
+        let http = HttpSettings { timeout: Some(1), ..Default::default() };
+        edge.table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert("a.test".into(), Route { http, ..route(&[&a], false) });
+        let addr = edge_on(&edge, Listener::default()).await;
+        let status = |mut s: BufReader<TcpStream>| async move {
+            let mut line = String::new();
+            s.read_line(&mut line).await.unwrap();
+            line
+        };
+        // Ten chunks 150 ms apart: longer than the 1 s timeout, never quiet for BODY_IDLE.
+        let mut s = dial(&addr).await;
+        s.get_mut().write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            s.get_mut().write_all(b"1\r\nx\r\n").await.unwrap();
+        }
+        s.get_mut().write_all(b"0\r\n\r\n").await.unwrap();
+        let line = status(s).await;
+        assert!(line.starts_with("HTTP/1.1 200"), "{line}");
+        // A body that stops.
+        let mut s = dial(&addr).await;
+        s.get_mut().write_all(b"POST / HTTP/1.1\r\nHost: a.test\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n").await.unwrap();
+        let line = status(s).await;
+        assert!(line.starts_with("HTTP/1.1 408"), "{line}");
+    }
+
+    /// An instance that answers the first request on each connection and closes on the second.
+    async fn closes_kept_connections() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut r = BufReader::new(s);
+                    for n in 0.. {
+                        let mut line = String::new();
+                        while line != "\r\n" {
+                            line.clear();
+                            if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                        }
+                        if n == 1 {
+                            return;
+                        }
+                        r.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").await.unwrap();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn a_get_on_a_closed_pooled_connection_goes_again() {
+        let a = closes_kept_connections().await;
+        let edge = Edge::new(None, fast());
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let addr = edge_on(&edge, Listener::default()).await;
+        let mut s = dial(&addr).await;
+        for _ in 0..4 {
+            assert_eq!(get(&mut s, "a.test", "").await, (200, "ok".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_502_names_the_request_not_the_instance() {
+        // Accepts, reads the request, closes.
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let a = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut r = BufReader::new(s);
+                    let mut line = String::new();
+                    let _ = r.read_line(&mut line).await;
+                });
+            }
+        });
+        let edge = Edge::new(None, fast());
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let addr = edge_on(&edge, Listener::default()).await;
+        let (code, body) = get(&mut dial(&addr).await, "a.test", "X-Request-Id: req-7\r\n").await;
+        assert_eq!((code, body.as_str()), (502, "bad gateway (request req-7)\n"));
     }
 
     #[test]

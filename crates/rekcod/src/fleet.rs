@@ -3090,6 +3090,9 @@ pub struct HttpSettings {
     /// Request body cap in bytes (100 MiB when unset).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_body: Option<u64>,
+    /// Seconds an instance has to answer once the request body is in (60 when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
 }
 
 /// Resolves a branch or tag to a commit with `git ls-remote`; a commit passes through.
@@ -4233,6 +4236,9 @@ fn upsert_app<'a>(c: &'a Controller, ns: &str, who: &Caller, b: &Value, preview_
             let s: HttpSettings = serde_json::from_value(h.clone()).context("http")?;
             if let Some(r) = &s.rate {
                 crate::edge::limit::parse_rate(r)?;
+            }
+            if s.timeout.is_some_and(|t| !(1..=3600).contains(&t)) {
+                bail!("http.timeout: 1 to 3600 seconds");
             }
             Some(serde_json::to_string(&s)?)
         }

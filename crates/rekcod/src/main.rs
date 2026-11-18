@@ -1619,8 +1619,8 @@ fn run_ns(paths: &paths::Paths, remote: &Option<String>, c: NsCmd) -> anyhow::Re
 /// `[http]` from rekcod.toml; null (keep the app's current settings) when there's none.
 #[cfg(target_os = "macos")]
 fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Result<serde_json::Value> {
-    let (rate, burst, max_body) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"));
-    if rate.is_none() && burst.is_none() && max_body.is_none() {
+    let (rate, burst, max_body, timeout) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"), t.get("http.timeout"));
+    if rate.is_none() && burst.is_none() && max_body.is_none() && timeout.is_none() {
         return Ok(serde_json::Value::Null);
     }
     if let Some(r) = rate {
@@ -1628,7 +1628,16 @@ fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Resul
     }
     let burst = burst.map(|b| b.parse::<u32>().map_err(|_| anyhow::anyhow!("rekcod.toml http.burst: {b} isn't a number"))).transpose()?;
     let max_body = max_body.map(|m| edge::limit::parse_size(m)).transpose()?;
-    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body}))
+    let timeout = timeout
+        .map(|t| {
+            t.trim_end_matches('s')
+                .parse::<u64>()
+                .ok()
+                .filter(|t| (1..=3600).contains(t))
+                .ok_or_else(|| anyhow::anyhow!("rekcod.toml http.timeout: {t} isn't 1 to 3600 seconds"))
+        })
+        .transpose()?;
+    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body, "timeout": timeout}))
 }
 
 fn remote_call(paths: &paths::Paths, remote: &Option<String>, method: &str, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {

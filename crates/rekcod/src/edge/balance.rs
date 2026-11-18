@@ -49,6 +49,8 @@ pub struct Pool {
 /// [`Lease::done`]; dropping it without that counts nothing toward latency.
 pub struct Lease {
     pub endpoint: String,
+    /// The connection was kept from an earlier request, so the instance may have closed it.
+    pub pooled: bool,
     sender: Option<SendRequest<Body>>,
     stats: Arc<Stats>,
     start: Instant,
@@ -132,6 +134,7 @@ impl Pool {
                 idle.retain(|s| !s.is_closed());
                 idle.iter().position(|s| s.is_ready()).map(|i| idle.swap_remove(i))
             };
+            let was_pooled = pooled.is_some();
             let sender = match pooled {
                 Some(s) => Some(s),
                 None => connect(&ep).await,
@@ -140,12 +143,22 @@ impl Pool {
                 Some(sender) => {
                     *stats.down_until.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
                     stats.in_flight.fetch_add(1, Ordering::Relaxed);
-                    return Some(Lease { endpoint: ep, sender: Some(sender), stats, start: Instant::now() });
+                    return Some(Lease { endpoint: ep, pooled: was_pooled, sender: Some(sender), stats, start: Instant::now() });
                 }
                 None => *stats.down_until.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now() + DOWN_FOR),
             }
         }
         None
+    }
+}
+
+impl Pool {
+    /// A new connection to `ep`, for a request that failed on a pooled one.
+    pub async fn fresh(&self, ep: &str) -> Option<Lease> {
+        let stats = self.stats(ep);
+        let sender = connect(ep).await?;
+        stats.in_flight.fetch_add(1, Ordering::Relaxed);
+        Some(Lease { endpoint: ep.to_string(), pooled: false, sender: Some(sender), stats, start: Instant::now() })
     }
 }
 

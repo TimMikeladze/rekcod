@@ -205,7 +205,7 @@ mod tests {
     fn app_rate_and_strikes() {
         let l = Limits::new(Duration::from_millis(1), 1000);
         let ip: IpAddr = "192.0.2.1".parse().unwrap();
-        let http = HttpSettings { rate: Some("1/m".into()), burst: Some(2), max_body: None };
+        let http = HttpSettings { rate: Some("1/m".into()), burst: Some(2), ..Default::default() };
         assert!(l.check(ip, "a.test", &http).is_ok());
         assert!(l.check(ip, "a.test", &http).is_ok());
         let r = l.check(ip, "a.test", &http).unwrap_err();

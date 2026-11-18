@@ -54,9 +54,16 @@ dd if=/dev/zero of="$REKCOD_HOME/vm/data.img" bs=1024 seek=1 count=1 conv=notrun
 check "a zeroed superblock is rebuilt from the backup" start
 check "and the data is still there" sh -c "$D run --rm -v keep:/k alpine:3.24 cat /k/f | grep -q precious"
 "$R" stop --no-switch >/dev/null
+# Zeros over the whole first 4 MiB (what the guest takes for a blank disk) on a disk that
+# isn't new: rebuilt from a backup superblock, never formatted.
+dd if=/dev/zero of="$REKCOD_HOME/vm/data.img" bs=1M count=4 conv=notrunc 2>/dev/null
+start >/dev/null 2>&1 || { "$R" stop --no-switch --force >/dev/null 2>&1; start --repair >/dev/null 2>&1; }
+check "zeros over the first 4 MiB aren't taken for a new disk" sh -c "! cat '$REKCOD_HOME'/logs/console.log* | grep -aq 'formatting data disk'"
+check "and the data behind them is still there" sh -c "$D run --rm -v keep:/k alpine:3.24 cat /k/f | grep -q precious"
+"$R" stop --no-switch >/dev/null
 dd if=/dev/urandom of="$REKCOD_HOME/vm/data.img" bs=1M count=200 conv=notrunc 2>/dev/null
 check "a disk past the first backup isn't formatted; start says so" sh -c "! '$R' start --no-switch 2>&1 | tee /dev/stderr | grep -q ready"
-check "the error names --repair" sh -c "'$R' status >/dev/null; grep -aq 'not formatting it' '$REKCOD_HOME/logs/console.log'"
+check "the guest reports the data disk error" grep -aq 'data disk error:' "$REKCOD_HOME/logs/console.log"
 "$R" stop --no-switch --force >/dev/null 2>&1
 check "start --repair brings it back" start --repair
 check "dockerd answers after the repair" $D info

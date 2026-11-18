@@ -1044,6 +1044,40 @@ mod tests {
         distinct_daemons("podman", "", "bb-rekcod").unwrap();
     }
 
+    /// import() itself, against a stand-in docker CLI and a stand-in dockerd that answers
+    /// /_ping: a --from context that reports rekcod's daemon ID gets no further than `info`,
+    /// so nothing is emptied.
+    #[test]
+    fn import_stops_before_touching_an_alias_of_rekcod() {
+        use std::io::{Read, Write};
+        let home = std::env::temp_dir().join(format!("rkimp-{}", std::process::id()));
+        let paths = Paths::at(home.clone()).unwrap();
+        let api = std::os::unix::net::UnixListener::bind(paths.socket()).unwrap();
+        std::thread::spawn(move || {
+            for mut c in api.incoming().flatten() {
+                let mut buf = [0u8; 1024];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nOK");
+            }
+        });
+        let log = home.join("docker-calls");
+        let docker = home.join("docker");
+        std::fs::write(
+            &docker,
+            format!("#!/bin/sh\necho \"$*\" >> {}\ncase \"$*\" in *version*) echo 29.0;; *info*) echo SAME-ID;; esac\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // SAFETY: a test running docker meanwhile gets the stand-in, which only echoes.
+        unsafe { std::env::set_var("REKCOD_DOCKER_CLI", &docker) };
+        let r = import(&paths, "alias", &[], true, true, true);
+        unsafe { std::env::remove_var("REKCOD_DOCKER_CLI") };
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(r.unwrap_err().to_string().contains("rekcod's own docker daemon"));
+        assert!(calls.lines().all(|l| l.contains("version") || l.contains("info")), "{calls}");
+    }
+
     #[test]
     fn anonymous_volume_names() {
         assert!(is_anonymous_volume(&"a".repeat(64)));

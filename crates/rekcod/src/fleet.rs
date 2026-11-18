@@ -750,10 +750,10 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         let hp = free_port()?;
         let (mut d, _) = sandbox::docker_cmd(paths, &meta.id)?;
         d.args(["run", "-d", "--name", "app", "--restart", "unless-stopped", "-p", &format!("127.0.0.1:{hp}:{port}")]);
-        for (k, v) in &env {
-            d.args(["-e", &format!("{k}={}", v.as_str().unwrap_or(""))]);
-        }
-        let out = d.arg(&image).stdin(Stdio::null()).output()?;
+        let env_file = sandbox::home(paths, &meta.id)?.join("run-env");
+        let out = pass_env(&mut d, &env, &env_file).and_then(|()| Ok(d.arg(&image).stdin(Stdio::null()).output()?));
+        let _ = std::fs::remove_file(&env_file);
+        let out = out?;
         if !out.status.success() {
             bail!("run failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -775,6 +775,44 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         let _ = sandbox::rm(paths, std::slice::from_ref(&meta.id), false);
     }
     result
+}
+
+/// Puts an app's env on `docker run` without its values on argv, where `ps` would show app
+/// secrets and bucket keys to every account on the node: `-e KEY` with the value in the
+/// docker client's environment. Variables the docker client reads itself (PATH, HOME,
+/// `DOCKER_*`, proxies) go through a 0600 `--env-file` at `file` instead, which the caller
+/// removes; those can't hold a newline.
+fn pass_env(d: &mut Command, env: &serde_json::Map<String, Value>, file: &Path) -> Result<()> {
+    let client = |k: &str| {
+        let u = k.to_ascii_uppercase();
+        ["PATH", "HOME", "TMPDIR", "SSH_AUTH_SOCK"].contains(&u.as_str())
+            || ["DOCKER_", "BUILDKIT_", "BUILDX_"].iter().any(|p| u.starts_with(p))
+            || u.ends_with("_PROXY")
+    };
+    let mut lines = String::new();
+    for (k, v) in env {
+        if !crate::sandbox_api::valid_env_key(k) {
+            bail!("env {k}: names are letters, digits and _, not starting with a digit");
+        }
+        let v = match v {
+            Value::String(s) => s.clone(),
+            Value::Null => String::new(),
+            v => v.to_string(),
+        };
+        if client(k) {
+            if v.contains(['\n', '\r']) {
+                bail!("env {k} can't hold a line break");
+            }
+            lines.push_str(&format!("{k}={v}\n"));
+        } else {
+            d.env(k, v).args(["-e", k]);
+        }
+    }
+    if !lines.is_empty() {
+        crate::paths::write_private(file, lines.as_bytes())?;
+        d.arg("--env-file").arg(file);
+    }
+    Ok(())
 }
 
 pub fn instance_logs(paths: &Paths, id: &str) -> Result<String> {
@@ -1571,6 +1609,14 @@ fn cap(v: i64) -> i32 {
     if v < 0 { -1 } else { v.min(MAX_TOKEN_CAP) as i32 }
 }
 
+/// A curl config line (`curl -K -`) naming `url`. A line break would start another option.
+fn curl_url_config(url: &str) -> Result<String> {
+    if url.chars().any(char::is_control) || !(url.starts_with("https://") || url.starts_with("http://")) {
+        bail!("the alert webhook is an http(s) URL without control characters");
+    }
+    Ok(format!("url = \"{}\"\n", url.replace('\\', "\\\\").replace('"', "\\\"")))
+}
+
 /// Tokens are kept as SHA-256 hex; the plaintext only exists on the client.
 fn hash_token(t: &str) -> String {
     use sha2::Digest;
@@ -1653,15 +1699,24 @@ impl Controller {
 
     /// Posts `{"text": msg}` to `--alert-webhook` (Slack and Discord both take that shape),
     /// in the background so a slow receiver never holds anything up.
+    /// The URL goes to curl on stdin (`-K -`): a Slack or Discord webhook URL is itself the
+    /// credential, and argv is readable by every account on the Mac.
     fn alert(&self, msg: &str) {
-        let Some(url) = self.alert_webhook.clone() else { return };
+        let Some(config) = self.alert_webhook.as_deref().and_then(|u| curl_url_config(u).ok()) else { return };
         let body = json!({"text": format!("rekcod: {msg}"), "domain": self.domain}).to_string();
         std::thread::spawn(move || {
-            let _ = Command::new("curl")
-                .args(["-sf", "-m", "10", "-X", "POST", "-H", "Content-Type: application/json", "-d", &body, &url])
+            let child = Command::new("curl")
+                .args(["-sf", "-m", "10", "-X", "POST", "-H", "Content-Type: application/json", "-d", &body, "-K", "-"])
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
-                .status();
+                .spawn();
+            if let Ok(mut child) = child {
+                if let Some(mut stdin) = child.stdin.take() {
+                    let _ = stdin.write_all(config.as_bytes());
+                }
+                let _ = child.wait();
+            }
         });
     }
 
@@ -4346,7 +4401,11 @@ fn upsert_app<'a>(c: &'a Controller, ns: &str, who: &Caller, b: &Value, preview_
     let mem = spec_count(b, "memory_gib", 1, MAX_MEMORY_GIB)?;
     let health = b["health"].as_str().unwrap_or("/");
     let start = b["start"].as_str();
-    let env = b.get("env").filter(|e| e.is_object()).map(|e| e.to_string());
+    let env = b.get("env").filter(|e| e.is_object());
+    if let Some(k) = env.and_then(Value::as_object).into_iter().flat_map(|m| m.keys()).find(|k| !crate::sandbox_api::valid_env_key(k)) {
+        bail!("env {k}: names are letters, digits and _, not starting with a digit");
+    }
+    let env = env.map(|e| e.to_string());
     // None keeps an existing app's visibility; new apps are private.
     let public = b["public"].as_bool();
     let idle_stop = spec_secs(b, "idle_stop_secs")?;
@@ -4523,6 +4582,9 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             let app = load(name, Role::Member)?;
             let secrets = seg[2] == "secrets";
             let mut map = if secrets { app.secrets.clone() } else { app.env.clone() };
+            if let Some(k) = b["set"].as_object().into_iter().flat_map(|m| m.keys()).find(|k| !crate::sandbox_api::valid_env_key(k)) {
+                bail!("{k}: names are letters, digits and _, not starting with a digit");
+            }
             for (k, v) in b["set"].as_object().into_iter().flatten() {
                 map[k] = v.clone();
             }
@@ -6255,6 +6317,9 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     names.extend(bonjour.iter().map(|i| format!("{i}{}", crate::bonjour::SUFFIX)));
     names.dedup();
     ctl.own_names = names.clone();
+    if let Some(u) = &o.alert_webhook {
+        curl_url_config(u)?;
+    }
     ctl.alert_webhook = o.alert_webhook;
     ctl.db_path = db_path;
     ctl.backup_dir = o.backup_dir;
@@ -6695,6 +6760,49 @@ mod tests {
             "dir": "/Users/owner", "mount": true, "golden": "..", "secrets": ["GITHUB_TOKEN"], "reach": ["10.0.0.1:22"],
         }));
         assert_eq!(b, json!({"git": {"url": "https://x/y", "ref": "main"}, "name": "n", "cpus": 2}));
+    }
+
+    #[test]
+    fn app_env_values_stay_off_the_docker_argv() {
+        let dir = std::env::temp_dir().join(format!("rekcod-pass-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("run-env");
+        let env = json!({"API_KEY": "s3cr3t\n-----END KEY-----", "AWS_SECRET_ACCESS_KEY": "wJalr", "PATH": "/app/bin", "N": 5});
+        let mut d = Command::new("docker");
+        d.arg("run");
+        pass_env(&mut d, env.as_object().unwrap(), &file).unwrap();
+        let argv: Vec<String> = d.get_args().map(|a| a.to_string_lossy().into()).collect();
+        for v in ["s3cr3t", "wJalr", "/app/bin"] {
+            assert!(!argv.iter().any(|a| a.contains(v)), "{v} on argv: {argv:?}");
+        }
+        assert!(argv.windows(2).any(|w| w == ["-e", "API_KEY"]) && argv.windows(2).any(|w| w == ["-e", "N"]), "{argv:?}");
+        let set: HashMap<String, String> =
+            d.get_envs().filter_map(|(k, v)| Some((k.to_string_lossy().into(), v?.to_string_lossy().into()))).collect();
+        assert_eq!((set["API_KEY"].as_str(), set["N"].as_str()), ("s3cr3t\n-----END KEY-----", "5"));
+        assert!(!set.contains_key("PATH"), "the docker client keeps its own PATH");
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "PATH=/app/bin\n");
+        let bad = json!({"DOCKER_HOST": "tcp://x\nEVIL=1"});
+        assert!(pass_env(&mut Command::new("docker"), bad.as_object().unwrap(), &file).is_err());
+        assert!(pass_env(&mut Command::new("docker"), json!({"A B": "x"}).as_object().unwrap(), &file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_alert_webhook_url_reaches_curl_on_stdin() {
+        assert!(curl_url_config("https://hooks.example/a\n-o /tmp/x").is_err());
+        assert!(curl_url_config("file:///etc/passwd").is_err());
+        assert_eq!(curl_url_config(r#"https://h.example/a"b\c"#).unwrap(), "url = \"https://h.example/a\\\"b\\\\c\"\n");
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        c.alert_webhook = Some(format!("http://{}/T000/B000/xyz", l.local_addr().unwrap()));
+        c.alert("node n-1 lost");
+        let (conn, _) = l.accept().unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let req = crate::sandbox_api::read_request(&mut BufReader::new(conn)).unwrap();
+        assert_eq!((req.method.as_str(), req.path.as_str()), ("POST", "/T000/B000/xyz"));
+        assert!(String::from_utf8_lossy(&req.body).contains("node n-1 lost"));
     }
 
     #[test]

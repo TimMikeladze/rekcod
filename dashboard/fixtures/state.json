@@ -119,6 +119,16 @@
           "confirm": null
         },
         {
+          "kind": "ContainerPause",
+          "label": "Pause",
+          "argv": [
+            "pause",
+            "shop-web-1"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
           "kind": "ContainerLogs",
           "label": "Logs",
           "argv": [
@@ -127,6 +137,20 @@
             "--tail",
             "200",
             "shop-web-1"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerShell",
+          "label": "Shell",
+          "argv": [
+            "exec",
+            "-it",
+            "shop-web-1",
+            "sh",
+            "-c",
+            "command -v bash >/dev/null && exec bash || exec sh"
           ],
           "interactive": true,
           "confirm": null
@@ -144,7 +168,10 @@
         }
       ],
       "service": "web",
-      "volumes": []
+      "volumes": [],
+      "networks": [
+        "shop_default"
+      ]
     },
     {
       "id": "shop-pg-100000000000000000000",
@@ -178,6 +205,16 @@
           "confirm": null
         },
         {
+          "kind": "ContainerPause",
+          "label": "Pause",
+          "argv": [
+            "pause",
+            "shop-pg-1"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
           "kind": "ContainerLogs",
           "label": "Logs",
           "argv": [
@@ -186,6 +223,20 @@
             "--tail",
             "200",
             "shop-pg-1"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerShell",
+          "label": "Shell",
+          "argv": [
+            "exec",
+            "-it",
+            "shop-pg-1",
+            "sh",
+            "-c",
+            "command -v bash >/dev/null && exec bash || exec sh"
           ],
           "interactive": true,
           "confirm": null
@@ -205,6 +256,9 @@
       "service": "pg",
       "volumes": [
         "shop_pg"
+      ],
+      "networks": [
+        "shop_default"
       ]
     },
     {
@@ -239,6 +293,16 @@
           "confirm": null
         },
         {
+          "kind": "ContainerPause",
+          "label": "Pause",
+          "argv": [
+            "pause",
+            "redis"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
           "kind": "ContainerLogs",
           "label": "Logs",
           "argv": [
@@ -247,6 +311,20 @@
             "--tail",
             "200",
             "redis"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "ContainerShell",
+          "label": "Shell",
+          "argv": [
+            "exec",
+            "-it",
+            "redis",
+            "sh",
+            "-c",
+            "command -v bash >/dev/null && exec bash || exec sh"
           ],
           "interactive": true,
           "confirm": null
@@ -266,6 +344,9 @@
       "service": null,
       "volumes": [
         "redis-data"
+      ],
+      "networks": [
+        "bridge"
       ]
     },
     {
@@ -313,7 +394,10 @@
         }
       ],
       "service": null,
-      "volumes": []
+      "volumes": [],
+      "networks": [
+        "bridge"
+      ]
     }
   ],
   "ports": [
@@ -559,7 +643,7 @@
       "created": 1792127524,
       "cpus": 4,
       "memory_gib": 8,
-      "cpu_pct": 38.0,
+      "cpu_pct": 38,
       "rss_mib": 6100,
       "actions": [
         {
@@ -2374,7 +2458,7 @@
         "team"
       ],
       "cpus": 8,
-      "load": 0.0,
+      "load": 0,
       "disk_total_gib": 460,
       "disk_free_gib": 38,
       "instances": 1,
@@ -2454,6 +2538,112 @@
       "dangling": false,
       "actions": [
         {
+          "kind": "ImageRun",
+          "label": "Run",
+          "argv": [
+            "run",
+            "-d",
+            "{name}",
+            "{publish}",
+            "{env}",
+            "{mount}",
+            "alpine:3.22"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "name",
+              "label": "Container name",
+              "kind": "name",
+              "optional": true,
+              "multiple": false,
+              "flag": "--name",
+              "placeholder": "web"
+            },
+            {
+              "key": "publish",
+              "label": "Ports",
+              "kind": "publish",
+              "optional": true,
+              "multiple": true,
+              "flag": "-p",
+              "placeholder": "8080:80"
+            },
+            {
+              "key": "env",
+              "label": "Environment",
+              "kind": "env",
+              "optional": true,
+              "multiple": true,
+              "flag": "-e",
+              "placeholder": "KEY=value"
+            },
+            {
+              "key": "mount",
+              "label": "Volumes",
+              "kind": "mount",
+              "optional": true,
+              "multiple": true,
+              "flag": "-v",
+              "placeholder": "data:/data"
+            }
+          ]
+        },
+        {
+          "kind": "ImagePull",
+          "label": "Pull again",
+          "argv": [
+            "pull",
+            "alpine:3.22"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ImagePush",
+          "label": "Push",
+          "argv": [
+            "push",
+            "alpine:3.22"
+          ],
+          "interactive": false,
+          "confirm": "Push alpine:3.22 to its registry? Anyone who can read that repository gets this image."
+        },
+        {
+          "kind": "ImageTag",
+          "label": "Tag",
+          "argv": [
+            "tag",
+            "alpine:3.22",
+            "{target}"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New tag",
+              "kind": "image",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "registry.example.com/team/app:1.0"
+            }
+          ]
+        },
+        {
+          "kind": "ImageHistory",
+          "label": "Layers",
+          "argv": [
+            "image",
+            "history",
+            "alpine:3.22"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
           "kind": "ImageRemove",
           "label": "Remove",
           "argv": [
@@ -2478,6 +2668,112 @@
       ],
       "dangling": false,
       "actions": [
+        {
+          "kind": "ImageRun",
+          "label": "Run",
+          "argv": [
+            "run",
+            "-d",
+            "{name}",
+            "{publish}",
+            "{env}",
+            "{mount}",
+            "postgres:17"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "name",
+              "label": "Container name",
+              "kind": "name",
+              "optional": true,
+              "multiple": false,
+              "flag": "--name",
+              "placeholder": "web"
+            },
+            {
+              "key": "publish",
+              "label": "Ports",
+              "kind": "publish",
+              "optional": true,
+              "multiple": true,
+              "flag": "-p",
+              "placeholder": "8080:80"
+            },
+            {
+              "key": "env",
+              "label": "Environment",
+              "kind": "env",
+              "optional": true,
+              "multiple": true,
+              "flag": "-e",
+              "placeholder": "KEY=value"
+            },
+            {
+              "key": "mount",
+              "label": "Volumes",
+              "kind": "mount",
+              "optional": true,
+              "multiple": true,
+              "flag": "-v",
+              "placeholder": "data:/data"
+            }
+          ]
+        },
+        {
+          "kind": "ImagePull",
+          "label": "Pull again",
+          "argv": [
+            "pull",
+            "postgres:17"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ImagePush",
+          "label": "Push",
+          "argv": [
+            "push",
+            "postgres:17"
+          ],
+          "interactive": false,
+          "confirm": "Push postgres:17 to its registry? Anyone who can read that repository gets this image."
+        },
+        {
+          "kind": "ImageTag",
+          "label": "Tag",
+          "argv": [
+            "tag",
+            "postgres:17",
+            "{target}"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New tag",
+              "kind": "image",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "registry.example.com/team/app:1.0"
+            }
+          ]
+        },
+        {
+          "kind": "ImageHistory",
+          "label": "Layers",
+          "argv": [
+            "image",
+            "history",
+            "postgres:17"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
         {
           "kind": "ImageRemove",
           "label": "Remove",
@@ -2504,6 +2800,112 @@
       "dangling": false,
       "actions": [
         {
+          "kind": "ImageRun",
+          "label": "Run",
+          "argv": [
+            "run",
+            "-d",
+            "{name}",
+            "{publish}",
+            "{env}",
+            "{mount}",
+            "redis:7"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "name",
+              "label": "Container name",
+              "kind": "name",
+              "optional": true,
+              "multiple": false,
+              "flag": "--name",
+              "placeholder": "web"
+            },
+            {
+              "key": "publish",
+              "label": "Ports",
+              "kind": "publish",
+              "optional": true,
+              "multiple": true,
+              "flag": "-p",
+              "placeholder": "8080:80"
+            },
+            {
+              "key": "env",
+              "label": "Environment",
+              "kind": "env",
+              "optional": true,
+              "multiple": true,
+              "flag": "-e",
+              "placeholder": "KEY=value"
+            },
+            {
+              "key": "mount",
+              "label": "Volumes",
+              "kind": "mount",
+              "optional": true,
+              "multiple": true,
+              "flag": "-v",
+              "placeholder": "data:/data"
+            }
+          ]
+        },
+        {
+          "kind": "ImagePull",
+          "label": "Pull again",
+          "argv": [
+            "pull",
+            "redis:7"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ImagePush",
+          "label": "Push",
+          "argv": [
+            "push",
+            "redis:7"
+          ],
+          "interactive": false,
+          "confirm": "Push redis:7 to its registry? Anyone who can read that repository gets this image."
+        },
+        {
+          "kind": "ImageTag",
+          "label": "Tag",
+          "argv": [
+            "tag",
+            "redis:7",
+            "{target}"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New tag",
+              "kind": "image",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "registry.example.com/team/app:1.0"
+            }
+          ]
+        },
+        {
+          "kind": "ImageHistory",
+          "label": "Layers",
+          "argv": [
+            "image",
+            "history",
+            "redis:7"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
           "kind": "ImageRemove",
           "label": "Remove",
           "argv": [
@@ -2529,6 +2931,112 @@
       "dangling": false,
       "actions": [
         {
+          "kind": "ImageRun",
+          "label": "Run",
+          "argv": [
+            "run",
+            "-d",
+            "{name}",
+            "{publish}",
+            "{env}",
+            "{mount}",
+            "shop-web:dev"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "name",
+              "label": "Container name",
+              "kind": "name",
+              "optional": true,
+              "multiple": false,
+              "flag": "--name",
+              "placeholder": "web"
+            },
+            {
+              "key": "publish",
+              "label": "Ports",
+              "kind": "publish",
+              "optional": true,
+              "multiple": true,
+              "flag": "-p",
+              "placeholder": "8080:80"
+            },
+            {
+              "key": "env",
+              "label": "Environment",
+              "kind": "env",
+              "optional": true,
+              "multiple": true,
+              "flag": "-e",
+              "placeholder": "KEY=value"
+            },
+            {
+              "key": "mount",
+              "label": "Volumes",
+              "kind": "mount",
+              "optional": true,
+              "multiple": true,
+              "flag": "-v",
+              "placeholder": "data:/data"
+            }
+          ]
+        },
+        {
+          "kind": "ImagePull",
+          "label": "Pull again",
+          "argv": [
+            "pull",
+            "shop-web:dev"
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
+          "kind": "ImagePush",
+          "label": "Push",
+          "argv": [
+            "push",
+            "shop-web:dev"
+          ],
+          "interactive": false,
+          "confirm": "Push shop-web:dev to its registry? Anyone who can read that repository gets this image."
+        },
+        {
+          "kind": "ImageTag",
+          "label": "Tag",
+          "argv": [
+            "tag",
+            "shop-web:dev",
+            "{target}"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New tag",
+              "kind": "image",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "registry.example.com/team/app:1.0"
+            }
+          ]
+        },
+        {
+          "kind": "ImageHistory",
+          "label": "Layers",
+          "argv": [
+            "image",
+            "history",
+            "shop-web:dev"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
           "kind": "ImageRemove",
           "label": "Remove",
           "argv": [
@@ -2549,6 +3057,92 @@
       "containers": [],
       "dangling": true,
       "actions": [
+        {
+          "kind": "ImageRun",
+          "label": "Run",
+          "argv": [
+            "run",
+            "-d",
+            "{name}",
+            "{publish}",
+            "{env}",
+            "{mount}",
+            "sha256:ee55"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "name",
+              "label": "Container name",
+              "kind": "name",
+              "optional": true,
+              "multiple": false,
+              "flag": "--name",
+              "placeholder": "web"
+            },
+            {
+              "key": "publish",
+              "label": "Ports",
+              "kind": "publish",
+              "optional": true,
+              "multiple": true,
+              "flag": "-p",
+              "placeholder": "8080:80"
+            },
+            {
+              "key": "env",
+              "label": "Environment",
+              "kind": "env",
+              "optional": true,
+              "multiple": true,
+              "flag": "-e",
+              "placeholder": "KEY=value"
+            },
+            {
+              "key": "mount",
+              "label": "Volumes",
+              "kind": "mount",
+              "optional": true,
+              "multiple": true,
+              "flag": "-v",
+              "placeholder": "data:/data"
+            }
+          ]
+        },
+        {
+          "kind": "ImageTag",
+          "label": "Tag",
+          "argv": [
+            "tag",
+            "sha256:ee55",
+            "{target}"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New tag",
+              "kind": "image",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "registry.example.com/team/app:1.0"
+            }
+          ]
+        },
+        {
+          "kind": "ImageHistory",
+          "label": "Layers",
+          "argv": [
+            "image",
+            "history",
+            "sha256:ee55"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
         {
           "kind": "ImageRemove",
           "label": "Remove",
@@ -2573,7 +3167,74 @@
       ],
       "anonymous": false,
       "snapshot": false,
-      "actions": []
+      "actions": [
+        {
+          "kind": "VolumeBrowse",
+          "label": "Files",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "redis-data:/v:ro",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "cd /v && find . -maxdepth 6 -exec ls -ld {} + | head -2000"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "VolumeClone",
+          "label": "Clone",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "redis-data:/v:ro",
+            "-v",
+            "{target}:/to",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "[ -z \"$(ls -A /to)\" ] || { echo \"that volume already has files; clone into a new name\" >&2; exit 1; }; cp -a /v/. /to/"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New volume",
+              "kind": "name",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "redis-data-copy"
+            }
+          ]
+        },
+        {
+          "kind": "VolumeExport",
+          "label": "Export to ~/Downloads/redis-data.tar.gz",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "redis-data:/v:ro",
+            "-v",
+            "/Users/me/Downloads:/out",
+            "alpine:3.24",
+            "tar",
+            "czf",
+            "/out/redis-data.tar.gz",
+            "-C",
+            "/v",
+            "."
+          ],
+          "interactive": false,
+          "confirm": null
+        }
+      ]
     },
     {
       "name": "shop_pg",
@@ -2584,7 +3245,74 @@
       ],
       "anonymous": false,
       "snapshot": false,
-      "actions": []
+      "actions": [
+        {
+          "kind": "VolumeBrowse",
+          "label": "Files",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "shop_pg:/v:ro",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "cd /v && find . -maxdepth 6 -exec ls -ld {} + | head -2000"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "VolumeClone",
+          "label": "Clone",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "shop_pg:/v:ro",
+            "-v",
+            "{target}:/to",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "[ -z \"$(ls -A /to)\" ] || { echo \"that volume already has files; clone into a new name\" >&2; exit 1; }; cp -a /v/. /to/"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New volume",
+              "kind": "name",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "shop_pg-copy"
+            }
+          ]
+        },
+        {
+          "kind": "VolumeExport",
+          "label": "Export to ~/Downloads/shop_pg.tar.gz",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "shop_pg:/v:ro",
+            "-v",
+            "/Users/me/Downloads:/out",
+            "alpine:3.24",
+            "tar",
+            "czf",
+            "/out/shop_pg.tar.gz",
+            "-C",
+            "/v",
+            "."
+          ],
+          "interactive": false,
+          "confirm": null
+        }
+      ]
     },
     {
       "name": "rekcod-snap.shop.before-migrate.shop_pg",
@@ -2594,6 +3322,72 @@
       "anonymous": false,
       "snapshot": true,
       "actions": [
+        {
+          "kind": "VolumeBrowse",
+          "label": "Files",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "rekcod-snap.shop.before-migrate.shop_pg:/v:ro",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "cd /v && find . -maxdepth 6 -exec ls -ld {} + | head -2000"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "VolumeClone",
+          "label": "Clone",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "rekcod-snap.shop.before-migrate.shop_pg:/v:ro",
+            "-v",
+            "{target}:/to",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "[ -z \"$(ls -A /to)\" ] || { echo \"that volume already has files; clone into a new name\" >&2; exit 1; }; cp -a /v/. /to/"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New volume",
+              "kind": "name",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "rekcod-snap.shop.before-migrate.shop_pg-copy"
+            }
+          ]
+        },
+        {
+          "kind": "VolumeExport",
+          "label": "Export to ~/Downloads/rekcod-snap.shop.before-migrate.shop_pg.tar.gz",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "rekcod-snap.shop.before-migrate.shop_pg:/v:ro",
+            "-v",
+            "/Users/me/Downloads:/out",
+            "alpine:3.24",
+            "tar",
+            "czf",
+            "/out/rekcod-snap.shop.before-migrate.shop_pg.tar.gz",
+            "-C",
+            "/v",
+            "."
+          ],
+          "interactive": false,
+          "confirm": null
+        },
         {
           "kind": "VolumeRemove",
           "label": "Remove",
@@ -2616,6 +3410,72 @@
       "snapshot": true,
       "actions": [
         {
+          "kind": "VolumeBrowse",
+          "label": "Files",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "rekcod-snap.shop.seeded.shop_pg:/v:ro",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "cd /v && find . -maxdepth 6 -exec ls -ld {} + | head -2000"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "VolumeClone",
+          "label": "Clone",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "rekcod-snap.shop.seeded.shop_pg:/v:ro",
+            "-v",
+            "{target}:/to",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "[ -z \"$(ls -A /to)\" ] || { echo \"that volume already has files; clone into a new name\" >&2; exit 1; }; cp -a /v/. /to/"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New volume",
+              "kind": "name",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "rekcod-snap.shop.seeded.shop_pg-copy"
+            }
+          ]
+        },
+        {
+          "kind": "VolumeExport",
+          "label": "Export to ~/Downloads/rekcod-snap.shop.seeded.shop_pg.tar.gz",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "rekcod-snap.shop.seeded.shop_pg:/v:ro",
+            "-v",
+            "/Users/me/Downloads:/out",
+            "alpine:3.24",
+            "tar",
+            "czf",
+            "/out/rekcod-snap.shop.seeded.shop_pg.tar.gz",
+            "-C",
+            "/v",
+            "."
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
           "kind": "VolumeRemove",
           "label": "Remove",
           "argv": [
@@ -2637,6 +3497,72 @@
       "snapshot": false,
       "actions": [
         {
+          "kind": "VolumeBrowse",
+          "label": "Files",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "3f9c2a1b7d:/v:ro",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "cd /v && find . -maxdepth 6 -exec ls -ld {} + | head -2000"
+          ],
+          "interactive": true,
+          "confirm": null
+        },
+        {
+          "kind": "VolumeClone",
+          "label": "Clone",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "3f9c2a1b7d:/v:ro",
+            "-v",
+            "{target}:/to",
+            "alpine:3.24",
+            "sh",
+            "-c",
+            "[ -z \"$(ls -A /to)\" ] || { echo \"that volume already has files; clone into a new name\" >&2; exit 1; }; cp -a /v/. /to/"
+          ],
+          "interactive": false,
+          "confirm": null,
+          "inputs": [
+            {
+              "key": "target",
+              "label": "New volume",
+              "kind": "name",
+              "optional": false,
+              "multiple": false,
+              "flag": null,
+              "placeholder": "3f9c2a1b7d-copy"
+            }
+          ]
+        },
+        {
+          "kind": "VolumeExport",
+          "label": "Export to ~/Downloads/3f9c2a1b7d.tar.gz",
+          "argv": [
+            "run",
+            "--rm",
+            "-v",
+            "3f9c2a1b7d:/v:ro",
+            "-v",
+            "/Users/me/Downloads:/out",
+            "alpine:3.24",
+            "tar",
+            "czf",
+            "/out/3f9c2a1b7d.tar.gz",
+            "-C",
+            "/v",
+            "."
+          ],
+          "interactive": false,
+          "confirm": null
+        },
+        {
           "kind": "VolumeRemove",
           "label": "Remove",
           "argv": [
@@ -2646,6 +3572,222 @@
           ],
           "interactive": false,
           "confirm": "Delete volume 3f9c2a1b7d (180.0 MiB) and everything in it?"
+        }
+      ]
+    }
+  ],
+  "networks": [
+    {
+      "id": "n-ci",
+      "name": "ci-net",
+      "driver": "bridge",
+      "scope": "local",
+      "internal": true,
+      "created": "2026-11-10T16:40:00Z",
+      "builtin": false,
+      "containers": [],
+      "actions": [
+        {
+          "kind": "NetworkRemove",
+          "label": "Remove",
+          "argv": [
+            "network",
+            "rm",
+            "ci-net"
+          ],
+          "interactive": false,
+          "confirm": "Remove network ci-net?"
+        }
+      ]
+    },
+    {
+      "id": "n-shop",
+      "name": "shop_default",
+      "driver": "bridge",
+      "scope": "local",
+      "internal": false,
+      "created": "2026-11-15T09:12:00Z",
+      "builtin": false,
+      "containers": [
+        "shop-web-1",
+        "shop-pg-1"
+      ],
+      "actions": [
+        {
+          "kind": "NetworkRemove",
+          "label": "Remove",
+          "argv": [
+            "network",
+            "rm",
+            "shop_default"
+          ],
+          "interactive": false,
+          "confirm": "Remove network shop_default? docker refuses while shop-web-1, shop-pg-1 are attached."
+        }
+      ]
+    },
+    {
+      "id": "n-bridge",
+      "name": "bridge",
+      "driver": "bridge",
+      "scope": "local",
+      "internal": false,
+      "created": "2026-11-01T08:00:00Z",
+      "builtin": true,
+      "containers": [
+        "redis",
+        "old-worker"
+      ],
+      "actions": []
+    },
+    {
+      "id": "n-host",
+      "name": "host",
+      "driver": "host",
+      "scope": "local",
+      "internal": false,
+      "created": "2026-11-01T08:00:00Z",
+      "builtin": true,
+      "containers": [],
+      "actions": []
+    },
+    {
+      "id": "n-none",
+      "name": "none",
+      "driver": "null",
+      "scope": "local",
+      "internal": false,
+      "created": "2026-11-01T08:00:00Z",
+      "builtin": true,
+      "containers": [],
+      "actions": []
+    }
+  ],
+  "engine_actions": [
+    {
+      "kind": "ImagePull",
+      "label": "Pull an image",
+      "argv": [
+        "pull",
+        "{image}"
+      ],
+      "interactive": false,
+      "confirm": null,
+      "inputs": [
+        {
+          "key": "image",
+          "label": "Image",
+          "kind": "image",
+          "optional": false,
+          "multiple": false,
+          "flag": null,
+          "placeholder": "postgres:17"
+        }
+      ]
+    },
+    {
+      "kind": "ImageRun",
+      "label": "Run a container",
+      "argv": [
+        "run",
+        "-d",
+        "{name}",
+        "{publish}",
+        "{env}",
+        "{mount}",
+        "{image}"
+      ],
+      "interactive": false,
+      "confirm": null,
+      "inputs": [
+        {
+          "key": "name",
+          "label": "Container name",
+          "kind": "name",
+          "optional": true,
+          "multiple": false,
+          "flag": "--name",
+          "placeholder": "web"
+        },
+        {
+          "key": "publish",
+          "label": "Ports",
+          "kind": "publish",
+          "optional": true,
+          "multiple": true,
+          "flag": "-p",
+          "placeholder": "8080:80"
+        },
+        {
+          "key": "env",
+          "label": "Environment",
+          "kind": "env",
+          "optional": true,
+          "multiple": true,
+          "flag": "-e",
+          "placeholder": "KEY=value"
+        },
+        {
+          "key": "mount",
+          "label": "Volumes",
+          "kind": "mount",
+          "optional": true,
+          "multiple": true,
+          "flag": "-v",
+          "placeholder": "data:/data"
+        },
+        {
+          "key": "image",
+          "label": "Image",
+          "kind": "image",
+          "optional": false,
+          "multiple": false,
+          "flag": null,
+          "placeholder": "nginx:latest"
+        }
+      ]
+    },
+    {
+      "kind": "VolumeCreate",
+      "label": "Create a volume",
+      "argv": [
+        "volume",
+        "create",
+        "{name}"
+      ],
+      "interactive": false,
+      "confirm": null,
+      "inputs": [
+        {
+          "key": "name",
+          "label": "Volume name",
+          "kind": "name",
+          "optional": false,
+          "multiple": false,
+          "flag": null,
+          "placeholder": "pgdata"
+        }
+      ]
+    },
+    {
+      "kind": "NetworkCreate",
+      "label": "Create a network",
+      "argv": [
+        "network",
+        "create",
+        "{name}"
+      ],
+      "interactive": false,
+      "confirm": null,
+      "inputs": [
+        {
+          "key": "name",
+          "label": "Network name",
+          "kind": "name",
+          "optional": false,
+          "multiple": false,
+          "flag": null,
+          "placeholder": "backend"
         }
       ]
     }
@@ -2693,6 +3835,28 @@
       ],
       "interactive": false,
       "confirm": "Clear unused build cache, freeing 5.0 GiB? The next builds start cold."
+    },
+    {
+      "kind": "NetworkPrune",
+      "label": "Remove unused networks",
+      "argv": [
+        "network",
+        "prune",
+        "-f"
+      ],
+      "interactive": false,
+      "confirm": "Remove every network no container uses? Compose recreates its networks on the next up."
+    },
+    {
+      "kind": "SystemPrune",
+      "label": "Remove everything unused",
+      "argv": [
+        "system",
+        "prune",
+        "-f"
+      ],
+      "interactive": false,
+      "confirm": "Remove stopped containers, unused networks, dangling images and unused build cache? Volumes are kept."
     }
   ],
   "remotes": {

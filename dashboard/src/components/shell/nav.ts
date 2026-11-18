@@ -1,11 +1,11 @@
-import { Activity, AppWindow, Boxes, Container, Cpu, Database, HardDrive, Layers, LayoutGrid, Network, Plug, Server, Timer, type LucideIcon } from "lucide-react"
+import { Activity, AppWindow, Boxes, Container, Cpu, Database, HardDrive, Layers, LayoutGrid, Network, Plug, Server, Timer, Waypoints, type LucideIcon } from "lucide-react"
 import type { Tab } from "@/lib/issues"
 import type { State } from "@/lib/types"
 
 /** `go`: the letter after `g` that opens the page (`g c` is Containers). */
 export type NavItem = { href: string; label: string; icon: LucideIcon; tab?: Tab; go: string }
 
-/** The list pages, in the order 1-9 jump to them. */
+/** The list pages, in the order 1-9 jump to them (Networks, tenth, has no digit). */
 export const SECTIONS: (NavItem & { tab: Tab; group: "This Mac" | "Fleet" })[] = [
   { tab: "containers", go: "c", href: "/containers", label: "Containers", icon: Container, group: "This Mac" },
   { tab: "images", go: "i", href: "/images", label: "Images", icon: Layers, group: "This Mac" },
@@ -16,6 +16,7 @@ export const SECTIONS: (NavItem & { tab: Tab; group: "This Mac" | "Fleet" })[] =
   { tab: "projects", go: "p", href: "/projects", label: "Projects", icon: Network, group: "This Mac" },
   { tab: "ports", go: "o", href: "/ports", label: "Ports", icon: Plug, group: "This Mac" },
   { tab: "fleet", go: "f", href: "/fleet", label: "Fleet", icon: Server, group: "Fleet" },
+  { tab: "networks", go: "n", href: "/networks", label: "Networks", icon: Waypoints, group: "This Mac" },
 ]
 
 export const OVERVIEW: NavItem = { href: "/", label: "Overview", icon: LayoutGrid, go: "h" }
@@ -47,6 +48,7 @@ export function counts(s: State): Record<Tab, string> {
     containers: s.containers.length ? `${running}/${s.containers.length}` : "",
     images: String((s.images ?? []).length || ""),
     volumes: String((s.volumes ?? []).length || ""),
+    networks: String((s.networks ?? []).length || ""),
     apps: String(s.apps.length || ""),
     jobs: String(s.jobs.filter((j) => j.state === "running").length || s.jobs.length || ""),
     sandboxes: String(s.sandboxes.length || ""),

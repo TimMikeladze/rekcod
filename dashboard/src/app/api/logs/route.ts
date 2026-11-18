@@ -1,4 +1,5 @@
 import { FIXTURE, spawnRekcod } from "@/lib/rekcod"
+import { onEngine } from "@/lib/server/engine"
 import { fakeLogLine, fakeLogs } from "@/lib/server/fixtures"
 import { bad, guarded } from "@/lib/server/readonly"
 import { cappedStream, fakeStream } from "@/lib/server/stream"
@@ -15,5 +16,5 @@ export async function GET(req: Request) {
     const ts = a.argv.includes("--timestamps")
     return fakeStream(req, fakeLogs(ts), a.argv.includes("--follow") ? () => fakeLogLine(0, ts) : undefined)
   }
-  return cappedStream(req, () => spawnRekcod(a.argv))
+  return cappedStream(req, () => spawnRekcod(onEngine(a.argv)))
 }

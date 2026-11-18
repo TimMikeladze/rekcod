@@ -797,7 +797,7 @@ pub fn parse_remote(line: &str) -> Option<(String, String, Option<String>)> {
     url.starts_with("http").then(|| (url.to_string(), token.to_string(), fp))
 }
 
-const FIND: &str = "command -v rekcod || { [ -x ~/.rekcod/bin/rekcod ] && echo ~/.rekcod/bin/rekcod; }";
+pub(crate) const FIND: &str = "command -v rekcod || { [ -x ~/.rekcod/bin/rekcod ] && echo ~/.rekcod/bin/rekcod; }";
 
 /// The server's rekcod, copying this one over when it has none.
 pub fn ensure_binary(dest: &str, ssh: impl Fn() -> Command, scp_dest: &[String]) -> Result<String> {

@@ -76,12 +76,28 @@ pub enum Kind {
     Doctor,
     Upgrade,
     Uninstall,
+    ImagePull,
+    ImageRun,
+    ImageTag,
+    ImagePush,
+    ImageHistory,
+    ContainerPause,
+    ContainerUnpause,
+    ContainerShell,
+    VolumeCreate,
+    VolumeClone,
+    VolumeExport,
+    VolumeBrowse,
+    NetworkCreate,
+    NetworkRemove,
+    NetworkPrune,
+    SystemPrune,
 }
 
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 62] = [
+    pub const ALL: [Kind; 78] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -144,7 +160,191 @@ impl Kind {
         Kind::Doctor,
         Kind::Upgrade,
         Kind::Uninstall,
+        Kind::ImagePull,
+        Kind::ImageRun,
+        Kind::ImageTag,
+        Kind::ImagePush,
+        Kind::ImageHistory,
+        Kind::ContainerPause,
+        Kind::ContainerUnpause,
+        Kind::ContainerShell,
+        Kind::VolumeCreate,
+        Kind::VolumeClone,
+        Kind::VolumeExport,
+        Kind::VolumeBrowse,
+        Kind::NetworkCreate,
+        Kind::NetworkRemove,
+        Kind::NetworkPrune,
+        Kind::SystemPrune,
     ];
+}
+
+impl Kind {
+    /// The kind `rekcod state` names `name` (its Debug form).
+    pub fn from_name(name: &str) -> Option<Kind> {
+        Kind::ALL.into_iter().find(|k| format!("{k:?}") == name)
+    }
+}
+
+/// What a value typed into an action's input must look like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InputKind {
+    /// An image reference: `nginx`, `ghcr.io/me/app:1.2`, `alpine@sha256:...`.
+    Image,
+    /// A container, volume or network name.
+    Name,
+    /// A `-p` mapping: `8080:80`, `80`, `127.0.0.1:8080:80`, with an optional `/udp`.
+    Publish,
+    /// `KEY=value`.
+    Env,
+    /// A `-v` mount: `volume:/path` or `/mac/path:/path`, optionally `:ro`.
+    Mount,
+}
+
+impl InputKind {
+    pub fn name(self) -> &'static str {
+        match self {
+            InputKind::Image => "image",
+            InputKind::Name => "name",
+            InputKind::Publish => "publish",
+            InputKind::Env => "env",
+            InputKind::Mount => "mount",
+        }
+    }
+
+    pub fn from_name(s: &str) -> Option<InputKind> {
+        [InputKind::Image, InputKind::Name, InputKind::Publish, InputKind::Env, InputKind::Mount].into_iter().find(|k| k.name() == s)
+    }
+}
+
+/// A value an action asks for before it runs. The argv holds `{key}` where it goes
+/// (docs/engines-and-objects.md).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Input {
+    pub key: String,
+    pub label: String,
+    pub kind: InputKind,
+    /// Empty is fine: the slot (and its flag) is left out.
+    pub optional: bool,
+    /// Several values, each with the flag.
+    pub multiple: bool,
+    /// Put before each value (`-p`, `--name`).
+    pub flag: Option<String>,
+    pub placeholder: String,
+}
+
+impl Input {
+    fn new(key: &str, label: &str, kind: InputKind, placeholder: &str) -> Input {
+        Input { key: key.into(), label: label.into(), kind, optional: false, multiple: false, flag: None, placeholder: placeholder.into() }
+    }
+
+    fn flag(mut self, flag: &str) -> Input {
+        self.flag = Some(flag.into());
+        self.optional = true;
+        self
+    }
+
+    fn multiple(mut self) -> Input {
+        self.multiple = true;
+        self
+    }
+
+    fn slot(&self) -> String {
+        format!("{{{}}}", self.key)
+    }
+}
+
+/// Why `v` isn't a valid `kind` value, or `None` when it is. The dashboard checks the
+/// same rules (lib/inputs.ts) before anything runs.
+pub fn invalid(kind: InputKind, v: &str) -> Option<String> {
+    let max = if kind == InputKind::Env { 4096 } else { 255 };
+    if v.is_empty() || v.len() > max {
+        return Some(format!("must be 1 to {max} characters"));
+    }
+    if v.starts_with('-') || v.chars().any(|c| c.is_control()) {
+        return Some("can't start with - or contain control characters".into());
+    }
+    let name = |s: &str| {
+        s.len() <= 128
+            && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+    };
+    let port = |s: &str| s.parse::<u16>().is_ok_and(|p| p > 0);
+    let ok = match kind {
+        InputKind::Image => {
+            v.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+                && v.chars().all(|c| c.is_ascii_alphanumeric() || "._/:@-".contains(c))
+        }
+        InputKind::Name => name(v),
+        InputKind::Publish => {
+            let spec = v.strip_suffix("/udp").or_else(|| v.strip_suffix("/tcp")).unwrap_or(v);
+            match spec.split(':').collect::<Vec<_>>()[..] {
+                [c] => port(c),
+                [h, c] => port(h) && port(c),
+                [ip, h, c] => ip.parse::<std::net::Ipv4Addr>().is_ok() && port(h) && port(c),
+                _ => false,
+            }
+        }
+        InputKind::Env => v.split_once('=').is_some_and(|(k, _)| {
+            k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }),
+        InputKind::Mount => {
+            let spec = v.strip_suffix(":ro").or_else(|| v.strip_suffix(":rw")).unwrap_or(v);
+            spec.split_once(':').is_some_and(|(src, dst)| {
+                (name(src) || src.starts_with('/'))
+                    && dst.starts_with('/')
+                    && !src.contains(',')
+                    && !dst.contains(':')
+                    && !dst.contains(',')
+            })
+        }
+    };
+    (!ok).then(|| {
+        match kind {
+            InputKind::Image => "isn't an image reference",
+            InputKind::Name => "names start with a letter or digit and use letters, digits, _ . -",
+            InputKind::Publish => "use HOST:CONTAINER, CONTAINER or IP:HOST:CONTAINER, optionally /udp",
+            InputKind::Env => "use KEY=value",
+            InputKind::Mount => "use VOLUME:/path or /mac/path:/path, optionally :ro",
+        }
+        .into()
+    })
+}
+
+/// `argv` with each input's `{key}` replaced by its checked values (docs/engines-and-objects.md).
+pub fn fill(argv: &[String], inputs: &[Input], values: &std::collections::BTreeMap<String, Vec<String>>) -> Result<Vec<String>, String> {
+    let mut checked: std::collections::BTreeMap<&str, Vec<String>> = std::collections::BTreeMap::new();
+    for i in inputs {
+        let vals: Vec<String> = values.get(&i.key).into_iter().flatten().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).collect();
+        if vals.is_empty() && !i.optional {
+            return Err(format!("{} is required", i.label));
+        }
+        if vals.len() > 1 && !i.multiple {
+            return Err(format!("{} takes one value", i.label));
+        }
+        for v in &vals {
+            if let Some(why) = invalid(i.kind, v) {
+                return Err(format!("{} {v:?}: {why}", i.label));
+            }
+        }
+        checked.insert(&i.key, vals);
+    }
+    let mut out = Vec::new();
+    for t in argv {
+        if let Some(i) = inputs.iter().find(|i| *t == i.slot()) {
+            for v in &checked[i.key.as_str()] {
+                out.extend(i.flag.clone());
+                out.push(v.clone());
+            }
+        } else if let Some(i) = inputs.iter().find(|i| t.contains(&i.slot())) {
+            let v = checked[i.key.as_str()].first().ok_or_else(|| format!("{} is required", i.label))?;
+            out.push(t.replace(&i.slot(), v));
+        } else {
+            out.push(t.clone());
+        }
+    }
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +366,8 @@ pub struct Action {
     pub interactive: bool,
     /// Ask before running (destroys or overwrites something). The question.
     pub confirm: Option<String>,
+    /// Values to ask for; `{key}` in the argv marks where each goes.
+    pub inputs: Vec<Input>,
 }
 
 impl Action {
@@ -177,7 +379,13 @@ impl Action {
             dir: None,
             interactive: false,
             confirm: None,
+            inputs: Vec::new(),
         }
+    }
+
+    fn input(mut self, i: Input) -> Action {
+        self.inputs.push(i);
+        self
     }
 
     fn interactive(mut self) -> Action {
@@ -247,6 +455,23 @@ pub struct Container {
     pub image_id: String,
     /// Named volumes it mounts.
     pub volumes: Vec<String>,
+    /// Networks it's attached to.
+    pub networks: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Network {
+    pub id: String,
+    pub name: String,
+    pub driver: String,
+    pub scope: String,
+    pub internal: bool,
+    /// RFC 3339, as docker gives it.
+    pub created: String,
+    /// Containers attached (from the container list).
+    pub containers: Vec<String>,
+    /// `bridge`, `host` and `none`: docker's own, never removed.
+    pub builtin: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +566,13 @@ pub struct Snapshot {
     pub volume_names: Vec<String>,
 }
 
+/// Another Mac's engine as `rekcod host state` gave it, or why it couldn't.
+#[derive(Debug, Clone)]
+pub struct Engine {
+    pub name: String,
+    pub state: Result<Value, String>,
+}
+
 /// Everything the menu bar shows, loaded in one go.
 #[derive(Debug, Default)]
 pub struct Model {
@@ -371,6 +603,7 @@ pub struct Model {
     pub bans: Option<Vec<String>>,
     pub images: Vec<Image>,
     pub volumes: Vec<Volume>,
+    pub networks: Vec<Network>,
     pub disk: Option<Disk>,
     /// Fleet nodes; `None` without an admin token.
     pub nodes: Option<Vec<FleetNode>>,
@@ -384,6 +617,8 @@ pub struct Model {
     /// Docker calls that failed while the VM runs (`containers`, `snapshots`, `images`,
     /// `volumes`), so an unanswered list isn't shown as an empty one.
     pub local_errors: std::collections::BTreeMap<String, String>,
+    /// Hosts' engines; only the menu bar loads these (`rekcod state` is this Mac's).
+    pub engines: Vec<Engine>,
 }
 
 /// Docker contexts `rekcod-*`, and whether the local `rekcod` context is in use.
@@ -637,6 +872,7 @@ impl Model {
         let snapshots = docker("snapshots", &format!("/volumes?filters={filter}")).map(|b| parse_snapshots(&b)).unwrap_or_default();
         let images = docker("images", "/images/json");
         let volumes = docker("volumes", "/volumes");
+        let networks = docker("networks", "/networks");
         let raw = raw.unwrap_or_default();
         m.containers = parse_containers(&raw);
         m.projects = projects(&m.containers, &raw, snapshots);
@@ -644,6 +880,7 @@ impl Model {
         m.images = images.map(|b| parse_images(&b, &m.containers)).unwrap_or_default();
         m.volumes = volumes.map(|b| parse_volumes(&b, &m.containers, df.as_ref())).unwrap_or_default();
         m.disk = df.as_ref().map(parse_disk);
+        m.networks = networks.map(|b| parse_networks(&b, &m.containers)).unwrap_or_default();
         m
     }
 }
@@ -788,11 +1025,35 @@ pub fn parse_containers(json: &[u8]) -> Vec<Container> {
                     .filter(|m| m["Type"] == "volume")
                     .filter_map(|m| m["Name"].as_str().map(String::from))
                     .collect(),
+                networks: c["NetworkSettings"]["Networks"].as_object().map(|n| n.keys().cloned().collect()).unwrap_or_default(),
             }
         })
         .collect();
     // Running first, then by name.
     out.sort_by(|a, b| (a.state != "running", &a.name).cmp(&(b.state != "running", &b.name)));
+    out
+}
+
+/// `GET /networks`, user networks first, each with the containers attached to it.
+pub fn parse_networks(json: &[u8], containers: &[Container]) -> Vec<Network> {
+    let list: Vec<Value> = serde_json::from_slice(json).unwrap_or_default();
+    let mut out: Vec<Network> = list
+        .iter()
+        .map(|n| {
+            let name = n["Name"].as_str().unwrap_or_default().to_string();
+            Network {
+                id: n["Id"].as_str().unwrap_or_default().into(),
+                driver: n["Driver"].as_str().unwrap_or_default().into(),
+                scope: n["Scope"].as_str().unwrap_or_default().into(),
+                internal: n["Internal"].as_bool().unwrap_or(false),
+                created: n["Created"].as_str().unwrap_or_default().into(),
+                containers: containers.iter().filter(|c| c.networks.contains(&name)).map(|c| c.name.clone()).collect(),
+                builtin: ["bridge", "host", "none"].contains(&name.as_str()),
+                name,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| (a.builtin, &a.name).cmp(&(b.builtin, &b.name)));
     out
 }
 
@@ -910,13 +1171,30 @@ pub fn storage_actions(running: bool, containers: &[Container]) -> Vec<Action> {
 pub fn container_actions(c: &Container) -> Vec<Action> {
     let n = c.name.as_str();
     let mut out = Vec::new();
-    if c.state == "running" {
-        out.push(Action::rekcod(Kind::ContainerStop, "Stop", &["stop", n]));
-        out.push(Action::rekcod(Kind::ContainerRestart, "Restart", &["restart", n]));
-    } else {
-        out.push(Action::rekcod(Kind::ContainerStart, "Start", &["start", n]));
+    match c.state.as_str() {
+        "running" => {
+            out.push(Action::rekcod(Kind::ContainerStop, "Stop", &["stop", n]));
+            out.push(Action::rekcod(Kind::ContainerRestart, "Restart", &["restart", n]));
+            out.push(Action::rekcod(Kind::ContainerPause, "Pause", &["pause", n]));
+        }
+        "paused" => {
+            out.push(Action::rekcod(Kind::ContainerUnpause, "Resume", &["unpause", n]));
+            out.push(Action::rekcod(Kind::ContainerStop, "Stop", &["stop", n]));
+        }
+        _ => out.push(Action::rekcod(Kind::ContainerStart, "Start", &["start", n])),
     }
     out.push(Action::rekcod(Kind::ContainerLogs, "Logs", &["logs", "-f", "--tail", "200", n]).interactive());
+    if c.state == "running" {
+        // bash when the image has it.
+        out.push(
+            Action::rekcod(
+                Kind::ContainerShell,
+                "Shell",
+                &["exec", "-it", n, "sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"],
+            )
+            .interactive(),
+        );
+    }
     out.push(Action::rekcod(Kind::ContainerRemove, "Remove", &["rm", "-f", n]).confirm(format!("Remove container {n}?")));
     out
 }
@@ -932,6 +1210,7 @@ pub fn port_actions(p: &Port) -> Vec<Action> {
         dir: None,
         interactive: false,
         confirm: None,
+        inputs: Vec::new(),
     }]
 }
 
@@ -954,24 +1233,139 @@ pub fn project_actions(p: &Project) -> Vec<Action> {
     out
 }
 
+/// `docker run -d` with the options Docker Desktop's run dialog has; `image` is the argv's last
+/// token (a reference, or `{image}` for one typed in).
+fn run_action(label: &str, image: &str) -> Action {
+    Action::rekcod(Kind::ImageRun, label, &["run", "-d", "{name}", "{publish}", "{env}", "{mount}", image])
+        .input(Input::new("name", "Container name", InputKind::Name, "web").flag("--name"))
+        .input(Input::new("publish", "Ports", InputKind::Publish, "8080:80").flag("-p").multiple())
+        .input(Input::new("env", "Environment", InputKind::Env, "KEY=value").flag("-e").multiple())
+        .input(Input::new("mount", "Volumes", InputKind::Mount, "data:/data").flag("-v").multiple())
+}
+
 pub fn image_actions(i: &Image) -> Vec<Action> {
     let name = i.tags.first().cloned().unwrap_or_else(|| short_id(&i.id).to_string());
     let users = if i.containers.is_empty() { String::new() } else { format!(" {} use it and keep it.", i.containers.join(", ")) };
-    vec![
+    // A tag when there is one, so `docker run` shows it as the container's image.
+    let image = i.tags.first().cloned().unwrap_or_else(|| i.id.clone());
+    let mut out = vec![run_action("Run", &image)];
+    if let Some(tag) = i.tags.first() {
+        out.push(Action::rekcod(Kind::ImagePull, "Pull again", &["pull", tag]));
+        out.push(
+            Action::rekcod(Kind::ImagePush, "Push", &["push", tag])
+                .confirm(format!("Push {tag} to its registry? Anyone who can read that repository gets this image.")),
+        );
+    }
+    out.push(Action::rekcod(Kind::ImageTag, "Tag", &["tag", &image, "{target}"]).input(Input::new(
+        "target",
+        "New tag",
+        InputKind::Image,
+        "registry.example.com/team/app:1.0",
+    )));
+    out.push(Action::rekcod(Kind::ImageHistory, "Layers", &["image", "history", &image]).interactive());
+    out.push(
         Action::rekcod(Kind::ImageRemove, "Remove", &["image", "rm", &i.id])
             .confirm(format!("Remove image {name} ({})?{users}", fmt_bytes(i.size))),
+    );
+    out
+}
+
+/// Things to create on the engine, rather than act on: pull, run, a volume, a network.
+pub fn engine_actions(running: bool) -> Vec<Action> {
+    if !running {
+        return vec![];
+    }
+    vec![
+        Action::rekcod(Kind::ImagePull, "Pull an image", &["pull", "{image}"]).input(Input::new(
+            "image",
+            "Image",
+            InputKind::Image,
+            "postgres:17",
+        )),
+        run_action("Run a container", "{image}").input(Input::new("image", "Image", InputKind::Image, "nginx:latest")),
+        Action::rekcod(Kind::VolumeCreate, "Create a volume", &["volume", "create", "{name}"]).input(Input::new(
+            "name",
+            "Volume name",
+            InputKind::Name,
+            "pgdata",
+        )),
+        Action::rekcod(Kind::NetworkCreate, "Create a network", &["network", "create", "{name}"]).input(Input::new(
+            "name",
+            "Network name",
+            InputKind::Name,
+            "backend",
+        )),
     ]
 }
 
-pub fn volume_actions(v: &Volume) -> Vec<Action> {
-    if !v.containers.is_empty() {
+pub fn network_actions(n: &Network) -> Vec<Action> {
+    if n.builtin {
         return vec![];
     }
-    let size = v.size.map(|s| format!(" ({})", fmt_bytes(s))).unwrap_or_default();
+    let attached = if n.containers.is_empty() {
+        String::new()
+    } else {
+        format!(" docker refuses while {} {} attached.", n.containers.join(", "), if n.containers.len() == 1 { "is" } else { "are" })
+    };
     vec![
-        Action::rekcod(Kind::VolumeRemove, "Remove", &["volume", "rm", &v.name])
-            .confirm(format!("Delete volume {}{size} and everything in it?", v.name)),
+        Action::rekcod(Kind::NetworkRemove, "Remove", &["network", "rm", &n.name]).confirm(format!("Remove network {}?{attached}", n.name)),
     ]
+}
+
+/// `VolumeClone`'s copy, in the helper container.
+const CLONE: &str =
+    r#"[ -z "$(ls -A /to)" ] || { echo "that volume already has files; clone into a new name" >&2; exit 1; }; cp -a /v/. /to/"#;
+
+/// Where `VolumeExport` writes: `~/Downloads` (shared with the VM at the same path).
+fn downloads() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Downloads")
+}
+
+pub fn volume_actions(v: &Volume) -> Vec<Action> {
+    let n = v.name.as_str();
+    let helper = crate::cli::HELPER_IMAGE;
+    let ro = format!("{n}:/v:ro");
+    let tgz = format!("{n}.tar.gz");
+    let out_dir = downloads();
+    let mut out = vec![
+        // `ls -ld` of up to 2000 paths, six levels deep.
+        Action::rekcod(
+            Kind::VolumeBrowse,
+            "Files",
+            &["run", "--rm", "-v", &ro, helper, "sh", "-c", "cd /v && find . -maxdepth 6 -exec ls -ld {} + | head -2000"],
+        )
+        .interactive(),
+        // Into a new (empty) volume only: copying over one that has files would mix the two.
+        Action::rekcod(Kind::VolumeClone, "Clone", &["run", "--rm", "-v", &ro, "-v", "{target}:/to", helper, "sh", "-c", CLONE])
+            .input(Input::new("target", "New volume", InputKind::Name, &format!("{n}-copy"))),
+        Action::rekcod(
+            Kind::VolumeExport,
+            format!("Export to ~/Downloads/{tgz}"),
+            &[
+                "run",
+                "--rm",
+                "-v",
+                &ro,
+                "-v",
+                &format!("{}:/out", out_dir.display()),
+                helper,
+                "tar",
+                "czf",
+                &format!("/out/{tgz}"),
+                "-C",
+                "/v",
+                ".",
+            ],
+        ),
+    ];
+    if v.containers.is_empty() {
+        let size = v.size.map(|s| format!(" ({})", fmt_bytes(s))).unwrap_or_default();
+        out.push(
+            Action::rekcod(Kind::VolumeRemove, "Remove", &["volume", "rm", n])
+                .confirm(format!("Delete volume {n}{size} and everything in it?")),
+        );
+    }
+    out
 }
 
 /// Prunes, while the VM runs. Snapshot volumes are left out of `volume prune`.
@@ -1001,6 +1395,10 @@ pub fn disk_actions(running: bool, images: &[Image], volumes: &[Volume], disk: O
         )),
         Action::rekcod(Kind::BuildCachePrune, "Clear the build cache", &["builder", "prune", "-f"])
             .confirm(format!("Clear unused build cache{}? The next builds start cold.", free(disk.map(|d| d.build_cache_free)))),
+        Action::rekcod(Kind::NetworkPrune, "Remove unused networks", &["network", "prune", "-f"])
+            .confirm("Remove every network no container uses? Compose recreates its networks on the next up.".into()),
+        Action::rekcod(Kind::SystemPrune, "Remove everything unused", &["system", "prune", "-f"])
+            .confirm("Remove stopped containers, unused networks, dangling images and unused build cache? Volumes are kept.".into()),
     ]
 }
 
@@ -1063,6 +1461,7 @@ pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
             dir: None,
             interactive: false,
             confirm: None,
+            inputs: Vec::new(),
         },
         Action::rekcod(Kind::AppLogs, "Logs", &["app", "logs", n]).interactive(),
         if a.sleeping {
@@ -1215,7 +1614,9 @@ pub mod tests {
     pub fn sample() -> (Vec<Container>, Vec<Port>, Vec<Project>) {
         let containers = parse_containers(
             br#"[{"Id":"a","Names":["/web"],"Image":"nginx","State":"running","Status":"Up 2 minutes",
-                  "Ports":[{"PublicPort":8080},{"PublicPort":8080}],"Labels":{"com.docker.compose.project":"shop"}},
+                  "Ports":[{"PublicPort":8080},{"PublicPort":8080}],"Labels":{"com.docker.compose.project":"shop"},
+                  "NetworkSettings":{"Networks":{"shop_default":{}}}},
+                 {"Id":"p","Names":["/held"],"Image":"redis","State":"paused","Status":"Up 1 minute (Paused)","Labels":{}},
                  {"Id":"b","Names":["/old"],"Image":"alpine","State":"exited","Status":"Exited (0)","Labels":{}}]"#,
         );
         let ports = ports_of(
@@ -1303,6 +1704,15 @@ pub mod tests {
         vec![EdgeClient { ip: "198.51.100.7".into(), requests: 900, limited: 120 }]
     }
 
+    pub fn sample_networks() -> Vec<Network> {
+        let (containers, ..) = sample();
+        parse_networks(
+            br#"[{"Name":"bridge","Id":"n0","Driver":"bridge","Scope":"local"},
+                 {"Name":"shop_default","Id":"n1","Driver":"bridge","Scope":"local","Created":"2026-11-01T10:00:00Z"}]"#,
+            &containers,
+        )
+    }
+
     pub fn sample_remotes() -> RemoteList {
         RemoteList { default: Some("home".into()), all: vec!["home".into(), "work".into()] }
     }
@@ -1310,7 +1720,12 @@ pub mod tests {
     #[test]
     fn model_parsing() {
         let (containers, ports, projects) = sample();
-        assert_eq!(containers.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["web", "old"]);
+        assert_eq!(containers.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["web", "held", "old"]);
+        assert_eq!(containers[0].networks, vec!["shop_default"]);
+        let nets = sample_networks();
+        assert_eq!(nets.iter().map(|n| n.name.as_str()).collect::<Vec<_>>(), ["shop_default", "bridge"], "user networks first");
+        assert_eq!(nets[0].containers, vec!["web"]);
+        assert!(network_actions(&nets[1]).is_empty(), "docker's own networks can't be removed");
         assert_eq!(containers[0].ports, vec![8080]);
         assert_eq!(ports.len(), 2, "127.0.0.1 + ::1 is one port");
         assert_eq!(projects.len(), 1);
@@ -1351,6 +1766,10 @@ pub mod tests {
         for v in &sample_volumes() {
             all.extend(volume_actions(v));
         }
+        for n in &sample_networks() {
+            all.extend(network_actions(n));
+        }
+        all.extend(engine_actions(true));
         all.extend(disk_actions(
             true,
             &sample_images(),
@@ -1400,6 +1819,10 @@ pub mod tests {
                     | Kind::Uninstall
                     | Kind::HostRestart
                     | Kind::HostUninstall
+                    | Kind::ImagePush
+                    | Kind::NetworkRemove
+                    | Kind::NetworkPrune
+                    | Kind::SystemPrune
             ) || (a.kind == Kind::EdgeBan && !a.interactive);
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }
@@ -1416,7 +1839,7 @@ pub mod tests {
         assert!(q(Kind::BuildCachePrune).contains("7.0 MiB"));
         let vp = d.iter().find(|a| a.kind == Kind::VolumePrune).unwrap();
         assert!(matches!(&vp.run, Run::Rekcod(v) if v.contains(&"label!=dev.rekcod.snap".to_string())));
-        assert!(volume_actions(&sample_volumes()[0]).is_empty(), "a volume in use can't be removed");
+        assert!(!volume_actions(&sample_volumes()[0]).iter().any(|a| a.kind == Kind::VolumeRemove), "a volume in use can't be removed");
         assert!(disk_actions(false, &[], &[], None).is_empty());
     }
 
@@ -1433,6 +1856,73 @@ pub mod tests {
         assert!(cancelling.iter().all(|a| a.kind == Kind::JobLogs));
         let bans = ban_actions(&["198.51.100.7".into()], &sample_clients());
         assert!(!bans.iter().any(|a| a.kind == Kind::EdgeBan && !a.interactive), "an IP that's banned isn't offered again");
+    }
+
+    fn values(pairs: &[(&str, &[&str])]) -> std::collections::BTreeMap<String, Vec<String>> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.iter().map(|s| s.to_string()).collect())).collect()
+    }
+
+    fn argv(a: &Action) -> Vec<String> {
+        match &a.run {
+            Run::Rekcod(v) => v.clone(),
+            Run::Open(_) => vec![],
+        }
+    }
+
+    #[test]
+    fn inputs_fill_their_slots() {
+        let run = engine_actions(true).into_iter().find(|a| a.kind == Kind::ImageRun).unwrap();
+        let filled =
+            fill(&argv(&run), &run.inputs, &values(&[("image", &["nginx:1.29"]), ("publish", &["8080:80", "127.0.0.1:8443:443/tcp"])]))
+                .unwrap();
+        assert_eq!(filled, ["run", "-d", "-p", "8080:80", "-p", "127.0.0.1:8443:443/tcp", "nginx:1.29"]);
+        assert_eq!(fill(&argv(&run), &run.inputs, &values(&[])).unwrap_err(), "Image is required");
+        let bad = fill(&argv(&run), &run.inputs, &values(&[("image", &["--privileged"])])).unwrap_err();
+        assert!(bad.contains("can't start with -"), "{bad}");
+        assert!(fill(&argv(&run), &run.inputs, &values(&[("image", &["a"]), ("name", &["x", "y"])])).is_err(), "one name only");
+        // A slot inside a token takes the value in place.
+        let clone = volume_actions(&sample_volumes()[0]).into_iter().find(|a| a.kind == Kind::VolumeClone).unwrap();
+        let filled = fill(&argv(&clone), &clone.inputs, &values(&[("target", &["pg2"])])).unwrap();
+        assert!(filled.contains(&"pg2:/to".to_string()), "{filled:?}");
+    }
+
+    #[test]
+    fn input_values_are_checked_by_kind() {
+        for (k, v) in [
+            (InputKind::Image, "ghcr.io/me/app:1.2"),
+            (InputKind::Image, "alpine@sha256:abc"),
+            (InputKind::Name, "pg_data-1.x"),
+            (InputKind::Publish, "80"),
+            (InputKind::Publish, "5353:53/udp"),
+            (InputKind::Env, "A_B=x y=z"),
+            (InputKind::Mount, "data:/data:ro"),
+            (InputKind::Mount, "/Users/me/src:/src"),
+        ] {
+            assert_eq!(invalid(k, v), None, "{k:?} {v}");
+        }
+        for (k, v) in [
+            (InputKind::Image, "-x"),
+            (InputKind::Image, "a b"),
+            (InputKind::Name, "_x"),
+            (InputKind::Publish, "70000:80"),
+            (InputKind::Publish, "host:80:80"),
+            (InputKind::Env, "1A=x"),
+            (InputKind::Env, "A=x\ny"),
+            (InputKind::Mount, "data"),
+            (InputKind::Mount, "data:rel"),
+        ] {
+            assert!(invalid(k, v).is_some(), "{k:?} {v}");
+        }
+    }
+
+    #[test]
+    fn paused_containers_resume_and_running_ones_get_a_shell() {
+        let (containers, ..) = sample();
+        let kinds =
+            |n: &str| container_actions(containers.iter().find(|c| c.name == n).unwrap()).iter().map(|a| a.kind).collect::<Vec<_>>();
+        assert!(kinds("held").contains(&Kind::ContainerUnpause) && !kinds("held").contains(&Kind::ContainerStart));
+        assert!(kinds("web").contains(&Kind::ContainerShell) && kinds("web").contains(&Kind::ContainerPause));
+        assert!(!kinds("old").contains(&Kind::ContainerShell));
     }
 
     #[test]

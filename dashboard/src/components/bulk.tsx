@@ -12,12 +12,12 @@ import { cn } from "@/lib/utils"
 export type BulkItem = { id: string; subject: string; actions: Action[] }
 
 /**
- * Action kinds every item offers and that run without a terminal or a stream: what the bulk
+ * Action kinds every item offers and that run without a terminal, a stream or typed values: what the bulk
  * bar can do to all of them. In the first item's order.
  */
 export function commonKinds(items: BulkItem[]): Action[] {
   if (!items.length) return []
-  const ok = (a: Action) => !!a.argv && !a.url && !a.interactive && !STREAMED.has(a.kind)
+  const ok = (a: Action) => !!a.argv && !a.url && !a.interactive && !STREAMED.has(a.kind) && !a.inputs?.length
   return items[0].actions.filter((a) => ok(a) && items.every((i) => i.actions.some((b) => b.kind === a.kind && ok(b))))
 }
 

@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest"
 import type { State } from "@/lib/types"
-import { mergeLocal, staleBinary, staleMessage } from "./merge"
+import fixture from "../../../fixtures/state.json"
+import { onEngine } from "./engine"
+import { fakeEngine } from "./fixtures"
+import { mergeEngine, mergeLocal, staleBinary, staleMessage, unreachableEngine } from "./merge"
 import { Colors, OTHER, PALETTE, parseStatLine, Ring, splitLines } from "./stats"
 import { inspectArgv, instanceLogsArgv, jobHistoryArgv, logsArgv, releaseArgv, sandboxStatArgv, screenshotArgv } from "./validate"
 
@@ -110,5 +113,24 @@ describe("read-only routes", () => {
     expect(logsArgv(base, q({ name: "web", since: "--details" }))).toHaveProperty("error")
     expect(logsArgv(base, q({ name: "web", follow: "yes" }))).toEqual({ argv: ["logs", "--tail", "1000", "web"] })
     expect(logsArgv(base, q({ name: "db" }))).toHaveProperty("error")
+  })
+})
+
+describe("engines", () => {
+  const local = fixture as unknown as State
+  it("runs a host's commands there and keeps this Mac's fleet and hosts", () => {
+    const remote = fakeEngine(local, "studio")
+    const s = mergeEngine(remote, { ...local, apps: [] }, "studio")
+    expect(s.engine).toBe("studio")
+    expect(s.containers[0].actions[0].argv?.slice(0, 4)).toEqual(["host", "exec", "studio", "--"])
+    expect(s.apps).toEqual([])
+    expect(s.hosts).toBe(local.hosts)
+    expect(onEngine(["logs", "web"], "studio")).toEqual(["host", "exec", "studio", "--", "logs", "web"])
+    expect(onEngine(["logs", "web"], "local")).toEqual(["logs", "web"])
+  })
+  it("shows an unreadable engine as empty, with why", () => {
+    const s = unreachableEngine(local, "studio", "ssh: connect timed out")
+    expect(s).toMatchObject({ engine: "studio", engine_error: "ssh: connect timed out", running: false, containers: [], vm_actions: [] })
+    expect(s.apps).toBe(local.apps)
   })
 })

@@ -627,6 +627,134 @@ pub fn forward(paths: &Paths, name: &str, only: &[u16]) -> Result<()> {
     Ok(())
 }
 
+// ------------------------------------------------------------ engines
+
+/// Kinds a host's `rekcod state` doesn't offer here: they act on the Mac that built them (its
+/// dashboard, its own hosts and remotes, a viewer opened there) or remove rekcod itself, which
+/// `host uninstall` does properly.
+const NOT_REMOTE: &[&str] = &[
+    "DashboardOpen",
+    "Uninstall",
+    "HostUse",
+    "HostForward",
+    "HostRefresh",
+    "HostRestart",
+    "HostUninstall",
+    "RemoteUse",
+    "NsUse",
+    "SandboxScreenshot",
+];
+
+/// Keys of `rekcod state` about the fleet and docker contexts: those are this Mac's.
+const LOCAL_KEYS: &[&str] =
+    &["hosts", "remotes", "namespaces", "bans", "controller_actions", "apps", "jobs", "nodes", "remote", "schedules", "routes", "backups"];
+
+/// `ssh`, or `REKCOD_SSH` (scripts/e2e-engines.sh points it at a stand-in that runs the
+/// command here), with the options `add` uses.
+fn engine_ssh(dest: &str, extra: &[&str]) -> Command {
+    let mut cmd = Command::new(std::env::var_os("REKCOD_SSH").unwrap_or_else(|| "ssh".into()));
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"])
+        .args(mux_opts())
+        .args(extra)
+        .args(ssh_dest(dest));
+    cmd
+}
+
+/// The ssh destination of host `name`.
+fn dest_of(name: &str) -> Result<String> {
+    let (hosts, _) = list();
+    let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
+    Ok(host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?.to_string())
+}
+
+/// The remote command line for `rekcod ARGS` there, found as `host restart` finds it.
+fn remote_rekcod(dir: Option<&str>, args: &[String]) -> String {
+    use crate::actions::shell_quote;
+    let cd = dir.map(|d| format!("cd {} && ", shell_quote(d))).unwrap_or_default();
+    // The dashboard's followers set it: a stopped VM there stays stopped too.
+    let no_boot = if std::env::var_os("REKCOD_NO_BOOT").is_some_and(|v| !v.is_empty()) { "export REKCOD_NO_BOOT=1; " } else { "" };
+    let args: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
+    let script = format!(
+        "r=$({}); [ -n \"$r\" ] || {{ echo \"rekcod isn't installed on $(hostname -s)\" >&2; exit 127; }}; {no_boot}{cd}exec \"$r\" {}",
+        crate::server::FIND,
+        args.join(" ")
+    );
+    format!("/bin/zsh -lc {}", shell_quote(&script))
+}
+
+/// `v` as an action `rekcod state` wrote: a kind and a label.
+fn is_action(o: &serde_json::Map<String, serde_json::Value>) -> bool {
+    o.get("kind").is_some_and(|k| k.is_string()) && o.get("label").is_some_and(|l| l.is_string())
+}
+
+/// A host's `rekcod state` made to run from here: each action's argv becomes
+/// `host exec NAME [--dir DIR] -- ARGV`; actions that can't run from here are dropped.
+pub fn rewrite(v: &mut serde_json::Value, name: &str) {
+    use serde_json::Value;
+    match v {
+        Value::Array(a) => {
+            a.retain(|x| match x {
+                Value::Object(o) if is_action(o) => o.contains_key("argv") && !NOT_REMOTE.contains(&o["kind"].as_str().unwrap_or_default()),
+                _ => true,
+            });
+            a.iter_mut().for_each(|x| rewrite(x, name));
+        }
+        Value::Object(o) if is_action(o) => {
+            o.remove("url");
+            let dir = o.remove("dir").and_then(|d| d.as_str().map(String::from));
+            let Some(old) = o.get("argv").and_then(Value::as_array) else { return };
+            let mut argv = vec!["host".to_string(), "exec".into(), name.into()];
+            if let Some(dir) = dir {
+                argv.extend(["--dir".into(), dir]);
+            }
+            argv.push("--".into());
+            argv.extend(old.iter().filter_map(|a| a.as_str().map(String::from)));
+            o.insert("argv".into(), argv.into());
+        }
+        Value::Object(o) => o.values_mut().for_each(|x| rewrite(x, name)),
+        _ => {}
+    }
+}
+
+/// `rekcod host state NAME`: `rekcod state --local` on that Mac, rewritten to run from here.
+pub fn engine_state(name: &str) -> Result<serde_json::Value> {
+    let dest = dest_of(name)?;
+    let out = engine_ssh(&dest, &[])
+        .arg(remote_rekcod(None, &["state".into(), "--local".into()]))
+        .stdin(Stdio::null())
+        .output()
+        .context("run ssh")?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        bail!("{name}: {}", err.trim().lines().last().unwrap_or("ssh failed"));
+    }
+    let mut v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| format!("{name}'s rekcod state isn't JSON"))?;
+    let o = v.as_object_mut().with_context(|| format!("{name}'s rekcod state isn't an object"))?;
+    for k in LOCAL_KEYS {
+        o.remove(*k);
+    }
+    o.remove("local");
+    rewrite(&mut v, name);
+    v["engine"] = name.into();
+    Ok(v)
+}
+
+pub fn print_engine_state(name: &str) -> Result<()> {
+    println!("{}", serde_json::to_string(&engine_state(name)?)?);
+    Ok(())
+}
+
+/// `rekcod host exec NAME [--dir DIR] -- ARGS`: `rekcod ARGS` on that Mac, with a terminal
+/// when this one has one.
+pub fn exec(name: &str, dir: Option<&str>, args: &[String]) -> Result<std::convert::Infallible> {
+    use std::os::unix::process::CommandExt;
+    let dest = dest_of(name)?;
+    let tty = unsafe { libc::isatty(0) } == 1;
+    let mut cmd = engine_ssh(&dest, if tty { &["-t"] } else { &[] });
+    cmd.arg(remote_rekcod(dir, args));
+    Err(cmd.exec()).context("exec ssh")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -670,6 +798,35 @@ mod tests {
         assert_eq!(known_hosts_name("me@Mac-Mini.local"), "Mac-Mini.local");
         assert_eq!(known_hosts_name("me@Mac-Mini.local:2222"), "[Mac-Mini.local]:2222");
         assert_eq!(known_hosts_name("Mac-Mini.local:22"), "Mac-Mini.local");
+    }
+
+    #[test]
+    fn engine_actions_run_there() {
+        let mut v = serde_json::json!({
+            "vm_actions": [{"kind": "VmStop", "label": "Stop", "argv": ["stop"], "interactive": false, "confirm": "Stop?"},
+                           {"kind": "DashboardOpen", "label": "Dashboard", "argv": ["dashboard"]}],
+            "ports": [{"port": 3000, "actions": [{"kind": "OpenPort", "label": "Open", "url": "http://localhost:3000"}]}],
+            "projects": [{"actions": [{"kind": "SnapSave", "label": "Save", "argv": ["snap", "save", "-p", "shop"], "dir": "/Users/me/shop"}]}],
+            "name": "kind-less objects stay"
+        });
+        rewrite(&mut v, "mini");
+        assert_eq!(v["vm_actions"].as_array().unwrap().len(), 1, "the dashboard opens there, not here");
+        assert_eq!(v["vm_actions"][0]["argv"], serde_json::json!(["host", "exec", "mini", "--", "stop"]));
+        assert_eq!(v["ports"][0]["actions"], serde_json::json!([]), "localhost there isn't localhost here");
+        let save = &v["projects"][0]["actions"][0];
+        assert_eq!(
+            save["argv"],
+            serde_json::json!(["host", "exec", "mini", "--dir", "/Users/me/shop", "--", "snap", "save", "-p", "shop"])
+        );
+        assert!(save.get("dir").is_none());
+        assert_eq!(v["name"], "kind-less objects stay");
+        // An action outside a list, without an argv, is left without its URL rather than panicking.
+        let mut lone = serde_json::json!({"open": {"kind": "OpenPort", "label": "Open", "url": "http://localhost:1"}});
+        rewrite(&mut lone, "mini");
+        assert_eq!(lone["open"], serde_json::json!({"kind": "OpenPort", "label": "Open"}));
+        let line = remote_rekcod(Some("/Users/me/my app"), &["logs".into(), "it's".into()]);
+        assert!(line.starts_with("/bin/zsh -lc '"), "{line}");
+        assert!(line.contains(r"cd '\''/Users/me/my app'\'' && exec"), "{line}");
     }
 
     #[test]

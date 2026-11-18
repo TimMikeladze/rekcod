@@ -1,15 +1,18 @@
 import "server-only"
 import type { ChildProcess } from "node:child_process"
 import type { State } from "@/lib/types"
-import { FIXTURE, readState, spawnWatcher } from "@/lib/rekcod"
+import { FIXTURE, readEngine, readState, spawnWatcher } from "@/lib/rekcod"
 import { broadcast, once, subscribers } from "./bus"
-import { mergeLocal } from "./merge"
+import { engine, onEngine, setEngine } from "./engine"
+import { mergeEngine, mergeLocal, unreachableEngine } from "./merge"
 import { fakeNodes, recordNodes } from "./nodes"
 import { splitLines } from "./stats"
 
 // The state the page sees. Docker events refresh `rekcod state --local` (no controller calls,
 // well under a second) and push it; a full `rekcod state` runs every 15 s for the fleet parts.
-// Polling clients (`GET /api/state`) get the cache when it's under 3 s old.
+// Polling clients (`GET /api/state`) get the cache when it's under 3 s old. With a host's
+// engine selected (engine.ts), its `rekcod host state` replaces the local docker parts and the
+// events follower runs there.
 const FULL_MS = 15_000
 const POLL_FRESH_MS = 3000
 const DEBOUNCE_MS = 150
@@ -76,16 +79,28 @@ function fail(e: unknown) {
   broadcast("fail", { error: h.error })
 }
 
+/** The selected host's engine merged with `local` (this Mac's last full state). */
+async function withEngine(local: State): Promise<State> {
+  const name = engine()
+  if (name === "local") return local
+  try {
+    return mergeEngine(await readEngine(name), local, name)
+  } catch (e) {
+    return unreachableEngine(local, name, (e as Error).message)
+  }
+}
+
 /** A full `rekcod state`; concurrent callers share one run. */
 export function refreshFull(): Promise<State> {
   h.fullInflight ??= readState(false)
-    .then((st) => {
+    .then(async (st) => {
       h.full = st
       h.fullAt = Date.now()
       if (FIXTURE) fakeNodes(st)
       else recordNodes(st, h.fullAt)
-      publish(st)
-      return st
+      const shown = await withEngine(st)
+      publish(shown)
+      return shown
     })
     .catch((e) => {
       fail(e)
@@ -98,9 +113,9 @@ export function refreshFull(): Promise<State> {
 /** `rekcod state --local` merged with the last full state's fleet parts. */
 export function refreshLocal(): Promise<State> {
   if (FIXTURE || !h.full) return refreshFull()
-  h.inflight ??= readState(true)
-    .then((st) => {
-      const merged = mergeLocal(st, h.full)
+  const full = h.full
+  h.inflight ??= (engine() === "local" ? readState(true).then((st) => mergeLocal(st, full)) : withEngine(full))
+    .then((merged) => {
       publish(merged)
       return merged
     })
@@ -129,7 +144,7 @@ export const vmRunning = () => h.current?.running === true
 
 function followEvents() {
   if (FIXTURE || h.events || !vmRunning()) return
-  const child = spawnWatcher(["events", "--format", "{{json .}}"])
+  const child = spawnWatcher(onEngine(["events", "--format", "{{json .}}"]))
   h.events = child
   let buf = ""
   child.stdout?.setEncoding("utf8")
@@ -181,6 +196,20 @@ export async function get(): Promise<State> {
   if (h.current && Date.now() - h.at < POLL_FRESH_MS) return h.current
   if (h.error && !h.current) return refreshFull()
   return Date.now() - h.fullAt >= FULL_MS ? refreshFull() : refreshLocal()
+}
+
+/**
+ * Shows another engine: the followers stop (they run on the old one), the cached engine parts
+ * go, and a refresh starts. The fleet parts stay.
+ */
+export function switchEngine(name: string): Promise<State> {
+  setEngine(name)
+  const old = h.events
+  h.events = null
+  old?.kill()
+  h.current = null
+  h.at = 0
+  return refreshFull()
 }
 
 /** What's there now, without waiting (null before the first read). */

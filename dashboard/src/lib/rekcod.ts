@@ -3,6 +3,8 @@ import { execFile, spawn } from "node:child_process"
 import { existsSync } from "node:fs"
 import path from "node:path"
 import { findOffered } from "./allow"
+import { engine } from "./server/engine"
+import { fakeEngine } from "./server/fixtures"
 import { staleBinary, staleMessage } from "./server/merge"
 import type { Action, State } from "./types"
 
@@ -49,12 +51,26 @@ export async function readState(local = false): Promise<State> {
   return JSON.parse(r.stdout)
 }
 
+/** `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. */
+export async function readEngine(name: string): Promise<State> {
+  if (FIXTURE) return fakeEngine(await readState(), name)
+  const r = await run(["host", "state", name], { timeout: 40_000 })
+  if (r.code !== 0) throw new Error(`${name}: ${r.stderr.trim().split("\n").at(-1) || `exited ${r.code}`}`)
+  return JSON.parse(r.stdout)
+}
+
 /** A fresh full state; the allow-list checks use this, never the cache. */
 export const state = () => readState(false)
 
-/** The offered action with exactly this argv, or null. Only these run. */
+/**
+ * The offered action with exactly this argv, or null. Only these run. With a host's engine
+ * selected, its fresh state counts too.
+ */
 export async function offered(argv: unknown): Promise<Action | null> {
-  return findOffered(await state(), argv)
+  const here = findOffered(await state(), argv)
+  const name = engine()
+  if (here || name === "local") return here
+  return findOffered(await readEngine(name), argv)
 }
 
 /** Opens Terminal.app running the action's command line, as the menu bar does. */

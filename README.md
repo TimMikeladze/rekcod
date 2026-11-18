@@ -197,6 +197,22 @@ The menu bar and dashboard expose the same actions as the CLI: container control
 logs, snapshots and sandbox changes. The dashboard uses `http://localhost:4500` or the
 next free port.
 
+They also cover what Docker Desktop's images, volumes and networks views do. Each one runs
+the docker command shown next to it:
+
+- Images: pull, run with a name, ports, environment and volumes (`run -d`), tag, push,
+  show layers, remove
+- Containers: start, stop, restart, pause and resume, a shell (`exec -it`), logs, remove
+- Volumes: create, list files, clone into a new volume, export to
+  `~/Downloads/NAME.tar.gz`, remove
+- Networks: create, remove, prune unused ones
+- Disk: remove dangling images, unused anonymous volumes, build cache, unused networks,
+  or everything unused (`system prune`)
+
+Actions that need a value, such as an image to pull, ask for it first. The dashboard
+checks values before running anything: no leading `-`, and ports, `KEY=value` pairs
+and mounts in docker's format.
+
 `rekcod status` shows disk use and forwarded ports, including ports another Mac process
 already occupies. Use `rekcod start --help` for VM sizing and startup settings.
 
@@ -234,6 +250,26 @@ rekcod host use local
 
 `host use local` selects this Mac's rekcod context again. Commands passed directly to
 rekcod, such as `rekcod ps`, always use the local VM regardless of the Docker context.
+
+### Manage another Mac's rekcod
+
+```sh
+rekcod host exec mini -- ps -a
+rekcod host exec mini -- stop
+rekcod host state mini
+```
+
+`host exec` runs any rekcod command on that Mac over SSH, with a terminal when you have
+one. `host state` prints that Mac's `rekcod state` with every action rewritten to run
+through `host exec`.
+
+The menu bar shows an `Engine: NAME` submenu per host with its VM, containers, images,
+volumes and networks. In the dashboard, pick the engine from the menu at the top of the
+sidebar. The pages then show that Mac's engine; the fleet pages stay the same. One
+dashboard shows one engine at a time.
+
+Opening a port, the dashboard and uninstalling aren't offered for another Mac's engine.
+Use `rekcod host forward NAME` to reach its ports from here.
 
 ## Self-host apps on a Mac
 

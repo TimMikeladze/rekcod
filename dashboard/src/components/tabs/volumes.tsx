@@ -1,6 +1,6 @@
 "use client"
 
-import { Actions } from "@/components/actions"
+import { Actions, EngineBar } from "@/components/actions"
 import { Empty, Mono } from "@/components/bits"
 import { memo } from "react"
 import { BulkBar, useSelection } from "@/components/bulk"
@@ -23,11 +23,19 @@ export function Volumes({ q }: { q: string }) {
   const rows = sort.apply(list.filter((v) => match(q, v.name, v.driver, ...v.containers, ...flags(v))))
   const known = list.filter((v) => v.size != null)
   const total = known.reduce((a, v) => a + (v.size ?? 0), 0)
-  if (!list.length) return <Empty>{state?.local_errors?.volumes ? `Couldn't list volumes: ${state.local_errors.volumes}` : state?.running ? "No volumes." : "The VM is stopped."}</Empty>
+  const bar = <EngineBar kinds={["VolumeCreate"]} />
+  if (!list.length)
+    return (
+      <>
+        {bar}
+        <Empty>{state?.local_errors?.volumes ? `Couldn't list volumes: ${state.local_errors.volumes}` : state?.running ? "No volumes." : "The VM is stopped."}</Empty>
+      </>
+    )
   const ids = rows.map((v) => v.name)
   const picked = rows.filter((v) => sel.has(v.name))
   return (
     <>
+      {bar}
       <PruneBar
         kinds={["VolumePrune"]}
         note={`${list.length} volumes${known.length ? `, ${fmtBytes(total)}` : ""}${known.length < list.length ? " (sizes come from the last disk check)" : ""}`}

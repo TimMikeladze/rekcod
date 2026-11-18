@@ -3,6 +3,7 @@ import type { ChildProcess } from "node:child_process"
 import type { Sample, Stat, StatsResponse } from "@/lib/types"
 import { FIXTURE, readState, spawnWatcher } from "@/lib/rekcod"
 import { broadcast, once, subscribers } from "./bus"
+import { engine, onEngine } from "./engine"
 import { vmRunning } from "./hub"
 import { Colors, fakeSample, parseStatLine, Ring, SAMPLE_SECS, splitLines, KEEP } from "./stats"
 
@@ -19,6 +20,8 @@ type S = {
   lastAsk: number
   timer: ReturnType<typeof setInterval> | null
   fixtureNames: string[] | null
+  /** The engine the child samples; another one selected means start over. */
+  engine: string
 }
 
 const s = once<S>("sampler", () => ({
@@ -29,11 +32,12 @@ const s = once<S>("sampler", () => ({
   lastAsk: 0,
   timer: null,
   fixtureNames: null,
+  engine: "local",
 }))
 
 function spawnChild() {
   if (!vmRunning()) return
-  const child = spawnWatcher(["stats", "--format", "{{json .}}"])
+  const child = spawnWatcher(onEngine(["stats", "--format", "{{json .}}"]))
   s.child = child
   let buf = ""
   child.stdout?.setEncoding("utf8")
@@ -72,6 +76,7 @@ function fixtureLatest(t: number) {
 }
 
 function tick() {
+  followEngine()
   const now = Date.now()
   if (FIXTURE) fixtureLatest(now)
   // Containers that stopped drop out of the stream; their last sample goes stale.
@@ -87,6 +92,16 @@ function tick() {
   else if (!FIXTURE && !s.child) spawnChild()
 }
 
+/** Another engine is selected: its containers aren't the old readings' or history's. */
+function followEngine() {
+  if (s.engine === engine()) return
+  s.engine = engine()
+  s.child?.kill()
+  s.child = null
+  s.latest.clear()
+  s.ring = new Ring()
+}
+
 function stop() {
   s.child?.kill()
   s.child = null
@@ -97,6 +112,7 @@ function stop() {
 /** Starts sampling if it isn't running. Every caller counts as a page that wants stats. */
 export async function ensure() {
   s.lastAsk = Date.now()
+  followEngine()
   if (FIXTURE) {
     if (!s.fixtureNames) await prefillFixture()
     fixtureLatest(Date.now())

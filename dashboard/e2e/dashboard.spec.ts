@@ -3,7 +3,7 @@ import { expect, test, type Page } from "@playwright/test"
 
 // Runs against fixtures/state.json (playwright.config.ts): every action is a dry run.
 
-const TABS = ["containers", "images", "volumes", "apps", "jobs", "sandboxes", "projects", "ports", "fleet"]
+const TABS = ["containers", "images", "volumes", "networks", "apps", "jobs", "sandboxes", "projects", "ports", "fleet"]
 
 async function noSeriousA11yIssues(page: Page) {
   const r = await new AxeBuilder({ page }).analyze()
@@ -83,6 +83,36 @@ test("a dry-run action shows its toast and lands in activity", async ({ page }) 
   await expect(page.getByText(/dry run: rekcod restart shop-web-1/)).toBeVisible()
   await page.goto("/activity")
   await expect(page.getByText("rekcod restart shop-web-1")).toBeVisible()
+})
+
+test("an action with inputs checks them, then runs filled in", async ({ page }) => {
+  await page.goto("/images")
+  await page.getByRole("button", { name: "Run a container" }).click()
+  const dialog = page.getByRole("dialog")
+  await dialog.getByLabel("Image").fill("nginx:1.29")
+  await dialog.getByLabel(/^Ports/).fill("8080:80\n70000:1")
+  await expect(dialog.getByText(/70000:1: use HOST:CONTAINER/)).toBeVisible()
+  await dialog.getByLabel(/^Ports/).fill("8080:80\n8443:443")
+  await expect(dialog.getByLabel("Command")).toHaveText("rekcod run -d -p 8080:80 -p 8443:443 nginx:1.29")
+  await dialog.getByRole("button", { name: "Run a container" }).click()
+  await expect(page.getByText(/dry run: rekcod run -d -p 8080:80 -p 8443:443 nginx:1.29/)).toBeVisible()
+})
+
+test("networks list docker's own last, without actions", async ({ page }) => {
+  await page.goto("/networks")
+  const rows = page.locator("[data-navrow]")
+  await expect(rows.first()).toContainText("ci-net")
+  await expect(page.getByRole("button", { name: "More actions for bridge" })).toHaveCount(0)
+  await page.getByRole("button", { name: "More actions for ci-net" }).click()
+  await page.getByRole("menuitem", { name: "Remove" }).click()
+  await expect(page.getByRole("alertdialog")).toContainText("Remove network ci-net?")
+})
+
+test("the sidebar offers each docker host's engine", async ({ page }) => {
+  await page.goto("/")
+  await page.getByRole("button", { name: /rekcod VM, running/ }).click()
+  await expect(page.getByRole("menuitemradio", { name: "This Mac" })).toHaveAttribute("aria-checked", "true")
+  await expect(page.getByRole("menuitemradio", { name: "studio" })).toBeVisible()
 })
 
 test("logs stream on their own page", async ({ page }) => {

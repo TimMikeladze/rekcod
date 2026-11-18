@@ -1,6 +1,6 @@
 "use client"
 
-import { ActionButton, Actions } from "@/components/actions"
+import { ActionButton, Actions, EngineBar } from "@/components/actions"
 import { Empty, Mono } from "@/components/bits"
 import { memo } from "react"
 import { BulkBar, useSelection } from "@/components/bulk"
@@ -38,11 +38,19 @@ export function Images({ q }: { q: string }) {
   const list = state?.images ?? []
   const rows = sort.apply(list.filter((i) => match(q, i.id, ...i.tags, ...i.containers, i.dangling ? "dangling" : "", i.containers.length ? "" : "unused")))
   const total = list.reduce((a, i) => a + i.size, 0)
-  if (!list.length) return <Empty>{state?.local_errors?.images ? `Couldn't list images: ${state.local_errors.images}` : state?.running ? "No images." : "The VM is stopped."}</Empty>
+  const bar = <EngineBar kinds={["ImagePull", "ImageRun"]} />
+  if (!list.length)
+    return (
+      <>
+        {bar}
+        <Empty>{state?.local_errors?.images ? `Couldn't list images: ${state.local_errors.images}` : state?.running ? "No images." : "The VM is stopped."}</Empty>
+      </>
+    )
   const ids = rows.map((i) => i.id)
   const picked = rows.filter((i) => sel.has(i.id))
   return (
     <>
+      {bar}
       <PruneBar
         kinds={["ImagePrune"]}
         note={`${list.length} images, ${fmtBytes(total)} (layers shared between images count once on disk)`}

@@ -1,5 +1,18 @@
 // The shape of `rekcod state` (crates/rekcod/src/state.rs).
 
+export type InputKind = "image" | "name" | "publish" | "env" | "mount"
+
+/** A value an action asks for; `{key}` in its argv marks where it goes (lib/inputs.ts). */
+export type Input = {
+  key: string
+  label: string
+  kind: InputKind
+  optional: boolean
+  multiple: boolean
+  flag: string | null
+  placeholder: string
+}
+
 export type Action = {
   kind: string
   label: string
@@ -8,6 +21,7 @@ export type Action = {
   dir?: string
   interactive: boolean
   confirm: string | null
+  inputs?: Input[]
 }
 
 export type Container = {
@@ -22,6 +36,22 @@ export type Container = {
   ports: number[]
   /** Named volumes it mounts. */
   volumes: string[]
+  /** Networks it's attached to (missing from older rekcod). */
+  networks?: string[]
+  actions: Action[]
+}
+
+export type Network = {
+  id: string
+  name: string
+  driver: string
+  scope: string
+  internal: boolean
+  /** RFC 3339. */
+  created: string
+  containers: string[]
+  /** bridge, host and none: docker's own. */
+  builtin: boolean
   actions: Action[]
 }
 
@@ -246,6 +276,14 @@ export type State = {
   sandboxes: Sandbox[]
   images: Image[]
   volumes: Volume[]
+  /** Missing from older rekcod. */
+  networks?: Network[]
+  /** Pull, run, create a volume or network. */
+  engine_actions?: Action[]
+  /** The host whose engine this is (`rekcod host state`); missing for this Mac's. */
+  engine?: string
+  /** Why that host's engine couldn't be read; the engine parts are empty meanwhile. */
+  engine_error?: string
   disk: Disk | null
   disk_actions: Action[]
   apps: App[]

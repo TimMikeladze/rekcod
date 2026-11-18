@@ -18,6 +18,7 @@ import { Containers } from "@/components/tabs/containers"
 import { Fleet } from "@/components/tabs/fleet"
 import { Images } from "@/components/tabs/images"
 import { Jobs } from "@/components/tabs/jobs"
+import { Networks } from "@/components/tabs/networks"
 import { Ports } from "@/components/tabs/ports"
 import { Projects } from "@/components/tabs/projects"
 import { Sandboxes } from "@/components/tabs/sandboxes"
@@ -318,6 +319,7 @@ const INTRO: Record<Tab, string> = {
   containers: "Everything dockerd runs in the VM, grouped by compose project. Open a row for its logs, inspect data and chart.",
   images: "Images in the VM and the containers using them.",
   volumes: "Volumes in the VM and the containers mounting them.",
+  networks: "Networks in the VM and the containers attached to them.",
   apps: "Apps on the default remote, in the current namespace.",
   jobs: "One-off and scheduled jobs on the default remote, newest first.",
   sandboxes: "Agent sandboxes on this Mac.",
@@ -330,6 +332,7 @@ const BODY: Record<Tab, (p: { q: string }) => React.ReactNode> = {
   containers: Containers,
   images: Images,
   volumes: Volumes,
+  networks: Networks,
   apps: Apps,
   jobs: Jobs,
   sandboxes: Sandboxes,

@@ -1,7 +1,7 @@
 import { ago } from "./format"
 import type { State as S } from "./types"
 
-export type Tab = "containers" | "images" | "volumes" | "apps" | "jobs" | "sandboxes" | "projects" | "ports" | "fleet"
+export type Tab = "containers" | "images" | "volumes" | "networks" | "apps" | "jobs" | "sandboxes" | "projects" | "ports" | "fleet"
 type Tone = "ok" | "warn" | "bad" | "info" | "idle"
 
 type Issue = { tone: Tone; text: string; tab: Tab }
@@ -9,12 +9,13 @@ type Issue = { tone: Tone; text: string; tab: Tab }
 /** Things worth looking at now, worst first. Empty means nothing is wrong. */
 export function issues(state: S): Issue[] {
   const out: Issue[] = []
+  if (state.engine_error) out.push({ tone: "bad", text: `Can't read ${state.engine}'s engine: ${state.engine_error}`, tab: "containers" })
   for (const [what, err] of Object.entries(state.remote?.errors ?? {})) {
     const tab: Tab = what === "jobs" ? "jobs" : what === "apps" ? "apps" : "fleet"
     out.push({ tone: "bad", text: `Remote ${state.remote?.name ?? ""} ${what}: ${err}`.replace("  ", " "), tab })
   }
   for (const [what, err] of Object.entries(state.local_errors ?? {})) {
-    const tab: Tab = what === "images" ? "images" : what === "volumes" ? "volumes" : what === "snapshots" ? "projects" : "containers"
+    const tab: Tab = what === "images" ? "images" : what === "volumes" ? "volumes" : what === "networks" ? "networks" : what === "snapshots" ? "projects" : "containers"
     out.push({ tone: "bad", text: `Couldn't list ${what}: ${err}`, tab })
   }
   for (const p of state.ports) if (p.error) out.push({ tone: "bad", text: `Port ${p.port} (${p.container}) isn't forwarded: ${p.error}`, tab: "ports" })

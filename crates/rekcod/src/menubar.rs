@@ -15,11 +15,12 @@ use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSImage, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSStatusItem, NSVariableStatusItemLength,
+    NSMenuItem, NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView,
 };
-use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSSize, NSString, NSTimer};
+use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
+use serde_json::Value;
 
-use crate::actions::{self, Action, Model};
+use crate::actions::{self, Action, Engine, InputKind, Model, Run};
 use crate::paths::Paths;
 
 const LABEL: &str = "dev.rekcod.menubar";
@@ -68,6 +69,11 @@ pub struct Ivars {
 #[derive(Default)]
 pub struct Models {
     latest: std::sync::Mutex<Option<(std::time::Instant, Arc<Model>)>>,
+    /// Hosts' engines, read over SSH on their own thread so a slow host never holds the menu:
+    /// once at start, then each time the menu opens (`fresh`).
+    engines: std::sync::Mutex<Vec<Engine>>,
+    engines_poke: std::sync::Mutex<bool>,
+    engines_poked: std::sync::Condvar,
     loaded: std::sync::Condvar,
     poke: std::sync::Mutex<bool>,
     poked: std::sync::Condvar,
@@ -76,9 +82,25 @@ pub struct Models {
 impl Models {
     /// Reloads every 15 s, and right away when `fresh` asks.
     fn run(self: Arc<Self>, paths: Paths) {
+        let me = self.clone();
         std::thread::spawn(move || {
             loop {
-                let m = Arc::new(Model::load(&paths));
+                let (hosts, _) = crate::host::list();
+                let engines = hosts
+                    .iter()
+                    .map(|h| Engine { name: h.name.clone(), state: crate::host::engine_state(&h.name).map_err(|e| format!("{e:#}")) })
+                    .collect();
+                *me.engines.lock().unwrap() = engines;
+                let poked = me.engines_poke.lock().unwrap();
+                let mut poked = me.engines_poked.wait_while(poked, |p| !*p).unwrap();
+                *poked = false;
+            }
+        });
+        std::thread::spawn(move || {
+            loop {
+                let mut m = Model::load(&paths);
+                m.engines = self.engines.lock().unwrap().clone();
+                let m = Arc::new(m);
                 *self.latest.lock().unwrap() = Some((std::time::Instant::now(), m));
                 self.loaded.notify_all();
                 let poked = self.poke.lock().unwrap();
@@ -93,6 +115,8 @@ impl Models {
         let asked = std::time::Instant::now();
         *self.poke.lock().unwrap() = true;
         self.poked.notify_all();
+        *self.engines_poke.lock().unwrap() = true;
+        self.engines_poked.notify_all();
         let latest = self.latest.lock().unwrap();
         let (latest, _) = self.loaded.wait_timeout_while(latest, wait, |l| l.as_ref().is_none_or(|(t, _)| *t < asked)).unwrap();
         latest.as_ref().map(|(_, m)| m.clone())
@@ -183,6 +207,9 @@ pub fn entries(m: &Model) -> Vec<Entry> {
             (None, false) => "Docker host: other context".into(),
         };
         out.push(Entry::Submenu(title, hosts.into_iter().map(Entry::Action).collect()));
+    }
+    for e in &m.engines {
+        out.push(Entry::Submenu(format!("Engine: {}", e.name), engine_entries(e)));
     }
     if !m.running {
         return out;
@@ -281,6 +308,23 @@ pub fn entries(m: &Model) -> Vec<Entry> {
             .collect();
         out.push(Entry::Submenu(format!("Volumes ({})", m.volumes.len()), items));
     }
+    out.extend(failed("networks"));
+    if !m.networks.is_empty() {
+        let items = m
+            .networks
+            .iter()
+            .map(|n| {
+                let used = if n.containers.is_empty() { String::new() } else { format!(", {} container(s)", n.containers.len()) };
+                let title = format!("{}  ({}{used})", n.name, n.driver);
+                match actions::network_actions(n) {
+                    a if a.is_empty() => Entry::Label(title),
+                    a => Entry::Submenu(title, a.into_iter().map(Entry::Action).collect()),
+                }
+            })
+            .collect();
+        out.push(Entry::Submenu(format!("Networks ({})", m.networks.len()), items));
+    }
+    out.push(Entry::Submenu("New".into(), actions::engine_actions(m.running).into_iter().map(Entry::Action).collect()));
     let disk = actions::disk_actions(m.running, &m.images, &m.volumes, m.disk.as_ref());
     out.push(Entry::Submenu("Free up disk space".into(), disk.into_iter().map(Entry::Action).collect()));
     if let Some(sb) = &m.sandbox {
@@ -350,6 +394,80 @@ pub fn entries(m: &Model) -> Vec<Entry> {
         let items = actions::ban_actions(bans, &m.edge_clients).into_iter().map(Entry::Action).collect();
         out.push(Entry::Submenu(format!("Edge bans ({})", bans.len()), items));
     }
+    out
+}
+
+/// A host's engine from its `rekcod host state` JSON: the same sections as this Mac's, each
+/// action already rewritten to run there.
+pub fn engine_entries(e: &Engine) -> Vec<Entry> {
+    let v = match &e.state {
+        Ok(v) => v,
+        Err(err) => return vec![Entry::Label(format!("Can't read {}: {err}", e.name))],
+    };
+    let acts = |v: &Value| -> Vec<Entry> {
+        v.as_array().into_iter().flatten().filter_map(crate::state::action_from_json).map(Entry::Action).collect()
+    };
+    let running = v["running"] == true;
+    let mut out =
+        vec![Entry::Label(if running { format!("rekcod running on {}", e.name) } else { format!("rekcod is stopped on {}", e.name) })];
+    out.extend(acts(&v["vm_actions"]));
+    if !running {
+        return out;
+    }
+    out.push(Entry::Separator);
+    let s = |x: &Value, k: &str| x[k].as_str().unwrap_or("?").to_string();
+    let section = |key: &str, title: &str, label: &dyn Fn(&Value) -> String| -> Option<Entry> {
+        let items: Vec<Entry> = v[key]
+            .as_array()?
+            .iter()
+            .map(|x| match acts(&x["actions"]) {
+                a if a.is_empty() => Entry::Label(label(x)),
+                a => Entry::Submenu(label(x), a),
+            })
+            .collect();
+        (!items.is_empty()).then(|| Entry::Submenu(format!("{title} ({})", items.len()), items))
+    };
+    let dot = |x: &Value| if x["state"] == "running" { "●" } else { "○" };
+    out.extend(section("containers", "Containers", &|c| format!("{} {}  ({})", dot(c), s(c, "name"), s(c, "image"))));
+    out.extend(section("images", "Images", &|i| {
+        let size = i["size"].as_u64().map(actions::fmt_bytes).unwrap_or_default();
+        format!("{}  ({size})", i["tags"][0].as_str().unwrap_or("<none>"))
+    }));
+    out.extend(section("volumes", "Volumes", &|x| s(x, "name")));
+    out.extend(section("networks", "Networks", &|n| format!("{}  ({})", s(n, "name"), s(n, "driver"))));
+    let new = acts(&v["engine_actions"]);
+    if !new.is_empty() {
+        out.push(Entry::Submenu("New".into(), new));
+    }
+    let disk = acts(&v["disk_actions"]);
+    if !disk.is_empty() {
+        out.push(Entry::Submenu("Free up disk space".into(), disk));
+    }
+    out
+}
+
+/// One field's text as values: split at commas for repeatable inputs. An env value may hold
+/// commas, so a piece that isn't `KEY=...` joins the one before it.
+pub fn split_values(kind: InputKind, multiple: bool, text: &str) -> Vec<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return vec![];
+    }
+    if !multiple {
+        return vec![text.to_string()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for piece in text.split(',') {
+        let starts_new = kind != InputKind::Env || actions::invalid(InputKind::Env, piece.trim()).is_none();
+        match out.last_mut() {
+            Some(last) if !starts_new => {
+                last.push(',');
+                last.push_str(piece);
+            }
+            _ => out.push(piece.trim().to_string()),
+        }
+    }
+    out.retain(|v| !v.is_empty());
     out
 }
 
@@ -434,6 +552,13 @@ impl Target {
     }
 
     fn perform(&self, action: &Action) {
+        let mut action = action.clone();
+        if !action.inputs.is_empty() {
+            let Some(argv) = self.ask_inputs(&action) else { return };
+            action.run = Run::Rekcod(argv);
+            action.inputs.clear();
+        }
+        let action = &action;
         if let Some(question) = &action.confirm
             && !self.ask(&action.label, question)
         {
@@ -482,6 +607,60 @@ impl Target {
                 self.update_title();
             }
             (false, None) => {}
+        }
+    }
+
+    /// One alert with a field per input; asks again (keeping what was typed) until the values
+    /// pass `actions::fill` or it's cancelled. The filled argv, or `None`.
+    fn ask_inputs(&self, action: &Action) -> Option<Vec<String>> {
+        let mtm = self.mtm();
+        let Run::Rekcod(argv) = &action.run else { return None };
+        let (w, row) = (340.0, 48.0);
+        let mut typed: Vec<String> = vec![String::new(); action.inputs.len()];
+        let mut problem: Option<String> = None;
+        loop {
+            let alert = NSAlert::new(mtm);
+            alert.setMessageText(&NSString::from_str(&action.label));
+            let hint = problem.clone().unwrap_or_else(|| {
+                let line = argv.iter().map(|a| actions::shell_quote(a)).collect::<Vec<_>>().join(" ");
+                format!("rekcod {line}")
+            });
+            alert.setInformativeText(&NSString::from_str(&hint));
+            alert.addButtonWithTitle(&NSString::from_str(&action.label));
+            alert.addButtonWithTitle(&NSString::from_str("Cancel"));
+            let n = action.inputs.len() as f64;
+            let view = NSView::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, row * n)));
+            let mut fields = Vec::new();
+            for (k, i) in action.inputs.iter().enumerate() {
+                let y = (n - 1.0 - k as f64) * row;
+                let mut text = i.label.clone();
+                if i.optional {
+                    text.push_str(" (optional)");
+                }
+                if i.multiple {
+                    text.push_str(", comma-separated");
+                }
+                let label = NSTextField::labelWithString(&NSString::from_str(&text), mtm);
+                label.setFrame(NSRect::new(NSPoint::new(0.0, y + 26.0), NSSize::new(w, 18.0)));
+                let field = NSTextField::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, y + 2.0), NSSize::new(w, 22.0)));
+                field.setPlaceholderString(Some(&NSString::from_str(&i.placeholder)));
+                field.setStringValue(&NSString::from_str(&typed[k]));
+                view.addSubview(&label);
+                view.addSubview(&field);
+                fields.push(field);
+            }
+            alert.setAccessoryView(Some(&view));
+            alert.window().setInitialFirstResponder(fields.first().map(|f| &**f as &NSView));
+            NSApplication::sharedApplication(mtm).activate();
+            if alert.runModal() != NSAlertFirstButtonReturn {
+                return None;
+            }
+            typed = fields.iter().map(|f| f.stringValue().to_string()).collect();
+            let values = action.inputs.iter().zip(&typed).map(|(i, t)| (i.key.clone(), split_values(i.kind, i.multiple, t))).collect();
+            match actions::fill(argv, &action.inputs, &values) {
+                Ok(filled) => return Some(filled),
+                Err(e) => problem = Some(e),
+            }
         }
     }
 
@@ -690,6 +869,8 @@ mod tests {
             admin: true,
             remote_errors: Default::default(),
             local_errors: Default::default(),
+            networks: crate::actions::tests::sample_networks(),
+            engines: vec![],
         };
         let done = crate::actions::RemoteJob { state: "done".into(), ..crate::actions::tests::sample_job() };
         let model = Model { jobs: vec![crate::actions::tests::sample_job(), done], ..model };
@@ -714,6 +895,37 @@ mod tests {
         let top = entries(&model);
         assert_eq!(top[0], Entry::Label("rekcod running · 6 CPUs · 8192 MiB".into()));
         assert!(top.contains(&Entry::Label("Ports".into())));
+    }
+
+    #[test]
+    fn engines_get_their_own_menu() {
+        let mut state = serde_json::json!({
+            "running": true,
+            "vm_actions": [{"kind": "VmStop", "label": "Stop rekcod", "argv": ["stop"], "interactive": false, "confirm": "Stop?"}],
+            "containers": [{"name": "db", "image": "postgres", "state": "running",
+                            "actions": [{"kind": "ContainerStop", "label": "Stop", "argv": ["stop", "db"], "interactive": false, "confirm": null}]}],
+            "networks": [{"name": "bridge", "driver": "bridge", "actions": []}],
+        });
+        crate::host::rewrite(&mut state, "mini");
+        let e = entries(&Model { engines: vec![Engine { name: "mini".into(), state: Ok(state) }], ..Model::default() });
+        let Some(Entry::Submenu(title, items)) = e.iter().find(|x| matches!(x, Entry::Submenu(t, _) if t.starts_with("Engine:"))) else {
+            panic!("no engine submenu in {e:?}")
+        };
+        assert_eq!(title, "Engine: mini");
+        assert_eq!(items[0], Entry::Label("rekcod running on mini".into()));
+        let Entry::Action(stop) = &items[1] else { panic!("{:?}", items[1]) };
+        assert_eq!(stop.run, Run::Rekcod(["host", "exec", "mini", "--", "stop"].map(String::from).into()));
+        assert!(items.contains(&Entry::Submenu("Networks (1)".into(), vec![Entry::Label("bridge  (bridge)".into())])));
+        let down = engine_entries(&Engine { name: "mini".into(), state: Err("ssh: connect timed out".into()) });
+        assert_eq!(down, vec![Entry::Label("Can't read mini: ssh: connect timed out".into())]);
+    }
+
+    #[test]
+    fn typed_values_split_at_commas() {
+        assert_eq!(split_values(InputKind::Publish, true, " 80:80, 443:443 "), ["80:80", "443:443"]);
+        assert_eq!(split_values(InputKind::Env, true, "A=1,B=x,y,C=2"), ["A=1", "B=x,y", "C=2"]);
+        assert_eq!(split_values(InputKind::Name, false, "a,b"), ["a,b"]);
+        assert!(split_values(InputKind::Mount, true, "  ").is_empty());
     }
 
     #[test]

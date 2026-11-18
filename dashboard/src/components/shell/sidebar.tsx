@@ -3,7 +3,8 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 import Link from "next/link"
 import { usePathname } from "next/navigation"
-import { ChevronsUpDown, Menu, PanelLeft, Search, X } from "lucide-react"
+import { Check, ChevronsUpDown, Menu, PanelLeft, Search, X } from "lucide-react"
+import { toast } from "sonner"
 import { useAction } from "@/components/actions"
 import { Dot } from "@/components/bits"
 import { counts, OVERVIEW, SECTIONS, sectionOf, SYSTEM, type NavItem } from "@/components/shell/nav"
@@ -20,6 +21,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu"
 import { useDash } from "@/hooks/dash-context"
+import { api } from "@/lib/api"
 import { fmtBytes } from "@/lib/format"
 import { issues, type Tab } from "@/lib/issues"
 import { cn } from "@/lib/utils"
@@ -187,7 +189,7 @@ function SidebarBody() {
       <nav aria-label="Main" className="flex flex-col gap-0.5">
         {item(OVERVIEW)}
         <PinnedNav itemClass={navClass} labelClass={label} />
-        <div className={groupClass}>This Mac</div>
+        <div className={groupClass}>{state?.engine ?? "This Mac"}</div>
         {SECTIONS.filter((s) => s.group === "This Mac").map(item)}
         <div className={groupClass}>Fleet</div>
         {SECTIONS.filter((s) => s.group === "Fleet").map(item)}
@@ -241,18 +243,53 @@ function ActionItems({ actions, subject }: { actions: Action[]; subject: string 
   ))
 }
 
-/** The top of the sidebar: the mark, the VM's state, and a menu with the VM and storage actions. */
+/** Shows another engine (POST /api/engine); the event stream then pushes its state. */
+async function switchEngine(name: string, refresh: () => void) {
+  const r = await api("/api/engine", { method: "POST", headers: { "content-type": "application/json", "x-rekcod": "1" }, body: JSON.stringify({ engine: name }) })
+  if (!r.ok) {
+    const body = await r.json().catch(() => ({ error: r.statusText }))
+    toast.error("Couldn't switch engines", { description: body.error })
+    return
+  }
+  toast.loading(`Reading ${name === "local" ? "this Mac's" : `${name}'s`} engine`, { id: "engine" })
+  refresh()
+}
+
+/** Which engine the pages show: this Mac's VM or a docker host's (`rekcod host ls`). */
+function EngineItems({ state }: { state: S }) {
+  const { refresh } = useDash()
+  const current = state.engine ?? "local"
+  const engines = [{ name: "local", label: "This Mac" }, ...state.hosts.all.map((h) => ({ name: h.name, label: h.name }))]
+  return (
+    <DropdownMenuGroup>
+      <DropdownMenuLabel className="text-[11px]">Engine</DropdownMenuLabel>
+      {engines.map((e) => (
+        <DropdownMenuItem key={e.name} onClick={() => e.name !== current && switchEngine(e.name, refresh)} aria-checked={e.name === current} role="menuitemradio">
+          <Check className={cn("size-3.5", e.name === current ? "" : "invisible")} aria-hidden />
+          {e.label}
+        </DropdownMenuItem>
+      ))}
+    </DropdownMenuGroup>
+  )
+}
+
+/** The top of the sidebar: the mark, the engine and its VM's state, and a menu with engines, the VM and storage actions. */
 function VmSwitcher({ state }: { state: S }) {
   const st = state.status
   const vm = state.vm_actions.filter((a) => a.kind !== "DashboardOpen")
+  const name = state.engine ?? "rekcod"
+  // The switch's "Reading ..." toast stays until the new engine's state is here.
+  useEffect(() => {
+    toast.dismiss("engine")
+  }, [state.engine, state.engine_error])
   return (
     <DropdownMenu>
       <DropdownMenuTrigger
-        render={<Button variant="ghost" className="h-11 w-full justify-between px-2 rail:justify-center rail:px-0" aria-label={`rekcod VM, ${state.running ? "running" : "stopped"}`} />}
+        render={<Button variant="ghost" className="h-11 w-full justify-between px-2 rail:justify-center rail:px-0" aria-label={`${state.engine ? `Engine ${state.engine}` : "rekcod VM"}, ${state.engine_error ? "unreachable" : state.running ? "running" : "stopped"}`} />}
       >
         <span className="inline-flex min-w-0 items-center gap-2.5">
           <Mark />
-          <span className={cn("font-semibold", label)}>rekcod</span>
+          <span className={cn("truncate font-semibold", label)}>{name}</span>
           <span
             className={cn(
               "inline-flex items-center gap-1 rounded-full px-[7px] py-px text-[11px] font-medium",
@@ -260,7 +297,7 @@ function VmSwitcher({ state }: { state: S }) {
               state.running ? "bg-primary text-primary-foreground" : "border text-muted-foreground",
             )}
           >
-            {state.running ? "running" : "stopped"}
+            {state.engine_error ? "unreachable" : state.running ? "running" : "stopped"}
           </span>
         </span>
         <ChevronsUpDown className={cn("size-3.5 text-muted-foreground", label)} />
@@ -272,6 +309,12 @@ function VmSwitcher({ state }: { state: S }) {
           </DropdownMenuLabel>
         </DropdownMenuGroup>
         <DropdownMenuItem render={<Link href="/vm" />}>VM details</DropdownMenuItem>
+        {state.hosts.all.length > 0 && (
+          <>
+            <DropdownMenuSeparator />
+            <EngineItems state={state} />
+          </>
+        )}
         <DropdownMenuSeparator />
         <ActionItems actions={vm.filter((a) => a.kind !== "VmStop" && a.kind !== "VmForceStop")} subject="rekcod" />
         {state.storage_actions.length > 0 && <DropdownMenuSeparator />}

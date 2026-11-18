@@ -21,7 +21,51 @@ fn action_json(a: &Action) -> Value {
     if let Some(dir) = &a.dir {
         v["dir"] = json!(dir);
     }
+    if !a.inputs.is_empty() {
+        v["inputs"] = a
+            .inputs
+            .iter()
+            .map(|i| {
+                json!({"key": i.key, "label": i.label, "kind": i.kind.name(), "optional": i.optional, "multiple": i.multiple,
+                       "flag": i.flag, "placeholder": i.placeholder})
+            })
+            .collect();
+    }
     v
+}
+
+/// An action as `action_json` wrote it (the menu bar reads a remote engine's this way).
+pub fn action_from_json(v: &Value) -> Option<Action> {
+    let run = match (v["argv"].as_array(), v["url"].as_str()) {
+        (Some(argv), _) => Run::Rekcod(argv.iter().map(|a| a.as_str().map(String::from)).collect::<Option<_>>()?),
+        (None, Some(url)) => Run::Open(url.into()),
+        _ => return None,
+    };
+    let inputs = v["inputs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|i| {
+            Some(actions::Input {
+                key: i["key"].as_str()?.into(),
+                label: i["label"].as_str()?.into(),
+                kind: actions::InputKind::from_name(i["kind"].as_str()?)?,
+                optional: i["optional"].as_bool().unwrap_or(false),
+                multiple: i["multiple"].as_bool().unwrap_or(false),
+                flag: i["flag"].as_str().map(String::from),
+                placeholder: i["placeholder"].as_str().unwrap_or_default().into(),
+            })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Action {
+        kind: actions::Kind::from_name(v["kind"].as_str()?)?,
+        label: v["label"].as_str()?.into(),
+        run,
+        dir: v["dir"].as_str().map(Into::into),
+        interactive: v["interactive"].as_bool().unwrap_or(false),
+        confirm: v["confirm"].as_str().map(String::from),
+        inputs,
+    })
 }
 
 fn actions_json(list: &[Action]) -> Value {
@@ -67,7 +111,7 @@ pub fn model_json(m: &Model) -> Value {
         .map(|c| {
             json!({
                 "id": c.id, "name": c.name, "image": c.image, "state": c.state, "status": c.status,
-                "project": c.project, "service": c.service, "ports": c.ports, "volumes": c.volumes,
+                "project": c.project, "service": c.service, "ports": c.ports, "volumes": c.volumes, "networks": c.networks,
                 "actions": actions_json(&actions::container_actions(c)),
             })
         })
@@ -151,6 +195,14 @@ pub fn model_json(m: &Model) -> Value {
                    "snapshot": v.snapshot, "actions": actions_json(&actions::volume_actions(v))})
         })
         .collect();
+    let networks: Vec<Value> = m
+        .networks
+        .iter()
+        .map(|n| {
+            json!({"id": n.id, "name": n.name, "driver": n.driver, "scope": n.scope, "internal": n.internal, "created": n.created,
+                   "containers": n.containers, "builtin": n.builtin, "actions": actions_json(&actions::network_actions(n))})
+        })
+        .collect();
     let nodes: Option<Vec<Value>> = m.nodes.as_ref().map(|n| {
         n.iter()
             .map(|n| json!({"id": n.id, "state": n.state, "last_seen": n.last_seen, "actions": actions_json(&actions::node_actions(n))}))
@@ -176,6 +228,8 @@ pub fn model_json(m: &Model) -> Value {
         "sandboxes": sandboxes,
         "images": images,
         "volumes": volumes,
+        "networks": networks,
+        "engine_actions": actions_json(&actions::engine_actions(m.running)),
         "disk": m.disk.as_ref().map(|d| json!({
             "checked": d.checked, "images": d.images, "containers": d.containers, "volumes": d.volumes,
             "build_cache": d.build_cache, "build_cache_free": d.build_cache_free,
@@ -331,6 +385,7 @@ mod tests {
             bans: Some(sample_bans()),
             images: sample_images(),
             volumes: sample_volumes(),
+            networks: sample_networks(),
             nodes: Some(sample_nodes()),
             edge_clients: sample_clients(),
             remotes: sample_remotes(),
@@ -346,6 +401,16 @@ mod tests {
         }
         let c = &model_json(&full)["containers"][0]["actions"][0];
         assert_eq!(c["argv"], json!(["stop", "web"]));
+    }
+
+    #[test]
+    fn actions_read_back_as_written() {
+        let mut all = actions::engine_actions(true);
+        all.extend(actions::volume_actions(&sample_volumes()[0]));
+        all.extend(actions::port_actions(&sample().1[0]));
+        for a in all {
+            assert_eq!(action_from_json(&action_json(&a)).as_ref(), Some(&a));
+        }
     }
 
     #[test]

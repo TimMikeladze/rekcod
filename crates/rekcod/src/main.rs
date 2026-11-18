@@ -1201,6 +1201,18 @@ enum HostCmd {
     },
     /// Switch the docker context to a host, or `local` for this Mac's rekcod.
     Use { name: String },
+    /// That Mac's `rekcod state` as JSON, each action rewritten to run from here (the
+    /// dashboard and menu bar manage a host's engine with it).
+    State { name: String },
+    /// Run `rekcod ARGS` on that Mac: `rekcod host exec mini -- ps -a`.
+    Exec {
+        name: String,
+        /// Working directory there.
+        #[arg(long)]
+        dir: Option<String>,
+        #[arg(last = true, required = true)]
+        args: Vec<String>,
+    },
     /// Delete a host's docker context.
     Rm { name: String },
     /// Forward the host's published ports to 127.0.0.1 here until Ctrl-C (default: all, followed live).
@@ -1506,6 +1518,8 @@ fn main() {
             Ok(())
         }
         Cmd::Host(HostCmd::Use { name }) => host::use_host(&paths, &name),
+        Cmd::Host(HostCmd::State { name }) => host::print_engine_state(&name),
+        Cmd::Host(HostCmd::Exec { name, dir, args }) => host::exec(&name, dir.as_deref(), &args).map(|_| ()),
         Cmd::Host(HostCmd::Rm { name }) => host::rm(&paths, &name),
         Cmd::Host(HostCmd::Forward { name, ports }) => host::forward(&paths, &name, &ports),
         Cmd::Host(HostCmd::Refresh { name: Some(name) }) => host::refresh(&paths, &name),

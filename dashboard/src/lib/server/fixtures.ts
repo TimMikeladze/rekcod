@@ -149,3 +149,17 @@ export function fakePng(w = 160, h = 100): Buffer {
   ihdr[9] = 2
   return Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), chunk("IHDR", ihdr), chunk("IDAT", deflateSync(raw)), chunk("IEND", Buffer.alloc(0))])
 }
+
+/** Fixture mode's host engine: the fixture's docker parts, each argv run there as `host state` would write it. */
+export function fakeEngine(s: State, name: string): State {
+  const walk = (v: unknown): unknown => {
+    if (Array.isArray(v)) return v.filter((x) => !(x && typeof x === "object" && "kind" in x && "url" in x)).map(walk)
+    if (v && typeof v === "object") {
+      const o = v as Record<string, unknown>
+      if (typeof o.kind === "string" && Array.isArray(o.argv)) return { ...o, argv: ["host", "exec", name, "--", ...(o.argv as string[])] }
+      return Object.fromEntries(Object.entries(o).map(([k, x]) => [k, walk(x)]))
+    }
+    return v
+  }
+  return { ...(walk(s) as State), engine: name }
+}

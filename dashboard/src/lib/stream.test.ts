@@ -199,7 +199,10 @@ describe("log stream children", () => {
 
   it("free their slot when a child exited with unread output and the client cancels", async () => {
     let child!: ChildProcess
-    const res = cappedStream(req(), () => (child = node("process.stdout.write('x'.repeat(180 * 1024))")()))
+    // The child exits at once; a grandchild keeps writing into its stdout, so the pipe stays
+    // full and unread whatever the platform's pipe size. Cancelling must still free the slot.
+    const writer = `require("child_process").spawn("/bin/sh", ["-c", "head -c 4000000 /dev/zero"], { stdio: ["ignore", "inherit", "ignore"], detached: true }).unref()`
+    const res = cappedStream(req(), () => (child = node(writer)()))
     await vi.waitFor(() => expect(child.exitCode).toBe(0))
     expect(openStreams()).toBe(1)
     await res.body!.cancel()

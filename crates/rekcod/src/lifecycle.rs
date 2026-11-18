@@ -1070,10 +1070,13 @@ mod tests {
         assert_eq!(team_of(&me), None);
         assert!(!signed_by(&me, "ABCDE12345"));
         // And a team-signed one passes its own team's requirement, so the requirement
-        // itself parses (a malformed one would refuse everything too).
+        // itself parses (a malformed one would refuse everything too). Only a bundle whose
+        // signature verifies at all counts: CI images patch some apps after signing.
+        let verifies = |b: &Path| Command::new("/usr/bin/codesign").args(["--verify", "--deep"]).arg(b).status().is_ok_and(|s| s.success());
         let signed = ["/Applications/Google Chrome.app", "/Applications/Docker.app", "/Applications/Slack.app"]
             .iter()
             .map(Path::new)
+            .filter(|b| verifies(b))
             .find_map(|b| team_of(b).map(|t| (b, t)));
         if let Some((b, team)) = signed {
             assert!(signed_by(b, &team), "{} by {team}", b.display());

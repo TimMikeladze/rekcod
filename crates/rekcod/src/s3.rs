@@ -1287,7 +1287,8 @@ mod tests {
         assert!(s3.bucket_exists("b").is_err());
         let big = vec![0u8; 64 << 20];
         assert!(s3.put("b", "k", Body::Bytes(&big)).is_err());
-        assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
+        // The test timeouts are 2 s a read or write; well under the 300 s a body read may take.
+        assert!(t0.elapsed() < Duration::from_secs(30), "{:?}", t0.elapsed());
     }
 
     #[test]

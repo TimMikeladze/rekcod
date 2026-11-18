@@ -1953,6 +1953,11 @@ pub mod tests {
         let clone = volume_actions(&sample_volumes()[0]).into_iter().find(|a| a.kind == Kind::VolumeClone).unwrap();
         let filled = fill(&argv(&clone), &clone.inputs, &values(&[("target", &["pg2"])])).unwrap();
         assert!(filled.contains(&"pg2:/to".to_string()), "{filled:?}");
+        // Into an empty volume only; `cp -a` over one with files would mix the two.
+        assert!(
+            filled.last().is_some_and(|s| s.starts_with(r#"[ -z "$(ls -A /to)" ] || {"#) && s.ends_with("cp -a /v/. /to/")),
+            "{filled:?}"
+        );
     }
 
     #[test]

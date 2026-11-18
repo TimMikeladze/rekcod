@@ -536,6 +536,12 @@ enum SandboxCmd {
         #[arg(long, conflicts_with = "ids")]
         all: bool,
     },
+    /// Delete stopped sandboxes not used for a while, and what failed creates left behind.
+    Prune {
+        /// Last used longer ago than this.
+        #[arg(long, default_value = "168h", value_parser = duration_secs)]
+        older_than: u64,
+    },
     /// Serve the sandbox API on ~/.rekcod/run/sandbox.sock.
     Serve {
         /// Also listen on 127.0.0.1:PORT, with a bearer token.
@@ -1964,6 +1970,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         SandboxCmd::Ls { json } => sandbox::print_list(paths, json),
         SandboxCmd::Stop { id } => sandbox::stop(paths, &id),
         SandboxCmd::Rm { ids, all } => sandbox::rm_each(paths, &ids, all, &mut |id| println!("{id}")),
+        SandboxCmd::Prune { older_than } => sandbox::prune(paths, older_than, &mut |id| println!("{id}")),
         SandboxCmd::Serve { listen, policy } => sandbox_api::serve(paths.clone(), policy.policy()?, listen),
         SandboxCmd::Golden(Golden::Build { name, images }) => sandbox::golden_build(paths, &name, &images),
         SandboxCmd::Golden(Golden::Ls) => sandbox::golden_list(paths),

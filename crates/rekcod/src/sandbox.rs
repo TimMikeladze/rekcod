@@ -256,6 +256,10 @@ impl Sandbox {
             return self.guest(main).map(|_| ());
         }
         if self.running() {
+            if self.paused_marker().exists() {
+                // A diff or fork was killed while the workspace was paused.
+                self.unpause();
+            }
             return Ok(());
         }
         let m = &self.meta;
@@ -358,12 +362,39 @@ impl Sandbox {
         a
     }
 
+    fn paused_marker(&self) -> PathBuf {
+        self.paths.home.join("run/paused")
+    }
+
+    /// Pauses the workspace container until the guard drops. A marker file outlives a kill
+    /// in between, so the next [`Sandbox::boot`] unpauses it.
+    fn pause(&self) -> Result<Paused<'_>> {
+        touch(&self.paused_marker());
+        let _ = self.docker()?.args(["pause", WS]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        Ok(Paused(self))
+    }
+
+    fn unpause(&self) {
+        if let Ok(mut c) = self.docker() {
+            let _ = c.args(["unpause", WS]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+        let _ = std::fs::remove_file(self.paused_marker());
+    }
+
     fn start_workspace(&self) -> Result<()> {
         let out = self.docker()?.args(self.workspace_args()).stdin(Stdio::null()).output().context("run docker")?;
         if !out.status.success() {
             bail!("starting the workspace container failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         Ok(())
+    }
+}
+
+struct Paused<'a>(&'a Sandbox);
+
+impl Drop for Paused<'_> {
+    fn drop(&mut self) {
+        self.0.unpause();
     }
 }
 
@@ -528,11 +559,18 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     }
     let memory_gib = if macos { o.memory_gib.max(8) } else { o.memory_gib };
     check_capacity(paths, memory_gib)?;
+    std::fs::create_dir_all(root(paths))?;
+    if !o.mount || macos {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(&project)?.dev() != std::fs::metadata(root(paths))?.dev() {
+            bail!("a sandbox clones the project, so it must be on the same volume as {}; use --mount", paths.home.display());
+        }
+    }
     let t0 = Instant::now();
     let id = new_id()?;
-    std::fs::create_dir_all(root(paths))?;
     crate::cli::exclude_from_backups(&root(paths));
     let sb = Paths::at(root(paths).join(&id))?;
+    let unmade = Unmade(Some(sb.home.clone()));
     let golden = golden_home(paths, &o.golden).join("vm/data.img");
     let golden = if macos {
         if let Err(e) = crate::macos::clone_image(paths, o.image.as_deref().unwrap_or("default"), &sb.home, o.cpus, memory_gib) {
@@ -588,8 +626,29 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
         let _ = remove(&s);
         return Err(e);
     }
+    unmade.done();
     eprintln!("rekcod: sandbox {id} ready in {:.1}s", t0.elapsed().as_secs_f64());
     Ok(s.meta)
+}
+
+/// Removes a sandbox directory being made unless [`Unmade::done`] is called: an early
+/// return would otherwise leave a cloned disk under `sb/` that `ls` and `rm --all` never
+/// see, since they list only directories with a meta.json.
+struct Unmade(Option<PathBuf>);
+
+impl Unmade {
+    fn done(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Unmade {
+    fn drop(&mut self) {
+        if let Some(home) = self.0.take() {
+            open_up(&home);
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
 }
 
 fn log_exec(s: &Sandbox, cmd: &[String], cwd: &str, exit: i32, ms: u128) {
@@ -760,6 +819,7 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
     let t0 = Instant::now();
     let new = new_id()?;
     let child_paths = Paths::at(root(paths).join(&new))?;
+    let unmade = Unmade(Some(child_paths.home.clone()));
     let running = parent.running();
     if parent.macos() {
         let n = macos_running(paths);
@@ -783,24 +843,26 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
             let _ = remove(&child);
             return Err(e);
         }
+        unmade.done();
         eprintln!("rekcod: sandbox {new} forked from {} in {:.1}s", parent.meta.id, t0.elapsed().as_secs_f64());
         return Ok(child.meta);
     }
-    if running {
+    let paused = if running {
         // Flush, then freeze the workspace's processes while the disk is cloned. dockerd
         // keeps running, so the clone is crash-consistent, like a power cut.
-        let _ = parent.docker()?.args(["exec", WS, "sync"]).status();
-        let _ = parent.docker()?.args(["pause", WS]).stdout(Stdio::null()).status();
-    }
+        let _ = parent.docker()?.args(["exec", WS, "sync"]).stdin(Stdio::null()).status();
+        Some(parent.pause()?)
+    } else {
+        None
+    };
     let cloned = clonefile(&parent.paths.data_disk(), &child_paths.data_disk()).and_then(|_| clone_workspace(&parent, &child_paths.home));
-    if running {
-        let _ = parent.docker()?.args(["unpause", WS]).stdout(Stdio::null()).status();
-    }
+    drop(paused);
     let child = Sandbox { meta: Meta { id: new.clone(), name, ..parent.meta.clone() }, paths: child_paths };
     if let Err(e) = cloned.and_then(|_| child.save()).and_then(|_| child.boot(paths)) {
         let _ = remove(&child);
         return Err(e);
     }
+    unmade.done();
     eprintln!("rekcod: sandbox {new} forked from {} in {:.1}s", parent.meta.id, t0.elapsed().as_secs_f64());
     Ok(child.meta)
 }
@@ -957,14 +1019,9 @@ fn freeze(s: &Sandbox, name: &str) -> Result<PathBuf> {
             std::fs::remove_dir_all(d)?;
         }
     }
-    let pause = !s.macos() && s.running();
-    if pause {
-        let _ = s.docker()?.args(["pause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    }
+    let paused = if !s.macos() && s.running() { Some(s.pause()?) } else { None };
     let r = clonefile(&s.ws(), &tmp);
-    if pause {
-        let _ = s.docker()?.args(["unpause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    }
+    drop(paused);
     if r.is_err()
         && let Some(p) = unreadable(&s.ws(), Path::new(""))
     {
@@ -1723,6 +1780,39 @@ pub fn rm_each(paths: &Paths, ids: &[String], every: bool, removed: &mut dyn FnM
     Ok(())
 }
 
+/// Deletes stopped sandboxes last used more than `older_than` seconds ago, and directories
+/// under `sb/` a failed create left without a meta.json, calling `removed` with each. The
+/// fleet's sandboxes are the controller's to remove.
+pub fn prune(paths: &Paths, older_than: u64, removed: &mut dyn FnMut(&str)) -> Result<()> {
+    let secs = |p: &Path| {
+        std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs())
+    };
+    let cutoff = now().saturating_sub(older_than);
+    for s in all(paths) {
+        let used = secs(&s.paths.home.join("run/last-used")).unwrap_or(0).max(s.meta.created);
+        if s.running() || used >= cutoff || s.paths.home.join(crate::fleet::FLEET_MARKER).exists() {
+            continue;
+        }
+        remove(&s)?;
+        removed(&s.meta.id);
+    }
+    // Not one being made right now.
+    let cutoff = now().saturating_sub(older_than.max(600));
+    for e in std::fs::read_dir(root(paths)).into_iter().flatten().flatten() {
+        let home = e.path();
+        if !home.is_dir() || Sandbox::meta_file(&home).exists() || secs(&home).is_none_or(|t| t >= cutoff) {
+            continue;
+        }
+        if crate::cli::running_pid(&Paths { home: home.clone() }).is_some() {
+            continue;
+        }
+        open_up(&home);
+        std::fs::remove_dir_all(&home).with_context(|| format!("remove {}", home.display()))?;
+        removed(&e.file_name().to_string_lossy());
+    }
+    Ok(())
+}
+
 pub fn golden_build(paths: &Paths, name: &str, images: &[String]) -> Result<()> {
     check_name("golden disk", name)?;
     let home = golden_home(paths, name);
@@ -2189,6 +2279,45 @@ mod tests {
         let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.ends_with("since the sandbox copied it: f"), "{e}");
         assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "saved on the Mac after the clone");
+    }
+
+    #[test]
+    fn a_failed_create_leaves_nothing_behind() {
+        let base = tmp("unmade");
+        let project = base.join("p");
+        std::fs::create_dir_all(project.join("locked")).unwrap();
+        std::fs::write(project.join("locked/x"), "x").unwrap();
+        std::fs::set_permissions(project.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let paths = Paths { home: base.join("home") };
+        let o = CreateOptions { dir: Some(project.clone()), image: Some("alpine".into()), ..Default::default() };
+        let e = create(&paths, o);
+        std::fs::set_permissions(project.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let left: Vec<_> = std::fs::read_dir(root(&paths)).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_dir()).collect();
+        assert!(e.is_err() && left.is_empty(), "{:?} {left:?}", e.err());
+    }
+
+    #[test]
+    fn prune_takes_old_stopped_sandboxes_and_leftovers() {
+        let (paths, project, old, _) = setup("prune", &[("f", "x")]);
+        let fresh = fake(&paths, &project, |_| {});
+        let fleet = fake(&paths, &project, |m| m.created = 1);
+        std::fs::write(root(&paths).join(&fleet.id).join(crate::fleet::FLEET_MARKER), b"").unwrap();
+        let s = find(&paths, &old.id).unwrap();
+        Sandbox { meta: Meta { created: 1, ..s.meta.clone() }, paths: Paths { home: s.paths.home.clone() } }.save().unwrap();
+        let used = s.paths.home.join("run/last-used");
+        std::fs::create_dir_all(used.parent().unwrap()).unwrap();
+        std::fs::File::create(&used).unwrap().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
+        let leftover = root(&paths).join("zzzzzzzz");
+        std::fs::create_dir_all(leftover.join("vm")).unwrap();
+        let mut gone = vec![];
+        prune(&paths, 3600, &mut |id| gone.push(id.to_string())).unwrap();
+        // The leftover is new: one being made right now looks the same.
+        assert_eq!(gone, vec![old.id.clone()]);
+        std::fs::File::open(&leftover).unwrap().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
+        gone.clear();
+        prune(&paths, 3600, &mut |id| gone.push(id.to_string())).unwrap();
+        assert_eq!(gone, vec!["zzzzzzzz".to_string()]);
+        assert!(find(&paths, &fresh.id).is_ok() && find(&paths, &fleet.id).is_ok());
     }
 
     #[test]

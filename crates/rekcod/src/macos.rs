@@ -449,7 +449,9 @@ pub fn boot(paths: &Paths, home: &Path, idle_ttl: u64) -> Result<String> {
                 Ok(())
             });
         }
-        cmd.spawn().context("spawn macOS guest")?;
+        let mut child = cmd.spawn().context("spawn macOS guest")?;
+        // Reaped when it exits, so a server that boots guests collects no zombies.
+        std::thread::spawn(move || child.wait());
     }
     let t0 = Instant::now();
     loop {

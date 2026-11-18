@@ -3857,6 +3857,16 @@
       ],
       "interactive": false,
       "confirm": "Remove stopped containers, unused networks, dangling images and unused build cache? Volumes are kept."
+    },
+    {
+      "kind": "SandboxPrune",
+      "label": "Remove unused agent sandboxes",
+      "argv": [
+        "sandbox",
+        "prune"
+      ],
+      "interactive": false,
+      "confirm": "Delete agent sandboxes stopped and unused for a week, and what failed creates left? Unapplied changes in them are lost."
     }
   ],
   "remotes": {

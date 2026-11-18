@@ -15,8 +15,6 @@ p=$(cd "$p" && pwd -P)
 printf keep >"$p/keep.txt"
 printf old >"$p/gone.txt"
 touch -t 202001010000 "$p/keep.txt" "$p/gone.txt"
-names=()
-for i in 1 2 3 4 5 6 7 8; do names+=("e2e-sb$i"); done
 
 check "create" "$R" sandbox create "$p" --name e2e-sb1 --image alpine:3.24
 check "exit code passes through" sh -c '"$0" sandbox exec e2e-sb1 -- sh -c "exit 7"; test $? = 7' "$R"
@@ -54,11 +52,26 @@ check "fork copies the workspace" sh -c '"$0" sandbox fork e2e-sb1 --name e2e-sb
 "$R" sandbox exec e2e-sb2 -- touch child-only >/dev/null 2>&1
 check "fork: child writes stay in the child" sh -c '! "$0" sandbox exec e2e-sb1 -- test -e child-only' "$R"
 check "stop, then exec boots it again" sh -c '"$0" sandbox stop e2e-sb2 && "$0" sandbox exec e2e-sb2 -- true' "$R"
-for i in 3 4 5 6 7 8; do "$R" sandbox create "$p" --name "e2e-sb$i" --image alpine:3.24 --memory 1 >/dev/null 2>&1 & done
+# Six more at once, with the first two stopped so their memory is free. On a Mac with less
+# memory some are still refused by the memory check (75% of RAM for the main VM and running
+# sandboxes together); that refusal is fine, any other failure isn't.
+for s in e2e-sb1 e2e-sb2; do "$R" sandbox stop "$s" >/dev/null 2>&1; done
+for i in 3 4 5 6 7 8; do
+  ("$R" sandbox create "$p" --name "e2e-sb$i" --image alpine:3.24 --memory 1 >"$p.create$i" 2>&1; echo $? >"$p.rc$i") &
+done
 wait
-check "8 sandboxes at once" sh -c 'test "$("$0" sandbox ls | grep -c "e2e-sb. .*running")" = 8' "$R"
+made=()
+refused=0
+for i in 3 4 5 6 7 8; do
+  if [[ $(cat "$p.rc$i") == 0 ]]; then made+=("e2e-sb$i")
+  elif grep -q "not enough memory" "$p.create$i"; then refused=$((refused + 1))
+  else sed 's/^/        /' "$p.create$i"; fi
+done
+rm -f "$p".create* "$p".rc*
+check "${#made[@]} sandboxes at once ($refused refused for memory)" test $((${#made[@]} + refused)) = 6 -a ${#made[@]} -ge 2
+check "and each is running" sh -c 'for s; do "$0" sandbox ls | grep -q "$s .*running" || exit 1; done' "$R" ${made[@]+"${made[@]}"}
 check "mcp lists tools" sh -c 'echo "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}" | "$0" mcp | grep -q sandbox_exec' "$R"
-check "rm deletes them" sh -c '"$0" sandbox rm "${@:1}" && ! "$0" sandbox ls | grep -q e2e-sb' "$R" "${names[@]}"
+check "rm deletes them" sh -c '"$0" sandbox rm "$@" && ! "$0" sandbox ls | grep -q e2e-sb' "$R" e2e-sb1 e2e-sb2 ${made[@]+"${made[@]}"}
 
 echo
 if [[ $failures -eq 0 ]]; then echo "all sandbox checks passed"; else echo "$failures sandbox check(s) failed"; exit 1; fi

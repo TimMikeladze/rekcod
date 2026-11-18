@@ -39,12 +39,14 @@ $D run --rm -v keep:/k alpine:3.24 sh -c 'echo precious > /k/f'
 check "a stalled reader gets all 200 MiB" sh -c "$D run --rm alpine:3.24 dd if=/dev/zero bs=1M count=200 2>/dev/null | (sleep 8; wc -c) | grep -q 209715200"
 
 echo "crashes"
+# Daemons of other homes running this same binary (your own VM, say) don't count below.
+others=$(pgrep -f "$R daemon" | grep -vx "$(cat "$REKCOD_HOME/run/daemon.pid")" | sort)
 kill -9 "$(cat "$REKCOD_HOME/run/daemon.pid")"; sleep 1
 check "a stale pid file doesn't count as running" sh -c "'$R' status | grep -q 'not running'"
 "$R" start --no-switch >/dev/null 2>&1 &
 "$R" start --no-switch >/dev/null 2>&1 &
 wait
-check "two starts at once boot one VM" sh -c "test \$(pgrep -f '$R daemon' | wc -l) -eq 1"
+check "two starts at once boot one VM" test "$(pgrep -f "$R daemon" | sort | comm -23 - <(echo "$others") | wc -l)" -eq 1
 check "data survives kill -9" sh -c "$D run --rm -v keep:/k alpine:3.24 cat /k/f | grep -q precious"
 
 echo "damaged data disk"

@@ -440,12 +440,26 @@ fn edge_layout(net: &Net, lan_name: Option<&str>) -> Result<EdgeLayout> {
     }
 }
 
-fn edge_node_args(
+/// How the edge-only setup brings up this Mac's node.
+#[derive(Debug, PartialEq, Eq)]
+enum EdgeNode {
+    /// Already joined to this fleet at this address: `node serve --install`.
+    Serve,
+    Join {
+        controller: String,
+        token: String,
+        listen: String,
+        advertise: String,
+        ca_fingerprint: Option<String>,
+    },
+}
+
+fn edge_node(
     remote: &crate::fleet::Remote,
     l: &EdgeLayout,
     join_token: Option<&str>,
     joined: Option<&serde_json::Value>,
-) -> Result<Vec<String>> {
+) -> Result<EdgeNode> {
     let secure = remote.url.starts_with("https://");
     let advertise = if secure { l.advertise.replacen("http://", "https://", 1) } else { l.advertise.clone() };
     if let Some(j) = joined {
@@ -455,25 +469,23 @@ fn edge_node_args(
         {
             bail!("this Mac's node is already joined with a different controller or address; use node serve or configure it separately");
         }
-        return Ok(["node", "serve", "--install"].map(String::from).into());
+        return Ok(EdgeNode::Serve);
     }
     let token = join_token.filter(|s| !s.is_empty()).context("a new node needs --join-token TOKEN (from the existing controller)")?;
-    let mut args = vec![
-        "node".into(),
-        "join".into(),
-        remote.url.clone(),
-        token.into(),
-        "--listen".into(),
-        l.node_listen.clone(),
-        "--advertise".into(),
-        advertise,
-    ];
-    if secure {
+    let ca_fingerprint = if secure {
         let ca = remote.ca.as_deref().context("the remote needs its pinned CA; add it with remote add --ca-fingerprint first")?;
-        args.extend(["--ca-fingerprint".into(), crate::tls::fingerprint(ca)?]);
-    }
-    args.push("--install".into());
-    Ok(args)
+        Some(crate::tls::fingerprint(ca)?)
+    } else {
+        None
+    };
+    Ok(EdgeNode::Join { controller: remote.url.clone(), token: token.into(), listen: l.node_listen.clone(), advertise, ca_fingerprint })
+}
+
+/// `node join ... --install`, in this process: a token in a child's argv is readable by
+/// every account on this Mac while it runs.
+fn join_node(paths: &Paths, controller: &str, token: &str, listen: &str, advertise: Option<&str>, fp: Option<&str>) -> Result<()> {
+    let options = crate::fleet::NodeJoinOptions { listen, advertise, install: true, ca_fingerprint: fp, zone: None };
+    crate::fleet::node_join(paths, controller, token, options).context("node join")
 }
 
 /// Whether `ip` is on one of this Mac's interfaces.
@@ -555,14 +567,19 @@ pub fn setup_edge(paths: &Paths, remote_name: &str, join_token: Option<&str>, ad
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    let args = edge_node_args(&remote, &l, join_token, joined.as_ref())?;
+    let node = edge_node(&remote, &l, join_token, joined.as_ref())?;
     // Check admin access before installing anything or changing power settings.
     crate::fleet::call(&remote.url, "GET", "/nodes", Some(&remote.token), &serde_json::Value::Null)?;
     // The jobs and the firewall exception keep this path: a Homebrew keg's would be gone
     // after the next `brew upgrade`.
     let exe = crate::service::stable_exe()?;
     let daemons = prepare_services(paths, &exe, no_power)?;
-    run(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    match &node {
+        EdgeNode::Serve => run(&exe, &["node", "serve", "--install"])?,
+        EdgeNode::Join { controller, token, listen, advertise, ca_fingerprint } => {
+            join_node(paths, controller, token, listen, Some(advertise), ca_fingerprint.as_deref())?
+        }
+    }
     let node: serde_json::Value = serde_json::from_slice(&std::fs::read(&node_file)?)?;
     let id = node["id"].as_str().context("node.json has no node id")?;
     let edge_name = format!("edge-{id}");
@@ -647,7 +664,8 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    run(&exe, &["remote", "add", "local", url, "--token", &admin, "--ca-fingerprint", &fp])?;
+    // Tokens stay in this process: another account's `ps` would see them in a child's argv.
+    crate::fleet::remote_add(paths, "local", url, &admin, None, Some(&fp)).context("remote add local")?;
     // A node that joined on another address (the LAN IP it had, a switch to or from --lan)
     // would serve its old one forever: forget it and join again.
     let node_file = paths.home.join("node.json");
@@ -666,19 +684,19 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
         run(&exe, &["node", "serve", "--install"])?;
     } else {
         let join = std::fs::read_to_string(ctl.join("join-token")).context("no join token")?;
-        run(&exe, &["node", "join", url, join.trim(), "--listen", &l.node_listen, "--ca-fingerprint", &fp, "--install"])?;
+        join_node(paths, url, join.trim(), &l.node_listen, None, Some(&fp))?;
     }
     // The edge gets a token that can only read routes and bans: taking over whatever runs
     // the edge shouldn't mean owning the fleet.
     let edge_token = if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
         "dry-run".to_string()
     } else {
-        // `remote add local` ran in a child process; reading the remotes here trusts its CA.
+        // Reading the remotes trusts the CA `remote add local` pinned.
         crate::fleet::remotes(paths);
         let v = crate::fleet::call(url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
         v["token"].as_str().context("no edge token")?.to_string()
     };
-    run(&exe, &["remote", "add", "edge", url, "--token", &edge_token, "--ca-fingerprint", &fp])?;
+    crate::fleet::remote_add(paths, "edge", url, &edge_token, None, Some(&fp)).context("remote add edge")?;
     run(&exe, &["edge", "serve", "--remote", "edge", "--listen", &l.edge_listen, "--public-listen", "127.0.0.1:8081", "--install"])?;
 
     // The docker VM, so docker over SSH works after a reboot too.
@@ -1255,26 +1273,32 @@ mod tests {
         let l = edge_layout(&Net::Fixed("100.64.0.2".into()), None).unwrap();
         assert_eq!(l.node_listen, "100.64.0.2:7701");
         assert_eq!(l.advertise, "http://100.64.0.2:7701");
-        let args = edge_node_args(&remote, &l, Some("join-secret"), None).unwrap();
+        let node = edge_node(&remote, &l, Some("join-secret"), None).unwrap();
         assert_eq!(
-            args,
-            [
-                "node",
-                "join",
-                "http://100.64.0.1:7700",
-                "join-secret",
-                "--listen",
-                "100.64.0.2:7701",
-                "--advertise",
-                "http://100.64.0.2:7701",
-                "--install"
-            ]
+            node,
+            EdgeNode::Join {
+                controller: "http://100.64.0.1:7700".into(),
+                token: "join-secret".into(),
+                listen: "100.64.0.2:7701".into(),
+                advertise: "http://100.64.0.2:7701".into(),
+                ca_fingerprint: None
+            }
         );
-        assert!(edge_node_args(&remote, &l, None, None).is_err());
+        assert!(edge_node(&remote, &l, None, None).is_err());
         let matching = serde_json::json!({"controller":remote.url, "listen":l.node_listen, "advertise":l.advertise});
-        assert_eq!(edge_node_args(&remote, &l, None, Some(&matching)).unwrap(), ["node", "serve", "--install"]);
+        assert_eq!(edge_node(&remote, &l, None, Some(&matching)).unwrap(), EdgeNode::Serve);
         let other = serde_json::json!({"controller":"http://100.64.0.3:7700", "listen":l.node_listen});
-        assert!(edge_node_args(&remote, &l, Some("join-secret"), Some(&other)).is_err());
+        assert!(edge_node(&remote, &l, Some("join-secret"), Some(&other)).is_err());
+    }
+
+    /// No child process `setup` starts gets a token in its argv.
+    #[test]
+    fn setup_children_carry_no_tokens() {
+        let src = include_str!("server.rs");
+        let body = &src[src.find("pub fn setup_edge(").unwrap()..src.find("/// Reads a line from the terminal").unwrap()];
+        for line in body.lines().filter(|l| l.contains("run(&exe")) {
+            assert!(!line.contains("token") && !line.contains("\"join\"") && !line.contains("admin"), "{line}");
+        }
     }
 
     #[test]

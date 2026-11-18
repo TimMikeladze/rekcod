@@ -41,9 +41,13 @@ const TCP_BUFFER: usize = 256 << 10;
 const CHUNK: usize = 64 << 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const UDP_IDLE: Duration = Duration::from_secs(60);
-/// Bytes of a gated connection (TLS, HTTP) held while looking for the name, and how long.
+/// Guest bytes a gated connection holds while looking for the name (a TLS ClientHello, an
+/// HTTP request head), and how long an incomplete one may take.
 const PEEK_MAX: usize = 16 << 10;
 const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Allowlisted sandboxes: ports whose traffic is encrypted from the first byte and only
+/// gets the address check. SSH, so `git` over SSH to an allowed host works.
+const OPAQUE_PORTS: [u16; 1] = [22];
 /// Frames waiting for room in the VM's receive buffer; past this smoltcp holds off.
 const OUT_QUEUE_MAX: usize = 4096;
 /// How long an address from a DNS answer stays usable past the record's TTL: programs
@@ -81,8 +85,12 @@ pub enum Verdict {
     Allow,
     /// Allowed by address; the TLS ClientHello's SNI must name an allowed host too.
     Tls,
-    /// Allowed by address; the HTTP Host header must name an allowed host too.
+    /// Allowed by address; every HTTP request's Host must name an allowed host too.
     Http,
+    /// Allowed by address on another port: the guest's first bytes decide. A TLS
+    /// ClientHello goes through the SNI check, an HTTP request through the Host check, and
+    /// anything else is refused, since a shared address (a CDN) serves other sites there too.
+    Sniff,
     Refuse(&'static str),
 }
 
@@ -102,8 +110,10 @@ pub struct Policy {
     everything: bool,
     tls_ports: Vec<u16>,
     http_ports: Vec<u16>,
-    /// The Mac's own interface addresses, re-read every 10 s.
-    local: Mutex<Option<(Instant, Vec<Ipv4Addr>)>>,
+    /// The Mac's own interface addresses and the networks they're on, re-read every 10 s.
+    local: Mutex<Option<(Instant, Vec<LocalNet>)>>,
+    /// Tests only: the Mac's interfaces.
+    fixed_local: Option<Vec<LocalNet>>,
 }
 
 impl Policy {
@@ -117,19 +127,21 @@ impl Policy {
             tls_ports: vec![443],
             http_ports: vec![80],
             local: Mutex::default(),
+            fixed_local: None,
         }
     }
 
-    fn local_addrs(&self) -> Vec<Ipv4Addr> {
-        let mut l = self.local.lock().unwrap_or_else(PoisonError::into_inner);
-        match &*l {
-            Some((at, addrs)) if at.elapsed() < Duration::from_secs(10) => addrs.clone(),
-            _ => {
-                let addrs = local_ipv4s();
-                *l = Some((Instant::now(), addrs.clone()));
-                addrs
-            }
+    /// On a network the Mac is directly connected to: one of its own addresses, a neighbour
+    /// on one of its subnets, or the far end of a point-to-point link.
+    fn is_local(&self, ip: Ipv4Addr) -> bool {
+        if let Some(nets) = &self.fixed_local {
+            return nets.iter().any(|n| n.contains(ip));
         }
+        let mut l = self.local.lock().unwrap_or_else(PoisonError::into_inner);
+        if l.as_ref().is_none_or(|(at, _)| at.elapsed() >= Duration::from_secs(10)) {
+            *l = Some((Instant::now(), local_nets()));
+        }
+        l.as_ref().is_some_and(|(_, nets)| nets.iter().any(|n| n.contains(ip)))
     }
 
     /// The main VM's policy for `--network user`: no filtering, as with Virtualization.
@@ -163,7 +175,7 @@ impl Policy {
             return Verdict::Refuse("DNS goes through rekcod");
         }
         let ip = *dst.ip();
-        if !(self.loopback && ip.is_loopback()) && (not_internet(ip) || self.local_addrs().contains(&ip)) {
+        if !(self.loopback && ip.is_loopback()) && (not_internet(ip) || self.is_local(ip)) {
             return Verdict::Refuse("the Mac or local network");
         }
         if self.allow.is_none() {
@@ -172,12 +184,16 @@ impl Policy {
         if !self.resolved.contains(ip) {
             return Verdict::Refuse("not from an allowed name");
         }
+        // UDP carries no name to check (QUIC's ClientHello is in encrypted Initial packets,
+        // and clients fall back to TCP). DNS goes over vsock.
+        if !tcp {
+            return Verdict::Refuse("UDP can't be checked against the allowlist");
+        }
         match dst.port() {
-            // QUIC: its ClientHello is in encrypted Initial packets; clients fall back to TCP.
-            p if !tcp && self.tls_ports.contains(&p) => Verdict::Refuse("QUIC can't be checked against the allowlist"),
-            p if tcp && self.tls_ports.contains(&p) => Verdict::Tls,
-            p if tcp && self.http_ports.contains(&p) => Verdict::Http,
-            _ => Verdict::Allow,
+            p if self.tls_ports.contains(&p) => Verdict::Tls,
+            p if self.http_ports.contains(&p) => Verdict::Http,
+            p if OPAQUE_PORTS.contains(&p) => Verdict::Allow,
+            _ => Verdict::Sniff,
         }
     }
 
@@ -187,7 +203,9 @@ impl Policy {
 }
 
 /// Loopback, RFC 1918, CGNAT (Tailscale), link-local (cloud metadata), 0/8, multicast,
-/// broadcast and 240/4.
+/// broadcast, 240/4, and the special-purpose ranges that are never the internet: IETF
+/// protocol assignments (192.0.0.0/24), documentation (192.0.2.0/24, 198.51.100.0/24,
+/// 203.0.113.0/24) and benchmarking (198.18.0.0/15, which local proxies hand out).
 fn not_internet(ip: Ipv4Addr) -> bool {
     let o = ip.octets();
     ip.is_loopback()
@@ -197,10 +215,34 @@ fn not_internet(ip: Ipv4Addr) -> bool {
         || o[0] == 0
         || o[0] >= 240
         || (o[0] == 100 && o[1] & 0xc0 == 64)
+        || matches!(o, [192, 0, 0 | 2, _] | [198, 51, 100, _] | [203, 0, 113, _])
+        || (o[0] == 198 && o[1] & 0xfe == 18)
 }
 
-/// IPv4 addresses on the Mac's interfaces (getifaddrs).
-pub fn local_ipv4s() -> Vec<Ipv4Addr> {
+/// An IPv4 network the Mac is on: an interface address with its netmask.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LocalNet {
+    addr: Ipv4Addr,
+    mask: u32,
+}
+
+impl LocalNet {
+    fn contains(&self, ip: Ipv4Addr) -> bool {
+        u32::from(ip) & self.mask == u32::from(self.addr) & self.mask
+    }
+}
+
+fn sockaddr_v4(sa: *const libc::sockaddr) -> Option<Ipv4Addr> {
+    if sa.is_null() || i32::from(unsafe { (*sa).sa_family }) != libc::AF_INET {
+        return None;
+    }
+    let sin = unsafe { &*(sa as *const libc::sockaddr_in) };
+    Some(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)))
+}
+
+/// The Mac's IPv4 interfaces (getifaddrs): each address with its subnet, and for a
+/// point-to-point link (a VPN's utun) the peer as a single address too.
+fn local_nets() -> Vec<LocalNet> {
     let mut out = Vec::new();
     let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
     if unsafe { libc::getifaddrs(&mut ifap) } != 0 {
@@ -209,9 +251,14 @@ pub fn local_ipv4s() -> Vec<Ipv4Addr> {
     let mut p = ifap;
     while !p.is_null() {
         let ifa = unsafe { &*p };
-        if !ifa.ifa_addr.is_null() && i32::from(unsafe { (*ifa.ifa_addr).sa_family }) == libc::AF_INET {
-            let sin = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in) };
-            out.push(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr)));
+        if let Some(addr) = sockaddr_v4(ifa.ifa_addr) {
+            let mask = sockaddr_v4(ifa.ifa_netmask).map_or(u32::MAX, u32::from);
+            out.push(LocalNet { addr, mask });
+            if ifa.ifa_flags & libc::IFF_POINTOPOINT as u32 != 0
+                && let Some(peer) = sockaddr_v4(ifa.ifa_dstaddr)
+            {
+                out.push(LocalNet { addr: peer, mask: u32::MAX });
+            }
         }
         p = ifa.ifa_next;
     }
@@ -331,16 +378,239 @@ enum Msg {
     Reset,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum GateKind {
+    /// The first bytes say whether this is TLS or HTTP.
+    Sniff,
     Tls,
-    Http,
+    /// For the life of the connection: every request head is checked, and the gate follows
+    /// each body by its framing so the next head is found where the server will find it.
+    Http(Framing),
 }
 
+/// Where an HTTP gate is in the guest's request stream.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Framing {
+    Head,
+    /// Body bytes left (Content-Length).
+    Length(u64),
+    ChunkSize,
+    /// Chunk data bytes left, then its CRLF.
+    ChunkData(u64),
+    ChunkEnd,
+    Trailers,
+}
+
+/// Guest-to-host bytes of a connection that must name an allowed host.
 struct Gate {
     kind: GateKind,
+    /// Guest bytes not checked yet.
     buf: Vec<u8>,
-    deadline: Instant,
+    /// Checked bytes waiting for room in the host channel.
+    out: Vec<u8>,
+    /// The ClientHello passed: the rest of the connection is opaque.
+    open: bool,
+    /// While a ClientHello or request head is incomplete: when to give up on it.
+    deadline: Option<Instant>,
+    dst: SocketAddrV4,
+}
+
+/// Longest chunk-size or trailer line an HTTP gate waits for.
+const LINE_MAX: usize = 4096;
+
+impl Gate {
+    fn new(kind: GateKind, dst: SocketAddrV4) -> Gate {
+        Gate { kind, buf: Vec::new(), out: Vec::new(), open: false, deadline: Some(Instant::now() + PEEK_TIMEOUT), dst }
+    }
+
+    /// Nothing held: everything the guest sent has gone to the host channel.
+    fn drained(&self) -> bool {
+        self.buf.is_empty() && self.out.is_empty()
+    }
+
+    /// Moves checked guest bytes from `s` to the host. `Ok(true)`: the rest of the
+    /// connection is opaque. `Err`: the denial to log; the caller resets the connection.
+    fn pump(&mut self, s: &mut tcp::Socket, policy: &Policy, to_host: &mpsc::Sender<Msg>) -> Result<bool, String> {
+        loop {
+            while !self.out.is_empty() {
+                let Ok(permit) = to_host.try_reserve() else { return Ok(false) };
+                let n = self.out.len().min(CHUNK);
+                permit.send(Msg::Data(self.out.drain(..n).collect()));
+            }
+            if self.open {
+                return Ok(true);
+            }
+            let mut read = 0;
+            while self.buf.len() < PEEK_MAX && s.can_recv() {
+                let room = PEEK_MAX - self.buf.len();
+                read += s
+                    .recv(|b| {
+                        let n = b.len().min(room);
+                        self.buf.extend_from_slice(&b[..n]);
+                        (n, n)
+                    })
+                    .unwrap_or(0);
+            }
+            let ended = !s.may_recv() && s.recv_queue() == 0;
+            self.advance(policy, ended, Instant::now())?;
+            if self.out.is_empty() && !self.open && read == 0 {
+                return Ok(false);
+            }
+        }
+    }
+
+    /// Checks what `buf` holds, moving what may pass to `out`. `ended`: the guest sent
+    /// everything it's going to.
+    fn advance(&mut self, policy: &Policy, ended: bool, now: Instant) -> Result<(), String> {
+        let ip = self.dst.ip();
+        loop {
+            let waiting = match self.kind {
+                GateKind::Sniff => match sniff(&self.buf) {
+                    Some(kind) => {
+                        self.kind = kind;
+                        continue;
+                    }
+                    None if self.buf.is_empty() || self.buf.iter().all(u8::is_ascii_uppercase) && self.buf.len() < 16 => {
+                        "(nothing to check)"
+                    }
+                    None => return Err(format!("refused tcp {} (neither TLS nor HTTP)", self.dst)),
+                },
+                GateKind::Tls => match tls_sni(&self.buf) {
+                    Peek::More if self.buf.len() < PEEK_MAX => "(no SNI)",
+                    Peek::Name(n) if policy.name_allowed(&n) => {
+                        self.out.append(&mut self.buf);
+                        self.open = true;
+                        return Ok(());
+                    }
+                    Peek::Name(n) => return Err(format!("refused tls {n} at {ip}")),
+                    Peek::More | Peek::NoName => return Err(format!("refused tls (no SNI) at {ip}")),
+                },
+                GateKind::Http(Framing::Head) => {
+                    if self.buf.is_empty() {
+                        if ended {
+                            return Ok(());
+                        }
+                        "(no Host)"
+                    } else if let Some(end) = self.buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let req = http_request(&self.buf[..end + 4]).map_err(|why| format!("refused http ({why}) at {ip}"))?;
+                        if !policy.name_allowed(&req.host) {
+                            return Err(format!("refused http {} at {ip}", req.host));
+                        }
+                        self.out.extend(self.buf.drain(..end + 4));
+                        self.kind = GateKind::Http(req.body);
+                        self.deadline = None;
+                        continue;
+                    } else if self.buf.len() >= PEEK_MAX {
+                        return Err(format!("refused http (no Host) at {ip}"));
+                    } else {
+                        "(no Host)"
+                    }
+                }
+                GateKind::Http(Framing::Length(left)) => {
+                    let n = (self.buf.len() as u64).min(left);
+                    self.out.extend(self.buf.drain(..n as usize));
+                    if n == left {
+                        self.kind = GateKind::Http(Framing::Head);
+                        continue;
+                    }
+                    self.kind = GateKind::Http(Framing::Length(left - n));
+                    return Ok(());
+                }
+                GateKind::Http(Framing::ChunkData(left)) => {
+                    let n = (self.buf.len() as u64).min(left);
+                    self.out.extend(self.buf.drain(..n as usize));
+                    self.kind = GateKind::Http(if n == left { Framing::ChunkEnd } else { Framing::ChunkData(left - n) });
+                    if n == left {
+                        continue;
+                    }
+                    return Ok(());
+                }
+                GateKind::Http(Framing::ChunkEnd) => {
+                    if self.buf.len() < 2 {
+                        return self.need_more(ended);
+                    }
+                    if &self.buf[..2] != b"\r\n" {
+                        return Err(format!("refused http (bad chunk) at {ip}"));
+                    }
+                    self.out.extend(self.buf.drain(..2));
+                    self.kind = GateKind::Http(Framing::ChunkSize);
+                    continue;
+                }
+                GateKind::Http(framing @ (Framing::ChunkSize | Framing::Trailers)) => {
+                    let Some(nl) = self.buf.windows(2).position(|w| w == b"\r\n") else {
+                        if self.buf.len() > LINE_MAX {
+                            return Err(format!("refused http (bad chunk) at {ip}"));
+                        }
+                        return self.need_more(ended);
+                    };
+                    let line = &self.buf[..nl];
+                    let next = if framing == Framing::Trailers {
+                        if line.is_empty() { Framing::Head } else { Framing::Trailers }
+                    } else {
+                        match chunk_size(line) {
+                            Some(0) => Framing::Trailers,
+                            Some(n) => Framing::ChunkData(n),
+                            None => return Err(format!("refused http (bad chunk) at {ip}")),
+                        }
+                    };
+                    if line.contains(&b'\r') || line.contains(&b'\n') {
+                        return Err(format!("refused http (bad chunk) at {ip}"));
+                    }
+                    self.out.extend(self.buf.drain(..nl + 2));
+                    self.kind = GateKind::Http(next);
+                    continue;
+                }
+            };
+            // An incomplete hello or head: wait for more, within limits.
+            if ended && !(self.buf.is_empty() && self.kind == GateKind::Sniff) {
+                return Err(match self.kind {
+                    GateKind::Sniff => format!("refused tcp {} (neither TLS nor HTTP)", self.dst),
+                    GateKind::Tls => format!("refused tls {waiting} at {ip}"),
+                    GateKind::Http(_) => format!("refused http {waiting} at {ip}"),
+                });
+            }
+            if !self.buf.is_empty() && self.deadline.is_none() {
+                self.deadline = Some(now + PEEK_TIMEOUT);
+            }
+            if self.deadline.is_some_and(|d| now >= d) {
+                return Err(match self.kind {
+                    GateKind::Sniff => format!("refused tcp {} (neither TLS nor HTTP)", self.dst),
+                    GateKind::Tls => format!("refused tls {waiting} at {ip}"),
+                    GateKind::Http(_) => format!("refused http {waiting} at {ip}"),
+                });
+            }
+            return Ok(());
+        }
+    }
+
+    /// Mid-body: an incomplete line is fine unless the guest has stopped sending.
+    fn need_more(&self, ended: bool) -> Result<(), String> {
+        if ended && !self.buf.is_empty() {
+            return Err(format!("refused http (bad chunk) at {}", self.dst.ip()));
+        }
+        Ok(())
+    }
+}
+
+/// What the first bytes on a [`Verdict::Sniff`] port are: TLS, an HTTP request, or (None)
+/// not known yet or neither.
+fn sniff(buf: &[u8]) -> Option<GateKind> {
+    match buf.first()? {
+        0x16 => Some(GateKind::Tls),
+        _ => {
+            let sp = buf.iter().position(|&b| b == b' ')?;
+            (sp > 0 && buf[..sp].iter().all(u8::is_ascii_uppercase)).then_some(GateKind::Http(Framing::Head))
+        }
+    }
+}
+
+fn chunk_size(line: &[u8]) -> Option<u64> {
+    let hex = line.split(|&b| b == b';').next()?;
+    let hex = std::str::from_utf8(hex).ok()?.trim_matches([' ', '\t']);
+    if hex.is_empty() || !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
 }
 
 /// One guest TCP connection and the host task relaying it.
@@ -409,48 +679,33 @@ impl Conn {
             s.close();
         }
         // Guest to host.
-        if let Some(g) = &mut self.gate {
-            while g.buf.len() < PEEK_MAX && s.can_recv() {
-                let room = PEEK_MAX - g.buf.len();
-                let _ = s.recv(|b| {
-                    let n = b.len().min(room);
-                    g.buf.extend_from_slice(&b[..n]);
-                    (n, ())
-                });
-            }
-            let (what, peek) = match g.kind {
-                GateKind::Tls => ("tls", tls_sni(&g.buf)),
-                GateKind::Http => ("http", http_host(&g.buf)),
-            };
-            let name = match peek {
-                Peek::More if g.buf.len() < PEEK_MAX && Instant::now() < g.deadline && s.may_recv() => return None,
-                Peek::Name(n) if policy.name_allowed(&n) => None,
-                Peek::Name(n) => Some(n),
-                Peek::More | Peek::NoName => Some(format!("(no {})", if what == "tls" { "SNI" } else { "Host" })),
-            };
-            if let Some(name) = name {
-                s.abort();
-                let _ = self.to_host.try_send(Msg::Reset);
-                self.told_host = true;
-                return Some(format!("refused {what} {name} at {}", self.dst.ip()));
-            }
-            // Nothing went to the host yet, so the channel has room.
-            let _ = self.to_host.try_send(Msg::Data(std::mem::take(&mut g.buf)));
-            self.gate = None;
-        }
         if self.told_host {
             return None;
         }
-        while s.can_recv() {
-            let Ok(permit) = self.to_host.try_reserve() else { break };
-            if let Ok(d) = s.recv(|b| {
-                let n = b.len().min(CHUNK);
-                (n, b[..n].to_vec())
-            }) {
-                permit.send(Msg::Data(d));
+        if let Some(g) = &mut self.gate {
+            match g.pump(s, policy, &self.to_host) {
+                Ok(true) => self.gate = None,
+                Ok(false) => {}
+                Err(denial) => {
+                    s.abort();
+                    let _ = self.to_host.try_send(Msg::Reset);
+                    self.told_host = true;
+                    return Some(denial);
+                }
             }
         }
-        if self.established && !s.may_recv() && s.recv_queue() == 0 {
+        if self.gate.is_none() {
+            while s.can_recv() {
+                let Ok(permit) = self.to_host.try_reserve() else { break };
+                if let Ok(d) = s.recv(|b| {
+                    let n = b.len().min(CHUNK);
+                    (n, b[..n].to_vec())
+                }) {
+                    permit.send(Msg::Data(d));
+                }
+            }
+        }
+        if self.gate.as_ref().is_none_or(Gate::drained) && self.established && !s.may_recv() && s.recv_queue() == 0 {
             let msg = if s.state() == State::Closed { Msg::Reset } else { Msg::Eof };
             self.told_host = self.to_host.try_send(msg).is_ok();
         }
@@ -631,7 +886,7 @@ impl Stack {
         let h = self.sockets.add(s);
         c.handle = Some(h);
         if let Some(g) = &mut c.gate {
-            g.deadline = Instant::now() + PEEK_TIMEOUT;
+            g.deadline = Some(Instant::now() + PEEK_TIMEOUT);
         }
         if let Some(syn) = c.syn.take() {
             self.inject(syn);
@@ -700,12 +955,13 @@ impl Stack {
             }
             Verdict::Allow => None,
             Verdict::Tls => Some(GateKind::Tls),
-            Verdict::Http => Some(GateKind::Http),
+            Verdict::Http => Some(GateKind::Http(Framing::Head)),
+            Verdict::Sniff => Some(GateKind::Sniff),
         };
         let (to_host, host_rx) = mpsc::channel(8);
         let (host_tx, from_host) = mpsc::channel(8);
         tokio::spawn(host_tcp(dst, host_rx, host_tx, self.notify.clone()));
-        let gate = kind.map(|kind| Gate { kind, buf: Vec::new(), deadline: Instant::now() });
+        let gate = kind.map(|kind| Gate::new(kind, dst));
         let conn = Conn {
             dst,
             guest_port,
@@ -981,24 +1237,106 @@ fn client_hello_sni(hs: &[u8]) -> Option<Peek> {
     if hs.len() < end { None } else { Some(Peek::NoName) }
 }
 
-/// The Host header of an HTTP/1 request at the start of `buf`, without the port.
-fn http_host(buf: &[u8]) -> Peek {
-    let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") else {
-        return if buf.len() >= PEEK_MAX { Peek::NoName } else { Peek::More };
-    };
-    let Ok(head) = std::str::from_utf8(&buf[..end]) else { return Peek::NoName };
-    let mut lines = head.split("\r\n");
-    if !lines.next().is_some_and(|l| l.split(' ').nth(2).is_some_and(|v| v.starts_with("HTTP/1."))) {
-        return Peek::NoName;
+/// A request head that passed [`http_request`]: the host it's for, and how its body is framed.
+#[derive(Debug, PartialEq)]
+struct Request {
+    host: String,
+    body: Framing,
+}
+
+/// Reads one HTTP/1 request head (through its blank line) the strict way, so the gate and
+/// the server agree on the host and on where the body ends: CRLF line ends only, no folded
+/// lines, exactly one Host, an origin-form target or an absolute-form one naming that same
+/// host, and a body framed by one Content-Length or by chunked. CONNECT, Upgrade and
+/// anything else that would turn the connection into something the gate can't follow
+/// is refused.
+fn http_request(head: &[u8]) -> Result<Request, &'static str> {
+    for (i, &b) in head.iter().enumerate() {
+        let bad = match b {
+            b'\r' => head.get(i + 1) != Some(&b'\n'),
+            b'\n' => i == 0 || head[i - 1] != b'\r',
+            0 => true,
+            _ => false,
+        };
+        if bad {
+            return Err("bad line ends");
+        }
     }
-    let hosts: Vec<&str> =
-        lines.filter_map(|l| l.split_once(':')).filter(|(k, _)| k.trim().eq_ignore_ascii_case("host")).map(|(_, v)| v.trim()).collect();
-    let [host] = hosts[..] else { return Peek::NoName };
-    let host = match host.rsplit_once(':') {
+    let text = std::str::from_utf8(head).map_err(|_| "not UTF-8")?;
+    let text = text.strip_suffix("\r\n\r\n").ok_or("incomplete head")?;
+    let mut lines = text.split("\r\n");
+    let start: Vec<&str> = lines.next().unwrap_or_default().split(' ').collect();
+    let [method, target, version] = start[..] else { return Err("bad request line") };
+    if !matches!(version, "HTTP/1.1" | "HTTP/1.0") || method.is_empty() || !method.bytes().all(|c| c.is_ascii_uppercase()) {
+        return Err("bad request line");
+    }
+    if method == "CONNECT" {
+        return Err("CONNECT");
+    }
+    let (mut hosts, mut length, mut chunked, mut encodings) = (Vec::new(), None::<u64>, false, 0);
+    for line in lines {
+        if line.starts_with([' ', '\t']) {
+            return Err("folded header");
+        }
+        let (name, value) = line.split_once(':').ok_or("bad header")?;
+        if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&c)) {
+            return Err("bad header");
+        }
+        let value = value.trim_matches([' ', '\t']);
+        match name.to_ascii_lowercase().as_str() {
+            "host" => hosts.push(value),
+            "content-length" => {
+                if value.is_empty() || !value.bytes().all(|c| c.is_ascii_digit()) {
+                    return Err("bad Content-Length");
+                }
+                let n = value.parse::<u64>().map_err(|_| "bad Content-Length")?;
+                if length.is_some_and(|l| l != n) {
+                    return Err("conflicting Content-Length");
+                }
+                length = Some(n);
+            }
+            "transfer-encoding" => {
+                encodings += 1;
+                chunked = value.rsplit(',').next().is_some_and(|c| c.trim_matches([' ', '\t']).eq_ignore_ascii_case("chunked"));
+            }
+            "upgrade" => return Err("Upgrade"),
+            _ => {}
+        }
+    }
+    let [host] = hosts[..] else { return Err("not exactly one Host") };
+    let Peek::Name(host) = hostname(strip_port(host).as_bytes()) else { return Err("bad Host") };
+    if encodings > 1 || (encodings == 1 && !chunked) {
+        return Err("unframeable body");
+    }
+    if chunked && length.is_some() {
+        return Err("Content-Length and chunked");
+    }
+    let target_ok = if target.starts_with('/') {
+        true
+    } else if target == "*" {
+        method == "OPTIONS"
+    } else {
+        // Absolute form: servers go by the target's host and ignore Host (RFC 9112 3.2.2).
+        let lower = target.to_ascii_lowercase();
+        let authority = lower.strip_prefix("http://").map(|r| r.split(['/', '?', '#']).next().unwrap_or_default());
+        authority.is_some_and(|a| !a.contains('@') && hostname(strip_port(a).as_bytes()) == Peek::Name(host.clone()))
+    };
+    if !target_ok {
+        return Err("request target");
+    }
+    let body = match (chunked, length) {
+        (true, _) => Framing::ChunkSize,
+        (false, Some(n)) if n > 0 => Framing::Length(n),
+        _ => Framing::Head,
+    };
+    Ok(Request { host, body })
+}
+
+fn strip_port(host: &str) -> &str {
+    match host.rsplit_once(':') {
         Some((h, port)) if !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) => h,
         _ => host,
-    };
-    hostname(host.as_bytes())
+    }
 }
 
 #[cfg(test)]
@@ -1153,14 +1491,15 @@ mod tests {
         let to = echo_server().await;
         let resolved = Arc::new(Resolved::default());
         let (mut g, _h, logs) = net(with_loopback(Policy::new(Some(vec!["x.test".into()]), vec![], resolved.clone())));
+        let req = b"GET / HTTP/1.1\r\nHost: x.test\r\n\r\n";
         let got = tokio::task::spawn_blocking(move || {
-            let before = g.exchange(to, b"hi");
+            let before = g.exchange(to, req);
             resolved.record(*to.ip(), 30);
-            (before, g.exchange(to, b"hi"))
+            (before, g.exchange(to, req))
         })
         .await
         .unwrap();
-        assert_eq!(got, (Err("reset"), Ok(b"hi".to_vec())));
+        assert_eq!(got, (Err("reset"), Ok(req.to_vec())));
         assert!(logs.lock().unwrap()[0].ends_with("(not from an allowed name)"));
     }
 
@@ -1190,6 +1529,42 @@ mod tests {
         assert_eq!(out.0, (Ok(hello), vec![]));
         assert_eq!(out.1, (Err("reset"), vec!["rekcod-egress: refused tls registry.npmjs.org at 127.0.0.1".to_string()]));
         assert_eq!(out.2, (Err("reset"), vec!["rekcod-egress: refused tls (no SNI) at 127.0.0.1".to_string()]));
+    }
+
+    /// The echo server's port is neither 443 nor 80, so the first bytes pick the check.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn other_ports_are_checked_by_what_they_carry() {
+        let to = echo_server().await;
+        let hello = include_bytes!("../testdata/clienthello-curl.bin").to_vec();
+        let run = move |allow: &str, msg: Vec<u8>| {
+            let resolved = Arc::new(Resolved::default());
+            resolved.record(*to.ip(), 30);
+            let (mut g, h, logs) = net(with_loopback(Policy::new(Some(vec![allow.into()]), vec![], resolved)));
+            let got = g.exchange(to, &msg);
+            drop(h);
+            (got, logs.lock().unwrap().clone())
+        };
+        let two = b"GET /a HTTP/1.1\r\nHost: a.com\r\n\r\nPOST /b HTTP/1.1\r\nHost: evil.example\r\nContent-Length: 2\r\n\r\nhi".to_vec();
+        let one = b"GET /a HTTP/1.1\r\nHost: a.com\r\n\r\n".to_vec();
+        let (h1, h2) = (hello.clone(), hello.clone());
+        let rt = tokio::runtime::Handle::current();
+        let out = tokio::task::spawn_blocking(move || {
+            let _guard = rt.enter();
+            (
+                run("example.com", h1),
+                run("*.npmjs.org", h2),
+                run("a.com", two),
+                run("a.com", one.clone()),
+                run("a.com", b"\0\0\0\x01hello".to_vec()),
+            )
+        })
+        .await
+        .unwrap();
+        assert_eq!(out.0, (Err("reset"), vec!["rekcod-egress: refused tls registry.npmjs.org at 127.0.0.1".to_string()]));
+        assert_eq!(out.1, (Ok(hello), vec![]));
+        assert_eq!(out.2, (Err("reset"), vec!["rekcod-egress: refused http evil.example at 127.0.0.1".to_string()]));
+        assert_eq!(out.3, (Ok(b"GET /a HTTP/1.1\r\nHost: a.com\r\n\r\n".to_vec()), vec![]));
+        assert_eq!(out.4, (Err("reset"), vec![format!("rekcod-egress: refused tcp {to} (neither TLS nor HTTP)")]));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1274,7 +1649,10 @@ mod tests {
         assert_eq!(check("192.168.1.5:9000"), Verdict::Allow);
         assert_eq!(check("1.1.1.1:443"), Verdict::Allow);
         assert_eq!(check("1.1.1.1:53"), Verdict::Refuse("DNS goes through rekcod"));
-        if let Some(mine) = local_ipv4s().into_iter().find(|ip| !not_internet(*ip)) {
+        for a in ["192.0.2.7:443", "198.51.100.7:443", "203.0.113.7:443", "198.19.4.4:80", "192.0.0.9:80"] {
+            assert_eq!(check(a), Verdict::Refuse("the Mac or local network"), "{a}");
+        }
+        if let Some(mine) = local_nets().into_iter().map(|n| n.addr).find(|ip| !not_internet(*ip)) {
             assert_eq!(check(&format!("{mine}:80")), Verdict::Refuse("the Mac or local network"));
         }
         let resolved = Arc::new(Resolved::default());
@@ -1284,8 +1662,27 @@ mod tests {
         assert_eq!(p.check(true, "104.16.1.1:443".parse().unwrap()), Verdict::Tls);
         assert_eq!(p.check(true, "104.16.1.1:80".parse().unwrap()), Verdict::Http);
         assert_eq!(p.check(true, "104.16.1.1:22".parse().unwrap()), Verdict::Allow);
-        assert!(matches!(p.check(false, "104.16.1.1:443".parse().unwrap()), Verdict::Refuse(_)));
+        // A CDN serves every site it fronts on its other ports too (Cloudflare: 2053, 8443, 8080...).
+        assert_eq!(p.check(true, "104.16.1.1:8443".parse().unwrap()), Verdict::Sniff);
+        assert_eq!(p.check(true, "104.16.1.1:8080".parse().unwrap()), Verdict::Sniff);
+        for port in [443, 8443, 22] {
+            assert!(matches!(p.check(false, SocketAddrV4::new("104.16.1.1".parse().unwrap(), port)), Verdict::Refuse(_)), "udp {port}");
+        }
         assert_eq!(Policy::new(Some(vec!["*".into()]), vec![], Arc::default()).allow, None);
+    }
+
+    #[test]
+    fn neighbours_on_the_macs_own_networks_are_local() {
+        // A LAN on public addresses (a campus, an office), and a VPN's point-to-point peer.
+        let mut p = Policy::new(None, vec!["81.2.69.20:5432".parse().unwrap()], Arc::default());
+        let net = |a: &str, mask: u32| LocalNet { addr: a.parse().unwrap(), mask };
+        p.fixed_local = Some(vec![net("81.2.69.7", 0xffff_ff00), net("25.0.0.1", u32::MAX)]);
+        let check = |a: &str| p.check(true, a.parse().unwrap());
+        assert_eq!(check("81.2.69.9:445"), Verdict::Refuse("the Mac or local network"));
+        assert_eq!(check("25.0.0.1:22"), Verdict::Refuse("the Mac or local network"));
+        assert_eq!(check("81.2.70.9:443"), Verdict::Allow);
+        assert_eq!(check("25.0.0.2:443"), Verdict::Allow);
+        assert_eq!(check("81.2.69.20:5432"), Verdict::Allow, "--reach still wins");
     }
 
     #[test]
@@ -1321,13 +1718,85 @@ mod tests {
 
     #[test]
     fn host_header() {
-        let req = |h: &str| http_host(format!("GET / HTTP/1.1\r\n{h}User-Agent: x\r\n\r\n").as_bytes());
-        assert_eq!(req("Host: Registry.NPMjs.org:8080\r\n"), Peek::Name("registry.npmjs.org".into()));
-        assert_eq!(req("host:example.com\r\n"), Peek::Name("example.com".into()));
-        assert_eq!(req(""), Peek::NoName);
-        assert_eq!(req("Host: a.com\r\nHost: b.com\r\n"), Peek::NoName);
-        assert_eq!(req("Host: [::1]:80\r\n"), Peek::NoName);
-        assert_eq!(http_host(b"GET / HTTP/1.1\r\nHost: a.com\r\n"), Peek::More);
-        assert_eq!(http_host(b"\x16\x03\x01\x00\x10\r\n\r\n"), Peek::NoName);
+        let host = |h: &str| http_request(format!("GET / HTTP/1.1\r\n{h}User-Agent: x\r\n\r\n").as_bytes()).map(|r| r.host);
+        assert_eq!(host("Host: Registry.NPMjs.org:8080\r\n"), Ok("registry.npmjs.org".into()));
+        assert_eq!(host("host:example.com\r\n"), Ok("example.com".into()));
+        assert!(host("").is_err());
+        assert!(host("Host: a.com\r\nHost: b.com\r\n").is_err());
+        assert!(host("Host: [::1]:80\r\n").is_err());
+        assert!(http_request(b"\x16\x03\x01\x00\x10\r\n\r\n").is_err());
+        assert!(http_request(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").is_err());
+
+        // Each of these names registry.npmjs.org in Host but a server would serve evil.example.
+        for bad in [
+            &b"GET http://evil.example/x HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n"[..],
+            b"GET / HTTP/1.1\r\nX: a\nHost: evil.example\n\r\nHost: registry.npmjs.org\r\n\r\n",
+            b"GET / HTTP/1.1\r\nX: a\r\n Host: evil.example\r\nHost: registry.npmjs.org\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: registry.npmjs.org\rHost: evil.example\r\n\r\n",
+            b"CONNECT evil.example:443 HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n",
+            b"GET / HTTP/1.1\r\nHost: registry.npmjs.org\r\nUpgrade: websocket\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: registry.npmjs.org\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: registry.npmjs.org\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\n",
+            b"POST / HTTP/1.1\r\nHost: registry.npmjs.org\r\nTransfer-Encoding: identity\r\n\r\n",
+        ] {
+            assert!(http_request(bad).is_err(), "{}", String::from_utf8_lossy(bad));
+        }
+        let ok = |r: &[u8]| http_request(r).unwrap();
+        assert_eq!(ok(b"GET http://Registry.npmjs.org:80/x HTTP/1.1\r\nHost: registry.npmjs.org\r\n\r\n").body, Framing::Head);
+        assert_eq!(ok(b"POST / HTTP/1.1\r\nHost: a.com\r\nContent-Length: 12\r\n\r\n").body, Framing::Length(12));
+        assert_eq!(ok(b"POST / HTTP/1.1\r\nHost: a.com\r\nTransfer-Encoding: gzip, chunked\r\n\r\n").body, Framing::ChunkSize);
+    }
+
+    /// Runs the gate over `input` as it arrives in `parts`; returns what reached the host
+    /// and the denial, if any.
+    fn gate(kind: GateKind, allow: &str, parts: &[&[u8]]) -> (Vec<u8>, Option<String>) {
+        let p = Policy::new(Some(vec![allow.into()]), vec![], Arc::default());
+        let mut g = Gate::new(kind, "104.16.1.1:80".parse().unwrap());
+        let mut out = Vec::new();
+        for (i, part) in parts.iter().enumerate() {
+            g.buf.extend_from_slice(part);
+            if let Err(e) = g.advance(&p, i + 1 == parts.len(), Instant::now()) {
+                return (out, Some(e));
+            }
+            out.append(&mut g.out);
+        }
+        (out, None)
+    }
+
+    #[test]
+    fn the_http_gate_checks_every_request_on_a_connection() {
+        let http = GateKind::Http(Framing::Head);
+        let a = b"POST /a HTTP/1.1\r\nHost: a.com\r\nContent-Length: 40\r\n\r\nGET / HTTP/1.1\r\nHost: evil.example\r\n\r\n\r\n".to_vec();
+        let b = b"POST /b HTTP/1.1\r\nHost: a.com\r\nTransfer-Encoding: chunked\r\n\r\n5;x=1\r\nhello\r\n0\r\nT: 1\r\n\r\n".to_vec();
+        let c = b"GET /c HTTP/1.1\r\nHost: a.com\r\n\r\n".to_vec();
+        // A body that looks like a request is body; split anywhere, the stream passes whole.
+        let all = [a.clone(), b.clone(), c.clone()].concat();
+        for cut in [1, 7, 30, 60, 90, 130, all.len() - 1] {
+            assert_eq!(gate(http, "a.com", &[&all[..cut], &all[cut..]]), (all.clone(), None), "cut at {cut}");
+        }
+        // The second request on the connection names another host.
+        let second = b"GET /x HTTP/1.1\r\nHost: evil.example\r\n\r\n";
+        let (out, denial) = gate(http, "a.com", &[&c, second]);
+        assert_eq!((out, denial.as_deref()), (c.clone(), Some("refused http evil.example at 104.16.1.1")));
+        // Pipelined in one segment: the connection is reset before any of it goes.
+        let (out, denial) = gate(http, "a.com", &[&[&c[..], second].concat()]);
+        assert_eq!((out, denial.is_some()), (vec![], true));
+        // A chunk whose data runs past its size.
+        let (_, denial) = gate(http, "a.com", &[b"POST / HTTP/1.1\r\nHost: a.com\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhello\r\n"]);
+        assert_eq!(denial.as_deref(), Some("refused http (bad chunk) at 104.16.1.1"));
+    }
+
+    #[test]
+    fn other_ports_must_speak_tls_or_http_to_an_allowed_name() {
+        let hello = include_bytes!("../testdata/clienthello-curl.bin");
+        assert_eq!(gate(GateKind::Sniff, "registry.npmjs.org", &[&hello[..1], &hello[1..]]), (hello.to_vec(), None));
+        let (_, denial) = gate(GateKind::Sniff, "example.com", &[hello]);
+        assert_eq!(denial.as_deref(), Some("refused tls registry.npmjs.org at 104.16.1.1"));
+        let req = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        assert_eq!(gate(GateKind::Sniff, "example.com", &[b"GE", &req[2..]]), (req.to_vec(), None));
+        let (_, denial) = gate(GateKind::Sniff, "example.com", &[b"SSH-2.0-OpenSSH_9.9\r\n"]);
+        assert_eq!(denial.as_deref(), Some("refused tcp 104.16.1.1:80 (neither TLS nor HTTP)"));
+        let (_, denial) = gate(GateKind::Sniff, "example.com", &[b"EHLO"]);
+        assert!(denial.is_some(), "the guest stopped before it said anything checkable");
     }
 }

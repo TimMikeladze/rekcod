@@ -5,7 +5,7 @@ import { onEngine } from "./engine"
 import { fakeEngine } from "./fixtures"
 import { mergeEngine, mergeLocal, staleBinary, staleMessage, unreachableEngine } from "./merge"
 import { Colors, OTHER, PALETTE, parseStatLine, Ring, splitLines } from "./stats"
-import { inspectArgv, instanceLogsArgv, jobHistoryArgv, logsArgv, releaseArgv, sandboxStatArgv, screenshotArgv } from "./validate"
+import { inspectArgv, instanceLogsArgv, jobHistoryArgv, logsArgv, probePorts, releaseArgv, sandboxStatArgv, screenshotArgv } from "./validate"
 
 const LINE = '{"BlockIO":"0B / 0B","CPUPerc":"1.25%","Container":"abc","ID":"abc","MemPerc":"0.5%","MemUsage":"123.5MiB / 7.753GiB","Name":"web","NetIO":"1.2kB / 3kB","PIDs":"4"}'
 
@@ -105,6 +105,14 @@ describe("read-only routes", () => {
     expect(sandboxStatArgv(base, "mac1")).toHaveProperty("error")
     expect(screenshotArgv(base, "mac1", "/tmp/x.png")).toEqual({ argv: ["sandbox", "screenshot", "mac1", "/tmp/x.png"] })
     expect(screenshotArgv(base, "cp1", "/tmp/x.png")).toHaveProperty("error")
+    // A host's state names the sandbox; the command would run here.
+    expect(screenshotArgv({ ...base, engine: "studio" }, "mac1", "/tmp/x.png")).toHaveProperty("error")
+    const dash = { ...base, sandboxes: base.sandboxes.map((x) => ({ ...x, id: "--open" })) }
+    expect(screenshotArgv(dash, "--open", "/tmp/x.png")).toHaveProperty("error")
+  })
+  it("probes real port numbers only", () => {
+    const ports = [3000, 3000, 0, 70000, 1.5, 8080].map((port) => ({ port, udp: false, container: "web", error: null, sandbox: false, actions: [] }))
+    expect(probePorts({ ...base, ports: [...ports, { ...ports[0], port: 53, udp: true }] })).toEqual([3000, 8080])
   })
   it("builds log argv from the whitelist only", () => {
     expect(logsArgv(base, q({ name: "web", follow: "1", timestamps: "1", since: "10m" }))).toEqual({

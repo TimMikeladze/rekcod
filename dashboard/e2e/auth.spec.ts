@@ -45,6 +45,15 @@ test.describe("signed out", () => {
   })
 })
 
+test("pages may run only this origin's scripts and connect only to it", async ({ request }) => {
+  const csp = (await request.get("/containers")).headers()["content-security-policy"]
+  expect(csp).toContain("script-src 'self' 'unsafe-inline'")
+  expect(csp).toContain("connect-src 'self'")
+  expect(csp).toContain("frame-ancestors 'none'")
+  const auth = (await request.get(`/auth?token=${TOKEN}`)).headers()["content-security-policy"]
+  expect(auth).toMatch(/script-src 'sha256-[A-Za-z0-9+/=]+'/)
+})
+
 test("signed in, the API answers to the header", async ({ request }) => {
   expect((await request.get("/api/state", { headers: { authorization: `Bearer ${TOKEN}` } })).status()).toBe(200)
 })
@@ -69,9 +78,9 @@ test("a token from an earlier launch shows the sign-in page", async ({ page }) =
   await expect(page.getByText("earlier launch")).toBeVisible()
 })
 
-// The audit's S1: cookies ignore ports, so a sign-in cookie on localhost went to every other
-// localhost server, which could replay it.
-test.describe("another localhost port", () => {
+// The audit's S1: cookies ignore ports, so a sign-in cookie went to every other server on the
+// same host, which could replay it.
+test.describe("another port on 127.0.0.1", () => {
   test.use({ storageState: { cookies: [], origins: [] } })
   let other: Server
   const seen: IncomingHttpHeaders[] = []
@@ -90,14 +99,14 @@ test.describe("another localhost port", () => {
     const port = new URL(baseURL!).port
     const otherPort = (other.address() as AddressInfo).port
     // What an earlier build left behind; signing in deletes it.
-    await page.context().addCookies([{ name: `rekcod-dashboard-${port}`, value: TOKEN, domain: "localhost", path: "/", httpOnly: true, sameSite: "Strict" }])
+    await page.context().addCookies([{ name: `rekcod-dashboard-${port}`, value: TOKEN, domain: "127.0.0.1", path: "/", httpOnly: true, sameSite: "Strict" }])
 
-    await page.goto(`http://localhost:${port}/auth?token=${TOKEN}`)
-    await expect(page).toHaveURL(`http://localhost:${port}/`)
+    await page.goto(`http://127.0.0.1:${port}/auth?token=${TOKEN}`)
+    await expect(page).toHaveURL(`http://127.0.0.1:${port}/`)
     await expect(page.getByRole("heading", { level: 1, name: "Overview" })).toBeVisible()
     expect(await page.context().cookies()).toEqual([])
 
-    await page.goto(`http://localhost:${otherPort}/`)
+    await page.goto(`http://127.0.0.1:${otherPort}/`)
     await expect(page).toHaveTitle("other")
     await expect.poll(() => seen.length).toBeGreaterThanOrEqual(2)
     for (const h of seen) {
@@ -105,5 +114,38 @@ test.describe("another localhost port", () => {
       expect(h.authorization).toBeUndefined()
     }
     expect(await page.evaluate(() => localStorage.length)).toBe(0)
+  })
+})
+
+// RD-01: `localhost` resolves to ::1 first, and anyone can listen on [::1] at the dashboard's
+// port. The dashboard's URLs say 127.0.0.1, and `localhost` is sent there.
+test.describe("[::1] at the dashboard's port", () => {
+  test.describe.configure({ mode: "serial" })
+  test.use({ storageState: { cookies: [], origins: [] } })
+
+  test("a localhost URL is sent to 127.0.0.1", async ({ page, baseURL }) => {
+    const port = new URL(baseURL!).port
+    await page.goto(`http://localhost:${port}/auth?token=${TOKEN}`)
+    await expect(page).toHaveURL(`http://127.0.0.1:${port}/`)
+    await expect(page.getByRole("heading", { level: 1, name: "Overview" })).toBeVisible()
+  })
+
+  test("a listener there gets nothing from signing in and using the page", async ({ page, baseURL }) => {
+    const port = Number(new URL(baseURL!).port)
+    const seen: string[] = []
+    const v6 = createServer((req, res) => {
+      seen.push(req.url ?? "")
+      res.end()
+    })
+    await new Promise<void>((ok, fail) => v6.once("error", fail).listen({ port, host: "::1", ipv6Only: true }, ok))
+    try {
+      await page.goto(`http://127.0.0.1:${port}/auth?token=${TOKEN}`)
+      await expect(page.getByRole("heading", { level: 1, name: "Overview" })).toBeVisible()
+      await page.goto(`http://127.0.0.1:${port}/containers`)
+      await expect(page.getByText("live", { exact: true })).toBeVisible()
+      expect(seen).toEqual([])
+    } finally {
+      await new Promise<void>((ok) => v6.close(() => ok()))
+    }
   })
 })

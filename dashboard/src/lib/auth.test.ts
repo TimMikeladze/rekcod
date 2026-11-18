@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { api, authStatus, subscribeAuth, TOKEN_KEY } from "./api"
-import { authorized, expireLegacyCookies, sameSecret, serverToken, TOKEN_ENV } from "./auth"
+import { authorized, expireLegacyCookies, loopbackUrl, sameSecret, serverToken, TOKEN_ENV } from "./auth"
 import { refuse } from "./guard"
 
 const TOKEN = "a".repeat(64)
-const HOST = "localhost:4500"
+const HOST = "127.0.0.1:4500"
 
 function req(headers: Record<string, string>, method = "GET") {
-  return new Request("http://localhost:4500/api/state", { method, headers: { host: HOST, ...headers } })
+  return new Request("http://127.0.0.1:4500/api/state", { method, headers: { host: HOST, ...headers } })
 }
 const signedIn = (h: Record<string, string> = {}, method = "GET") => req({ authorization: `Bearer ${TOKEN}`, ...h }, method)
 
@@ -57,11 +57,19 @@ describe("token", () => {
 describe("refuse", () => {
   it("lets a signed-in same-origin request through", () => {
     expect(refuse(signedIn(), false)).toBeNull()
-    expect(refuse(signedIn({ origin: "http://localhost:4500", "sec-fetch-site": "same-origin", "x-rekcod": "1" }, "POST"), true)).toBeNull()
+    expect(refuse(signedIn({ origin: "http://127.0.0.1:4500", "sec-fetch-site": "same-origin", "x-rekcod": "1" }, "POST"), true)).toBeNull()
   })
   it("checks Host before anything, so a rebinding page gets 403 even with the token", () => {
     expect(refuse(signedIn({ host: "evil.example:4500" }), false)?.status).toBe(403)
     expect(refuse(req({ host: "evil.example" }), false)?.status).toBe(403)
+  })
+  it("answers on 127.0.0.1 only: localhost and [::1] are another listener's to take", () => {
+    expect(refuse(signedIn({ host: "localhost:4500" }), false)?.status).toBe(403)
+    expect(refuse(signedIn({ host: "[::1]:4500" }), false)?.status).toBe(403)
+    expect(loopbackUrl("localhost:4500", "/auth?token=x")).toBe("http://127.0.0.1:4500/auth?token=x")
+    expect(loopbackUrl("localhost", "/")).toBe("http://127.0.0.1/")
+    expect(loopbackUrl("localhost.evil.example:4500", "/")).toBeNull()
+    expect(loopbackUrl("127.0.0.1:4500", "/")).toBeNull()
   })
   it("401s without the header, GETs included, and with the token only in a cookie", () => {
     expect(refuse(req({}), false)?.status).toBe(401)
@@ -69,7 +77,7 @@ describe("refuse", () => {
     expect(refuse(req({ cookie: `rekcod-dashboard-4500=${TOKEN}` }), false)?.status).toBe(401)
   })
   it("refuses other origins, the null origin and other sites", () => {
-    expect(refuse(signedIn({ origin: "http://localhost:3000" }), false)?.status).toBe(403)
+    expect(refuse(signedIn({ origin: "http://127.0.0.1:3000" }), false)?.status).toBe(403)
     expect(refuse(signedIn({ origin: "null" }), false)?.status).toBe(403)
     expect(refuse(signedIn({ origin: "not a url" }), false)?.status).toBe(403)
     expect(refuse(signedIn({ "sec-fetch-site": "same-site" }), false)?.status).toBe(403)

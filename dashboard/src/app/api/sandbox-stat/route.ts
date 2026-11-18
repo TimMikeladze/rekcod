@@ -10,6 +10,6 @@ export async function GET(req: Request) {
   if ("no" in g) return g.no
   const a = sandboxStatArgv(g.s, g.q.get("id"))
   if ("error" in a) return bad(a.error)
-  const text = FIXTURE ? FAKE_DIFF_STAT : await run(onEngine(a.argv), { timeout: 30_000 }).then((r) => (r.code ? r.stderr || `exit ${r.code}` : r.stdout))
+  const text = FIXTURE ? FAKE_DIFF_STAT : await run(onEngine(a.argv, g.engine), { timeout: 30_000 }).then((r) => (r.code ? r.stderr || `exit ${r.code}` : r.stdout))
   return new Response(text, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } })
 }

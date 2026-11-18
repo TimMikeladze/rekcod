@@ -27,7 +27,8 @@ export function SandboxDetail({ id }: { id: string }) {
     }
   }, [id, s?.copy])
 
-  const screenshots = !!s?.macos && !!s.running
+  // `rekcod sandbox screenshot` reads this Mac's sandboxes only.
+  const screenshots = !!s?.macos && !!s.running && !state?.engine
   useEffect(() => {
     if (!screenshots) return
     let stop = false

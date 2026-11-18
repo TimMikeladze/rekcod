@@ -1,20 +1,24 @@
+import { createHash } from "node:crypto"
 import { NextResponse, type NextRequest } from "next/server"
 import { TOKEN_KEY } from "@/lib/api"
-import { authorized, expireLegacyCookies, LOCAL_HOST, sameSecret, serverToken } from "@/lib/auth"
+import { authorized, expireLegacyCookies, LOCAL_HOST, loopbackUrl, sameSecret, serverToken } from "@/lib/auth"
 
 // Every API route needs `Authorization: Bearer <token>` (lib/auth.ts); `/auth?token=` puts the
 // token where the page's `api()` finds it. Pages are public: they're shells that fetch
 // everything they show from the API.
 export function proxy(req: NextRequest) {
   const host = req.headers.get("host") ?? ""
-  if (!LOCAL_HOST.test(host)) return new Response("dashboard answers on localhost only", { status: 403 })
+  const moved = loopbackUrl(host, req.nextUrl.pathname + req.nextUrl.search)
+  // Next turns a Location on another loopback name into a relative one, so this is a page.
+  if (moved) return page(200, movedPage(moved), [])
+  if (!LOCAL_HOST.test(host)) return new Response("dashboard answers on 127.0.0.1 only", { status: 403 })
   const expire = expireLegacyCookies(req.headers.get("cookie"))
   const { pathname, searchParams } = req.nextUrl
   if (pathname === "/auth") {
     const token = serverToken()
     const given = searchParams.get("token")
     if (!token || !given || !sameSecret(given, token)) return signIn(token ? "That link's token is wrong or from an earlier launch." : "This server was started without a token.", expire)
-    return page(200, AUTH_PAGE, expire)
+    return page(200, AUTH_PAGE, expire, AUTH_SCRIPT)
   }
   if (pathname.startsWith("/api/") && !authorized(req)) return new Response("not signed in; open the dashboard with `rekcod dashboard`", { status: 401 })
   const res = NextResponse.next()
@@ -24,10 +28,19 @@ export function proxy(req: NextRequest) {
 
 // Reads the token from its own URL (checked above), so the HTML doesn't echo it, then
 // replaces the history entry so the token isn't left in the address bar or Back.
+const AUTH_SCRIPT = `try{localStorage.setItem(${JSON.stringify(TOKEN_KEY)},new URLSearchParams(location.search).get("token"));location.replace("/")}catch(e){document.body.textContent="This browser didn't let the dashboard keep its sign-in in localStorage: "+e}`
 const AUTH_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Signing in · rekcod</title></head><body>
 <noscript>The dashboard needs JavaScript.</noscript>
-<script>try{localStorage.setItem(${JSON.stringify(TOKEN_KEY)},new URLSearchParams(location.search).get("token"));location.replace("/")}catch(e){document.body.textContent="This browser didn't let the dashboard keep its sign-in in localStorage: "+e}</script>
+<script>${AUTH_SCRIPT}</script>
 </body></html>`
+
+const attr = (s: string) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+
+function movedPage(url: string) {
+  const u = attr(new URL(url).href)
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=${u}"><title>rekcod</title></head>
+<body><p>The dashboard is at <a href="${u}">127.0.0.1</a>, not localhost.</p></body></html>`
+}
 
 function signIn(why: string, expire: string[]) {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · rekcod</title>
@@ -37,13 +50,15 @@ function signIn(why: string, expire: string[]) {
 }
 
 // referrer-policy keeps the /auth URL, token included, out of any request the page makes.
-function page(status: number, html: string, expire: string[]) {
+// These pages are fixed strings: the one script they may run is named by its hash.
+function page(status: number, html: string, expire: string[], script?: string) {
+  const scriptSrc = script ? `'sha256-${createHash("sha256").update(script).digest("base64")}'` : "'none'"
   const headers = new Headers({
     "content-type": "text/html; charset=utf-8",
     "cache-control": "no-store",
     "referrer-policy": "no-referrer",
     "x-frame-options": "DENY",
-    "content-security-policy": "frame-ancestors 'none'",
+    "content-security-policy": `default-src 'none'; script-src ${scriptSrc}; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
   })
   for (const c of expire) headers.append("set-cookie", c)
   return new Response(html, { status, headers })

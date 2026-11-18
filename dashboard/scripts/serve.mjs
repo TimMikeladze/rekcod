@@ -17,7 +17,7 @@ const free = (port) =>
 let port = Number(process.env.PORT) || 4500
 while (!(await free(port))) port++
 const token = process.env.REKCOD_DASHBOARD_TOKEN || randomBytes(32).toString("hex")
-console.log(`rekcod dashboard: http://localhost:${port}/auth?token=${token}`)
+console.log(`rekcod dashboard: http://127.0.0.1:${port}/auth?token=${token}`)
 const env = { ...process.env, REKCOD_DASHBOARD_TOKEN: token }
 const child = spawn("next", [mode, "-H", HOST, "-p", String(port)], { stdio: "inherit", shell: false, env })
 child.on("exit", (code) => process.exit(code ?? 0))

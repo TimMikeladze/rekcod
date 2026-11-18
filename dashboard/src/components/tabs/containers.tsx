@@ -120,7 +120,7 @@ export function Containers({ q }: { q: string }) {
                   </TableCell>
                 </TableRow>
               )}
-              {!shut && g.rows.map((c) => <Row key={c.id} c={c} s={stats[c.name]} selected={sel.has(c.id)} onTick={tick} />)}
+              {!shut && g.rows.map((c) => <Row key={c.id} c={c} s={stats[c.name]} selected={sel.has(c.id)} onTick={tick} engine={state?.engine} />)}
             </TableBody>
           )
         })}
@@ -131,7 +131,20 @@ export function Containers({ q }: { q: string }) {
 }
 
 /** One container. Memoised: shared state keeps `c` and `s` the same object while nothing in them changed. */
-const Row = memo(function Row({ c, s, selected, onTick }: { c: Container; s?: Stat; selected: boolean; onTick: (id: string) => void }) {
+const Row = memo(function Row({
+  c,
+  s,
+  selected,
+  onTick,
+  engine,
+}: {
+  c: Container
+  s?: Stat
+  selected: boolean
+  onTick: (id: string) => void
+  /** Set for another Mac's engine, whose ports aren't this Mac's localhost. */
+  engine?: string
+}) {
   const router = useRouter()
   return (
     <NavRow onOpen={() => router.push(`/containers/${encodeURIComponent(c.name)}`)} label={`${c.name}, ${c.state}`} watch={c.state} selected={selected}>
@@ -157,18 +170,24 @@ const Row = memo(function Row({ c, s, selected, onTick }: { c: Container; s?: St
       </TableCell>
       <TableCell className="hidden sm:table-cell">
         <div className="flex flex-wrap gap-1">
-          {c.ports.map((p) => (
-            <a
-              key={p}
-              href={`http://localhost:${p}`}
-              target="_blank"
-              rel="noreferrer"
-              onClick={(e) => e.stopPropagation()}
-              className="font-mono text-xs underline-offset-2 hover:underline"
-            >
-              :{p}
-            </a>
-          ))}
+          {c.ports.map((p) =>
+            engine ? (
+              <Mono key={p} className="text-xs">
+                :{p}
+              </Mono>
+            ) : (
+              <a
+                key={p}
+                href={`http://localhost:${p}`}
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => e.stopPropagation()}
+                className="font-mono text-xs underline-offset-2 hover:underline"
+              >
+                :{p}
+              </a>
+            ),
+          )}
         </div>
       </TableCell>
       <TableCell className="text-right tabular-nums">

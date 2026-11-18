@@ -1,9 +1,12 @@
 import { request } from "node:http"
 import { FIXTURE } from "@/lib/rekcod"
 import { once } from "@/lib/server/bus"
+import { engine } from "@/lib/server/engine"
 import { guarded } from "@/lib/server/readonly"
+import { probePorts } from "@/lib/server/validate"
 
-// What answers on each forwarded TCP port: a 1 s HEAD to localhost, cached 10 s.
+// What answers on each forwarded TCP port: a 1 s HEAD to 127.0.0.1, cached 10 s. Only this
+// Mac's engine: a host's ports are forwarded on that Mac.
 type Probe = { status: number | null; note: string }
 const cache = once("probe", () => new Map<number, { at: number; p: Probe }>())
 
@@ -26,7 +29,8 @@ function head(port: number): Promise<Probe> {
 export async function GET(req: Request) {
   const g = await guarded(req)
   if ("no" in g) return g.no
-  const ports = g.s.ports.filter((p) => !p.udp && !p.error).map((p) => p.port)
+  if (g.s.engine || engine() !== "local") return Response.json({})
+  const ports = probePorts(g.s)
   if (FIXTURE) return Response.json(Object.fromEntries(ports.map((p) => [p, p === 3000 ? { status: 200, note: "HTTP 200" } : { status: null, note: "not HTTP" }])))
   const now = Date.now()
   const out = await Promise.all(

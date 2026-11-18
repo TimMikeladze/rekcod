@@ -745,6 +745,7 @@ pub fn engine_state(name: &str) -> Result<serde_json::Value> {
         o.remove(*k);
     }
     o.remove("local");
+    crate::state::check_remote(&mut v, name);
     rewrite(&mut v, name);
     v["engine"] = name.into();
     Ok(v)

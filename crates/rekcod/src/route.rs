@@ -50,7 +50,12 @@ pub fn docker_args(args: &[String]) -> Option<&[String]> {
         "docker" => Some(&args[1..]),
         _ if OWN.contains(&first) => None,
         "start" | "stop" => (!only_vm_flags(&args[1..])).then_some(args),
-        "import" => (!args[1..].iter().any(|a| a == "--from" || a.starts_with("--from="))).then_some(args),
+        // Bare, or only asking for help: rekcod's import, not a VM boot for docker's usage.
+        "import" => {
+            let rest = &args[1..];
+            let ours = rest.iter().any(|a| a == "--from" || a.starts_with("--from=")) || rest.iter().all(|a| a == "-h" || a == "--help");
+            (!ours).then_some(args)
+        }
         _ => Some(args),
     }
 }
@@ -101,6 +106,9 @@ mod tests {
             "--version",
             "import --from orbstack",
             "import --from=x redis:7",
+            "import --help",
+            "import -h",
+            "import",
             "snap save",
             "storage up",
             "x npm run dev",

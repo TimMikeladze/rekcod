@@ -408,16 +408,18 @@ fn quota_value(s: &str) -> Result<i64, String> {
     }
 }
 
-/// `30m`, `2h`, `90s`, `0` (never).
+/// `30m`, `2h`, `90s`, `30d`, `0` (never).
 fn duration_secs(s: &str) -> Result<u64, String> {
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = n.parse().map_err(|_| format!("bad duration {s}"))?;
-    match unit {
-        "" | "s" => Ok(n),
-        "m" => Ok(n * 60),
-        "h" => Ok(n * 3600),
-        _ => Err(format!("bad duration {s} (use s, m or h)")),
-    }
+    let scale = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err(format!("bad duration {s} (use s, m, h or d)")),
+    };
+    n.checked_mul(scale).ok_or_else(|| format!("bad duration {s} (too large)"))
 }
 
 #[derive(Subcommand)]
@@ -500,7 +502,8 @@ enum SandboxCmd {
     /// Write the workspace's changes into the real project.
     Apply {
         id: String,
-        /// Only print what would change; exit 1 if anything would.
+        /// Only print what would change: exit 0 if nothing would, 1 if anything would, 2 on
+        /// an error.
         #[arg(long)]
         check: bool,
         /// Write the copy the last `diff` showed, not the workspace as it is now.
@@ -1961,7 +1964,14 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         }
         SandboxCmd::Diff { id, stat } => sandbox::diff(paths, &id, stat),
         SandboxCmd::Apply { id, check, reviewed } => {
-            let ch = sandbox::apply(paths, &id, check, reviewed)?;
+            let ch = match sandbox::apply(paths, &id, check, reviewed) {
+                // 1 means "there are changes": a failure can't say the same.
+                Err(e) if check => {
+                    eprintln!("rekcod: {e:#}");
+                    std::process::exit(2);
+                }
+                r => r?,
+            };
             sandbox::print_changes(&ch);
             if check && !ch.is_empty() {
                 std::process::exit(1);
@@ -2028,6 +2038,16 @@ mod tests {
         // The node's 64 KiB window moved past the start of what was shown.
         assert_eq!(super::new_output("xxhello\n", "hello\nworld\n"), "world\n");
         assert_eq!(super::new_output("gone", "fresh\n"), "fresh\n");
+    }
+
+    #[test]
+    fn durations() {
+        use super::duration_secs;
+        assert_eq!(duration_secs("30d"), Ok(2_592_000));
+        assert_eq!(duration_secs("12h"), Ok(43_200));
+        assert_eq!(duration_secs("0"), Ok(0));
+        assert!(duration_secs("99999999999999999h").is_err());
+        assert!(duration_secs("3w").is_err());
     }
 
     #[test]

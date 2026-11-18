@@ -847,6 +847,34 @@ fn push_dir(url: &str, dir: &Path, tmp: &Path) -> Result<()> {
     crate::s3::url_put(url, crate::s3::Body::File(tmp))
 }
 
+/// SHA-256 over every regular file under `dir` (relative path and contents, in path order),
+/// so two trees with the same files match whatever their modification times.
+fn dir_digest(dir: &Path) -> Result<String> {
+    use sha2::Digest;
+    fn walk(base: &Path, d: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for e in std::fs::read_dir(d)? {
+            let e = e?;
+            let t = e.file_type()?;
+            if t.is_dir() {
+                walk(base, &e.path(), out)?;
+            } else if t.is_file() {
+                out.push(e.path().strip_prefix(base).map(Path::to_path_buf).unwrap_or_default());
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files)?;
+    files.sort();
+    let mut h = sha2::Sha256::new();
+    for f in files {
+        h.update(f.to_string_lossy().as_bytes());
+        h.update([0]);
+        h.update(sha256_file(&dir.join(&f))?.as_bytes());
+    }
+    Ok(hex(&h.finalize()))
+}
+
 /// The reverse of `push_dir`.
 fn pull_dir(url: &str, dir: &Path, tmp: &Path) -> Result<()> {
     crate::s3::url_get(url, &mut std::fs::File::create(tmp)?)?;
@@ -891,7 +919,9 @@ fn build_image(paths: &Paths, sb: &str, image: &str, dir: &Path, st: Option<&Rel
                 }
                 bail!("build failed: {}", tail(&out.stderr));
             }
-            if let Err(e) = push_dir(put, &to, &tmp) {
+            // A build that added nothing leaves the stored cache as it is.
+            let unchanged = had && dir_digest(&from).ok().is_some_and(|f| dir_digest(&to).ok() == Some(f));
+            if !unchanged && let Err(e) = push_dir(put, &to, &tmp) {
                 eprintln!("rekcod: build cache for {}: {e:#}", st.name);
             }
             Ok(None)
@@ -9527,6 +9557,21 @@ mod tests {
         let st: ReleaseStore = serde_json::from_value(release_store(&c, "web", &sha)).unwrap();
         assert!(st.cached && st.image_put.is_none() && st.toml_put.is_none() && st.cache_put.is_none());
         assert_eq!((st.image_sha256.as_deref(), st.toml_sha256.as_deref()), (Some("11"), Some("22")));
+    }
+
+    #[test]
+    fn cache_trees_match_by_content_not_time() {
+        let dir = std::env::temp_dir().join(format!("rekcod-dir-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for side in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(side).join("blobs/sha256")).unwrap();
+            std::fs::write(dir.join(side).join("index.json"), b"{}").unwrap();
+            std::fs::write(dir.join(side).join("blobs/sha256/x"), b"layer").unwrap();
+        }
+        assert_eq!(dir_digest(&dir.join("a")).unwrap(), dir_digest(&dir.join("b")).unwrap());
+        std::fs::write(dir.join("b").join("blobs/sha256/y"), b"new layer").unwrap();
+        assert_ne!(dir_digest(&dir.join("a")).unwrap(), dir_digest(&dir.join("b")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

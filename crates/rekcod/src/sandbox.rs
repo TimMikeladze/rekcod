@@ -263,29 +263,9 @@ impl Sandbox {
             }
             return Ok(());
         }
-        let m = &self.meta;
-        check_capacity(main, m.memory_gib)?;
+        check_capacity(main, self.meta.memory_gib)?;
         self.touch();
-        let allow = match (&m.allow, m.offline) {
-            (_, true) => Some(String::new()),
-            (Some(a), _) => Some(a.join(",")),
-            (None, _) => None,
-        };
-        let opts = crate::cli::BootOptions {
-            cpus: Some(m.cpus),
-            memory_gib: Some(m.memory_gib),
-            base_memory_gib: None,
-            disk_gib: DISK_GIB,
-            project: Some(m.project.clone()),
-            guest_dir: Some(main.guest_dir()?),
-            workspace: (m.mode == "copy").then(|| self.ws()),
-            allow,
-            reach: m.reach.clone(),
-            idle_ttl: (m.ttl_secs > 0).then_some(m.ttl_secs),
-            repair: false,
-            ..Default::default()
-        };
-        crate::cli::boot(&self.paths, &opts)?;
+        crate::cli::boot(&self.paths, &self.boot_options(main.guest_dir()?))?;
         // A restarted or forked VM: the workspace container comes back by its restart policy,
         // but a fork's copy may have been cloned while paused.
         let _ = self.docker()?.args(["unpause", WS]).stderr(Stdio::null()).stdout(Stdio::null()).status();
@@ -362,6 +342,33 @@ impl Sandbox {
         }
         a.extend([m.image.clone(), "sh".into(), "-c".into(), "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done".into()]);
         a
+    }
+
+    /// How the sandbox's VM boots. Its workspace container runs `--network host`, so the
+    /// ports it listens on are forwarded to the Mac's loopback (the daemon allows only
+    /// 127.0.0.1 and ::1); an offline sandbox has nothing to forward.
+    fn boot_options(&self, guest_dir: PathBuf) -> crate::cli::BootOptions {
+        let m = &self.meta;
+        let allow = match (&m.allow, m.offline) {
+            (_, true) => Some(String::new()),
+            (Some(a), _) => Some(a.join(",")),
+            (None, _) => None,
+        };
+        crate::cli::BootOptions {
+            cpus: Some(m.cpus),
+            memory_gib: Some(m.memory_gib),
+            base_memory_gib: None,
+            disk_gib: DISK_GIB,
+            project: Some(m.project.clone()),
+            guest_dir: Some(guest_dir),
+            workspace: (m.mode == "copy").then(|| self.ws()),
+            allow,
+            reach: m.reach.clone(),
+            idle_ttl: (m.ttl_secs > 0).then_some(m.ttl_secs),
+            repair: false,
+            publish: m.offline.then(Vec::new),
+            no_autoports: m.offline,
+        }
     }
 
     fn paused_marker(&self) -> PathBuf {
@@ -2432,6 +2439,16 @@ mod tests {
         assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('M', "l")]);
         assert_eq!(std::fs::read_link(project.join("l")).unwrap(), Path::new("g"));
         assert!(project.join(".rekcod-123-0-f").exists());
+    }
+
+    #[test]
+    fn offline_sandboxes_forward_nothing() {
+        let (paths, project, m, _) = setup("fwd", &[("f", "x")]);
+        let o = find(&paths, &m.id).unwrap().boot_options(PathBuf::from("/g"));
+        assert_eq!((o.publish, o.no_autoports), (None, false));
+        let off = fake(&paths, &project, |m| m.offline = true);
+        let o = find(&paths, &off.id).unwrap().boot_options(PathBuf::from("/g"));
+        assert_eq!((o.publish, o.no_autoports, o.allow.as_deref()), (Some(vec![]), true, Some("")));
     }
 
     #[test]

@@ -102,6 +102,16 @@ fn recorded(paths: &Paths) -> Option<(i32, u16, String)> {
     Some((v["pid"].as_i64()? as i32, v["port"].as_u64()? as u16, v["token"].as_str()?.to_string()))
 }
 
+/// The port of a dashboard that runs from `home` or a home above it (a sandbox VM's home is
+/// inside the main one). The VM daemons keep their port forwards off it: a forward on `[::1]`
+/// there would get whatever a browser sends to `localhost` at that port.
+pub fn serving_port(home: &Path) -> Option<u16> {
+    home.ancestors().take(4).find_map(|h| {
+        let (pid, port, _) = recorded(&Paths { home: h.to_path_buf() })?;
+        (unsafe { libc::kill(pid, 0) } == 0).then_some(port)
+    })
+}
+
 /// The sign-in URL of a dashboard started earlier that still answers.
 fn running(paths: &Paths) -> Option<String> {
     let (pid, port, token) = recorded(paths)?;
@@ -231,6 +241,18 @@ mod tests {
         assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(recorded(&paths), Some((42, 4501, "ab12".to_string())));
         assert_eq!(auth_url(4501, "ab12"), "http://127.0.0.1:4501/auth?token=ab12");
+        std::fs::remove_dir_all(&paths.home).unwrap();
+    }
+
+    #[test]
+    fn the_running_dashboards_port_is_found_from_a_sandbox_home() {
+        let paths = home("serving");
+        assert_eq!(serving_port(&paths.home), None);
+        record(&paths, std::process::id(), 4512, "ab12").unwrap();
+        assert_eq!(serving_port(&paths.home.join("sandboxes/k3j9x2ab")), Some(4512));
+        // A pid that's gone: the file is left over from a dashboard that crashed.
+        record(&paths, i32::MAX as u32, 4512, "ab12").unwrap();
+        assert_eq!(serving_port(&paths.home), None);
         std::fs::remove_dir_all(&paths.home).unwrap();
     }
 

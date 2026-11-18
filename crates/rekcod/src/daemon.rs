@@ -1036,6 +1036,7 @@ fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
         let mut active = status.forwards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // Ports our listeners hold now, including ones closed below (abort is asynchronous).
         let ours: BTreeSet<u16> = active.iter().filter(|(_, f)| f.task.is_some()).map(|(b, _)| b.port).collect();
+        let dashboard = crate::dashboard::serving_port(&status.paths.home);
         active.retain(|binding, fwd| {
             let keep = want.get(binding) == Some(&fwd.container) && (fwd.task.is_some() || !retry_failed);
             if !keep {
@@ -1052,7 +1053,7 @@ fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
                 continue;
             }
             changed = true;
-            let fwd = match listen(binding, !ours.contains(&binding.port)) {
+            let fwd = match listen(binding, !ours.contains(&binding.port), dashboard) {
                 Ok(listener) => {
                     log!("port {}:{}/{:?} -> {container}", binding.addr, binding.port, binding.proto);
                     let task = match listener {
@@ -1088,9 +1089,14 @@ enum Listener {
 }
 
 /// `probe`: refuse if something already answers on the port. Off when one of our own
-/// listeners has (or just had) the port, since it would answer the probe itself.
-fn listen(b: Binding, probe: bool) -> std::io::Result<Listener> {
+/// listeners has (or just had) the port, since it would answer the probe itself. `dashboard`:
+/// the dashboard's port, refused on any address (it listens on 127.0.0.1 only, so a probe of
+/// `[::1]` finds nothing there).
+fn listen(b: Binding, probe: bool, dashboard: Option<u16>) -> std::io::Result<Listener> {
     use socket2::{Domain, Socket, Type};
+    if dashboard == Some(b.port) {
+        return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "the rekcod dashboard's port"));
+    }
     let addr = SocketAddr::new(b.addr, b.port);
     let kind = if b.proto == Proto::Udp { Type::DGRAM } else { Type::STREAM };
     let socket = Socket::new(Domain::for_address(addr), kind, None)?;
@@ -1488,11 +1494,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_wildcard_forward_leaves_a_port_127_0_0_1_answers_on() {
+    async fn forwards_leave_the_dashboards_port_alone() {
         let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = held.local_addr().unwrap().port();
         let any = Binding { proto: Proto::Tcp, addr: std::net::Ipv6Addr::UNSPECIFIED.into(), port };
-        assert_eq!(listen(any, true).err().map(|e| e.kind()), Some(std::io::ErrorKind::AddrInUse));
+        assert_eq!(listen(any, true, None).err().map(|e| e.kind()), Some(std::io::ErrorKind::AddrInUse));
+        // The dashboard holds 127.0.0.1 only; [::1] at its port is refused too.
+        let v6 = Binding { proto: Proto::Tcp, addr: std::net::Ipv6Addr::LOCALHOST.into(), port };
+        assert_eq!(listen(v6, true, Some(port)).err().map(|e| e.kind()), Some(std::io::ErrorKind::AddrInUse));
+        drop(held);
+        assert!(listen(v6, true, None).is_ok(), "any other [::1] port is fine");
     }
 
     #[test]

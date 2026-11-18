@@ -267,6 +267,20 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
         if open.is_empty() { "home, run/, logs/ and vm/ 700, VM disks 600".into() } else { open.join(", ") },
         "sudo chown -R \"$(whoami)\" ~/.rekcod, then any rekcod command sets the modes again",
     );
+    let certs = crate::fleet::cert_expiries(paths);
+    if !certs.is_empty() {
+        let soon = crate::fleet::expiring(&certs, crate::fleet::now());
+        add(
+            "fleet certificates",
+            soon.is_empty(),
+            if soon.is_empty() {
+                format!("{} valid for 90 days or more", certs.iter().map(|c| c.0).collect::<Vec<_>>().join(" and "))
+            } else {
+                soon.join(", ")
+            },
+            "node: check logs/node.log for renewal errors (it renews through its heartbeat); controller: rekcod server restart",
+        );
+    }
     let refused = crate::fleet::refused_cas(paths);
     add(
         "fleet CA pins",

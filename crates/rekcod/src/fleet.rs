@@ -22,7 +22,7 @@ use crate::paths::Paths;
 use crate::sandbox;
 use crate::sandbox_api::respond;
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
@@ -189,6 +189,29 @@ pub fn refused_cas(paths: &Paths) -> Vec<String> {
         out.push("node.json".into());
     }
     out
+}
+
+/// Certificates on this Mac and when they expire, for `rekcod doctor`: the node's (renewed
+/// through its heartbeat) and the controller's (made again at each start).
+pub fn cert_expiries(paths: &Paths) -> Vec<(&'static str, i64)> {
+    let mut out = vec![];
+    let node: Option<NodeConfig> = std::fs::read(paths.home.join("node.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if let Some(t) = node.filter(|n| n.cert.is_some()).and_then(|n| n.cert_expires) {
+        out.push(("node", t));
+    }
+    if let Some(t) = std::fs::read_to_string(paths.home.join("controller/cert-expires")).ok().and_then(|s| s.trim().parse().ok()) {
+        out.push(("controller", t));
+    }
+    out
+}
+
+/// The ones inside `tls::RENEW_WITHIN` of `now`, described.
+pub fn expiring(certs: &[(&str, i64)], now: i64) -> Vec<String> {
+    certs
+        .iter()
+        .filter(|(_, t)| *t < now + crate::tls::RENEW_WITHIN.as_secs() as i64)
+        .map(|(what, t)| format!("{what} certificate expires in {} day(s)", (t - now).div_euclid(86400)))
+        .collect()
 }
 
 pub fn remote(paths: &Paths, name: Option<&str>) -> Result<Remote> {
@@ -1309,7 +1332,8 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             let renew = cert_expires.is_some_and(|t| t < now() + crate::tls::RENEW_WITHIN.as_secs() as i64);
             let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs,
                               "cpus": crate::cli::sysctl_u64("hw.ncpu"), "load": load_average(),
-                              "disk_total_gib": disk_total, "disk_free_gib": disk_free, "renew_cert": renew});
+                              "disk_total_gib": disk_total, "disk_free_gib": disk_free, "renew_cert": renew,
+                              "cert_expires": cert_expires.filter(|t| *t > 0)});
             match call_within(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body, QUICK) {
                 Ok(v) => {
                     if let (Some(c), Some(k), Some(t)) = (v["cert"].as_str(), v["key"].as_str(), v["cert_expires"].as_i64()) {
@@ -1633,6 +1657,9 @@ struct Controller {
     node_ca: Option<crate::tls::Ca>,
     /// Names in the controller's own certificate, never issued to a node.
     own_names: Vec<String>,
+    /// Nodes reporting a certificate inside `tls::RENEW_WITHIN`: when one was handed to them,
+    /// and when that was last alerted.
+    cert_renewals: Mutex<HashMap<String, (i64, i64)>>,
 }
 
 struct Caller {
@@ -1734,7 +1761,31 @@ impl Controller {
             ca_pem: None,
             node_ca: None,
             own_names: vec![],
+            cert_renewals: Default::default(),
         }
+    }
+
+    /// An alert for node `id`, whose heartbeat reports its certificate expiring at `expires`:
+    /// inside `tls::RENEW_WITHIN` with nothing issued on this heartbeat, or still the old one
+    /// after a new one was handed over on an earlier heartbeat. At most once a day per node.
+    fn node_cert_alert(&self, id: &str, expires: Option<i64>, issued: bool) -> Option<String> {
+        let mut m = self.cert_renewals.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(t) = expires.filter(|t| *t < now() + crate::tls::RENEW_WITHIN.as_secs() as i64) else {
+            m.remove(id);
+            return None;
+        };
+        let (handed, alerted) = m.entry(id.to_string()).or_insert((0, 0));
+        let stuck = *handed > 0;
+        if issued && !stuck {
+            *handed = now();
+            return None;
+        }
+        if *alerted > now() - 86400 {
+            return None;
+        }
+        *alerted = now();
+        let left = (t - now()).div_euclid(86400);
+        Some(format!("node {id}: its certificate expires in {left} day(s) and renewing it hasn't worked; see the node's log"))
     }
 
     /// Posts `{"text": msg}` to `--alert-webhook` (Slack and Discord both take that shape),
@@ -2543,14 +2594,23 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                 let mut reply = json!({"ingress": ingress, "delete": delete});
                 // The node asks once its certificate is near its end (`tls::RENEW_WITHIN`); the
                 // new one names the same node, so the controller's check of it doesn't change.
+                let mut issued = false;
                 if body["renew_cert"] == true
                     && let (Some(ca), true) = (&c.node_ca, url.starts_with("https://"))
                 {
-                    let (cert, key, expires) = ca.issue_until(&[crate::tls::node_name(id)])?;
-                    reply["cert"] = json!(cert);
-                    reply["key"] = json!(key);
-                    reply["cert_expires"] = json!(expires);
-                    eprintln!("rekcod: node {id}: issued a new certificate");
+                    match ca.issue_until(&[crate::tls::node_name(id)]) {
+                        Ok((cert, key, expires)) => {
+                            reply["cert"] = json!(cert);
+                            reply["key"] = json!(key);
+                            reply["cert_expires"] = json!(expires);
+                            issued = true;
+                            eprintln!("rekcod: node {id}: issued a new certificate");
+                        }
+                        Err(e) => eprintln!("rekcod: node {id}: issuing a certificate: {e:#}"),
+                    }
+                }
+                if let Some(msg) = c.node_cert_alert(id, body["cert_expires"].as_i64(), issued) {
+                    c.alert(&msg);
                 }
                 Ok(reply)
             })();
@@ -5513,6 +5573,25 @@ mod job_and_node_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A node inside the renewal window that keeps its old certificate after one was handed
+    /// over raises an alert, once a day; one that takes it doesn't.
+    #[test]
+    fn a_node_that_cant_renew_its_certificate_raises_an_alert() {
+        let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        let (soon, later) = (Some(now() + 40 * 86400), Some(now() + 700 * 86400));
+        assert_eq!(c.node_cert_alert("n-a", later, false), None);
+        assert_eq!(c.node_cert_alert("n-a", soon, true), None, "handed a new one");
+        assert_eq!(c.node_cert_alert("n-a", later, false), None, "and it took it");
+        assert_eq!(c.node_cert_alert("n-b", soon, true), None);
+        let msg = c.node_cert_alert("n-b", soon, true).unwrap();
+        assert!(msg.contains("n-b") && (msg.contains("39 day(s)") || msg.contains("40 day(s)")), "{msg}");
+        assert_eq!(c.node_cert_alert("n-b", soon, true), None, "once a day");
+        assert!(c.node_cert_alert("n-c", soon, false).is_some(), "nothing could be issued");
+        let t = 1_800_000_000;
+        let certs = [("node", t + 30 * 86400), ("controller", t + 700 * 86400)];
+        assert_eq!(expiring(&certs, t), ["node certificate expires in 30 day(s)"]);
+    }
+
     /// A node from before node-named certificates holds one naming its host. The first start
     /// after the upgrade records it, and from then on only it may present one.
     #[test]
@@ -6190,7 +6269,9 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
         eprintln!("rekcod: on Bonjour as {i}: remote URL https://{i}{}", crate::bonjour::SUFFIX);
     }
     let tls = c.ca.as_ref().map(|ca| -> Result<_> {
-        let (cert, key) = ca.issue(&names)?;
+        let (cert, key, expires) = ca.issue_until(&names)?;
+        // For `rekcod doctor`: this certificate lasts until the controller next starts.
+        std::fs::write(dir.join("cert-expires"), expires.to_string())?;
         let fp = ca.fingerprint()?;
         std::fs::write(dir.join("ca-fingerprint"), &fp)?;
         eprintln!("rekcod: controller on https://{} for {}; CA {fp}", o.listen, names.join(", "));

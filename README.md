@@ -419,7 +419,10 @@ The controller makes a CA only when both of its files are missing. With one of a
 missing or unreadable, or a key that doesn't match its certificate, it refuses to start
 and names the file, since a new CA would break every remote, edge and node. Node
 certificates last two years; a node asks the controller for a new one in its heartbeat
-once its certificate has 90 days left. Application buckets need their own backups too.
+once its certificate has 90 days left. `rekcod doctor` flags a node or controller
+certificate with less than 90 days left (the controller makes its own again at each start),
+and the controller posts to `--alert-webhook` once a day while a node's renewal isn't
+working. Application buckets need their own backups too.
 
 ## Run jobs on the server
 

@@ -1,10 +1,17 @@
 name: e2e
 # The VM suites need a Mac that can run VMs, which hosted runners can't. Every job is
 # skipped until the repository variable REKCOD_E2E_RUNNER is "true", so nothing queues
-# while no self-hosted runner is registered. Setup: docs/releasing.md.
+# while no self-hosted runner is registered. The runner is a Mac with the label
+# rekcod-e2e (.github/actionlint.yaml), a logged-in user and the Mac's folders shared into
+# the VM.
 #
-# On a v* tag, release.yml calls this workflow and won't publish if it fails. Run it by
-# hand from the Actions tab (workflow_dispatch) on any branch.
+# Never add pull_request, pull_request_target or push triggers here: the runner must not
+# run code from a PR or an unreviewed branch. Keep "Require approval for all outside
+# collaborators" on in the repository's Actions settings.
+#
+# On a v* tag, release.yml calls this workflow and won't publish if it fails or is skipped
+# (unless REKCOD_RELEASE_WITHOUT_E2E is "true"). bump.yml dispatches it on bump/versions.
+# Run it by hand from the Actions tab (workflow_dispatch) on any branch.
 on:
   workflow_dispatch:
   workflow_call:
@@ -71,6 +78,24 @@ jobs:
       # Controller, nodes and edge in their own homes; leaves the main VM alone.
       - if: success() || failure()
         run: scripts/e2e-fleet.sh
+      # RustFS, a controller with --storage and a node, in their own homes.
+      - if: success() || failure()
+        run: scripts/e2e-storage.sh
+      # e2e.sh stopped the VM; the next two want it up. e2e-lifecycle.sh boots a VM of its
+      # own (~/.rke2l) and copies alpine:3.24 in from the current docker context, which is
+      # this one's.
+      - name: start the e2e VM again
+        if: success() || failure()
+        run: |
+          target/release/rekcod start --no-switch
+          DOCKER_HOST="unix://$REKCOD_HOME/run/docker.sock" docker pull -q alpine:3.24
+      - if: success() || failure()
+        run: scripts/e2e-engines.sh
+      - if: success() || failure()
+        run: DOCKER_HOST="unix://$REKCOD_HOME/run/docker.sock" scripts/e2e-lifecycle.sh
+      # Skips itself without a ready macOS base image (rekcod macos ls).
+      - if: success() || failure()
+        run: scripts/e2e-macos.sh
       - name: stop the e2e VM
         if: always()
         run: |

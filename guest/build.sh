@@ -21,6 +21,9 @@ KERNEL_REPO=${KERNEL_REPO:-$ALPINE_KERNEL_REPO}
 FUSE_PATCH=${FUSE_PATCH:-1}
 WORK=${REKCOD_GUEST_WORK:-/var/tmp/rekcod-guest}
 KCACHE=${REKCOD_KERNEL_CACHE:-$WORK/kernel-cache}
+# Every file in root.img gets this mtime, and mke2fs uses it as "now", so two builds of the
+# same inputs give the same root.img (and VERSION). The kernel's timestamp is fixed below.
+SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH:-946684800}
 
 [ $# -eq 2 ] || { echo "usage: $0 <rekcod-agent> <out dir>" >&2; exit 2; }
 [ "$(id -u)" = 0 ] || { echo "$0: needs root (chroot, mount)" >&2; exit 1; }
@@ -67,7 +70,7 @@ inroot() {
   st=0; chroot "$r" /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
     ALPINE="$ALPINE" DOCKER_VERSION="$DOCKER_VERSION" DOCKER_SHA256="$DOCKER_SHA256" \
     LINUX_VERSION="$LINUX_VERSION" LINUX_SHA256="$LINUX_SHA256" LINUX_VIRT_VERSION="$LINUX_VIRT_VERSION" \
-    KERNEL_REPO="$KERNEL_REPO" FUSE_PATCH="$FUSE_PATCH" \
+    KERNEL_REPO="$KERNEL_REPO" FUSE_PATCH="$FUSE_PATCH" SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" FSUUID="${FSUUID:-}" \
     /bin/sh -euc "$2" || st=$?
   [ "$had_resolv" = 1 ] || rm -f "$r/etc/resolv.conf"
   umount "$r/dev" "$r/proc"
@@ -93,6 +96,9 @@ tar -xzf /tmp/docker.tgz -C /tmp
 cd /tmp/docker
 install -m 0755 dockerd containerd containerd-shim-runc-v2 runc docker-proxy docker-init /usr/local/bin/
 rm -rf /tmp/docker /tmp/docker.tgz
+# What apk installed (name-version, arch, origin, license), for NOTICE and for comparing builds.
+mkdir -p /usr/share/rekcod && apk list --installed | sort >/usr/share/rekcod/packages.txt
+[ -s /usr/share/rekcod/packages.txt ]
 '
 install -m 0755 -o 0 -g 0 "$AGENT" "$R/usr/local/bin/rekcod-agent"
 copyroot "$G/rootfs" "$R"
@@ -136,6 +142,11 @@ rm /tmp/linux.tar.xz
   install -m 0644 -o 0 -g 0 "$G/kernel/rekcod.config" "$T/src/rekcod.config"
   inroot "$T" '
 cd /src
+# Reproducible: no build date, user or host in the image, and the latent_entropy plugin
+# seeded from a constant instead of /dev/urandom. A constant, not SOURCE_DATE_EPOCH: the
+# kernel cache key does not include it.
+export KBUILD_BUILD_TIMESTAMP="Sat Jan  1 00:00:00 UTC 2000" KBUILD_BUILD_USER=rekcod KBUILD_BUILD_HOST=rekcod
+export KBUILD_BUILD_VERSION=1 KCFLAGS=-frandom-seed=rekcod
 if [ "$FUSE_PATCH" = 1 ]; then (cd fs/fuse && patch -p1 < /patch/rekcod-fuse.patch && cp /patch/rekcod.c .); fi
 # Elastic memory driver (crates/rekcod/src/elastic.rs is the host side), built in.
 cp /elastic/rekcod_elastic.c drivers/block/ && echo "obj-y += rekcod_elastic.o" >> drivers/block/Makefile
@@ -197,20 +208,27 @@ log "pack"
 rm -rf "$T/rootfs" "$T/kout" "$T/out"
 mv "$R" "$T/rootfs"
 cp -a "$KOUT" "$T/kout"
+# The root filesystem's UUID and directory hash seed (random by default), from the inputs.
+FSUUID=$(echo "rekcod-root $key $ALPINE_RELEASE $DOCKER_VERSION $(sha256sum "$AGENT" | cut -c1-64)" | sha256sum |
+  sed -E 's/^(.{8})(.{4})(.{4})(.{4})(.{12}).*/\1-\2-\3-\4-\5/')
 inroot "$T" '
 mkdir /out; rm -rf /rootfs/boot/* /rootfs/lib/modules
 # the cache may have come back owned by whoever restored it (CI)
 cp -a /kout/lib/modules /rootfs/lib/ && chown -R 0:0 /rootfs/lib/modules; cp /kout/Image /out/Image
 [ "$(dd if=/out/Image bs=1 skip=56 count=4 2>/dev/null)" = "ARMd" ]
 [ ! -f /kout/initramfs ] || cp /kout/initramfs /out/initramfs
+# The kernel config and the package list ship next to the image (NOTICE points at them).
+cp /kout/config /out/config && cp /rootfs/usr/share/rekcod/packages.txt /out/packages.txt
 # content + 25% + 64 MB: the root only takes logs and /etc writes; docker
 # state is on the data disk. The release tarball compresses the rest away.
 mb=$(( $(du -sm /rootfs | cut -f1) * 5 / 4 + 64 ))
-mke2fs -q -t ext4 -L rekcod-root -d /rootfs /out/root.img "${mb}M"
+find /rootfs -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+E2FSPROGS_FAKE_TIME=$SOURCE_DATE_EPOCH mke2fs -q -t ext4 -L rekcod-root -U "$FSUUID" -E "hash_seed=$FSUUID" \
+  -d /rootfs /out/root.img "${mb}M"
 cat /out/Image $( [ -f /out/initramfs ] && echo /out/initramfs ) /out/root.img | sha256sum | cut -c1-16 > /out/VERSION
 '
 mkdir -p "$OUT"
-rm -f "$OUT/Image" "$OUT/initramfs" "$OUT/root.img" "$OUT/VERSION"
+rm -f "$OUT/Image" "$OUT/initramfs" "$OUT/root.img" "$OUT/VERSION" "$OUT/config" "$OUT/packages.txt"
 cp "$T"/out/* "$OUT/"
 rm -rf "$T/rootfs" "$T/kout" "$T/out"
 log "done: $OUT ($(cat "$OUT/VERSION"))"

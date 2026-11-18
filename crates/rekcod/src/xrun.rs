@@ -1,11 +1,11 @@
-//! `rekcod x <cmd>`: run a command in a container with no Dockerfile
-//! (docs/phase5.md §6-7, plan.md §3b).
+//! `rekcod x <cmd>`: run a command in a container with no Dockerfile (README, "Run project
+//! tools without installing them on your Mac").
 //!
 //! The image comes from the command or the project's version files, the
 //! current directory is mounted at the same path, Linux dependencies live on
 //! VM-local volumes, and listening ports show up on the Mac's localhost
 //! (the daemon's autoports). `--sandbox` runs it in a separate VM that sees
-//! only this directory (docs/sandbox.md).
+//! only this directory (README, "Run project tools without installing them on your Mac").
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -187,7 +187,8 @@ fn runtime_of_tool(tool: &str) -> Option<Runtime> {
     })
 }
 
-/// The runtime a project's files point to, in the order of docs/phase5.md §6.
+/// The runtime a project's files point to: asdf/mise pins first, then each runtime's own
+/// files in this order.
 fn runtime_of_project(p: &Project) -> Option<Runtime> {
     if let Some(r) = tool_versions(p).iter().find_map(|(t, _)| runtime_of_tool(t)) {
         return Some(r);
@@ -311,8 +312,60 @@ pub struct Options {
     pub keep: bool,
 }
 
-/// The `docker run` arguments (everything after `docker`).
-pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, tty: bool) -> Vec<String> {
+/// `.git` entries under a project shared live, keyed by path from the project: kind (`f`,
+/// `d`, `l`), inode and, for a link, its target. Git on the Mac runs what a `.git` names
+/// (hooks, `core.fsmonitor`), from a worktree's or submodule's `.git` file as much as a
+/// directory. The inode catches one swapped for another of the same kind.
+pub type GitEntries = std::collections::BTreeMap<PathBuf, (char, u64, Option<PathBuf>)>;
+
+/// Every `.git` under `project`, under any spelling the Mac's filesystem takes for it, not
+/// entering one or a link. `skip` names directories at the root the container sees as
+/// volumes instead of the Mac's copy.
+pub fn git_entries(project: &Path, skip: &[&str]) -> GitEntries {
+    fn walk(base: &Path, rel: &Path, skip: &[&str], out: &mut GitEntries) {
+        let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
+        for e in rd.flatten() {
+            let (name, r) = (e.file_name(), rel.join(e.file_name()));
+            let Ok(t) = e.file_type() else { continue };
+            if crate::sandbox::is_git(&name) {
+                let kind = if t.is_symlink() {
+                    'l'
+                } else if t.is_dir() {
+                    'd'
+                } else {
+                    'f'
+                };
+                let target = t.is_symlink().then(|| std::fs::read_link(base.join(&r)).ok()).flatten();
+                let ino = std::fs::symlink_metadata(base.join(&r)).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).unwrap_or(0);
+                out.insert(r, (kind, ino, target));
+            } else if t.is_dir() && !(rel.as_os_str().is_empty() && skip.iter().any(|s| name == *s)) {
+                walk(base, &r, skip, out);
+            }
+        }
+    }
+    let mut out = GitEntries::new();
+    walk(project, Path::new(""), skip, &mut out);
+    out
+}
+
+/// `-v` options that share every `.git` file and directory in `git` read-only. A link can't
+/// be bound in its place; a change to one shows in [`new_git_entries`].
+pub fn git_binds(project: &Path, git: &GitEntries) -> Vec<String> {
+    let p = project.to_string_lossy();
+    git.iter()
+        .filter(|(_, (k, ..))| *k != 'l')
+        .flat_map(|(r, _)| ["-v".into(), format!("{p}/{}:{p}/{}:ro", r.display(), r.display())])
+        .collect()
+}
+
+/// `.git` entries in `after` that weren't in `before`, or are another entry or link now.
+pub fn new_git_entries(before: &GitEntries, after: &GitEntries) -> Vec<PathBuf> {
+    after.iter().filter(|(r, v)| before.get(*r) != Some(v)).map(|(r, _)| r.clone()).collect()
+}
+
+/// The `docker run` arguments (everything after `docker`). `git` is the project's `.git`
+/// entries, bound read-only for `--sandbox`.
+pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, tty: bool, git: &GitEntries) -> Vec<String> {
     let p = project.to_string_lossy().to_string();
     let mut a: Vec<String> = vec!["run".into(), "--rm".into(), "-i".into()];
     if tty {
@@ -328,7 +381,7 @@ pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, 
         }
     } else {
         // The VM's network: listeners are on the VM's 127.0.0.1, where the
-        // daemon's port forwarding dials (docs/phase5.md §6).
+        // daemon's port forwarding dials.
         a.extend(["--network".into(), "host".into(), "--label".into(), format!("{AUTOPORTS_LABEL}=1")]);
         if !opts.sandbox {
             a.extend(["--add-host".into(), "host.docker.internal:host-gateway".into()]);
@@ -338,11 +391,9 @@ pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, 
     if opts.sandbox {
         // Raw sockets would skip the sandbox VM's egress rules.
         a.extend(["--cap-drop".into(), "NET_RAW".into(), "--security-opt".into(), "no-new-privileges".into()]);
-        if project.join(".git").is_dir() {
-            // The share is live, and a .git the sandbox could write is code the Mac runs
-            // (hooks, core.fsmonitor) on the next `git status`.
-            a.extend(["-v".into(), format!("{p}/.git:{p}/.git:ro")]);
-        }
+        // The share is live, and a .git the sandbox could write is code the Mac runs
+        // (hooks, core.fsmonitor) on the next `git status`.
+        a.extend(git_binds(project, git));
     }
     for dir in &plan.local_dirs {
         a.extend(["-v".into(), format!("{}:{p}/{dir}", local_volume(project, dir))]);
@@ -393,9 +444,20 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
             bail!("--secret {s}: not set in this shell's environment");
         }
     }
-    let target = if opts.sandbox { sandbox_boot(paths, &project)? } else { main_boot(paths)? };
+    // Held (shared) for as long as this run uses the sandbox VM; see [`only_user`].
+    let mut users = None;
+    let target = if opts.sandbox {
+        let sb = sandbox_paths(paths)?;
+        let lock = users_lock(&sb)?;
+        let sb = sandbox_boot(paths, &project, &lock)?;
+        users = Some(lock);
+        sb
+    } else {
+        main_boot(paths)?
+    };
     let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
-    let args = docker_args(&project, cmd, &plan, &opts, tty);
+    let git = if opts.sandbox { git_entries(&project, &plan.local_dirs) } else { GitEntries::new() };
+    let args = docker_args(&project, cmd, &plan, &opts, tty, &git);
     if std::env::var_os("REKCOD_DEBUG").is_some() {
         eprintln!("rekcod: docker {}", args.join(" "));
     }
@@ -415,8 +477,21 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
         }
     });
     let status = docker.status().context("run docker")?;
-    if !opts.keep {
+    // Another `rekcod x --sandbox` still using the VM keeps it up.
+    if !opts.keep && users.as_ref().is_some_and(only_user) {
         let _ = crate::cli::stop_daemon(&target);
+    }
+    drop(users);
+    let made = new_git_entries(&git, &git_entries(&project, &plan.local_dirs));
+    if !made.is_empty() {
+        // A bind can't cover a .git that didn't exist yet.
+        let list: Vec<String> = made.iter().map(|p| crate::sandbox::printable(&p.to_string_lossy())).collect();
+        eprintln!(
+            "rekcod: the command made or replaced {} in {}; git on this Mac runs what a .git names, so check it before running git there",
+            list.join(", "),
+            project.display()
+        );
+        std::process::exit(status.code().filter(|c| *c != 0).unwrap_or(1));
     }
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -439,17 +514,52 @@ pub fn sandbox_paths(paths: &Paths) -> Result<Paths> {
     Paths::at(paths.home.join("sandbox"))
 }
 
-/// Boots the sandbox VM for `project`, replacing one running for another directory.
-fn sandbox_boot(paths: &Paths, project: &Path) -> Result<Paths> {
+/// A shared `flock` on the sandbox VM's `run/x-users`, held by every `rekcod x --sandbox`
+/// from before it boots the VM until its command ends.
+fn users_lock(sb: &Paths) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = sb.home.join("run/x-users");
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("lock {}", path.display()));
+    }
+    Ok(f)
+}
+
+/// Whether the holder of `lock` is the VM's only user: it trades its shared lock for an
+/// exclusive one, which succeeds only when nobody else holds one. Keeps the lock either way
+/// (exclusive on true, shared again on false).
+fn only_user(lock: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return true;
+    }
+    // A failed conversion may have dropped the shared lock.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH) };
+    false
+}
+
+/// Boots the sandbox VM for `project`, replacing one running for another directory when no
+/// other `rekcod x --sandbox` uses it (`users` is this run's shared lock).
+fn sandbox_boot(paths: &Paths, project: &Path, users: &std::fs::File) -> Result<Paths> {
     let sb = sandbox_paths(paths)?;
     if crate::cli::running_pid(&sb).is_some() {
         let status: serde_json::Value =
             std::fs::read(sb.status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        if status["project"].as_str().map(PathBuf::from).as_deref() == Some(project) {
+        let running = status["project"].as_str().map(PathBuf::from);
+        if running.as_deref() == Some(project) {
             return Ok(sb);
         }
+        if !only_user(users) {
+            bail!(
+                "the sandbox VM is running `rekcod x --sandbox` for {}; one directory at a time, so wait for that to finish",
+                running.map(|p| p.display().to_string()).unwrap_or_else(|| "another directory".into())
+            );
+        }
         eprintln!("rekcod: restarting the sandbox VM for {}", project.display());
-        crate::cli::stop_daemon(&sb)?;
+        let stopped = crate::cli::stop_daemon(&sb);
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(users), libc::LOCK_SH) };
+        stopped?;
     }
     let t0 = Instant::now();
     eprintln!("rekcod: starting a sandbox VM that sees only {}", project.display());
@@ -559,7 +669,7 @@ mod tests {
             secrets: vec!["TOKEN".into()],
             keep: false,
         };
-        let a = docker_args(project, &["pnpm".into(), "dev".into()], &plan, &opts, false).join(" ");
+        let a = docker_args(project, &["pnpm".into(), "dev".into()], &plan, &opts, false, &GitEntries::new()).join(" ");
         assert!(a.contains("--network host --label dev.rekcod.autoports=1"), "{a}");
         assert!(a.contains("-v /Users/me/My App:/Users/me/My App -w /Users/me/My App"), "{a}");
         assert!(a.contains(&format!("-v {}:/Users/me/My App/node_modules", local_volume(project, "node_modules"))), "{a}");
@@ -567,8 +677,66 @@ mod tests {
         assert!(a.ends_with("-- pnpm dev"), "{a}");
 
         let opts = Options { publish: vec!["3000".into()], sandbox: true, ..opts };
-        let a = docker_args(project, &["node".into()], &plan, &opts, false).join(" ");
+        let a = docker_args(project, &["node".into()], &plan, &opts, false, &GitEntries::new()).join(" ");
         assert!(a.contains("-p 127.0.0.1:3000:3000") && !a.contains("host-gateway") && !a.contains("autoports"), "{a}");
+    }
+
+    #[test]
+    fn every_git_entry_is_bound_read_only() {
+        let dir = std::env::temp_dir().join(format!("rekcod-x-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A worktree's `.git` file, a submodule's, a nested repository, one under a dependency
+        // volume (shadowed in the container) and a link.
+        std::fs::create_dir_all(dir.join("sub/vendor/.git")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/pkg/.git")).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        std::fs::create_dir_all(dir.join("linked")).unwrap();
+        std::os::unix::fs::symlink("/elsewhere", dir.join("linked/.git")).unwrap();
+        let git = git_entries(&dir, &["node_modules"]);
+        let keys: Vec<&str> = git.keys().map(|k| k.to_str().unwrap()).collect();
+        assert_eq!(keys, vec![".git", "linked/.git", "sub/.git", "sub/vendor/.git"]);
+        let plan = Plan { image: "alpine".into(), local_dirs: vec!["node_modules"], caches: vec![], corepack: false };
+        let opts = Options {
+            image: None,
+            publish: vec![],
+            env: vec![],
+            no_autoports: false,
+            sandbox: true,
+            offline: false,
+            secrets: vec![],
+            keep: false,
+        };
+        let a = docker_args(&dir, &["sh".into()], &plan, &opts, false, &git).join(" ");
+        let p = dir.display();
+        for r in [".git", "sub/.git", "sub/vendor/.git"] {
+            assert!(a.contains(&format!("-v {p}/{r}:{p}/{r}:ro")), "{r}: {a}");
+        }
+        assert!(!a.contains("linked/.git") && !a.contains("node_modules/pkg"), "{a}");
+        // One the command made, or a link it swapped for a directory, is reported.
+        std::fs::create_dir_all(dir.join("new/.git")).unwrap();
+        std::fs::remove_dir_all(dir.join("sub/vendor/.git")).unwrap();
+        std::fs::write(dir.join("sub/vendor/.git"), "gitdir: /tmp/evil").unwrap();
+        // So is one swapped for another of the same kind.
+        std::fs::remove_file(dir.join("sub/.git")).unwrap();
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let made = new_git_entries(&git, &git_entries(&dir, &["node_modules"]));
+        assert_eq!(made, vec![PathBuf::from("new/.git"), PathBuf::from("sub/.git"), PathBuf::from("sub/vendor/.git")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_vm_stops_only_after_its_last_user() {
+        let dir = std::env::temp_dir().join(format!("rekcod-x-users-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sb = Paths::at(dir.clone()).unwrap();
+        let (a, b) = (users_lock(&sb).unwrap(), users_lock(&sb).unwrap());
+        assert!(!only_user(&a));
+        // A's failed try left it a shared lock: B isn't alone either.
+        assert!(!only_user(&b));
+        drop(b);
+        assert!(only_user(&a));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

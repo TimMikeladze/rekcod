@@ -424,13 +424,26 @@ fn known_hosts(paths: &Paths) -> PathBuf {
     root(paths).join("known_hosts")
 }
 
-fn ssh_base(paths: &Paths, ip: &str) -> Result<Command> {
-    let mut c = Command::new("ssh");
+/// Options ssh and scp share: the guest's host key pinned in [`known_hosts`], our key.
+fn ssh_options(c: &mut Command, paths: &Paths, key: &Path) {
     c.args(["-q", "-o", "StrictHostKeyChecking=accept-new", "-o"])
         .arg(format!("UserKnownHostsFile={}", known_hosts(paths).display()))
         .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-i"])
-        .arg(key(paths)?)
-        .arg(format!("{USER}@{ip}"));
+        .arg(key);
+}
+
+fn ssh_base(paths: &Paths, ip: &str) -> Result<Command> {
+    let mut c = Command::new("ssh");
+    ssh_options(&mut c, paths, &key(paths)?);
+    c.arg(format!("{USER}@{ip}"));
+    Ok(c)
+}
+
+/// `scp -r` with the same host key pinning as ssh; add the paths (`rekcod@IP:path` remote).
+pub fn scp_command(paths: &Paths) -> Result<Command> {
+    let mut c = Command::new("scp");
+    c.arg("-r");
+    ssh_options(&mut c, paths, &key(paths)?);
     Ok(c)
 }
 
@@ -449,7 +462,9 @@ pub fn boot(paths: &Paths, home: &Path, idle_ttl: u64) -> Result<String> {
                 Ok(())
             });
         }
-        cmd.spawn().context("spawn macOS guest")?;
+        let mut child = cmd.spawn().context("spawn macOS guest")?;
+        // Reaped when it exits, so a server that boots guests collects no zombies.
+        std::thread::spawn(move || child.wait());
     }
     let t0 = Instant::now();
     loop {
@@ -490,7 +505,7 @@ pub fn pull_ws(paths: &Paths, ip: &str, ws: &Path) -> Result<()> {
         }
     }
     std::fs::create_dir_all(&fresh)?;
-    let mut ssh = ssh_base(paths, ip)?.arg("tar -C ~/ws --exclude ./.git -cf - .").stdout(Stdio::piped()).spawn()?;
+    let mut ssh = ssh_base(paths, ip)?.arg("tar -C ~/ws --exclude ./.git -cf - .").stdin(Stdio::null()).stdout(Stdio::piped()).spawn()?;
     let out = ssh.stdout.take().context("ssh stdout")?;
     let ok = Command::new("tar").arg("-C").arg(&fresh).args(["-xf", "-"]).stdin(out).status()?.success();
     if !ssh.wait()?.success() || !ok {
@@ -582,7 +597,11 @@ pub fn input_script(action: &[String]) -> Result<String> {
 
 pub fn input(paths: &Paths, ip: &str, action: &[String]) -> Result<()> {
     let script = input_script(action)?;
-    let ok = ssh_base(paths, ip)?.arg(format!("osascript -l JavaScript -e {}", crate::actions::shell_quote(&script))).status()?.success();
+    let ok = ssh_base(paths, ip)?
+        .arg(format!("osascript -l JavaScript -e {}", crate::actions::shell_quote(&script)))
+        .stdin(Stdio::null())
+        .status()?
+        .success();
     if !ok {
         bail!("input failed; the guest needs Accessibility allowed for sshd-keygen-wrapper");
     }
@@ -660,6 +679,20 @@ pub fn run(home: PathBuf, idle_ttl: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scp_pins_host_keys_like_ssh() {
+        let paths = Paths { home: PathBuf::from("/nonexistent/rekcod") };
+        let mut c = Command::new("scp");
+        ssh_options(&mut c, &paths, Path::new("/k"));
+        let a: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let a = a.join(" ");
+        assert!(
+            a.contains("StrictHostKeyChecking=accept-new") && a.contains("UserKnownHostsFile=/nonexistent/rekcod/macos/known_hosts"),
+            "{a}"
+        );
+        assert!(!a.contains("StrictHostKeyChecking=no") && !a.contains("/dev/null"), "{a}");
+    }
 
     #[test]
     fn leases_and_input() {

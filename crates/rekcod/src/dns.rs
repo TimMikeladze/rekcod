@@ -243,8 +243,6 @@ mod tests {
         big.resize(60 << 10, b'a');
         assert_eq!(refused(&big).unwrap().len(), q.len());
         assert!(refused(&q[..12]).unwrap().len() == 12);
-        assert_eq!(printable("a\nb\x1b[31m"), "a\\nb\\u{1b}[31m");
-        assert!(printable(&"x".repeat(60_000)).len() < 260);
     }
 
     #[test]

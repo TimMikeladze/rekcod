@@ -4,7 +4,8 @@ name: bump
 #
 # Needs "Allow GitHub Actions to create and approve pull requests" in the repository's
 # Actions settings. A PR opened with GITHUB_TOKEN doesn't start other workflows, so this
-# dispatches ci.yml on the branch itself; its checks show on the PR's head commit.
+# dispatches ci.yml (and e2e.yml, when REKCOD_E2E_RUNNER is "true") on the branch itself;
+# their checks show on the PR's head commit.
 on:
   schedule:
     - cron: "17 6 * * 1"
@@ -25,23 +26,51 @@ jobs:
       actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # main and bump/versions with history, to see who committed on the branch.
+          fetch-depth: 0
+      # Commits someone pushed to bump/versions (the fuse patch rebased for a new kernel
+      # series, say) are kept: the bump goes on top of them and the push isn't forced.
+      # Otherwise the branch starts over from main.
+      - name: pick the base
+        id: base
+        run: |
+          base=main
+          if git rev-parse -q --verify origin/bump/versions >/dev/null; then
+            others=$(git log --format=%ae origin/main..origin/bump/versions | grep -cvx '41898282+github-actions\[bot\]@users.noreply.github.com' || true)
+            if [ "$others" -gt 0 ]; then
+              base=bump/versions
+              git switch -C bump/versions origin/bump/versions
+            fi
+          fi
+          echo "base=$base" >> "$GITHUB_OUTPUT"
+          echo "bump on $base"
       - name: bump
         env:
+          # GitHub API rate limit; the script never sends it past a redirect.
           GITHUB_TOKEN: ${{ github.token }}
         run: python3 scripts/bump-versions.py --summary "$RUNNER_TEMP/body.md"
       - name: open or update the PR
         env:
           GH_TOKEN: ${{ github.token }}
+          BASE: ${{ steps.base.outputs.base }}
+          E2E: ${{ vars.REKCOD_E2E_RUNNER }}
         run: |
           if git diff --quiet; then echo "nothing to update"; exit 0; fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git switch -C bump/versions
-          git commit -qam "chore: bump pinned guest and CLI versions"
-          git push --force origin bump/versions
+          if [ "$BASE" = main ]; then
+            git switch -C bump/versions
+            git commit -qam "chore: bump pinned guest and CLI versions"
+            git push --force origin bump/versions
+          else
+            git commit -qam "chore: bump pinned guest and CLI versions"
+            git push origin bump/versions
+          fi
           if gh pr view bump/versions --json state -q .state 2>/dev/null | grep -q OPEN; then
             gh pr edit bump/versions --body-file "$RUNNER_TEMP/body.md"
           else
             gh pr create --head bump/versions --title "chore: bump pinned guest and CLI versions" --body-file "$RUNNER_TEMP/body.md"
           fi
           gh workflow run ci.yml --ref bump/versions
+          if [ "$E2E" = true ]; then gh workflow run e2e.yml --ref bump/versions; fi

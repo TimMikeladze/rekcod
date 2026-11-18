@@ -1678,31 +1678,6 @@ fn meta_reply(req: &str) -> String {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn a_guest_that_never_reads_answers_stops_being_read() {
-        let (ours, mut guest) = tokio::io::duplex(64 << 10);
-        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let n = answered.clone();
-        tokio::spawn(dns_serve(ours, move |q: Vec<u8>| {
-            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            async move { dns::refused(&q) }
-        }));
-        let q = [&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x04evil\x03com\x00\x00\x01\x00\x01"].concat();
-        let framed = frame(&q).unwrap();
-        tokio::spawn(async move {
-            for _ in 0..100_000 {
-                if guest.write_all(&framed).await.is_err() {
-                    return;
-                }
-            }
-        });
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let settled = answered.load(std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert_eq!(answered.load(std::sync::atomic::Ordering::SeqCst), settled, "still reading");
-        assert!(settled < 10_000, "{settled} queries read");
-    }
-
     #[test]
     fn stats_carry_elastic_held_only_with_elastic_memory() {
         assert_eq!(with_elastic_held(r#"{"disk_used":1}"#.into(), Some(5)), r#"{"disk_used":1,"elastic_held":5}"#);

@@ -27,7 +27,7 @@ echo 1 >/proc/sys/net/ipv4/ip_forward
 
 # Network. Main VM: VZ NAT, and udhcpc's default script writes the address, route and
 # resolv.conf. Sandbox VMs get rekcod.net=IP/PREFIX,GW: eth0 is a socket the rekcod daemon
-# serves and filters (docs/sandbox-network.md), configured statically. Offline sandboxes
+# serves and filters (crates/rekcod/src/netstack.rs), configured statically. Offline sandboxes
 # have no eth0.
 log "modules loaded"
 ip link set lo up
@@ -78,7 +78,7 @@ else
 fi
 
 # Mac directories at the same paths as on the Mac, so bind mounts need no translation.
-# "rekcod" = patched virtiofs with host-driven invalidation (docs/phase2.md);
+# "rekcod" = patched virtiofs with host-driven invalidation (guest/fuse/rekcod.c, crates/rekcod/src/watch.rs);
 # fall back to stock behaviour if the module doesn't know the option.
 if mount -t virtiofs -o rekcod mac /mnt/mac 2>/dev/null || mount -t virtiofs mac /mnt/mac; then
   for d in Users Volumes private; do
@@ -88,7 +88,7 @@ if mount -t virtiofs -o rekcod mac /mnt/mac 2>/dev/null || mount -t virtiofs mac
   # Mac /tmp is /private/tmp: `-v /tmp/x:/x` must mean the Mac's /tmp/x (as on
   # Docker Desktop/OrbStack). Guest services keep their state under /run and /var/lib.
   [ -d /private/tmp ] && mount --bind /private/tmp /tmp
-  # Sandbox VM (docs/sandbox.md): the share holds only the project directory,
+  # Sandbox VM (crates/rekcod/src/sandbox.rs): the share holds only the project directory,
   # mounted at its real Mac path (base64 on the cmdline, paths may have spaces).
   proj=$(sed -n 's/.*rekcod\.project=\([^ ]*\).*/\1/p' /proc/cmdline)
   if [ -n "$proj" ] && [ -d /mnt/mac/project ]; then
@@ -107,7 +107,7 @@ if mount -t virtiofs rosetta /mnt/rosetta 2>/dev/null; then
     >/proc/sys/fs/binfmt_misc/register
 fi
 
-# Elastic memory (docs/elastic-memory.md): swap on memory the Mac gets back once the guest
+# Elastic memory (crates/rekcod/src/elastic.rs): swap on memory the Mac gets back once the guest
 # frees it. /dev/rswap appears when the host has mapped the region in, just after boot.
 if grep -qx 0x003f /sys/bus/virtio/devices/*/device 2>/dev/null; then
   (
@@ -148,7 +148,7 @@ if grep -q 'rekcod.sandbox=1' /proc/cmdline; then
     iptables -A OUTPUT -o eth0 -d "$net" -j REJECT
     iptables -A DOCKER-USER -o eth0 -d "$net" -j REJECT
   done
-  # Agent sandbox allowlist (docs/agent-sandboxes.md): rekcod-agent adds an ACCEPT to
+  # Agent sandbox allowlist (crates/rekcod/src/sandbox.rs): rekcod-agent adds an ACCEPT to
   # REKCOD-ALLOW for each address an allowed name resolves to; everything else is rejected.
   if grep -q 'rekcod.allow=' /proc/cmdline; then
     iptables -N REKCOD-ALLOW
@@ -159,7 +159,7 @@ if grep -q 'rekcod.sandbox=1' /proc/cmdline; then
     log "sandbox network: allowlist"
   fi
   # rekcod.reach=IP:PORT,...: exact TCP holes through the block above (an app instance's
-  # RustFS, docs/rustfs.md). Inserted first, so they win over the REJECTs and the allowlist.
+  # RustFS, crates/rekcod/src/storage.rs). Inserted first, so they win over the REJECTs and the allowlist.
   reach=$(tr ' ' '\n' </proc/cmdline | sed -n 's/^rekcod\.reach=//p')
   for hp in $(echo "$reach" | tr ',' ' '); do
     for chain in OUTPUT DOCKER-USER; do
@@ -173,18 +173,22 @@ if grep -q 'rekcod.sandbox=1' /proc/cmdline; then
   log "sandbox network: internet only"
 # host.docker.internal is the gateway address. Its TCP goes to rekcod-agent,
 # which has the daemon connect to 127.0.0.1:<port> on the Mac, so services
-# listening only on the Mac's loopback are reachable too.
+# listening only on the Mac's loopback are reachable too. Only for containers
+# (docker0, br-*) and the guest itself (OUTPUT): another VM on the NAT segment
+# could route the gateway address through this one and arrive on eth0.
 elif [ -n "$gw" ]; then
-  iptables -t nat -I PREROUTING -d "$gw" -p tcp -j REDIRECT --to-ports 2379
+  iptables -t nat -I PREROUTING ! -i eth0 -d "$gw" -p tcp -j REDIRECT --to-ports 2379
   iptables -t nat -I OUTPUT -d "$gw" -p tcp -j REDIRECT --to-ports 2379
+  iptables -I INPUT -i eth0 -p tcp --dport 2379 -j DROP
 fi
 
-# Build cache would otherwise grow until the data disk is full.
+# Build cache and container logs would otherwise grow until the data disk is full.
+# The log limit applies to containers created after it; older ones keep their own.
 # shutdown-timeout: containers get 10 s after SIGTERM, inside shutdown.sh's 18 s wait.
-gc='"shutdown-timeout": 10, "builder": {"gc": {"enabled": true, "defaultMaxUsedSpace": "20GB"}}'
+opts='"shutdown-timeout": 10, "log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "3"}, "builder": {"gc": {"enabled": true, "defaultMaxUsedSpace": "20GB"}}'
 if [ -n "$gw" ]; then
-  echo "{\"host-gateway-ips\": [\"$gw\"], $gc}" >/etc/docker/daemon.json
+  echo "{\"host-gateway-ips\": [\"$gw\"], $opts}" >/etc/docker/daemon.json
 else
-  echo "{$gc}" >/etc/docker/daemon.json
+  echo "{$opts}" >/etc/docker/daemon.json
 fi
 log "ready (ip ${ip4:-none}, gateway ${gw:-none})"

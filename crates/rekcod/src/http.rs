@@ -152,4 +152,27 @@ mod tests {
         }
         assert_eq!(lines, vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]);
     }
+
+    /// A server that answers 200 and then sends `n` bytes of `fill`.
+    fn endless(fill: u8, n: usize) -> tokio::io::DuplexStream {
+        let (mut server, client) = tokio::io::duplex(64 << 10);
+        tokio::spawn(async move {
+            let mut req = [0u8; 256];
+            let _ = server.read(&mut req).await;
+            server.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.unwrap();
+            let chunk = vec![fill; 64 << 10];
+            let mut left = n;
+            while left > 0 && server.write_all(&chunk[..left.min(chunk.len())]).await.is_ok() {
+                left = left.saturating_sub(chunk.len());
+            }
+        });
+        client
+    }
+
+    #[tokio::test]
+    async fn a_guest_cant_send_without_end() {
+        let mut lines = Lines::open(endless(b'x', 2 << 20), "/events").await.unwrap();
+        assert!(lines.next().await.is_err());
+        assert!(get(endless(b'x', BODY_MAX as usize + (1 << 20)), "/containers/json").await.is_err());
+    }
 }

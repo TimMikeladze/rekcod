@@ -143,6 +143,25 @@ pub fn answer_a(p: &[u8]) -> Vec<(std::net::Ipv4Addr, u32)> {
 
 pub use rekcod_proto::dns_refused as refused;
 
+/// Sends `query` to `server` over UDP and waits up to `within` for its answer. The socket
+/// is connected, so datagrams from anyone else are dropped, and replies that don't match
+/// the query's ID and question are skipped.
+pub async fn ask_udp(query: &[u8], server: SocketAddr, within: std::time::Duration) -> Option<Vec<u8>> {
+    let local: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().ok()?;
+    let sock = tokio::net::UdpSocket::bind(local).await.ok()?;
+    sock.connect(server).await.ok()?;
+    sock.send(query).await.ok()?;
+    let deadline = tokio::time::Instant::now() + within;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf)).await.ok()?.ok()?;
+        if answers(query, &buf[..n]) {
+            buf.truncate(n);
+            return Some(buf);
+        }
+    }
+}
+
 pub fn if_index(name: &str) -> u32 {
     let Ok(name) = std::ffi::CString::new(name) else { return 0 };
     unsafe { libc::if_nametoindex(name.as_ptr()) }
@@ -197,6 +216,55 @@ mod tests {
         bare[5] = 0;
         assert!(answers(&q, &bare), "an error reply without the question");
         assert!(!answers(&q, &q), "a query isn't an answer");
+        // A 60 KiB query gets the header and its first question back, nothing more.
+        let mut big = q.clone();
+        big.resize(60 << 10, b'a');
+        assert_eq!(refused(&big).unwrap().len(), q.len());
+        assert!(refused(&q[..12]).unwrap().len() == 12);
+    }
+
+    #[test]
+    fn answers_match_the_query() {
+        let q = [&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x03npm\x03org\x00\x00\x01\x00\x01"].concat();
+        let mut r = q.clone();
+        r[2] |= 0x80;
+        assert!(answers(&q, &r));
+        let mut upper = r.clone();
+        upper[13] = b'N';
+        assert!(answers(&q, &upper), "0x20 case randomisation");
+        let mut other_id = r.clone();
+        other_id[1] = 0x35;
+        assert!(!answers(&q, &other_id));
+        let mut other_name = r.clone();
+        other_name[14] = b'x';
+        assert!(!answers(&q, &other_name));
+        assert!(!answers(&q, &q), "not a response");
+    }
+
+    #[tokio::test]
+    async fn ask_udp_takes_only_the_servers_matching_answer() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let q = [&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x03npm\x03org\x00\x00\x01\x00\x01"].concat();
+        let mut good = q.clone();
+        good[2] |= 0x80;
+        good[7] = 1;
+        let good2 = good.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (_, client) = server.recv_from(&mut buf).await.unwrap();
+            // Someone else on the network answers first (same ID and question), then the
+            // server with a wrong ID.
+            let forger = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut forged = good2.clone();
+            forged[11] = 9;
+            forger.send_to(&forged, client).await.unwrap();
+            let mut wrong = good2.clone();
+            wrong[0] = 0;
+            server.send_to(&wrong, client).await.unwrap();
+            server.send_to(&good2, client).await.unwrap();
+        });
+        assert_eq!(ask_udp(&q, addr, std::time::Duration::from_secs(2)).await, Some(good));
     }
 
     #[test]

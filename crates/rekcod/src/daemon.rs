@@ -133,7 +133,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     // `rekcod sandbox rm`, `rekcod stop --force`: skip the graceful shutdown.
     let mut kill = signal(SignalKind::user_defined1())?;
     let _ = std::fs::remove_file(paths.last_exit());
-    raise_fd_limit();
+    crate::lifecycle::raise_fd_limit();
     // Every minute: what a sandbox's guest does reaches this log, limited but not silenced.
     crate::lifecycle::trim_log_every(paths.daemon_log(), Duration::from_secs(60));
     let guest = paths.guest_dir()?;
@@ -411,21 +411,6 @@ async fn force_stop(vm: &Vm) {
 /// Tells `rekcod start --foreground` (the login agent) that this stop was on purpose.
 fn clean_exit(paths: &Paths) {
     let _ = std::fs::write(paths.last_exit(), b"clean");
-}
-
-/// launchd starts agents with a soft limit of 256 descriptors; every forwarded connection
-/// and docker client takes two.
-fn raise_fd_limit() {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-        return;
-    }
-    let per_proc = crate::cli::sysctl_u64("kern.maxfilesperproc").unwrap_or(10240) as libc::rlim_t;
-    let want = lim.rlim_max.min(per_proc);
-    if want > lim.rlim_cur {
-        lim.rlim_cur = want;
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
-    }
 }
 
 /// After a failed accept (EMFILE, ENFILE), wait before the next one instead of spinning.
@@ -922,29 +907,16 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
     None
 }
 
-/// One resolver's answer to `query`. The socket is connected, so only `server` is heard,
-/// and a datagram that doesn't answer this query is ignored.
+/// One resolver's answer to `query` ([`dns::ask_udp`]); a truncated one is asked again over TCP.
 async fn ask_resolver(query: &[u8], server: SocketAddr, wait: Duration) -> Option<Vec<u8>> {
-    let local: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
-    let sock = UdpSocket::bind(local).await.ok()?;
-    sock.connect(server).await.ok()?;
-    sock.send(query).await.ok()?;
-    let deadline = tokio::time::Instant::now() + wait;
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf)).await.ok()?.ok()?;
-        let answer = &buf[..n];
-        if !dns::answers(query, answer) {
-            continue;
-        }
-        // Truncated (TC): the full answer only comes over TCP.
-        if answer[2] & 0x02 != 0
-            && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
-        {
-            return Some(full);
-        }
-        return Some(answer.to_vec());
+    let answer = dns::ask_udp(query, server, wait).await?;
+    // Truncated (TC): the full answer only comes over TCP.
+    if answer[2] & 0x02 != 0
+        && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
+    {
+        return Some(full);
     }
+    Some(answer)
 }
 
 async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {

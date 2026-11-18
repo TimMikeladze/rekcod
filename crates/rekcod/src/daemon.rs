@@ -211,6 +211,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         mac_address: std::fs::read_to_string(paths.mac_address())?.trim().to_string(),
         console_log: paths.console_log(),
         console_rate: opts.project.is_some().then_some(SANDBOX_CONSOLE_RATE),
+        conn_budget: opts.project.is_some().then_some(SANDBOX_CONN_BUDGET),
         shares,
         net,
     };
@@ -438,6 +439,11 @@ async fn forget_fresh_disk(vm: Vm, marker: PathBuf) {
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
+
+/// Unread guest bytes all of a sandbox VM's connections may hold together. The main VM's
+/// limits are sized for your own `docker logs`; a sandbox's guest may write to a connection
+/// the daemon isn't reading on purpose.
+const SANDBOX_CONN_BUDGET: u64 = 256 << 20;
 
 /// A sandbox's console output kept per second; the rest is dropped.
 const SANDBOX_CONSOLE_RATE: u64 = 64 << 10;
@@ -1675,7 +1681,14 @@ mod tests {
 
     #[tokio::test]
     async fn removing_a_udp_port_frees_it_with_a_flow_open() {
-        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        // Below macOS's ephemeral range, so another test's `bind(:0)` can't take it while it's free.
+        let mut port = 20_000 + (std::process::id() % 20_000) as u16;
+        let sock = loop {
+            match UdpSocket::bind(("127.0.0.1", port)).await {
+                Ok(s) => break s,
+                Err(_) => port += 1,
+            }
+        };
         let addr = sock.local_addr().unwrap();
         let (guests_tx, mut guests) = mpsc::unbounded_channel();
         let connect = move || {

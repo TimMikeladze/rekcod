@@ -325,21 +325,79 @@ pub fn check_git_source(url: &str, rev: &str) -> Result<()> {
 }
 
 /// `git` with only network transports allowed (plus `file` under [`ALLOW_LOCAL_GIT`]),
-/// no prompts and no ext:: helpers.
+/// no prompts and no ext:: helpers. A server that accepts and then stalls is dropped: http
+/// below 1 KB/s for 30 s, ssh after 10 s to connect or 30 s without an answer.
 fn git_cmd() -> Command {
     let mut c = Command::new("git");
     let protocols = if std::env::var_os(ALLOW_LOCAL_GIT).is_some() { "https:ssh:http:file" } else { "https:ssh:http" };
     c.env("GIT_ALLOW_PROTOCOL", protocols).env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null());
+    c.args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30"]);
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        c.env("GIT_SSH_COMMAND", "ssh -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 -o BatchMode=yes");
+    }
     c
+}
+
+/// `git ls-remote` on the controller, which holds no lock meanwhile.
+const LS_REMOTE_DEADLINE: Duration = Duration::from_secs(60);
+/// A clone's fetch on a node; the controller allows the whole launch [`SLOW`].
+const FETCH_DEADLINE: Duration = Duration::from_secs(600);
+
+/// Runs `c` and collects its output; kills it and everything it started once `deadline`
+/// passes or `stop` returns true.
+fn output_within(mut c: Command, deadline: Duration, stop: &dyn Fn() -> bool) -> Result<std::process::Output> {
+    use std::os::unix::process::CommandExt;
+    let what = c
+        .get_args()
+        .find(|a| !a.to_string_lossy().starts_with('-') && !a.to_string_lossy().contains('='))
+        .map(|a| a.to_string_lossy().to_string());
+    let what = format!("{} {}", c.get_program().to_string_lossy(), what.unwrap_or_default());
+    c.stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
+    let mut child = c.spawn().with_context(|| format!("run {what}"))?;
+    let read = |p: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            if let Some(mut p) = p {
+                let _ = p.read_to_end(&mut b);
+            }
+            b
+        })
+    };
+    let (out, err) = (read(child.stdout.take().map(|p| Box::new(p) as _)), read(child.stderr.take().map(|p| Box::new(p) as _)));
+    let t0 = Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        let cancelled = stop();
+        if cancelled || t0.elapsed() > deadline {
+            // Its own process group: git's helpers (git-remote-https, ssh) go too.
+            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+            let _ = child.wait();
+            if cancelled {
+                bail!("{what}: cancelled");
+            }
+            bail!("{what}: no result after {}s", deadline.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
 }
 
 /// Clones `url` at `rev` (branch, tag or commit) into `~/.rekcod/remote-ws/<id>`.
 pub fn clone(paths: &Paths, url: &str, rev: &str) -> Result<PathBuf> {
+    clone_until(paths, url, rev, &|| false)
+}
+
+/// [`clone`] that gives up once `stop` returns true (a cancelled job).
+fn clone_until(paths: &Paths, url: &str, rev: &str, stop: &dyn Fn() -> bool) -> Result<PathBuf> {
     check_git_source(url, rev)?;
     let dir = paths.home.join("remote-ws").join(sandbox::new_id()?);
     std::fs::create_dir_all(&dir)?;
     let git = |args: &[&str]| -> Result<()> {
-        let o = git_cmd().arg("-C").arg(&dir).args(args).output()?;
+        let mut c = git_cmd();
+        c.arg("-C").arg(&dir).args(args);
+        let o = output_within(c, FETCH_DEADLINE, stop)?;
         if !o.status.success() {
             bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&o.stderr).trim());
         }
@@ -862,7 +920,8 @@ fn job_dir(paths: &Paths, id: &str) -> Result<PathBuf> {
 /// What a job does to the node: clone, make and run a sandbox, remove it. Tests swap in
 /// stubs to drive cancellation through every step without git or a VM.
 trait JobHost: Send + Sync {
-    fn clone(&self, url: &str, rev: &str) -> Result<PathBuf>;
+    /// Gives up once job `job` is cancelled.
+    fn clone(&self, job: &str, url: &str, rev: &str) -> Result<PathBuf>;
     /// Creates the job's sandbox and marks it with `job`; returns its ID.
     fn create(&self, job: &str, o: sandbox::CreateOptions) -> Result<String>;
     fn exec(&self, sb: &str, o: &sandbox::ExecOptions, cmd: &[String]) -> Result<Command>;
@@ -872,8 +931,8 @@ trait JobHost: Send + Sync {
 struct NodeHost(Paths);
 
 impl JobHost for NodeHost {
-    fn clone(&self, url: &str, rev: &str) -> Result<PathBuf> {
-        clone(&self.0, url, rev)
+    fn clone(&self, job: &str, url: &str, rev: &str) -> Result<PathBuf> {
+        clone_until(&self.0, url, rev, &|| jobs().get(job).is_some_and(|j| j.cancelled))
     }
     fn create(&self, job: &str, o: sandbox::CreateOptions) -> Result<String> {
         let meta = sandbox::create(&self.0, o)?;
@@ -962,7 +1021,7 @@ fn cancel_point(id: &str) -> Result<()> {
 
 fn job_body(host: &dyn JobHost, id: &str, a: &Value, log: std::fs::File) -> Result<i32> {
     let cmd: Vec<String> = a["cmd"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
-    let src = host.clone(a["git"]["url"].as_str().context("missing git.url")?, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
+    let src = host.clone(id, a["git"]["url"].as_str().context("missing git.url")?, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
     let r = job_in_checkout(host, id, a, &cmd, &src, log);
     let _ = std::fs::remove_dir_all(&src);
     r
@@ -1000,7 +1059,9 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
         let env = a["env"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
         let eo = sandbox::ExecOptions { workdir: None, env, timeout_secs: a["timeout_secs"].as_u64(), tty: false };
         let mut c = host.exec(&sb, &eo, cmd)?;
-        c.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
+        // Through a pipe, so the log stops growing at its cap while the job runs on.
+        let (output, w) = std::io::pipe()?;
+        c.stdin(Stdio::null()).stdout(w.try_clone()?).stderr(w);
         let child = {
             let mut j = jobs();
             let run = j.entry(id.to_string()).or_default();
@@ -1011,10 +1072,60 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
             run.pid = Some(child.id() as i32);
             child
         };
-        Ok(wait_job(id, child)?.code().unwrap_or(137))
+        // The Command holds write ends too; the copy only ends once every one is closed.
+        drop(c);
+        let copied = copy_capped(output, log, JOB_LOG_FILE_CAP);
+        let status = wait_job(id, child)?;
+        // Whatever the command wrote last, before the result says it's over. Something it
+        // left running may hold the pipe; that isn't waited for.
+        let _ = copied.recv_timeout(Duration::from_secs(5));
+        Ok(status.code().unwrap_or(137))
     })();
     host.remove(&sb);
     r
+}
+
+/// A job's output kept on the node; after that the command runs on and its output is
+/// dropped, with a line in the log saying so.
+const JOB_LOG_FILE_CAP: u64 = 64 << 20;
+
+/// Copies `from` into `to` until `from` ends, writing at most `cap` bytes in all to `to`.
+/// The receiver gets a message when it's done.
+fn copy_capped(mut from: impl Read + Send + 'static, mut to: std::fs::File, cap: u64) -> std::sync::mpsc::Receiver<()> {
+    let (done, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut written = to.metadata().map_or(0, |m| m.len());
+        let mut noted = false;
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            let n = match from.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let room = cap.saturating_sub(written).min(n as u64) as usize;
+            if room > 0 && to.write_all(&buf[..room]).is_ok() {
+                written += room as u64;
+            }
+            if room < n && !noted {
+                let _ = writeln!(to, "\nrekcod: the log reached {} MiB; later output isn't kept", cap >> 20);
+                noted = true;
+            }
+        }
+        let _ = done.send(());
+    });
+    rx
+}
+
+/// The last `n` bytes of the file at `path`, read without the rest.
+fn read_tail(path: &Path, n: u64) -> Vec<u8> {
+    use std::io::{Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(path) else { return Vec::new() };
+    let len = f.metadata().map_or(0, |m| m.len());
+    let mut b = Vec::new();
+    if f.seek(SeekFrom::Start(len.saturating_sub(n))).is_ok() {
+        let _ = f.take(n).read_to_end(&mut b);
+    }
+    b
 }
 
 /// Waits for the command without reaping it first, then clears its pid under the lock, so
@@ -1039,8 +1150,7 @@ pub fn job_get(paths: &Paths, id: &str) -> Result<Value> {
     if !dir.exists() {
         bail!("no job {id} on this node");
     }
-    let log = std::fs::read(dir.join("log")).unwrap_or_default();
-    let tail = String::from_utf8_lossy(&log[log.len().saturating_sub(JOB_LOG_BYTES)..]).to_string();
+    let tail = String::from_utf8_lossy(&read_tail(&dir.join("log"), JOB_LOG_BYTES as u64)).to_string();
     let running = jobs().contains_key(id);
     let mut v = match std::fs::read(dir.join("result.json")) {
         Ok(b) => serde_json::from_slice::<Value>(&b)?,
@@ -3214,11 +3324,17 @@ pub struct HttpSettings {
 
 /// Resolves a branch or tag to a commit with `git ls-remote`; a commit passes through.
 fn resolve(url: &str, rev: &str) -> Result<String> {
+    resolve_within(url, rev, LS_REMOTE_DEADLINE)
+}
+
+fn resolve_within(url: &str, rev: &str, deadline: Duration) -> Result<String> {
     if rev.len() == 40 && rev.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Ok(rev.into());
     }
     check_git_source(url, rev)?;
-    let o = git_cmd().args(["ls-remote", "--", url, rev]).output()?;
+    let mut c = git_cmd();
+    c.args(["ls-remote", "--", url, rev]);
+    let o = output_within(c, deadline, &|| false)?;
     let text = String::from_utf8_lossy(&o.stdout);
     text.split_whitespace().next().map(String::from).ok_or_else(|| anyhow!("{url} has no ref {rev}"))
 }
@@ -3436,6 +3552,12 @@ fn delete_instance(c: &Controller, node: &str, sandbox_id: &str) {
 /// New release from `commit` (or the app's ref), holding the app's lock: two deploys of
 /// one app at once could leave the older commit live.
 fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> Result<Value> {
+    // Before the lock: a slow git server holds up this deploy, not the app's others.
+    let commit = match commit {
+        Some(c) => c,
+        None => resolve(&app.git_url, &app.git_ref)?,
+    };
+    let commit = Some(commit);
     let lock = c.app_lock(&app.name);
     let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     deploy_locked(c, app, commit, who)
@@ -5242,7 +5364,7 @@ mod job_and_node_tests {
     }
 
     impl JobHost for FakeHost {
-        fn clone(&self, _: &str, _: &str) -> Result<PathBuf> {
+        fn clone(&self, _: &str, _: &str, _: &str) -> Result<PathBuf> {
             self.step("clone");
             let d = self.work.join(sandbox::new_id()?);
             std::fs::create_dir_all(&d)?;
@@ -7752,6 +7874,53 @@ mod tests {
             assert!(Instant::now() < deadline, "timed out");
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn git_against_a_server_that_stalls_gives_up_at_its_deadline() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/r.git", l.local_addr().unwrap());
+        // Accepts and never answers.
+        std::thread::spawn(move || {
+            let held: Vec<_> = l.incoming().flatten().collect();
+            drop(held);
+        });
+        let t0 = Instant::now();
+        let e = resolve_within(&url, "main", Duration::from_secs(2)).unwrap_err().to_string();
+        assert!(e.contains("no result after 2s"), "{e}");
+        assert!(t0.elapsed() < Duration::from_secs(10));
+        // A cancelled job's clone stops at once, whatever git is doing.
+        let mut sleep = Command::new("sleep");
+        sleep.arg("30");
+        let t0 = Instant::now();
+        let e = output_within(sleep, Duration::from_secs(60), &|| t0.elapsed() > Duration::from_millis(300)).unwrap_err().to_string();
+        assert!(e.contains("cancelled") && t0.elapsed() < Duration::from_secs(5), "{e}");
+    }
+
+    #[test]
+    fn job_logs_stop_growing_at_their_cap_and_are_read_from_the_end() {
+        let dir = std::env::temp_dir().join(format!("rekcod-joblog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let job = dir.join("jobs/j-big");
+        std::fs::create_dir_all(&job).unwrap();
+        let log = std::fs::OpenOptions::new().create(true).append(true).open(job.join("log")).unwrap();
+        let (r, mut w) = std::io::pipe().unwrap();
+        let done = copy_capped(r, log, 1000);
+        w.write_all(&[b'x'; 5000]).unwrap();
+        drop(w);
+        done.recv_timeout(Duration::from_secs(5)).unwrap();
+        let text = std::fs::read_to_string(job.join("log")).unwrap();
+        assert!(text.starts_with(&"x".repeat(1000)) && !text.contains(&"x".repeat(1001)), "{}", text.len());
+        assert!(text.ends_with("later output isn't kept\n"), "{text:?}");
+        // A large log (sparse here) is read from its end only.
+        let f = std::fs::OpenOptions::new().write(true).open(job.join("log")).unwrap();
+        f.set_len(1 << 30).unwrap();
+        drop(f);
+        std::fs::OpenOptions::new().append(true).open(job.join("log")).unwrap().write_all(b"last line\n").unwrap();
+        let v = job_get(&Paths { home: dir.clone() }, "j-big").unwrap();
+        let tail = v["log"].as_str().unwrap();
+        assert!(tail.ends_with("last line\n") && tail.len() == JOB_LOG_BYTES, "{}", tail.len());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -412,7 +412,7 @@ Per-app settings go in `rekcod.toml`:
 rate = "10/s"        # per client, on top of the edge-wide rate
 burst = 20
 max_body = "20MB"    # 100 MiB by default; larger bodies get 413
-timeout = 300        # seconds to answer once the request body is in; 60 by default
+timeout = "5m"       # to answer once the request body is in; 60s by default, at most 1h
 ```
 
 Timeouts and caps:

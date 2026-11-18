@@ -1630,11 +1630,10 @@ fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Resul
     let max_body = max_body.map(|m| edge::limit::parse_size(m)).transpose()?;
     let timeout = timeout
         .map(|t| {
-            t.trim_end_matches('s')
-                .parse::<u64>()
+            duration_secs(t)
                 .ok()
                 .filter(|t| (1..=3600).contains(t))
-                .ok_or_else(|| anyhow::anyhow!("rekcod.toml http.timeout: {t} isn't 1 to 3600 seconds"))
+                .ok_or_else(|| anyhow::anyhow!("rekcod.toml http.timeout: {t} isn't between 1s and 1h"))
         })
         .transpose()?;
     Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body, "timeout": timeout}))
@@ -2027,6 +2026,16 @@ mod tests {
         // The node's 64 KiB window moved past the start of what was shown.
         assert_eq!(super::new_output("xxhello\n", "hello\nworld\n"), "world\n");
         assert_eq!(super::new_output("gone", "fresh\n"), "fresh\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn http_timeout_from_rekcod_toml() {
+        let t = |v: &str| std::collections::HashMap::from([("http.timeout".to_string(), v.to_string())]);
+        assert_eq!(http_settings(&t("5m")).unwrap()["timeout"], 300);
+        assert_eq!(http_settings(&t("90")).unwrap()["timeout"], 90);
+        assert!(http_settings(&t("0")).is_err());
+        assert!(http_settings(&t("2h")).is_err());
     }
 
     #[test]

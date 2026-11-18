@@ -1838,19 +1838,28 @@ pub fn prune(paths: &Paths, older_than: u64, removed: &mut dyn FnMut(&str)) -> R
     }
     // Not one being made right now.
     let cutoff = now().saturating_sub(older_than.max(600));
-    for e in std::fs::read_dir(root(paths)).into_iter().flatten().flatten() {
-        let home = e.path();
-        if !home.is_dir() || Sandbox::meta_file(&home).exists() || secs(&home).is_none_or(|t| t >= cutoff) {
-            continue;
-        }
-        if crate::cli::running_pid(&Paths { home: home.clone() }).is_some() {
+    for home in leftovers(paths) {
+        if secs(&home).is_none_or(|t| t >= cutoff) {
             continue;
         }
         open_up(&home);
         std::fs::remove_dir_all(&home).with_context(|| format!("remove {}", home.display()))?;
-        removed(&e.file_name().to_string_lossy());
+        removed(&home.file_name().unwrap_or_default().to_string_lossy());
     }
     Ok(())
+}
+
+/// Directories under `sb/` with no meta.json and no VM running: what a create or fork that
+/// died left, invisible to `ls` and `rm --all`. One being made right now looks the same for
+/// a moment.
+pub fn leftovers(paths: &Paths) -> Vec<PathBuf> {
+    std::fs::read_dir(root(paths))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|h| h.is_dir() && !Sandbox::meta_file(h).exists() && crate::cli::running_pid(&Paths { home: h.clone() }).is_none())
+        .collect()
 }
 
 pub fn golden_build(paths: &Paths, name: &str, images: &[String]) -> Result<()> {
@@ -2391,6 +2400,7 @@ mod tests {
         std::fs::File::create(&used).unwrap().set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1)).unwrap();
         let leftover = root(&paths).join("zzzzzzzz");
         std::fs::create_dir_all(leftover.join("vm")).unwrap();
+        assert_eq!(leftovers(&paths), vec![leftover.clone()]);
         let mut gone = vec![];
         prune(&paths, 3600, &mut |id| gone.push(id.to_string())).unwrap();
         // The leftover is new: one being made right now looks the same.

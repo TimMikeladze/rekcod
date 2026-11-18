@@ -192,7 +192,8 @@ enum Cmd {
     },
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp(ApiPolicyArgs),
-    /// Install the latest release over this binary (the VM keeps running the old one until restarted).
+    /// Install the latest release over this binary and restart the fleet services that run it
+    /// (the VM keeps running the old one until restarted).
     Upgrade {
         /// Only say whether a newer release exists; exit 1 if one does.
         #[arg(long)]
@@ -1098,7 +1099,7 @@ enum JobCmd {
         /// Kill it after this long (exit 124).
         #[arg(long, value_parser = duration_secs)]
         timeout: Option<u64>,
-        /// Run it on this schedule instead of once (needs --name).
+        /// Run it on this schedule instead of once (needs --name; at least 1m).
         #[arg(long, value_parser = duration_secs)]
         every: Option<u64>,
         #[arg(long)]
@@ -1778,8 +1779,9 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 // Neither given keeps the app's current count (1 for a new app).
                 "instances": instances.or(num("resources.instances")),
                 "spread": t.get("resources.spread"),
-                "cpus": num("resources.cpus").unwrap_or(1),
-                "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()).unwrap_or(1),
+                // Left out keeps the app's resources. `[env]` is merged over the env it has.
+                "cpus": num("resources.cpus"),
+                "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()),
                 "health": t.get("app.health").cloned(),
                 "start": t.get("app.start"),
                 "env": env,

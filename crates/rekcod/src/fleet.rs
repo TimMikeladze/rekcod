@@ -1813,6 +1813,31 @@ impl Controller {
         Ok(db.query_row(&sql, rusqlite::params![ns, skip_app], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
     }
 
+    /// What counts against `owner`'s token cap: their sandboxes (not app instances, which
+    /// the namespace quota covers) and jobs that may still run.
+    fn held_by(&self, owner: &str) -> Result<i64> {
+        Ok(self
+            .db()
+            .query_one(
+                &format!(
+                    "select (select count(*) from sandboxes s where owner = ?1 and state in ('running', 'creating')
+                               and not exists(select 1 from instances i where i.sandbox = s.id))
+                          + (select count(*) from jobs where owner = ?1 and state in {JOB_ACTIVE_SQL})"
+                ),
+                &[&owner],
+            )?
+            .get(0))
+    }
+
+    /// Fails when `who` already holds their cap.
+    fn check_cap(&self, owner: &str, max: i32) -> Result<()> {
+        let used = self.held_by(owner)?;
+        if max >= 0 && used >= max as i64 {
+            bail!("quota: {used} of {max} sandboxes and jobs in use");
+        }
+        Ok(())
+    }
+
     fn check_quota(&self, ns: &str, skip_app: &str, cpus: i64, gib: i64, sandboxes: i64) -> Result<()> {
         Self::quota_on(&self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).0, ns, skip_app, cpus, gib, sandboxes)
     }
@@ -2774,6 +2799,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                     };
                     let ql = c.quota_lock(&ns);
                     let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    c.check_cap(&who.name, who.max)?;
                     c.check_quota(&ns, "", cpus, gib, 1)?;
                     let mut v = call(&url, "POST", &node_path, Some(&sec), &body)?;
                     let child = v["id"].as_str().context("node returned no id")?.to_string();
@@ -2836,13 +2862,8 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
     }
     let ql = c.quota_lock(ns);
     let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let count: i64 =
-        c.db.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query_one("select count(*) from sandboxes where owner = ?1 and state = 'running'", &[&who.name])?
-            .get(0);
-    if who.max >= 0 && count >= who.max as i64 {
-        return err(w, format!("quota: {count} of {} sandboxes in use", who.max));
+    if let Err(e) = c.check_cap(&who.name, who.max) {
+        return err(w, format!("{e:#}"));
     }
     let macos = body["os"].as_str() == Some("macos");
     let (cpus, gib) = match (spec_count(&body, "cpus", 2, MAX_CPUS), spec_count(&body, "memory_gib", 2, MAX_MEMORY_GIB)) {
@@ -4652,20 +4673,7 @@ fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, sche
     let node = {
         let ql = c.quota_lock(ns);
         let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let used: i64 =
-            c.db.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .query_one(
-                    &format!(
-                        "select (select count(*) from sandboxes where owner = ?1 and state = 'running')
-                          + (select count(*) from jobs where owner = ?1 and state in {JOB_ACTIVE_SQL})"
-                    ),
-                    &[&owner],
-                )?
-                .get(0);
-        if max >= 0 && used >= max as i64 {
-            bail!("quota: {used} of {max} sandboxes and jobs in use");
-        }
+        c.check_cap(owner, max)?;
         c.check_quota(ns, "", cpus, gib, 1)?;
         let mib = gib * 1024;
         let (node, _, _) = c.place(mib, false, ns)?.into_iter().next().ok_or_else(|| anyhow!("no node has {mib} MiB free"))?;
@@ -7025,6 +7033,33 @@ mod tests {
         db.0.execute_batch(MIGRATIONS.iter().find(|m| m.contains("lost before an upgrade")).unwrap()).unwrap();
         let mut state = |id: &str| db.query_one("select state from jobs where id = ?1", &[&id]).unwrap().get::<String>(0);
         assert_eq!((state("j-old"), state("j-new")), ("failed".into(), "lost".into()));
+    }
+
+    #[test]
+    fn the_token_cap_counts_sandboxes_and_jobs_but_not_app_instances() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        let sb = |id: &str| {
+            c.db()
+                .execute(
+                    "insert into sandboxes (id, node, owner, state, created, ns) values (?1, 'n-1', 'alice', 'running', 0, 'default')",
+                    &[&id],
+                )
+                .unwrap();
+        };
+        for i in 0..10 {
+            sb(&format!("inst{i}"));
+            c.db().execute("insert into instances values ('web', 1, ?1, 'n-1', 'e', 'live')", &[&format!("inst{i}")]).unwrap();
+        }
+        let create = json!({"git": {"url": "https://example.invalid/r", "ref": "main"}});
+        let e = call(&url, "POST", "/sandboxes", Some("alice-t"), &create).unwrap_err().to_string();
+        assert!(e.contains("no node has"), "past the cap check: {e}");
+        for i in 0..10 {
+            sb(&format!("own{i}"));
+        }
+        c.db().execute("insert into nodes (id, url, secret, last_seen) values ('n-1', 'http://127.0.0.1:9', 's', ?1)", &[&now()]).unwrap();
+        let e = call(&url, "POST", "/sandboxes/own0/fork", Some("alice-t"), &json!({})).unwrap_err().to_string();
+        assert!(e.contains("quota: 10 of 10"), "{e}");
     }
 
     #[test]

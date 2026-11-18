@@ -280,6 +280,26 @@ run `sudo` to install services that start at boot.
 For access between networks, connect both Macs to the same Tailscale tailnet. Without
 Tailscale, rekcod uses Bonjour discovery on the LAN; both Macs need the same subnet.
 
+Server setup uses https. A plain `http://` controller or node URL is accepted only when it
+resolves to a loopback or tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48), and the
+address is checked again before every request, so a `.ts.net` name stops working while
+Tailscale is off. `REKCOD_INSECURE=1` allows plain http on a network you trust. Set it for
+every command that talks to such an address. Services installed with it set keep it;
+services installed by an older rekcod need installing again with it set.
+
+To add a remote or join a node by hand, pass tokens through a file, stdin or the
+environment. Tokens on the command line are visible to other accounts on the Mac in the
+process list:
+
+```sh
+# admin-token is from the controller's ~/.rekcod/controller/; REKCOD_TOKEN also works
+rekcod remote add mini https://mini.tail1234.ts.net:7700 --token-file - --ca-fingerprint sha256:... < admin-token
+REKCOD_JOIN_TOKEN="$(cat join-token)" rekcod node join https://mini.tail1234.ts.net:7700 --ca-fingerprint sha256:... --install
+```
+
+`--token TOKEN` and `node join URL TOKEN` still work. A `node join` without `--install`
+keeps serving in the terminal as `rekcod node serve`, without the token in its arguments.
+
 From your development Mac:
 
 ```sh
@@ -353,6 +373,15 @@ Environment and secret changes redeploy the live release. Secrets are encrypted 
 the controller database. `scale` changes the number of instances, subject to available
 node capacity. `rollback` deploys the previous good release.
 
+Keys set with `app env set` stay across deploys. `app deploy` merges the `[env]` table
+of `rekcod.toml` over the app's env, so a key in both takes the value from the file;
+`rekcod app env unset blog KEY` removes one. `[resources]` values the file leaves out
+keep the app's current ones.
+
+Deploys of one app run one at a time. While one runs and another waits, a third
+(deploy, rollback, scale, env or secret change) is refused with a 409; run it again
+once one finishes.
+
 To make `mini` the default for fleet commands:
 
 ```sh
@@ -411,6 +440,83 @@ so GitHub's Redeliver runs it again.
 The controller used to have one webhook secret for every app at `/webhooks/github`. That
 route is gone; set each repository's hook up again with `app webhook`.
 
+### Take a node out for maintenance
+
+```sh
+rekcod node drain NODE_ID --remote mini
+rekcod node undrain NODE_ID --remote mini
+```
+
+`drain` stops placing work on the node and moves its app instances to other nodes as
+capacity allows; instances without anywhere to go keep serving where they are. The
+node stays drained through reboots and missed heartbeats until `undrain`.
+
+A node that misses heartbeats for 15 s is `lost`: its app instances leave the routes
+and are replaced on other nodes after a minute, and its jobs and user sandboxes are
+held. When it heartbeats again, sandboxes it still has run again and ones it no longer
+has are removed; deleting a sandbox while its node is away removes the VM once the
+node is back. A controller that was itself away (the Mac slept, the process was
+stopped) waits 20 s for heartbeats before it marks any node lost.
+
+### Edge limits and client addresses
+
+Server setup installs the edge as `rekcod edge serve --remote edge --listen <addr>:8080
+--public-listen 127.0.0.1:8081 --install`. The options that change what it accepts:
+
+```sh
+# Peers whose X-Forwarded-For names the client. Default: loopback, where cloudflared runs.
+rekcod edge serve --trusted-proxy 10.0.0.5 --trusted-proxy 127.0.0.1
+# Read the client address from a header the proxy overwrites, instead of X-Forwarded-For.
+rekcod edge serve --client-ip-header cf-connecting-ip
+# A TCP load balancer that sends a PROXY v2 header; anyone else is disconnected.
+rekcod edge serve --public-listen 0.0.0.0:8081 --proxy-protocol --proxy-protocol-from 10.0.0.2
+# Requests per client across all apps (IPv6 counts per /64).
+rekcod edge serve --rate 50/s --burst 100
+```
+
+X-Forwarded-For is read from the right: the first address that isn't a trusted proxy is the
+client. CF-Connecting-IP is removed from the request unless `--client-ip-header` names it,
+because only Cloudflare overwrites it. Through cloudflared that's fine: Cloudflare appends the
+address it saw to X-Forwarded-For, so the rightmost entry is the visitor. The app gets `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`
+and `X-Request-Id` from the edge; `Forwarded`, `True-Client-IP`, `X-Client-IP`,
+`X-Forwarded-Port` and `X-Forwarded-Server` from the client are removed.
+
+A client over the edge-wide rate gets 429. 100 of those within a minute ban its address (its
+/64 for IPv6) on every edge for 10 minutes. An app's own `[http] rate` only answers 429; it
+never bans. Bans are managed with `rekcod edge ban`, `unban` and `bans`. An edge token can
+only ban an IPv4 /24 or IPv6 /48 or narrower, for at most a day.
+
+Per-app settings go in `rekcod.toml`:
+
+```toml
+[http]
+rate = "10/s"        # per client, on top of the edge-wide rate
+burst = 20
+max_body = "20MB"    # 100 MiB by default; larger bodies get 413
+timeout = "5m"       # to answer once the request body is in; 60s by default, at most 1h
+```
+
+Timeouts and caps:
+
+- A request head has 10 s from its first byte. A request body has to send something every
+  30 s or the client gets 408. The response timeout starts when the body is in.
+- A connection that moves no bytes for 90 s is closed, also in the middle of a response.
+  A server-sent event stream needs a heartbeat more often than that. WebSockets close after
+  an hour without traffic.
+- An instance takes at most 512 requests at once; with every instance at that, the client
+  gets 503 with `Retry-After: 1`.
+- One address (an IPv6 /64) may hold 200 connections and 100 WebSockets. The edge raises its
+  descriptor limit at start and prints the connection and WebSocket totals it derived from it.
+- A request for a sleeping app waits up to 120 s for the wake, then gets 503 with
+  `Retry-After`. After a failed wake the app gets 503s for 30 s.
+- A GET, HEAD or OPTIONS without a body that fails on a reused instance connection is sent
+  once more on a new one. Other failures are a 502 naming the request ID; the instance's
+  address and the error are in `~/.rekcod/logs/edge.log`.
+- On SIGTERM the edge stops accepting and waits up to 15 s for requests in flight.
+
+Traffic from the edge to the nodes' relays, and both edge listeners, are plain HTTP. Keep the
+private listener on a tailnet or LAN.
+
 ### Back up the controller
 
 Server setup configures RustFS for release images, build caches and hourly controller
@@ -421,10 +527,25 @@ rekcod controller backup --remote mini
 rekcod controller backups --remote mini
 ```
 
+`rekcod controller restore` puts a backup in place of `fleet.db`. It refuses while a
+controller runs on that database; stop the controller service first.
+
 These backups are stored on the server's RustFS disk. Copy them off the server for
-recovery from disk loss. Back up the server's `~/.rekcod/controller/secret-key` separately: it is
-needed to decrypt app secrets and is not included in the database backup. Application
-buckets need their own backups too.
+recovery from disk loss. Back up these files from the server's `~/.rekcod/controller/`
+separately; the database backup doesn't include them:
+
+- `secret-key` decrypts app secrets.
+- `ca.pem` and `ca.key` are the CA that remotes and edges pinned with `--ca-fingerprint`.
+- `node-ca.pem` and `node-ca.key` sign node certificates.
+
+The controller makes a CA only when both of its files are missing. With one of a pair
+missing or unreadable, or a key that doesn't match its certificate, it refuses to start
+and names the file, since a new CA would break every remote, edge and node. Node
+certificates last two years; a node asks the controller for a new one in its heartbeat
+once its certificate has 90 days left. `rekcod doctor` flags a node or controller
+certificate with less than 90 days left (the controller makes its own again at each start),
+and the controller posts to `--alert-webhook` once a day while a node's renewal isn't
+working. Application buckets need their own backups too.
 
 ### Give people access
 
@@ -485,6 +606,11 @@ Each job runs in a new sandbox VM on the fleet. `job run` follows its output by
 default; add `--detach` to print the job ID and return. Replace `JOB_ID` with the ID
 from `job ls` when reading logs later. `rekcod job cancel JOB_ID --remote mini`
 stops a job.
+
+`job run --name nightly --every 24h -- ./backup.sh` runs it on a schedule instead; the
+shortest interval is one minute. A run that can't start (no node with room, a full
+quota) shows in `job ls` as a failed job with the reason, and is tried again after
+5 minutes. A job's output on the node stops at 64 MiB; the command keeps running.
 
 ## Run S3-compatible storage
 
@@ -553,6 +679,22 @@ rekcod doctor --bundle
 
 `upgrade` verifies the release checksum and replaces the installed binary and any
 bundled dashboard. A running VM keeps using its current daemon until restarted.
+
+On a server, `upgrade` then restarts the controller, node, edge and storage services
+that run that binary, in that order, and waits for the controller to listen again
+before the rest. A controller accepts heartbeats and route fetches from nodes and edges
+one minor version behind it, so with several Macs, upgrade the controller's Mac first.
+CLIs must be on the controller's minor version; an older one gets "this controller
+runs rekcod X, you have Y".
+
+Before a new rekcod migrates `fleet.db`, it copies it to
+`fleet.db.before-schema-N`. An older rekcod refuses a database a newer one migrated.
+To go back a release, stop the controller, put that copy back as `fleet.db`, and
+install the older version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TimMikeladze/rekcod/main/scripts/install.sh | REKCOD_VERSION=0.3.0 bash
+```
 `doctor --bundle` writes a diagnostic archive under `~/.rekcod` with configuration,
 status and logs, excluding tokens and keys.
 

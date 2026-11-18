@@ -192,7 +192,8 @@ enum Cmd {
     },
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp(ApiPolicyArgs),
-    /// Install the latest release over this binary (the VM keeps running the old one until restarted).
+    /// Install the latest release over this binary and restart the fleet services that run it
+    /// (the VM keeps running the old one until restarted).
     Upgrade {
         /// Only say whether a newer release exists; exit 1 if one does.
         #[arg(long)]
@@ -637,8 +638,13 @@ enum RemoteCmd {
     Add {
         name: String,
         url: String,
-        #[arg(long)]
-        token: String,
+        /// The controller token. Anyone on this Mac can read it from the process list while
+        /// this runs; REKCOD_TOKEN or --token-file keep it off argv.
+        #[arg(long, env = "REKCOD_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// Read the token from this file (`-` for stdin) instead.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<std::path::PathBuf>,
         /// Namespace this remote's commands use (default: default).
         #[arg(long)]
         ns: Option<String>,
@@ -661,7 +667,12 @@ enum NodeCmd {
     /// Register with a controller and start serving (saves ~/.rekcod/node.json).
     Join {
         controller: String,
-        join_token: String,
+        /// The controller's join token; REKCOD_JOIN_TOKEN or --token-file keep it off argv.
+        #[arg(env = "REKCOD_JOIN_TOKEN", hide_env_values = true)]
+        join_token: Option<String>,
+        /// Read the join token from this file (`-` for stdin) instead.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<std::path::PathBuf>,
         /// Address the node API listens on.
         #[arg(long, default_value = "127.0.0.1:7701")]
         listen: String,
@@ -924,12 +935,20 @@ enum EdgeCmd {
         #[arg(long)]
         public_listen: Option<String>,
         /// The public listener's clients send a PROXY v2 header (a TCP load balancer in front).
-        #[arg(long, requires = "public_listen")]
+        #[arg(long, requires_all = ["public_listen", "proxy_protocol_from"])]
         proxy_protocol: bool,
-        /// Peers (IP or CIDR) whose CF-Connecting-IP / X-Forwarded-For name the client, such
-        /// as cloudflared. Repeat it; giving any replaces the loopback default.
+        /// The load balancer's address (IP or CIDR) for --proxy-protocol; connections from
+        /// anywhere else are closed. Repeat it for more than one.
+        #[arg(long = "proxy-protocol-from", value_name = "NET", requires = "proxy_protocol")]
+        proxy_protocol_from: Vec<String>,
+        /// Peers (IP or CIDR) whose X-Forwarded-For names the client, such as cloudflared.
+        /// Repeat it; giving any replaces the loopback default.
         #[arg(long = "trusted-proxy", value_name = "NET", default_values = ["127.0.0.0/8", "::1"])]
         trusted_proxies: Vec<String>,
+        /// A header the trusted proxy overwrites with the client's address, read instead of
+        /// X-Forwarded-For: `cf-connecting-ip` behind cloudflared.
+        #[arg(long, value_name = "HEADER")]
+        client_ip_header: Option<String>,
         /// Requests per client IP across all apps (N/s, N/m or N/h).
         #[arg(long, default_value = "50/s")]
         rate: String,
@@ -1124,7 +1143,7 @@ enum JobCmd {
         /// Kill it after this long (exit 124).
         #[arg(long, value_parser = duration_secs)]
         timeout: Option<u64>,
-        /// Run it on this schedule instead of once (needs --name).
+        /// Run it on this schedule instead of once (needs --name; at least 1m).
         #[arg(long, value_parser = duration_secs)]
         every: Option<u64>,
         #[arg(long)]
@@ -1273,6 +1292,7 @@ enum ServerCmd {
         #[arg(long, requires = "edge_only")]
         remote: Option<String>,
         /// Existing controller's join token, required when this Mac has not joined yet.
+        /// REKCOD_JOIN_TOKEN keeps it off argv.
         #[arg(long, requires = "edge_only")]
         join_token: Option<String>,
         /// Listen here instead of the Tailscale IP.
@@ -1371,8 +1391,9 @@ fn main() {
         Cmd::Macos(MacosCmd::Ls) => macos::list(&paths),
         Cmd::Macos(MacosCmd::Rm { name }) => macos::remove(&paths, &name),
         Cmd::Macos(MacosCmd::Run { home, idle_ttl }) => macos::run(home, idle_ttl),
-        Cmd::Remote(RemoteCmd::Add { name, url, token, ns, ca_fingerprint }) => {
-            fleet::remote_add(&paths, &name, &url, &token, ns.as_deref(), ca_fingerprint.as_deref())
+        Cmd::Remote(RemoteCmd::Add { name, url, token, token_file, ns, ca_fingerprint }) => {
+            fleet::token_arg(token, token_file.as_deref(), "--token (or REKCOD_TOKEN)")
+                .and_then(|token| fleet::remote_add(&paths, &name, &url, &token, ns.as_deref(), ca_fingerprint.as_deref()))
         }
         Cmd::Remote(RemoteCmd::Ls) => {
             fleet::remote_list(&paths);
@@ -1380,18 +1401,22 @@ fn main() {
         }
         Cmd::Remote(RemoteCmd::Rm { name }) => fleet::remote_rm(&paths, &name),
         Cmd::Remote(RemoteCmd::Use { name }) => fleet::remote_use(&paths, &name),
-        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install, ca_fingerprint, zone }) => fleet::node_join(
-            &paths,
-            &controller,
-            &join_token,
-            fleet::NodeJoinOptions {
-                listen: &listen,
-                advertise: advertise.as_deref(),
-                install,
-                ca_fingerprint: ca_fingerprint.as_deref(),
-                zone: zone.as_deref(),
-            },
-        ),
+        Cmd::Node(NodeCmd::Join { controller, join_token, token_file, listen, advertise, install, ca_fingerprint, zone }) => {
+            fleet::token_arg(join_token, token_file.as_deref(), "JOIN_TOKEN (or REKCOD_JOIN_TOKEN)").and_then(|join_token| {
+                fleet::node_join(
+                    &paths,
+                    &controller,
+                    &join_token,
+                    fleet::NodeJoinOptions {
+                        listen: &listen,
+                        advertise: advertise.as_deref(),
+                        install,
+                        ca_fingerprint: ca_fingerprint.as_deref(),
+                        zone: zone.as_deref(),
+                    },
+                )
+            })
+        }
         Cmd::Node(NodeCmd::Serve { install: true }) => service::install(&paths, "node", &["node".into(), "serve".into()]),
         Cmd::Node(NodeCmd::Serve { install: false }) => fleet::node_serve(&paths),
         Cmd::Node(NodeCmd::Uninstall) => service::uninstall("node"),
@@ -1496,10 +1521,28 @@ fn main() {
             remote_call(&paths, &remote, "POST", "/join-token", &serde_json::json!({}))
         }
         Cmd::Edge(EdgeCmd::Serve { install: true, .. }) => service::install(&paths, "edge", &service::args_without_install()),
-        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, proxy_protocol, trusted_proxies, rate, burst, access_log, remote, .. }) => {
+        Cmd::Edge(EdgeCmd::Serve {
+            listen,
+            public_listen,
+            proxy_protocol,
+            proxy_protocol_from,
+            trusted_proxies,
+            client_ip_header,
+            rate,
+            burst,
+            access_log,
+            remote,
+            ..
+        }) => {
             let rate = edge::limit::parse_rate(&rate)?;
-            let trusted_proxies = trusted_proxies.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<_>>()?;
-            let settings = edge::Settings { rate, burst, access_log, trusted_proxies };
+            let nets = |v: &[String]| v.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<Vec<_>>>();
+            let (trusted_proxies, proxy_protocol_from) = (nets(&trusted_proxies)?, nets(&proxy_protocol_from)?);
+            let client_ip_header = client_ip_header
+                .map(|h| hyper::header::HeaderName::from_bytes(h.trim().to_ascii_lowercase().as_bytes()))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("--client-ip-header: {e}"))?;
+            let settings =
+                edge::Settings { rate, burst, access_log, trusted_proxies, client_ip_header, proxy_protocol_from, ..Default::default() };
             let o = edge::Options { listen, public_listen, proxy_protocol, settings };
             edge::serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), o)
         }
@@ -1541,6 +1584,9 @@ fn main() {
         }
         Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token }) => {
             if edge_only {
+                // Read here, not as the flag's clap `env`: an exported variable would make a
+                // plain setup fail `requires = "edge_only"`.
+                let join_token = join_token.or_else(|| std::env::var("REKCOD_JOIN_TOKEN").ok().filter(|t| !t.is_empty()));
                 server::setup_edge(
                     &paths,
                     remote.as_deref().context("--edge-only requires --remote")?,
@@ -1640,8 +1686,8 @@ fn run_ns(paths: &paths::Paths, remote: &Option<String>, c: NsCmd) -> anyhow::Re
 /// `[http]` from rekcod.toml; null (keep the app's current settings) when there's none.
 #[cfg(target_os = "macos")]
 fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Result<serde_json::Value> {
-    let (rate, burst, max_body) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"));
-    if rate.is_none() && burst.is_none() && max_body.is_none() {
+    let (rate, burst, max_body, timeout) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"), t.get("http.timeout"));
+    if rate.is_none() && burst.is_none() && max_body.is_none() && timeout.is_none() {
         return Ok(serde_json::Value::Null);
     }
     if let Some(r) = rate {
@@ -1649,7 +1695,15 @@ fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Resul
     }
     let burst = burst.map(|b| b.parse::<u32>().map_err(|_| anyhow::anyhow!("rekcod.toml http.burst: {b} isn't a number"))).transpose()?;
     let max_body = max_body.map(|m| edge::limit::parse_size(m)).transpose()?;
-    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body}))
+    let timeout = timeout
+        .map(|t| {
+            duration_secs(t)
+                .ok()
+                .filter(|t| (1..=3600).contains(t))
+                .ok_or_else(|| anyhow::anyhow!("rekcod.toml http.timeout: {t} isn't between 1s and 1h"))
+        })
+        .transpose()?;
+    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body, "timeout": timeout}))
 }
 
 fn remote_call(paths: &paths::Paths, remote: &Option<String>, method: &str, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
@@ -1825,8 +1879,9 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 // Neither given keeps the app's current count (1 for a new app).
                 "instances": instances.or(num("resources.instances")),
                 "spread": t.get("resources.spread"),
-                "cpus": num("resources.cpus").unwrap_or(1),
-                "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()).unwrap_or(1),
+                // Left out keeps the app's resources. `[env]` is merged over the env it has.
+                "cpus": num("resources.cpus"),
+                "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()),
                 "health": t.get("app.health").cloned(),
                 "start": t.get("app.start"),
                 "env": env,
@@ -2049,6 +2104,40 @@ mod tests {
         // The node's 64 KiB window moved past the start of what was shown.
         assert_eq!(super::new_output("xxhello\n", "hello\nworld\n"), "world\n");
         assert_eq!(super::new_output("gone", "fresh\n"), "fresh\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn http_timeout_from_rekcod_toml() {
+        let t = |v: &str| std::collections::HashMap::from([("http.timeout".to_string(), v.to_string())]);
+        assert_eq!(http_settings(&t("5m")).unwrap()["timeout"], 300);
+        assert_eq!(http_settings(&t("90")).unwrap()["timeout"], 90);
+        assert!(http_settings(&t("0")).is_err());
+        assert!(http_settings(&t("2h")).is_err());
+    }
+
+    #[test]
+    fn tokens_can_stay_off_argv() {
+        use clap::{CommandFactory, Parser};
+        let env_of = |path: &[&str], arg: &str| {
+            let mut c = Args::command();
+            for p in path {
+                c = c.find_subcommand(p).unwrap().clone();
+            }
+            let a = c.get_arguments().find(|a| a.get_id() == arg).unwrap().clone();
+            (a.get_env().map(|e| e.to_string_lossy().to_string()), a.is_hide_env_values_set())
+        };
+        assert_eq!(env_of(&["remote", "add"], "token"), (Some("REKCOD_TOKEN".into()), true));
+        assert_eq!(env_of(&["node", "join"], "join_token"), (Some("REKCOD_JOIN_TOKEN".into()), true));
+        assert!(Args::try_parse_from(["rekcod", "remote", "add", "x", "https://h:7700", "--token-file", "-"]).is_ok());
+        assert!(Args::try_parse_from(["rekcod", "node", "join", "https://h:7700", "--token-file", "/t"]).is_ok());
+        assert!(Args::try_parse_from(["rekcod", "node", "join", "https://h:7700", "jt", "--listen", "127.0.0.1:1"]).is_ok());
+        let f = std::env::temp_dir().join(format!("rekcod-token-{}", std::process::id()));
+        std::fs::write(&f, "from-file\n").unwrap();
+        assert_eq!(fleet::token_arg(Some("from-env".into()), Some(&f), "x").unwrap(), "from-file");
+        assert_eq!(fleet::token_arg(Some(" argv ".into()), None, "x").unwrap(), "argv");
+        assert!(fleet::token_arg(None, None, "--token").unwrap_err().to_string().contains("--token"));
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]

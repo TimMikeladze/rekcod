@@ -62,4 +62,6 @@ Fixes for the fleet-auth findings in `docs/audit-2026-11-18.md` that land on the
   that recently authenticated as a node or edge.
 - Left to the deploy branch (`audit-fixes-deploy`), which already changes that code: git's
   low-speed limits and deadline in `git_cmd`/`resolve`, and the 409 for a third queued deploy
-  of one app. A connect timeout in `proxy()` belongs with the tls branch's rewrite of that line.
+  of one app.
+- `proxy()` connects to a node within 10 s, with a 60 s write timeout and the 900 s read
+  timeout `call` uses (none for `?follow` streams).

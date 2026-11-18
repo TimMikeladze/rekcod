@@ -24,6 +24,14 @@ pub fn compatible(a: &str, b: &str) -> bool {
     a.0 == b.0 && (a.0 > 0 || a.1 == b.1)
 }
 
+/// A node or edge at `peer` may still talk to a controller at `ours`: [`compatible`], or
+/// one minor version behind while major is 0. Servers upgrade controller first, then
+/// nodes and edges, so those are never ahead.
+pub fn compatible_peer(peer: &str, ours: &str) -> bool {
+    let (p, o) = (parse_version(peer), parse_version(ours));
+    compatible(peer, ours) || (p.0 == 0 && o.0 == 0 && p.1 + 1 == o.1)
+}
+
 fn curl(args: &[&str]) -> Result<Vec<u8>> {
     let out = Command::new("curl").args(["-fsSL", "--max-time", "60"]).args(args).output().context("run curl")?;
     if !out.status.success() {
@@ -116,7 +124,58 @@ pub fn upgrade(check: bool) -> Result<()> {
     r?;
     let _ = Command::new("xattr").args(["-d", "com.apple.quarantine"]).arg(&exe).stderr(Stdio::null()).status();
     println!("rekcod {latest} installed at {}. A running VM keeps {current} until `rekcod stop && rekcod start`", exe.display());
+    restart_fleet(&exe);
     Ok(())
+}
+
+/// Restarts the fleet services installed on this Mac that run `exe`, in
+/// [`crate::service::FLEET_SERVICES`] order, so they run the new binary. Once the
+/// controller is restarted, the rest wait until it listens again.
+fn restart_fleet(exe: &Path) {
+    for name in crate::service::FLEET_SERVICES {
+        let Some(argv) = crate::service::job_args(name) else { continue };
+        if argv.first().and_then(|a| Path::new(a).canonicalize().ok()).as_deref() != Some(exe) {
+            eprintln!("rekcod: {name} runs {}, not this binary; leaving it alone", argv.first().map_or("?", String::as_str));
+            continue;
+        }
+        eprintln!("rekcod: restarting {name}");
+        if let Err(e) = crate::service::restart(name) {
+            eprintln!("rekcod: {name}: {e:#}");
+            continue;
+        }
+        // It waits up to 30 s for deploys in flight before it exits.
+        if *name == "controller"
+            && let Some(addr) = listen_addr(&argv)
+            && !wait_for_port(&addr, Duration::from_secs(90))
+        {
+            eprintln!("rekcod: the controller isn't listening on {addr} yet; restarting the rest anyway");
+        }
+    }
+}
+
+/// Where a service's `--listen` points, as an address to connect to.
+fn listen_addr(argv: &[String]) -> Option<String> {
+    let l = argv.iter().skip_while(|a| *a != "--listen").nth(1)?;
+    let (host, port) = l.rsplit_once(':')?;
+    let host = match host.trim_matches(['[', ']']) {
+        "0.0.0.0" | "::" | "" => "127.0.0.1",
+        h => h,
+    };
+    Some(if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") })
+}
+
+fn wait_for_port(addr: &str, within: Duration) -> bool {
+    use std::net::ToSocketAddrs;
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < within {
+        let up =
+            addr.to_socket_addrs().into_iter().flatten().any(|a| std::net::TcpStream::connect_timeout(&a, Duration::from_secs(1)).is_ok());
+        if up {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    false
 }
 
 /// What `rekcod dashboard` runs from a build (dashboard.rs); a copy without them isn't installed.
@@ -267,6 +326,27 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
         if open.is_empty() { "home, run/, logs/ and vm/ 700, VM disks 600".into() } else { open.join(", ") },
         "sudo chown -R \"$(whoami)\" ~/.rekcod, then any rekcod command sets the modes again",
     );
+    let certs = crate::fleet::cert_expiries(paths);
+    if !certs.is_empty() {
+        let soon = crate::fleet::expiring(&certs, crate::fleet::now());
+        add(
+            "fleet certificates",
+            soon.is_empty(),
+            if soon.is_empty() {
+                format!("{} valid for 90 days or more", certs.iter().map(|c| c.0).collect::<Vec<_>>().join(" and "))
+            } else {
+                soon.join(", ")
+            },
+            "node: check logs/node.log for renewal errors (it renews through its heartbeat); controller: rekcod server restart",
+        );
+    }
+    let refused = crate::fleet::refused_cas(paths);
+    add(
+        "fleet CA pins",
+        refused.is_empty(),
+        if refused.is_empty() { "one certificate each".into() } else { format!("more than one certificate: {}", refused.join(", ")) },
+        "rekcod remote add NAME URL --token T --ca-fingerprint sha256:... again (node.json: rekcod node join again)",
+    );
     if crate::docker::available() {
         let ctx = crate::docker::current_context().unwrap_or_default();
         // `default` is /var/run/docker.sock, which is rekcod once the socket is routed.
@@ -381,6 +461,24 @@ fn sw_vers() -> String {
 /// Past this, a long-running process's log is copied to `.1` and truncated.
 const LOG_MAX: u64 = 20 << 20;
 
+/// launchd starts agents with a soft limit of 256 descriptors; every proxied or forwarded
+/// connection takes two. Raises the soft limit as far as the system allows and returns it.
+pub fn raise_fd_limit() -> u64 {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return 256;
+    }
+    let per_proc = crate::cli::sysctl_u64("kern.maxfilesperproc").unwrap_or(10240) as libc::rlim_t;
+    let want = lim.rlim_max.min(per_proc);
+    if want > lim.rlim_cur {
+        let raised = libc::rlimit { rlim_cur: want, rlim_max: lim.rlim_max };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return want;
+        }
+    }
+    lim.rlim_cur
+}
+
 /// Checks `log` every hour for as long as this process runs. Its writers opened it
 /// `O_APPEND`, so after truncation they carry on at the new end.
 pub fn trim_log_hourly(log: PathBuf) {
@@ -411,6 +509,10 @@ mod tests {
         assert!(parse_version("0.3.0") > parse_version("0.2.9"));
         assert!(parse_version("v1.0.0") > parse_version("0.99.0"));
         assert!(compatible("0.3.1", "0.3.0") && !compatible("0.3.0", "0.2.1"));
+        // Nodes and edges may lag the controller by a minor version, never lead it.
+        assert!(compatible_peer("0.2.9", "0.3.0") && !compatible_peer("0.4.0", "0.3.0") && !compatible_peer("0.1.0", "0.3.0"));
+        assert_eq!(listen_addr(&["x".into(), "--listen".into(), "0.0.0.0:7700".into()]).as_deref(), Some("127.0.0.1:7700"));
+        assert_eq!(listen_addr(&["--listen".into(), "100.64.0.1:7700".into()]).as_deref(), Some("100.64.0.1:7700"));
         assert!(compatible("1.4.0", "1.2.0") && !compatible("2.0.0", "1.9.0"));
     }
 

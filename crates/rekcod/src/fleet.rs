@@ -3007,7 +3007,8 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
 fn routes(c: &Controller) -> Result<Value> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select i.app, i.endpoint, a.public, i.state, a.ns, a.http from instances i join apps a on a.name = i.app
-         where i.state in ('live', 'sleeping') and a.destroying is null order by i.app",
+         where i.state in ('live', 'sleeping') and a.destroying is null
+           and (i.state <> 'live' or i.release = a.live_release) order by i.app",
         &[],
     )?;
     let mut out: std::collections::BTreeMap<String, Route> = Default::default();
@@ -3267,9 +3268,13 @@ fn delete_instance(c: &Controller, node: &str, sandbox_id: &str) {
         }
         let _ = call_within(&url, "DELETE", &format!("/sandboxes/{sandbox_id}"), Some(&sec), &Value::Null, QUICK);
     }
+    c.strikes.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(sandbox_id);
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let _ = db.execute("update instances set state = 'removed' where sandbox = ?1", &[&sandbox_id]);
-    let _ = db.execute("update sandboxes set state = 'removed' where id = ?1", &[&sandbox_id]);
+    if let Ok(tx) = db.0.transaction()
+        && retire(&tx, [sandbox_id]).is_ok()
+    {
+        let _ = tx.commit();
+    }
 }
 
 /// New release from `commit` (or the app's ref), holding the app's lock: two deploys of
@@ -3281,6 +3286,24 @@ fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> 
 }
 
 type StartedInstance = (String, String, String);
+
+/// What a release switch took out of service, as (node, sandbox).
+struct Switched {
+    /// Live instances of older releases: deleted after the drain period.
+    draining: Vec<(String, String)>,
+    /// Stopped instances of older releases: deleted at once.
+    sleeping: Vec<(String, String)>,
+}
+
+/// Marks instances and their sandbox rows removed together. A sandbox row left `running`
+/// or `lost` would keep its VM on the node for good: the orphan check skips known rows.
+fn retire<'a>(db: &rusqlite::Connection, sandboxes: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    for sb in sandboxes {
+        db.execute("update instances set state = 'removed' where sandbox = ?1", [sb])?;
+        db.execute("update sandboxes set state = 'removed' where id = ?1", [sb])?;
+    }
+    Ok(())
+}
 
 struct Launched {
     started: Vec<StartedInstance>,
@@ -3482,20 +3505,29 @@ fn top_up_locked(c: &Arc<Controller>, app: &App) -> Result<usize> {
     let mut log = vec![format!("recovering {missing} missing instance(s) of r{release}")];
     let launched = launch_instances(c, app, release, &commit, missing, "reconcile", &mut log)?;
     let added = launched.started.len();
-    {
+    let switched = (|| -> Result<()> {
+        use rusqlite::OptionalExtension;
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db.0.transaction()?;
         // A returning worker must not revive a replica already replaced elsewhere.
         for (_, sb, _) in &launched.started {
-            db.execute("update instances set state = 'live' where sandbox = ?1", &[sb])?;
-            let retired = db.query_opt(
-                "update instances set state = 'removed' where sandbox = (select sandbox from instances
-                   where app = ?1 and release = ?2 and state = 'lost' order by sandbox limit 1) returning sandbox",
-                &[&app.name, &release],
-            )?;
-            if let Some(r) = retired {
-                db.execute("update sandboxes set state = 'removed' where id = ?1", &[&r.get::<String>(0)])?;
-            }
+            tx.execute("update instances set state = 'live' where sandbox = ?1", [sb])?;
+            let lost: Option<String> = tx
+                .query_row(
+                    "select sandbox from instances where app = ?1 and release = ?2 and state = 'lost' order by sandbox limit 1",
+                    rusqlite::params![app.name, release],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            retire(&tx, lost.as_deref())?;
         }
+        Ok(tx.commit()?)
+    })();
+    if let Err(e) = switched {
+        for (node, sb, _) in &launched.started {
+            delete_instance(c, node, sb);
+        }
+        return Err(e);
     }
     log.extend(launched.errors);
     log_shared_placement(c, &app.name, &mut log)?;
@@ -3645,41 +3677,74 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
         c.alert(&format!("{} r{n} failed to deploy; the previous release keeps serving", app.short));
         bail!("release {n} failed, the previous release keeps serving:\n{}", errors.join("\n"));
     }
-    let old: Vec<(String, String)> = {
+    // The switch is one transaction: if any of it fails, the previous release keeps its
+    // routes and stays live, and the new instances go.
+    let switched = (|| -> Result<Option<Switched>> {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Checked in the same hold as the switch, so a destroy can't slip in between.
-        if !is_current(&db.0, app)? {
-            drop(db);
+        let tx = db.0.transaction()?;
+        // Checked in the same transaction as the switch, so a destroy can't slip in between.
+        if !is_current(&tx, app)? {
+            return Ok(None);
+        }
+        let pairs = |sql: &str| -> Result<Vec<(String, String)>> {
+            let mut st = tx.prepare(sql)?;
+            let rows = st.query_map(rusqlite::params![app.name, n], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        };
+        let draining =
+            pairs("update instances set state = 'draining' where app = ?1 and release <> ?2 and state = 'live' returning node, sandbox")?;
+        tx.execute(
+            "update instances set state = 'live' where app = ?1 and release = ?2 and state = 'starting'",
+            rusqlite::params![app.name, n],
+        )?;
+        // Older releases' stopped VMs (the app was asleep) and lost ones are replaced now. A
+        // wake would otherwise start them next to this release.
+        let sleeping = pairs("select node, sandbox from instances where app = ?1 and release <> ?2 and state = 'sleeping'")?;
+        let lost = pairs("select node, sandbox from instances where app = ?1 and release <> ?2 and state = 'lost'")?;
+        // Lost ones are deleted on their node when it reports them again (the orphan check).
+        retire(&tx, lost.iter().chain(&sleeping).map(|(_, sb)| sb.as_str()))?;
+        tx.execute("update apps set live_release = ?2 where name = ?1", rusqlite::params![app.name, n])?;
+        // One live release: the one it replaces is what `rollback` goes back to.
+        tx.execute("update releases set state = 'old' where app = ?1 and state = 'live' and n <> ?2", rusqlite::params![app.name, n])?;
+        tx.execute("update releases set state = 'live' where app = ?1 and n = ?2", rusqlite::params![app.name, n])?;
+        tx.commit()?;
+        Ok(Some(Switched { draining, sleeping }))
+    })();
+    let Switched { draining: old, sleeping } = match switched {
+        Ok(Some(s)) => s,
+        Ok(None) | Err(_) => {
             for (node, sb, _) in &started {
                 delete_instance(c, node, sb);
             }
-            log.push("the app was destroyed during this deploy".into());
+            let destroyed = matches!(switched, Ok(None));
+            let why = match &switched {
+                Err(e) => format!("switching to release {n}: {e:#}; the previous release keeps serving"),
+                _ => "the app was destroyed during this deploy".into(),
+            };
+            log.push(why.clone());
             finish("failed", &log);
-            bail!("{} was destroyed during this deploy", app.short);
+            if destroyed {
+                bail!("{} was destroyed during this deploy", app.short);
+            }
+            c.audit(&app.ns, who, "deploy", &format!("{} r{n}", app.short), false);
+            bail!("{why}");
         }
-        let old = db.query(
-            "update instances set state = 'draining' where app = ?1 and release <> ?2 and state = 'live' returning node, sandbox",
-            &[&app.name, &n],
-        )?;
-        db.execute("update instances set state = 'live' where app = ?1 and release = ?2 and state = 'starting'", &[&app.name, &n])?;
-        // Lost ones of older releases are replaced now; their sandboxes go when their node
-        // reports them (it's told to delete what the controller doesn't know).
-        db.execute("update instances set state = 'removed' where app = ?1 and release <> ?2 and state = 'lost'", &[&app.name, &n])?;
-        db.execute("update apps set live_release = ?2 where name = ?1", &[&app.name, &n])?;
-        // One live release: the one it replaces is what `rollback` goes back to.
-        db.execute("update releases set state = 'old' where app = ?1 and state = 'live' and n <> ?2", &[&app.name, &n])?;
-        old.iter().map(|r| (r.get(0), r.get(1))).collect()
     };
-    log.push(format!("live; draining {} old instance(s) for {}s", old.len(), c.drain_secs));
-    log_shared_placement(c, &app.name, &mut log)?;
-    finish("live", &log);
+    // Started before anything else can fail, so what was marked draining is always deleted.
     let (c2, drain) = (c.clone(), c.drain_secs);
+    let old_count = old.len();
     std::thread::spawn(move || {
+        for (node, sb) in sleeping {
+            delete_instance(&c2, &node, &sb);
+        }
         std::thread::sleep(Duration::from_secs(drain));
         for (node, sb) in old {
             delete_instance(&c2, &node, &sb);
         }
     });
+    log.push(format!("live; draining {old_count} old instance(s) for {}s", c.drain_secs));
+    let _ = log_shared_placement(c, &app.name, &mut log);
+    finish("live", &log);
     if health != app.health {
         // rekcod.toml's health path, so waking checks the same one.
         c.db.lock()
@@ -3840,12 +3905,18 @@ fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .execute("update apps set last_request = ?2 where name = ?1", &[&app.name, &now()]);
-    let rows =
-        c.db.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query("select node, sandbox, endpoint from instances where app = ?1 and state = 'sleeping'", &[&app.name])?;
+    let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
+        "select i.node, i.sandbox, i.endpoint, i.release = a.live_release from instances i join apps a on a.name = i.app
+         where i.app = ?1 and i.state = 'sleeping'",
+        &[&app.name],
+    )?;
+    // Sleeping instances of a release a later deploy replaced: never woken again.
+    for r in rows.iter().filter(|r| !r.get::<bool>(3)) {
+        delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
+    }
     let handles: Vec<_> = rows
         .iter()
+        .filter(|r| r.get::<bool>(3))
         .map(|r| {
             let (node, sb, ep): (String, String, String) = (r.get(0), r.get(1), r.get(2));
             let target = c.node(&node);
@@ -3883,10 +3954,18 @@ fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
     }
     // Node lost or VM gone: a normal deploy of the same commit (a rebuild).
     let commit = live_commit(c, &app.name)?.ok_or_else(|| anyhow!("{} isn't deployed", app.name))?;
-    let _ =
-        c.db.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .execute("update instances set state = 'removed' where app = ?1 and state = 'sleeping'", &[&app.name]);
+    // Their sandbox rows go too, so a node that comes back is told to delete those VMs.
+    {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let asleep: Vec<String> = db
+            .query("select sandbox from instances where app = ?1 and state = 'sleeping'", &[&app.name])?
+            .iter()
+            .map(|r| r.get(0))
+            .collect();
+        let tx = db.0.transaction()?;
+        retire(&tx, asleep.iter().map(String::as_str))?;
+        tx.commit()?;
+    }
     deploy_locked(c, app, Some(commit), "wake")?;
     live_endpoints(c, &app.name)
 }
@@ -4344,9 +4423,8 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 &[&app.name, &target],
             )?;
             let commit: String = row.ok_or_else(|| anyhow!("no earlier good release of {name}"))?.get(0);
-            c.db.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execute("update releases set state = 'old' where app = ?1 and state = 'live'", &[&app.name])?;
+            // The serving release becomes `old` at the switch, not before: a rollback that
+            // fails leaves it live.
             deploy(c, &app, Some(commit), &who.name)
         }
         ("POST", ["apps", name, "scale"]) => {
@@ -7261,6 +7339,89 @@ mod tests {
         assert_eq!(db.query_one("select state from instances where sandbox = 'old'", &[]).unwrap().get::<String>(0), "removed");
     }
 
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn states(c: &Controller, sb: &str) -> (String, String) {
+        let mut db = c.db.lock().unwrap();
+        let i = db.query_one("select state from instances where sandbox = ?1", &[&sb]).unwrap().get(0);
+        let s = db.query_one("select state from sandboxes where id = ?1", &[&sb]).unwrap().get(0);
+        (i, s)
+    }
+
+    #[test]
+    fn a_deploy_while_asleep_retires_the_old_release_and_its_lost_instances() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let ep = instance_node(&c, "n1", 8192, false);
+        let app = recovery_app(&c, 1);
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute(
+                "insert into instances values ('web', 7, 'r7-asleep', 'n1', ?1, 'sleeping'), ('web', 7, 'r7-lost', 'gone', 'ep', 'lost')",
+                &[&ep],
+            )
+            .unwrap();
+            db.execute("insert into sandboxes (id, node, owner, state, created) values ('r7-asleep', 'n1', 'a', 'running', 0), ('r7-lost', 'gone', 'a', 'lost', 0)", &[])
+                .unwrap();
+        }
+        deploy_locked(&c, &app, Some(SHA.into()), "test").unwrap();
+        // Both rows go with their sandbox rows: the orphan check reads sandboxes.
+        assert_eq!(states(&c, "r7-asleep"), ("removed".into(), "removed".into()));
+        assert_eq!(states(&c, "r7-lost"), ("removed".into(), "removed".into()));
+        // The new release idles, and the next request wakes only it.
+        c.db.lock().unwrap().execute("update instances set state = 'sleeping' where state = 'live'", &[]).unwrap();
+        assert_eq!(wake(&c, &app).unwrap().len(), 1);
+        let live = c.db.lock().unwrap().query("select release from instances where state = 'live'", &[]).unwrap();
+        assert_eq!(live.iter().map(|r| r.get::<i32>(0)).collect::<Vec<_>>(), [8]);
+        // A live row of a release that isn't live never routes.
+        c.db.lock().unwrap().execute("insert into instances values ('web', 6, 'stray', 'n1', 'stray:1', 'live')", &[]).unwrap();
+        let r: HashMap<String, Route> = serde_json::from_value(routes(&c).unwrap()).unwrap();
+        assert_eq!(r["web.apps.test"].endpoints, vec![ep]);
+    }
+
+    #[test]
+    fn a_failed_switch_keeps_the_previous_release_live_and_routed() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let ep = instance_node(&c, "n1", 8192, false);
+        let app = recovery_app(&c, 1);
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("insert into instances values ('web', 7, 'r7', 'n1', ?1, 'live')", &[&ep]).unwrap();
+            // A write error in the middle of the switch.
+            db.0.execute_batch(
+                "create trigger full before update of state on instances when old.state = 'starting' and new.state = 'live'
+                 begin select raise(abort, 'database or disk is full (simulated)'); end;",
+            )
+            .unwrap();
+        }
+        let e = deploy_locked(&c, &app, Some(SHA.into()), "test").unwrap_err().to_string();
+        assert!(e.contains("previous release keeps serving"), "{e}");
+        let r: HashMap<String, Route> = serde_json::from_value(routes(&c).unwrap()).unwrap();
+        assert_eq!(r["web.apps.test"].endpoints, vec![ep]);
+        let mut db = c.db.lock().unwrap();
+        assert_eq!(db.query_one("select live_release from apps", &[]).unwrap().get::<i32>(0), 7);
+        let rel = db.query("select n, state from releases order by n", &[]).unwrap();
+        assert_eq!(
+            rel.iter().map(|r| (r.get::<i32>(0), r.get::<String>(1))).collect::<Vec<_>>(),
+            [(7, "live".into()), (8, "failed".into())]
+        );
+        assert_eq!(db.query_one("select count(*) from instances where release = 8 and state <> 'removed'", &[]).unwrap().get::<i64>(0), 0);
+    }
+
+    #[test]
+    fn a_rollback_that_fails_leaves_the_serving_release_live() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        recovery_app(&c, 1);
+        c.db.lock()
+            .unwrap()
+            .execute("insert into releases (app, n, commit_sha, state, created) values ('web', 6, ?1, 'old', 0)", &[&SHA])
+            .unwrap();
+        // No node: the rollback's deploy can't place anything.
+        let r = apps_route(&c, &Caller::system("t"), "default", "POST", &["apps", "web", "rollback"], &json!({}), &[]);
+        assert!(r.is_err());
+        let state: String = c.db.lock().unwrap().query_one("select state from releases where n = 7", &[]).unwrap().get(0);
+        assert_eq!(state, "live");
+    }
+
     #[test]
     fn assignment_spreads_reserves_memory_and_honours_zones() {
         let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
@@ -7377,6 +7538,7 @@ mod tests {
             db.execute("insert into instances values (?1, 1, ?2, 'n1', ?3, ?4)", &[&app, &sb, &format!("10.0.0.1:{}", sb.len()), &state])
                 .unwrap();
         }
+        db.execute("update apps set live_release = 1", &[]).unwrap();
         let c = Controller::new(db, "apps.test".into(), 0, [7; 32]);
         let r: HashMap<String, Route> = serde_json::from_value(routes(&c).unwrap()).unwrap();
         assert_eq!(r.len(), 2, "removed instances don't route");

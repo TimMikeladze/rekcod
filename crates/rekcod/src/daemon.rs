@@ -137,6 +137,10 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     crate::lifecycle::raise_fd_limit();
     // Every minute: what a sandbox's guest does reaches this log, limited but not silenced.
     crate::lifecycle::trim_log_every(paths.daemon_log(), Duration::from_secs(60));
+    // Rotated only at boot otherwise; a VM up for months grows it. The dashboard started
+    // in the background has no rekcod process of its own to trim its log.
+    crate::lifecycle::trim_log_hourly(paths.console_log());
+    crate::lifecycle::trim_log_hourly(paths.home.join("logs/dashboard.log"));
     let guest = paths.guest_dir()?;
     let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
     let fresh = paths.data_fresh().exists();

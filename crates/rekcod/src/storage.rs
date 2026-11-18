@@ -93,7 +93,7 @@ pub fn ensure_binary(paths: &Paths) -> Result<PathBuf> {
     let r = (|| -> Result<()> {
         eprintln!("rekcod: downloading RustFS {RUSTFS_VERSION}");
         let zip = tmp.join("rustfs.zip");
-        if !Command::new("curl").args(crate::fetch::CURL_LIMITS).args(["-fsSL", "-o"]).arg(&zip).arg(RUSTFS_ZIP).status()?.success() {
+        if !crate::fetch::download_cmd(RUSTFS_ZIP, &zip, true).arg("-sS").status()?.success() {
             bail!("could not download {RUSTFS_ZIP}");
         }
         let out = Command::new("shasum").args(["-a", "256"]).arg(&zip).output()?;
@@ -152,7 +152,9 @@ fn use_system_lzma(bin: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Runs RustFS in the foreground (it replaces this process) on `listen`, data in `data`.
+/// Runs RustFS in the foreground on `listen`, data in `data`, until it exits; exits with
+/// its status. RustFS is a child rather than an exec so this process lives on to trim
+/// storage.log, which launchd keeps appending RustFS's output to.
 pub fn serve(paths: &Paths, listen: &str, data: Option<&Path>) -> Result<()> {
     crate::lifecycle::trim_log_hourly(paths.home.join("logs/storage.log"));
     let addr: SocketAddr = listen.parse().context("--listen takes IP:PORT")?;
@@ -169,9 +171,40 @@ pub fn serve(paths: &Paths, listen: &str, data: Option<&Path>) -> Result<()> {
     write_private(&file, &serde_json::to_vec_pretty(&creds)?)?;
     let bin = ensure_binary(paths)?;
     eprintln!("rekcod: RustFS {RUSTFS_VERSION} on {} (data {}, keys {})", creds.endpoint, data.display(), file.display());
-    use std::os::unix::process::CommandExt;
-    let err = rustfs_command(&bin, listen, &data, &creds).exec();
-    Err(err).context("exec rustfs")
+    // Signals for this process go to RustFS; launchd stopping the job (or Ctrl-C) reaches
+    // both anyway, since they share a process group.
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        unsafe { libc::signal(sig, on_signal as *const () as libc::sighandler_t) };
+    }
+    let child = rustfs_command(&bin, listen, &data, &creds).spawn().context("start rustfs")?;
+    let st = supervise(child, &SIGNAL)?;
+    std::process::exit(exit_code(st));
+}
+
+static SIGNAL: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+extern "C" fn on_signal(sig: libc::c_int) {
+    SIGNAL.store(sig, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Waits for `child`, passing on each signal `pending` reports.
+fn supervise(mut child: std::process::Child, pending: &std::sync::atomic::AtomicI32) -> Result<std::process::ExitStatus> {
+    loop {
+        if let Some(st) = child.try_wait()? {
+            return Ok(st);
+        }
+        let sig = pending.swap(0, std::sync::atomic::Ordering::SeqCst);
+        if sig != 0 {
+            unsafe { libc::kill(child.id() as libc::pid_t, sig) };
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// The exit code a shell would give for `st`: its code, or 128 + the signal.
+fn exit_code(st: std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    st.code().unwrap_or_else(|| 128 + st.signal().unwrap_or(0))
 }
 
 /// RustFS on `listen` only. Its console is off: RustFS 1.0.1 otherwise also serves the
@@ -330,6 +363,19 @@ fn env_target(var: &dyn Fn(&str) -> Option<String>) -> Result<Option<(S3, String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A signal for `storage serve` reaches RustFS, and RustFS's exit status is serve's.
+    #[test]
+    fn rustfs_runs_as_a_child_and_gets_the_signals() {
+        let pending = std::sync::atomic::AtomicI32::new(0);
+        let child = Command::new("/bin/sh").args(["-c", "trap 'exit 7' TERM; while :; do sleep 0.05; done"]).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        pending.store(libc::SIGTERM, std::sync::atomic::Ordering::SeqCst);
+        let st = supervise(child, &pending).unwrap();
+        assert_eq!(exit_code(st), 7);
+        let killed = Command::new("/bin/sh").args(["-c", "kill -KILL $$"]).status().unwrap();
+        assert_eq!(exit_code(killed), 128 + libc::SIGKILL);
+    }
 
     #[test]
     fn rustfs_serves_only_its_listen_address() {

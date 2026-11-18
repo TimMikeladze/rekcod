@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use crate::paths::Paths;
 
 /// `sudo pmset` arguments: no sleep, even with the lid shut; boot again after a power cut.
-pub const PMSET: &[&str] = &["pmset", "-a", "sleep", "0", "disablesleep", "1", "autorestart", "1", "womp", "1"];
+pub const PMSET: &[&str] = &["/usr/bin/pmset", "-a", "sleep", "0", "disablesleep", "1", "autorestart", "1", "womp", "1"];
 
 fn tailscale() -> String {
     which("tailscale").unwrap_or_else(|| "/Applications/Tailscale.app/Contents/MacOS/Tailscale".into())
@@ -68,13 +68,14 @@ fn gui_session() -> bool {
 }
 
 fn auto_login_user() -> Option<String> {
-    let o = Command::new("defaults").args(["read", "/Library/Preferences/com.apple.loginwindow", "autoLoginUser"]).output().ok()?;
+    let o =
+        Command::new("/usr/bin/defaults").args(["read", "/Library/Preferences/com.apple.loginwindow", "autoLoginUser"]).output().ok()?;
     let u = String::from_utf8_lossy(&o.stdout).trim().to_string();
     (o.status.success() && !u.is_empty()).then_some(u)
 }
 
 fn filevault_on() -> bool {
-    Command::new("fdesetup").arg("status").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("FileVault is On"))
+    Command::new("/usr/bin/fdesetup").arg("status").output().is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("FileVault is On"))
 }
 
 /// What happens after a reboot or power cut. Daemons start once macOS is up, which with
@@ -125,7 +126,8 @@ fn after_reboot(daemons: bool, exe: &Path) {
 }
 
 fn can_sudo() -> bool {
-    std::io::stdin().is_terminal() || Command::new("sudo").args(["-n", "true"]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
+    std::io::stdin().is_terminal()
+        || Command::new("/usr/bin/sudo").args(["-n", "true"]).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }
 
 fn power(paths: &Paths) {
@@ -133,21 +135,28 @@ fn power(paths: &Paths) {
         eprintln!("rekcod: skipped `sudo {}` (sudo needs a terminal); run it once so the lid can stay shut", PMSET.join(" "));
         return;
     }
-    // What `rekcod uninstall` puts back. Written once: a re-run would record rekcod's own values.
-    let before = pmset_file(paths);
-    if !before.exists() {
-        let custom = Command::new("pmset").args(["-g", "custom"]).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
-        let g = Command::new("pmset").arg("-g").output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
-        if let (Ok(c), Ok(g)) = (custom, g) {
-            let undo = pmset_undo(&c, &g);
-            let _ = std::fs::create_dir_all(before.parent().unwrap_or(&paths.home));
-            let _ = std::fs::write(&before, serde_json::to_vec(&undo).unwrap_or_default());
-        }
-    }
+    record_power(paths);
     eprintln!("rekcod: sudo {}", PMSET.join(" "));
-    match Command::new("sudo").args(PMSET).status() {
+    match Command::new("/usr/bin/sudo").args(PMSET).status() {
         Ok(s) if s.success() => eprintln!("rekcod: never sleeps, lid shut or not; boots again after a power cut"),
         _ => eprintln!("rekcod: pmset failed; the Mac sleeps when its lid shuts"),
+    }
+}
+
+/// What `rekcod uninstall` puts back, recorded before `PMSET` changes anything. Written
+/// once: a re-run would record rekcod's own values. The server pkg runs it (`server
+/// record-power`) as the user before its root half sets pmset.
+pub fn record_power(paths: &Paths) {
+    let before = pmset_file(paths);
+    if before.exists() {
+        return;
+    }
+    let custom = Command::new("/usr/bin/pmset").args(["-g", "custom"]).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    let g = Command::new("/usr/bin/pmset").arg("-g").output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    if let (Ok(c), Ok(g)) = (custom, g) {
+        let undo = pmset_undo(&c, &g);
+        let _ = std::fs::create_dir_all(before.parent().unwrap_or(&paths.home));
+        let _ = std::fs::write(&before, serde_json::to_vec(&undo).unwrap_or_default());
     }
 }
 
@@ -165,7 +174,7 @@ fn pmset_undo(custom: &str, global: &str) -> Vec<Vec<String>> {
         if let Some(f) = flag
             && !settings.is_empty()
         {
-            let mut cmd = vec!["pmset".to_string(), f.to_string()];
+            let mut cmd = vec!["/usr/bin/pmset".to_string(), f.to_string()];
             cmd.append(settings);
             out.push(cmd);
         }
@@ -189,13 +198,24 @@ fn pmset_undo(custom: &str, global: &str) -> Vec<Vec<String>> {
     }
     flush(flag, &mut settings);
     let disabled = global.lines().find_map(|l| l.trim().strip_prefix("SleepDisabled")).map(str::trim).unwrap_or("0");
-    out.push(["pmset", "-a", "disablesleep", disabled].map(String::from).into());
+    out.push(["/usr/bin/pmset", "-a", "disablesleep", disabled].map(String::from).into());
     out
+}
+
+/// A recorded undo line as root runs it: `pmset` and its arguments, nothing else. The file
+/// is the user's to edit, and it runs under sudo.
+fn pmset_replay(c: &[String]) -> Result<Vec<&str>> {
+    match c.split_first() {
+        Some((p, rest)) if p == "pmset" || p == "/usr/bin/pmset" => {
+            Ok(std::iter::once("/usr/bin/pmset").chain(rest.iter().map(String::as_str)).collect())
+        }
+        _ => bail!("{} has a line that isn't pmset: {c:?}", "server/pmset-before.json"),
+    }
 }
 
 /// `sudo` that asks in a terminal and otherwise only works with cached credentials.
 fn sudo(args: &[&str]) -> Result<()> {
-    let mut cmd = Command::new("sudo");
+    let mut cmd = Command::new("/usr/bin/sudo");
     if !std::io::stdin().is_terminal() {
         cmd.arg("-n");
     }
@@ -206,21 +226,39 @@ fn sudo(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The `~/.zshenv` block `host add` writes, removed (the rest of the file stays).
-pub fn without_zshenv_block(s: &str) -> String {
-    let mut out = String::new();
+/// The `~/.zshenv` block `host add` writes, removed (the rest of the file stays). A start
+/// line with no end line after it is an error: everything below it would go.
+pub fn without_zshenv_block(s: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len());
     let mut skipping = false;
-    for line in s.lines() {
-        if line.starts_with("# >>> rekcod host") {
+    for line in s.split_inclusive(|b| *b == b'\n') {
+        if !skipping && line.starts_with(b"# >>> rekcod host") {
             skipping = true;
-        } else if skipping && line.starts_with("# <<< rekcod host") {
+        } else if skipping && line.starts_with(b"# <<< rekcod host") {
             skipping = false;
         } else if !skipping {
-            out.push_str(line);
-            out.push('\n');
+            out.extend_from_slice(line);
         }
     }
-    out
+    if skipping {
+        bail!("its `# >>> rekcod host` line has no `# <<< rekcod host` after it; remove the block by hand");
+    }
+    Ok(out)
+}
+
+/// Replaces `path`'s contents through a temp file and a rename, so a crash can't leave a
+/// half-written shell startup file. A symlink (dotfiles) is written through and the mode kept.
+fn replace_file(path: &Path, data: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::fs::canonicalize(path)?;
+    let mode = std::fs::metadata(&path)?.permissions().mode();
+    let tmp = path.with_extension("rekcod-tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    std::fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
 }
 
 /// What `rekcod uninstall` undoes outside `~/.rekcod` on a Mac `server setup` or `host add`
@@ -230,12 +268,12 @@ pub fn undo_system(paths: &Paths) -> Vec<(String, Result<()>)> {
     let mut steps = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         let f = PathBuf::from(home).join(".zshenv");
-        if let Ok(s) = std::fs::read_to_string(&f)
-            && s.contains("# >>> rekcod host")
+        if let Ok(s) = std::fs::read(&f)
+            && s.windows(17).any(|w| w == b"# >>> rekcod host")
         {
             steps.push((
                 "remove the rekcod block from ~/.zshenv".to_string(),
-                std::fs::write(&f, without_zshenv_block(&s)).map_err(Into::into),
+                without_zshenv_block(&s).and_then(|next| replace_file(&f, &next)),
             ));
         }
     }
@@ -251,17 +289,17 @@ pub fn undo_system(paths: &Paths) -> Vec<(String, Result<()>)> {
     }
     match std::fs::read(pmset_file(paths)).ok().and_then(|b| serde_json::from_slice::<Vec<Vec<String>>>(&b).ok()) {
         Some(undo) => {
-            let r = undo.iter().try_for_each(|c| sudo(&c.iter().map(String::as_str).collect::<Vec<_>>()));
+            let r = undo.iter().try_for_each(|c| sudo(&pmset_replay(c)?));
             steps.push(("put pmset back as it was before `server setup`".to_string(), r));
         }
         None => {
-            let disabled = Command::new("pmset").arg("-g").output().is_ok_and(|o| {
+            let disabled = Command::new("/usr/bin/pmset").arg("-g").output().is_ok_and(|o| {
                 String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim().strip_prefix("SleepDisabled").is_some_and(|v| v.trim() == "1"))
             });
             if disabled {
                 steps.push((
                     "let the Mac sleep with the lid shut again (pmset disablesleep 0; sleep, womp and autorestart weren't recorded, so they stay)".to_string(),
-                    sudo(&["pmset", "-a", "disablesleep", "0"]),
+                    sudo(&["/usr/bin/pmset", "-a", "disablesleep", "0"]),
                 ));
             }
         }
@@ -329,7 +367,7 @@ fn firewall(exe: &Path) {
     }
     eprintln!("rekcod: the firewall is on; letting {exe} accept connections");
     for c in &cmds {
-        if !Command::new("sudo").args(c).stdout(Stdio::null()).status().is_ok_and(|s| s.success()) {
+        if !Command::new("/usr/bin/sudo").args(c).stdout(Stdio::null()).status().is_ok_and(|s| s.success()) {
             eprintln!("rekcod: `sudo {}` failed; other Macs can't reach this one", c.join(" "));
         }
     }
@@ -487,7 +525,7 @@ fn pick_net(addr: Option<&str>, lan: bool) -> Net {
             Net::Tailnet { ip, name }
         }
         None => {
-            eprintln!("rekcod: no Tailscale address up; the fleet goes on the LAN and is found over Bonjour (docs/lan-discovery.md)");
+            eprintln!("rekcod: no Tailscale address up; the fleet goes on the LAN and is found over Bonjour");
             Net::Lan
         }
     }
@@ -542,7 +580,9 @@ pub fn setup_edge(paths: &Paths, remote_name: &str, join_token: Option<&str>, ad
     let args = edge_node_args(&remote, &l, join_token, joined.as_ref())?;
     // Check admin access before installing anything or changing power settings.
     crate::fleet::call(&remote.url, "GET", "/nodes", Some(&remote.token), &serde_json::Value::Null)?;
-    let exe = std::env::current_exe()?.canonicalize()?;
+    // The jobs and the firewall exception keep this path: a Homebrew keg's would be gone
+    // after the next `brew upgrade`.
+    let exe = crate::service::stable_exe()?;
     let daemons = prepare_services(paths, &exe, no_power)?;
     let env: Vec<(&str, &str)> = join_token.map(|t| ("REKCOD_JOIN_TOKEN", t)).into_iter().collect();
     run_env(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>(), &env)?;
@@ -571,7 +611,7 @@ pub fn setup_edge(paths: &Paths, remote_name: &str, join_token: Option<&str>, ad
 }
 
 pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_power: bool, backup_dir: Option<&Path>) -> Result<()> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let exe = crate::service::stable_exe()?;
     let net = pick_net(addr, lan);
     let l = layout(&net);
     let daemons = prepare_services(paths, &exe, no_power)?;
@@ -670,7 +710,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
     let edge_token = if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
         "dry-run".to_string()
     } else {
-        // `remote add local` ran in a child process; reading the remotes here trusts its CA.
+        // Reading the remotes trusts the CA `remote add local` pinned.
         crate::fleet::remotes(paths);
         let v = crate::fleet::call(url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
         v["token"].as_str().context("no edge token")?.to_string()
@@ -743,7 +783,7 @@ fn unlock_plist(user: &str, password: &str) -> String {
 
 /// Runs sudo with `input` on stdin (`-S`: the password, or a command's input).
 fn sudo_fed(args: &[&str], input: &str) -> Result<std::process::Output> {
-    let mut child = Command::new("sudo").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let mut child = Command::new("/usr/bin/sudo").args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     child.stdin.take().context("sudo stdin")?.write_all(input.as_bytes())?;
     Ok(child.wait_with_output()?)
 }
@@ -762,13 +802,13 @@ pub fn restart() -> Result<()> {
     }
     if !fv {
         eprintln!("rekcod: restarting; the services are back about a minute after it boots");
-        let out = Command::new("sudo").args(["-n", "shutdown", "-r", "now"]).output()?;
+        let out = Command::new("/usr/bin/sudo").args(["-n", "/sbin/shutdown", "-r", "now"]).output()?;
         if !out.status.success() {
             bail!("shutdown -r failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
         return Ok(());
     }
-    let list = Command::new("sudo").args(["-n", "fdesetup", "list"]).output()?;
+    let list = Command::new("/usr/bin/sudo").args(["-n", "/usr/bin/fdesetup", "list"]).output()?;
     let users = String::from_utf8_lossy(&list.stdout);
     if !users.lines().any(|l| l.split(',').next() == Some(user.as_str())) {
         bail!(
@@ -777,7 +817,7 @@ pub fn restart() -> Result<()> {
         );
     }
     eprintln!("rekcod: restarting with FileVault unlocked for this one boot; the services are back about a minute after it boots");
-    let out = sudo_fed(&["-n", "fdesetup", "authrestart", "-inputplist"], &unlock_plist(&user, &pw))?;
+    let out = sudo_fed(&["-n", "/usr/bin/fdesetup", "authrestart", "-inputplist"], &unlock_plist(&user, &pw))?;
     if !out.status.success() {
         bail!(
             "fdesetup authrestart failed, nothing restarted: {}{}",
@@ -786,6 +826,29 @@ pub fn restart() -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn alert_webhook_file(paths: &Paths) -> PathBuf {
+    paths.home.join("controller/alert-webhook")
+}
+
+/// `controller serve --alert-webhook URL --install`: the URL kept 0600 beside the
+/// controller's other secrets instead of in its job; empty removes it.
+pub fn set_alert_webhook(paths: &Paths, url: &str) -> Result<()> {
+    let f = alert_webhook_file(paths);
+    if url.is_empty() {
+        return match std::fs::remove_file(&f) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        };
+    }
+    std::fs::create_dir_all(f.parent().context("controller dir")?)?;
+    crate::paths::write_private(&f, url.as_bytes())
+}
+
+/// The URL [`set_alert_webhook`] kept, if any.
+pub fn alert_webhook(paths: &Paths) -> Option<String> {
+    std::fs::read_to_string(alert_webhook_file(paths)).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// The jobs `server setup` installs.
@@ -811,7 +874,7 @@ pub fn at_boot(user: Option<&str>) -> Result<()> {
         // Re-run under sudo: root writes /Library/LaunchDaemons, and it has to read this
         // user's agents.
         let exe = std::env::current_exe()?;
-        let st = Command::new("sudo").arg(&exe).args(["server", "at-boot", "--user", &run_as.user]).status()?;
+        let st = Command::new("/usr/bin/sudo").arg(&exe).args(["server", "at-boot", "--user", &run_as.user]).status()?;
         if !st.success() {
             bail!("`sudo rekcod server at-boot` failed");
         }
@@ -931,12 +994,12 @@ fn copy_signed(dest: &str, exe: &Path, ssh: &impl Fn() -> Command, scp_dest: &[S
     Ok(format!("{}/.rekcod/bin/rekcod", String::from_utf8_lossy(&o.stdout).trim()))
 }
 
-/// `scp` arguments for `scp_dest` (`[host]` or `["-p", port, host]`): the options and the
-/// `host:` prefix remote paths go after.
+/// `scp` arguments for `scp_dest` (`["--", host]` or `["-p", port, "--", host]`): the
+/// options, ended by `--`, and the `host:` prefix remote paths go after.
 fn scp_target(dest: &str, scp_dest: &[String]) -> Result<(Command, String)> {
     let (port, host) = match scp_dest {
-        [p, port, host] if p == "-p" => (Some(port.clone()), host.clone()),
-        [host] => (None, host.clone()),
+        [p, port, end, host] if p == "-p" && end == "--" => (Some(port.clone()), host.clone()),
+        [end, host] if end == "--" => (None, host.clone()),
         _ => bail!("bad destination {dest}"),
     };
     let mut scp = Command::new("scp");
@@ -944,6 +1007,7 @@ fn scp_target(dest: &str, scp_dest: &[String]) -> Result<(Command, String)> {
     if let Some(p) = port {
         scp.args(["-P", &p]);
     }
+    scp.arg("--");
     Ok((scp, host))
 }
 
@@ -1110,18 +1174,60 @@ mod tests {
         assert_eq!(
             undo,
             [
-                vec!["pmset", "-b", "womp", "0", "sleep", "1"],
-                vec!["pmset", "-c", "womp", "1", "sleep", "10", "autorestart", "0"],
-                vec!["pmset", "-a", "disablesleep", "0"],
+                vec!["/usr/bin/pmset", "-b", "womp", "0", "sleep", "1"],
+                vec!["/usr/bin/pmset", "-c", "womp", "1", "sleep", "10", "autorestart", "0"],
+                vec!["/usr/bin/pmset", "-a", "disablesleep", "0"],
             ]
         );
     }
 
+    /// What runs as root is named by path, never looked up on the user's PATH.
+    #[test]
+    fn root_commands_are_absolute() {
+        assert!(PMSET[0].starts_with('/'));
+        assert!(firewall_allow("/x/rekcod").iter().all(|c| c[0].starts_with('/')));
+        let old = ["pmset", "-c", "sleep", "10"].map(String::from);
+        assert_eq!(pmset_replay(&old).unwrap(), ["/usr/bin/pmset", "-c", "sleep", "10"]);
+        assert!(pmset_replay(&["sh".into(), "-c".into(), "id".into()]).is_err());
+        for src in [include_str!("server.rs"), include_str!("service.rs")] {
+            for name in ["sudo", "pmset", "plutil", "defaults", "fdesetup", "shutdown"] {
+                assert!(!src.contains(&format!("Command::new(\"{name}\")")), "{name} by PATH");
+            }
+        }
+    }
+
+    #[test]
+    fn alert_webhook_kept_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("rekcod-hook-{}", std::process::id()));
+        let paths = Paths { home: home.clone() };
+        set_alert_webhook(&paths, "https://hooks.slack.com/services/T/B/x").unwrap();
+        let f = alert_webhook_file(&paths);
+        assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(alert_webhook(&paths).as_deref(), Some("https://hooks.slack.com/services/T/B/x"));
+        set_alert_webhook(&paths, "").unwrap();
+        assert_eq!(alert_webhook(&paths), None);
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
     #[test]
     fn zshenv_block_removed_rest_kept() {
-        let s = "export A=1\n# >>> rekcod host (written by rekcod host add)\nexport PATH=x\n# <<< rekcod host\nexport B=2\n";
-        assert_eq!(without_zshenv_block(s), "export A=1\nexport B=2\n");
-        assert_eq!(without_zshenv_block("export A=1\n"), "export A=1\n");
+        let s = b"export A=1\n# >>> rekcod host (written by rekcod host add)\nexport PATH=x\n# <<< rekcod host\nexport B=2";
+        assert_eq!(without_zshenv_block(s).unwrap(), b"export A=1\nexport B=2");
+        assert_eq!(without_zshenv_block(b"export A=1\n").unwrap(), b"export A=1\n");
+        assert!(without_zshenv_block(b"# >>> rekcod host\nexport PATH=x\nexport MINE=1\n").is_err());
+        // Through a symlink, with the file's mode.
+        let dir = std::env::temp_dir().join(format!("rekcod-zshenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (real, link) = (dir.join("dotfiles-zshenv"), dir.join(".zshenv"));
+        std::fs::write(&real, s).unwrap();
+        std::fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        replace_file(&link, &without_zshenv_block(s).unwrap()).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"export A=1\nexport B=2");
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&real).unwrap().permissions()) & 0o777, 0o640);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1131,7 +1237,7 @@ mod tests {
         assert!(p.contains("<key>Password</key><string>a&lt;b&amp;c&quot;d</string>"), "{p}");
         let f = std::env::temp_dir().join(format!("rekcod-unlock-{}.plist", std::process::id()));
         std::fs::write(&f, &p).unwrap();
-        let ok = Command::new("plutil").arg("-lint").arg(&f).output().unwrap().status.success();
+        let ok = Command::new("/usr/bin/plutil").arg("-lint").arg(&f).output().unwrap().status.success();
         std::fs::remove_file(&f).unwrap();
         assert!(ok);
     }
@@ -1224,6 +1330,14 @@ mod tests {
         assert_eq!(l.edge_listen, "0.0.0.0:8080");
         assert!(edge_layout(&Net::Lan, None).is_err());
         assert!(edge_layout(&Net::Lan, Some("bad/name.local")).is_err());
+    }
+
+    #[test]
+    fn scp_options_end_before_the_files() {
+        let (scp, host) = scp_target("me@mini:2222", &["-p", "2222", "--", "me@mini"].map(String::from)).unwrap();
+        let args: Vec<_> = scp.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!((args[args.len() - 3..].to_vec(), host.as_str()), (vec!["-P".into(), "2222".into(), "--".into()], "me@mini"));
+        assert!(scp_target("mini", &["mini".into()]).is_err());
     }
 
     #[test]

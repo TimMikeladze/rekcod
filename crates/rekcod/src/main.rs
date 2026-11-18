@@ -19,6 +19,8 @@ mod route;
 #[cfg(target_os = "macos")]
 mod actions;
 #[cfg(target_os = "macos")]
+mod apptoml;
+#[cfg(target_os = "macos")]
 mod bonjour;
 #[cfg(target_os = "macos")]
 mod cli;
@@ -194,17 +196,24 @@ enum Cmd {
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp(ApiPolicyArgs),
     /// Install the latest release over this binary and restart the fleet services that run it
-    /// (the VM keeps running the old one until restarted).
+    /// (the VM keeps running the old one until restarted). The replaced binary stays as
+    /// .rekcod.previous beside it. Checks the release's build provenance with gh when it's
+    /// installed, and a Developer ID signature by the team that signed this binary.
     Upgrade {
-        /// Only say whether a newer release exists; exit 1 if one does.
-        #[arg(long)]
+        /// Only say whether a newer release exists: exit 0 if not, 1 if one does, 2 if it
+        /// couldn't tell (no network).
+        #[arg(long, conflicts_with = "rollback")]
         check: bool,
+        /// Put back the binary the last upgrade replaced, and restart the fleet services on it.
+        #[arg(long)]
+        rollback: bool,
     },
     /// Stop rekcod and remove everything it set up: launchd jobs, the socket route, the
-    /// docker context, the ~/.zshenv block, firewall exceptions, pmset (as `server setup`
-    /// found it), and ~/.rekcod.
+    /// docker contexts, the ~/.zshenv block, firewall exceptions, pmset (as `server setup`
+    /// found it), and ~/.rekcod. Exits non-zero, keeping ~/.rekcod, when a step fails.
+    /// Under another REKCOD_HOME only that home's VM, sandboxes, jobs and directory.
     Uninstall {
-        /// Keep ~/.rekcod (VM disks, volumes, snapshots).
+        /// Keep ~/.rekcod (VM disks, volumes, snapshots, stopped agent sandboxes).
         #[arg(long)]
         keep_data: bool,
         /// Don't ask first.
@@ -212,10 +221,14 @@ enum Cmd {
         yes: bool,
     },
     /// Check what usually goes wrong and say how to fix it.
+    /// Exits 1 when a check fails.
     Doctor {
         /// Also write ~/.rekcod/doctor-<time>.tar.gz with status and logs (no tokens or keys).
         #[arg(long)]
         bundle: bool,
+        /// The checks as JSON: {"ok": bool, "checks": [{"name", "ok", "detail", "fix"}]}.
+        #[arg(long)]
+        json: bool,
     },
     /// macOS guests: base images for `rekcod sandbox create --os macos`.
     #[command(subcommand)]
@@ -403,13 +416,14 @@ fn quota_value(s: &str) -> Result<i64, String> {
 fn duration_secs(s: &str) -> Result<u64, String> {
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = n.parse().map_err(|_| format!("bad duration {s}"))?;
-    match unit {
-        "" | "s" => Ok(n),
-        "m" => Ok(n * 60),
-        "h" => Ok(n * 3600),
-        "d" => Ok(n * 86400),
-        _ => Err(format!("bad duration {s} (use s, m, h or d)")),
-    }
+    let scale = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86_400,
+        _ => return Err(format!("bad duration {s} (use s, m, h or d)")),
+    };
+    n.checked_mul(scale).ok_or_else(|| format!("bad duration {s} (too large)"))
 }
 
 #[derive(Subcommand)]
@@ -494,7 +508,8 @@ enum SandboxCmd {
     /// Write the workspace's changes into the real project.
     Apply {
         id: String,
-        /// Only print what would change; exit 1 if anything would.
+        /// Only print what would change: exit 0 if nothing would, 1 if anything would, 2 on
+        /// an error.
         #[arg(long)]
         check: bool,
         /// Write the copy the `diff` that printed REVIEW showed, not the workspace as it is
@@ -841,6 +856,8 @@ enum ControllerCmd {
         #[arg(long)]
         auto_approve: bool,
         /// POST a JSON line ({"text": ...}) here when a node is lost or a deploy or backup fails.
+        /// With --install it's kept in ~/.rekcod/controller/alert-webhook (0600), not the
+        /// job, and used whenever the flag isn't given; an empty value removes it.
         #[arg(long)]
         alert_webhook: Option<String>,
         /// Also keep the hourly fleet.db backups here (another disk, a synced folder).
@@ -1349,6 +1366,10 @@ enum ServerCmd {
         #[arg(long)]
         user: Option<String>,
     },
+    /// Record pmset as it is, for `rekcod uninstall` to put back (the server pkg runs it
+    /// before it sets pmset).
+    #[command(hide = true)]
+    RecordPower,
 }
 
 #[derive(Subcommand)]
@@ -1425,9 +1446,10 @@ fn main() {
         Cmd::Sandbox { remote: None, ns: Some(_), .. } => Err(anyhow::anyhow!("--ns is for fleet sandboxes; add --remote")),
         Cmd::Sandbox { remote: None, cmd, .. } => run_sandbox(&paths, cmd),
         Cmd::Mcp(policy) => sandbox_api::mcp(paths, policy.policy()?),
-        Cmd::Upgrade { check } => lifecycle::upgrade(check),
+        Cmd::Upgrade { rollback: true, .. } => lifecycle::rollback(),
+        Cmd::Upgrade { check, .. } => lifecycle::upgrade(check),
         Cmd::Uninstall { keep_data, yes } => lifecycle::uninstall(&paths, keep_data, yes),
-        Cmd::Doctor { bundle } => lifecycle::doctor(&paths, bundle),
+        Cmd::Doctor { bundle, json } => lifecycle::doctor(&paths, bundle, json),
         Cmd::Macos(MacosCmd::Fetch) => macos::fetch(&paths),
         Cmd::Macos(MacosCmd::Install { name, disk, cpus, memory }) => macos::install(&paths, &name, disk, cpus, memory),
         Cmd::Macos(MacosCmd::Setup { name }) => macos::setup(&paths, &name),
@@ -1480,7 +1502,13 @@ fn main() {
             remote_call(&paths, &remote, "POST", &format!("/nodes/{id}/undrain"), &serde_json::json!({}))
         }
         Cmd::Controller(ControllerCmd::Serve { install: true, .. }) => {
-            service::install(&paths, "controller", &service::args_without_install())
+            // A webhook URL is a credential, and a daemon's plist is world-readable: it goes
+            // in a 0600 file the controller reads instead.
+            let (args, hook) = service::take_flag(&service::args_without_install(), "--alert-webhook");
+            if let Some(h) = hook {
+                server::set_alert_webhook(&paths, &h)?;
+            }
+            service::install(&paths, "controller", &args)
         }
         Cmd::Controller(ControllerCmd::Serve {
             db,
@@ -1496,23 +1524,26 @@ fn main() {
             tls_names,
             bonjour,
             ..
-        }) => fleet::controller_serve(
-            &paths,
-            fleet::ControllerOptions {
-                db,
-                listen,
-                domain,
-                drain_secs: drain,
-                storage,
-                storage_credentials,
-                auto_approve,
-                alert_webhook,
-                backup_dir,
-                http,
-                tls_names,
-                bonjour,
-            },
-        ),
+        }) => {
+            let alert_webhook = alert_webhook.or_else(|| server::alert_webhook(&paths));
+            fleet::controller_serve(
+                &paths,
+                fleet::ControllerOptions {
+                    db,
+                    listen,
+                    domain,
+                    drain_secs: drain,
+                    storage,
+                    storage_credentials,
+                    auto_approve,
+                    alert_webhook,
+                    backup_dir,
+                    http,
+                    tls_names,
+                    bonjour,
+                },
+            )
+        }
         Cmd::Controller(ControllerCmd::Backup { remote }) => remote_call(&paths, &remote, "POST", "/backups", &serde_json::json!({})),
         Cmd::Controller(ControllerCmd::Backups { remote }) => remote_call(&paths, &remote, "GET", "/backups", &serde_json::Value::Null),
         Cmd::Controller(ControllerCmd::Restore { key, db, storage_credentials, from }) => {
@@ -1652,6 +1683,10 @@ fn main() {
         }
         Cmd::Server(ServerCmd::Uninstall) => server::uninstall(),
         Cmd::Server(ServerCmd::AtBoot { user }) => server::at_boot(user.as_deref()),
+        Cmd::Server(ServerCmd::RecordPower) => {
+            server::record_power(&paths);
+            Ok(())
+        }
         Cmd::Server(ServerCmd::Restart) => server::restart(),
         Cmd::Host(HostCmd::Ls { json }) => {
             host::print_list(json);
@@ -1927,6 +1962,18 @@ fn new_output<'a>(shown: &str, log: &'a str) -> &'a str {
     log
 }
 
+/// cpus, memory (GiB) and `[env]` from a parsed rekcod.toml, each None when the file doesn't
+/// set it: the controller keeps what the app has for whatever isn't sent.
+#[cfg(target_os = "macos")]
+fn toml_resources(
+    t: &std::collections::HashMap<String, String>,
+) -> (Option<i64>, Option<i64>, Option<serde_json::Map<String, serde_json::Value>>) {
+    let num = |k: &str| t.get(k).and_then(|v| v.parse::<i64>().ok());
+    let env: serde_json::Map<String, serde_json::Value> =
+        t.iter().filter_map(|(k, v)| k.strip_prefix("env.").map(|k| (k.to_string(), serde_json::json!(v)))).collect();
+    (num("resources.cpus"), num("resources.memory"), (!env.is_empty()).then_some(env))
+}
+
 #[cfg(target_os = "macos")]
 fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::Result<()> {
     use serde_json::json;
@@ -1936,7 +1983,7 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
     match c {
         AppCmd::Deploy { name, port, instances, git, git_ref, public, private, idle_stop, recycle } => {
             let dir = std::env::current_dir()?;
-            let t = fleet::parse_toml(&std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default());
+            let local_head = git_ref.is_none();
             let (origin, head) = match (&git, &git_ref) {
                 (Some(g), Some(r)) => (g.clone(), r.clone()),
                 _ => {
@@ -1944,11 +1991,11 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                     (git.unwrap_or(o), git_ref.unwrap_or(h))
                 }
             };
+            let t = apptoml::parse(&fleet::deployed_toml(&dir, local_head.then_some(head.as_str()))?)?;
             let dir_name = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
             let num = |k: &str| t.get(k).and_then(|v| v.parse::<i64>().ok());
             let dur = |k: &str| t.get(k).map(|v| duration_secs(v).map_err(|e| anyhow::anyhow!("rekcod.toml {k}: {e}"))).transpose();
-            let env: serde_json::Map<String, serde_json::Value> =
-                t.iter().filter_map(|(k, v)| k.strip_prefix("env.").map(|k| (k.to_string(), json!(v)))).collect();
+            let (cpus, memory_gib, env) = toml_resources(&t);
             let body = json!({
                 "name": name.or(t.get("app.name").cloned()).unwrap_or(dir_name),
                 "git": {"url": origin, "ref": head},
@@ -1957,8 +2004,8 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 "instances": instances.or(num("resources.instances")),
                 "spread": t.get("resources.spread"),
                 // Left out keeps the app's resources. `[env]` is merged over the env it has.
-                "cpus": num("resources.cpus"),
-                "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()),
+                "cpus": cpus,
+                "memory_gib": memory_gib,
                 "health": t.get("app.health").cloned(),
                 "start": t.get("app.start"),
                 "env": env,
@@ -2124,7 +2171,14 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         }
         SandboxCmd::Diff { id, stat } => sandbox::diff(paths, &id, stat),
         SandboxCmd::Apply { id, check, reviewed } => {
-            let ch = sandbox::apply(paths, &id, check, reviewed.as_deref())?;
+            let ch = match sandbox::apply(paths, &id, check, reviewed.as_deref()) {
+                // 1 means "there are changes": a failure can't say the same.
+                Err(e) if check => {
+                    eprintln!("rekcod: {e:#}");
+                    std::process::exit(2);
+                }
+                r => r?,
+            };
             sandbox::print_changes(&ch);
             if check && !ch.is_empty() {
                 std::process::exit(1);
@@ -2227,6 +2281,28 @@ mod tests {
         assert_eq!(fleet::token_arg(Some(" argv ".into()), None, "x").unwrap(), "argv");
         assert!(fleet::token_arg(None, None, "--token").unwrap_err().to_string().contains("--token"));
         let _ = std::fs::remove_file(&f);
+    }
+
+    /// A rekcod.toml that leaves resources and env out sends none of them, so the app keeps
+    /// its own; one that sets them sends them.
+    #[test]
+    fn absent_toml_settings_are_not_sent() {
+        let t = crate::apptoml::parse("[app]\nport = 3000\n").unwrap();
+        assert_eq!(super::toml_resources(&t), (None, None, None));
+        let t = crate::apptoml::parse("[resources]\ncpus = 2\nmemory = \"4GiB\"\n[env]\nA = \"1\"\n").unwrap();
+        let (cpus, mem, env) = super::toml_resources(&t);
+        assert_eq!((cpus, mem), (Some(2), Some(4)));
+        assert_eq!(env.unwrap()["A"], "1");
+    }
+
+    #[test]
+    fn durations() {
+        use super::duration_secs;
+        assert_eq!(duration_secs("30d"), Ok(2_592_000));
+        assert_eq!(duration_secs("12h"), Ok(43_200));
+        assert_eq!(duration_secs("0"), Ok(0));
+        assert!(duration_secs("99999999999999999h").is_err());
+        assert!(duration_secs("3w").is_err());
     }
 
     #[test]

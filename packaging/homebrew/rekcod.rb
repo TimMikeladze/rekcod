@@ -1,5 +1,5 @@
-# Homebrew formula for a tap (TimMikeladze/homebrew-tap). Not published yet; see
-# docs/releasing.md. Bump `version` and `sha256` from the release's SHA256SUMS
+# Homebrew formula for a tap (TimMikeladze/homebrew-tap). Not published yet.
+# Bump `version` and `sha256` from the release's SHA256SUMS
 # (rekcod-<version>-darwin-arm64.tar.gz).
 class Rekcod < Formula
   desc "Docker on Apple Silicon: upstream dockerd in a Virtualization.framework VM"

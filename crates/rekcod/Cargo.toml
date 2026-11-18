@@ -24,6 +24,7 @@ block2 = "0.6"
 dispatch2 = "0.3"
 notify = "8"
 rusqlite = { version = "0.43", features = ["bundled"] }
+toml = { version = "1.2", default-features = false, features = ["std", "serde", "parse"] }
 hmac = "0.12"
 sha2 = "0.10"
 similar = "3"

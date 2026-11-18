@@ -100,7 +100,7 @@ fn pid_is_rekcod(pid: i32) -> bool {
 pub struct Saved {
     pub cpus: Option<usize>,
     pub memory_gib: Option<u64>,
-    /// `rekcod start --base-memory` (docs/elastic-memory.md); None is the default split.
+    /// `rekcod start --base-memory`; None is the default split.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_memory_gib: Option<u64>,
     pub disk_gib: Option<u64>,
@@ -158,6 +158,47 @@ fn save_settings(
         std::fs::write(paths.config(), serde_json::to_vec_pretty(&new)?)?;
     }
     Ok(())
+}
+
+/// `--memory` and `--base-memory` against what this Mac and Virtualization.framework allow
+/// (`limit` bytes), before they're saved for every later boot.
+fn check_memory(memory_gib: Option<u64>, base_memory_gib: Option<u64>, limit: u64) -> Result<()> {
+    let limit_gib = limit >> 30;
+    for (flag, v) in [("--memory", memory_gib), ("--base-memory", base_memory_gib)] {
+        match v {
+            Some(0) => bail!("{flag} is in GiB and must be at least 1"),
+            Some(g) if g > limit_gib => bail!("{flag} {g} is more than this Mac allows a VM ({limit_gib} GiB); it's in GiB"),
+            _ => {}
+        }
+    }
+    if let (Some(m), Some(b)) = (memory_gib, base_memory_gib)
+        && b > m
+    {
+        bail!("--base-memory {b} is more than --memory {m}");
+    }
+    Ok(())
+}
+
+/// The most memory a VM can have here: the Mac's RAM, capped by Virtualization.framework.
+fn memory_limit() -> u64 {
+    let host = sysctl_u64("hw.memsize").unwrap_or(u64::MAX);
+    let vz = unsafe { objc2_virtualization::VZVirtualMachineConfiguration::maximumAllowedMemorySize() };
+    host.min(vz)
+}
+
+/// Saves the settings, runs `boot`, and puts the previous `config.json` back if it fails:
+/// a value the VM refused would otherwise fail every later boot that doesn't pass it.
+fn with_saved_settings<T>(paths: &Paths, save: impl FnOnce() -> Result<()>, boot: impl FnOnce() -> Result<T>) -> Result<T> {
+    let before = std::fs::read(paths.config()).ok();
+    save()?;
+    let r = boot();
+    if r.is_err() {
+        let _ = match &before {
+            Some(b) => std::fs::write(paths.config(), b),
+            None => std::fs::remove_file(paths.config()),
+        };
+    }
+    r
 }
 
 /// (total, free) GiB on the volume holding `dir`.
@@ -279,14 +320,14 @@ fn tail(path: &std::path::Path, lines: usize) -> String {
 pub struct BootOptions {
     pub cpus: Option<usize>,
     pub memory_gib: Option<u64>,
-    /// RAM part of `memory_gib`; None is the default split (docs/elastic-memory.md).
+    /// RAM part of `memory_gib`; None is the default split.
     pub base_memory_gib: Option<u64>,
     pub disk_gib: u64,
-    /// Sandbox VM: share only this directory (docs/sandbox.md).
+    /// Sandbox VM: share only this directory.
     pub project: Option<PathBuf>,
     /// Guest image to boot (the sandbox uses the main install's).
     pub guest_dir: Option<PathBuf>,
-    /// Agent sandbox: share this copy as the project (docs/agent-sandboxes.md).
+    /// Agent sandbox: share this copy as the project.
     pub workspace: Option<PathBuf>,
     /// Agent sandbox: egress allowlist, comma-separated.
     pub allow: Option<String>,
@@ -532,17 +573,24 @@ pub fn start(
     if repair && let Some(pid) = running_pid(paths) {
         bail!("rekcod is running (pid {pid}); `rekcod stop` first, then `rekcod start --repair`");
     }
-    save_settings(paths, cpus, (memory_gib, base_memory_gib), disk_gib, network)?;
-    if autostart_installed() && !repair {
-        // Let the login agent own the VM, so a crash brings it back. Whoever boots first
-        // wins the boot lock; the agent supervises either way.
-        crate::service::kickstart(AUTOSTART);
-    }
+    check_memory(memory_gib, base_memory_gib, memory_limit())?;
     let opts = BootOptions { cpus, memory_gib, base_memory_gib, disk_gib, repair, ..Default::default() };
     if repair {
         println!("checking the data disk with e2fsck -fy and reinstalling the root disk; this can take a while");
     }
-    if let Some(pid) = boot(paths, &opts)? {
+    let booted = with_saved_settings(
+        paths,
+        || save_settings(paths, cpus, (memory_gib, base_memory_gib), disk_gib, network),
+        || {
+            if autostart_installed() && !repair {
+                // Let the login agent own the VM, so a crash brings it back. Whoever boots
+                // first wins the boot lock; the agent supervises either way.
+                crate::service::kickstart(AUTOSTART);
+            }
+            boot(paths, &opts)
+        },
+    )?;
+    if let Some(pid) = booted {
         println!("rekcod is already running (pid {pid})");
         let running: serde_json::Value =
             std::fs::read(paths.status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
@@ -1180,6 +1228,34 @@ mod tests {
     }
 
     #[test]
+    fn memory_is_checked_before_it_is_saved() {
+        let limit = 64u64 << 30;
+        check_memory(Some(16), Some(4), limit).unwrap();
+        check_memory(None, None, limit).unwrap();
+        for (m, b) in [(Some(512), None), (Some(0), None), (Some(8), Some(16)), (None, Some(65))] {
+            assert!(check_memory(m, b, limit).is_err(), "{m:?} {b:?}");
+        }
+    }
+
+    /// A boot that fails leaves config.json as it was, so later boots don't inherit the value.
+    #[test]
+    fn failed_boot_restores_the_settings() {
+        let home = std::env::temp_dir().join(format!("rekcod-settings-{}", std::process::id()));
+        let paths = Paths::at(home.clone()).unwrap();
+        std::fs::write(paths.config(), br#"{"memory_gib":8}"#).unwrap();
+        let r: Result<()> = with_saved_settings(
+            &paths,
+            || save_settings(&paths, None, (Some(48), None), 0, None),
+            || bail!("invalid virtual machine configuration"),
+        );
+        assert!(r.is_err());
+        assert_eq!(saved(&paths).memory_gib, Some(8));
+        with_saved_settings(&paths, || save_settings(&paths, None, (Some(12), None), 0, None), || Ok(())).unwrap();
+        assert_eq!(saved(&paths).memory_gib, Some(12));
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    #[test]
     fn port_lines_collapse_localhost_pairs() {
         let ports: Vec<serde_json::Value> = serde_json::from_str(
             r#"[{"proto":"tcp","address":"127.0.0.1","port":3000,"container":"x"},
@@ -1198,6 +1274,40 @@ mod tests {
         distinct_daemons("desktop-linux", "aa-desktop", "bb-rekcod").unwrap();
         // An engine that reports no ID can't be rekcod's daemon, which does.
         distinct_daemons("podman", "", "bb-rekcod").unwrap();
+    }
+
+    /// import() itself, against a stand-in docker CLI and a stand-in dockerd that answers
+    /// /_ping: a --from context that reports rekcod's daemon ID gets no further than `info`,
+    /// so nothing is emptied.
+    #[test]
+    fn import_stops_before_touching_an_alias_of_rekcod() {
+        use std::io::{Read, Write};
+        let home = std::env::temp_dir().join(format!("rkimp-{}", std::process::id()));
+        let paths = Paths::at(home.clone()).unwrap();
+        let api = std::os::unix::net::UnixListener::bind(paths.socket()).unwrap();
+        std::thread::spawn(move || {
+            for mut c in api.incoming().flatten() {
+                let mut buf = [0u8; 1024];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\n\r\nOK");
+            }
+        });
+        let log = home.join("docker-calls");
+        let docker = home.join("docker");
+        std::fs::write(
+            &docker,
+            format!("#!/bin/sh\necho \"$*\" >> {}\ncase \"$*\" in *version*) echo 29.0;; *info*) echo SAME-ID;; esac\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&docker, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // SAFETY: a test running docker meanwhile gets the stand-in, which only echoes.
+        unsafe { std::env::set_var("REKCOD_DOCKER_CLI", &docker) };
+        let r = import(&paths, "alias", &[], true, true, true);
+        unsafe { std::env::remove_var("REKCOD_DOCKER_CLI") };
+        let calls = std::fs::read_to_string(&log).unwrap_or_default();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(r.unwrap_err().to_string().contains("rekcod's own docker daemon"));
+        assert!(calls.lines().all(|l| l.contains("version") || l.contains("info")), "{calls}");
     }
 
     #[test]

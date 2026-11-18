@@ -79,6 +79,7 @@ pub enum Kind {
     VmAutostartOff,
     Doctor,
     Upgrade,
+    UpgradeRollback,
     Uninstall,
     ImagePull,
     ImageRun,
@@ -101,7 +102,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 82] = [
+    pub const ALL: [Kind; 83] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -167,6 +168,7 @@ impl Kind {
         Kind::VmAutostartOff,
         Kind::Doctor,
         Kind::Upgrade,
+        Kind::UpgradeRollback,
         Kind::Uninstall,
         Kind::ImagePull,
         Kind::ImageRun,
@@ -203,6 +205,7 @@ impl Kind {
                 | Kind::SocketInstall
                 | Kind::Doctor
                 | Kind::Upgrade
+                | Kind::UpgradeRollback
                 | Kind::Uninstall
                 | Kind::StorageEnv
                 | Kind::StorageUp
@@ -492,7 +495,8 @@ pub fn has_control(s: &str) -> bool {
 }
 
 pub fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,".contains(c)) {
+    // A word zsh starts with `=` is replaced by a command's path (`=ls` is /bin/ls).
+    if !s.is_empty() && !s.starts_with('=') && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,".contains(c)) {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -653,6 +657,8 @@ pub struct Model {
     pub socket_installed: bool,
     /// The VM starts at login (`rekcod start --install`).
     pub autostart: bool,
+    /// An upgrade kept the binary it replaced (`rekcod upgrade --rollback`).
+    pub rollback: bool,
     /// Agent sandboxes (`rekcod sandbox ls`).
     pub sandboxes: Vec<AgentSandbox>,
     /// Apps on the default fleet remote (`rekcod app ls`), if one is configured.
@@ -913,6 +919,7 @@ impl Model {
             sandbox,
             socket_installed,
             autostart: crate::cli::autostart_installed(),
+            rollback: crate::lifecycle::rollback_available(),
             sandboxes,
             apps: rd.apps,
             jobs: rd.jobs,
@@ -1181,7 +1188,7 @@ fn git_branch(dir: &std::path::Path) -> Option<String> {
 
 // -------------------------------------------------------------- actions
 
-pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool) -> Vec<Action> {
+pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool, rollback: bool) -> Vec<Action> {
     let mut out = if !running {
         vec![
             Action::rekcod(Kind::VmStart, "Start rekcod", &["start"]),
@@ -1214,6 +1221,13 @@ pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool) -> Vec
     out.push(Action::rekcod(Kind::DashboardOpen, "Open the dashboard", &["dashboard"]));
     out.push(Action::rekcod(Kind::Doctor, "Check for problems", &["doctor"]).interactive());
     out.push(Action::rekcod(Kind::Upgrade, "Check for updates", &["upgrade"]).interactive());
+    if rollback {
+        out.push(
+            Action::rekcod(Kind::UpgradeRollback, "Go back to the previous version", &["upgrade", "--rollback"])
+                .confirm("Put back the rekcod binary the last upgrade replaced? A running VM keeps its version until it restarts.".into())
+                .interactive(),
+        );
+    }
     out.push(
         Action::rekcod(Kind::Uninstall, "Uninstall rekcod", &["uninstall", "--yes"])
             .confirm("Uninstall rekcod? This stops it, removes its login agents and docker context, and deletes ~/.rekcod with every VM disk, volume and snapshot.".into())
@@ -1816,8 +1830,8 @@ pub mod tests {
     /// Every action kind comes out of the lists the menu bar renders.
     pub fn reachable_kinds() -> Vec<Action> {
         let (containers, ports, projects) = sample();
-        let mut all = vm_actions(true, false, false);
-        all.extend(vm_actions(false, true, true));
+        let mut all = vm_actions(true, false, false, false);
+        all.extend(vm_actions(false, true, true, true));
         all.extend(storage_actions(true, &[]));
         all.extend(storage_actions(true, &[sample_storage()]));
         for c in &containers {
@@ -1890,6 +1904,7 @@ pub mod tests {
                     | Kind::SandboxApply
                     | Kind::SandboxRemove
                     | Kind::AppRollback
+                    | Kind::UpgradeRollback
                     | Kind::AppDestroy
                     | Kind::AppPublic
                     | Kind::JobCancel
@@ -1915,6 +1930,8 @@ pub mod tests {
         }
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!((shell_quote("=="), shell_quote("=ls")), ("'=='".into(), "'=ls'".into()));
+        assert_eq!(shell_quote("KEY=value"), "KEY=value");
     }
 
     /// `may_be_interactive` is exactly the kinds some list builds with `.interactive()`.
@@ -1932,7 +1949,7 @@ pub mod tests {
         a.dir = Some("/Users/me/my app".into());
         let s = a.terminal_script().unwrap();
         assert!(s.starts_with("#!/bin/sh\nrm -f -- \"$0\"\ncd '/Users/me/my app' || exit\nexec "), "{s}");
-        assert!(s.trim_end().ends_with(r" logs 'it'\''s' =x"), "{s:?}");
+        assert!(s.trim_end().ends_with(r" logs 'it'\''s' '=x'"), "{s:?}");
         for bad in ["\u{15}touch x\n#", "\u{3}", "\u{7f}", "\u{9b}"] {
             let a = Action::rekcod(Kind::ContainerLogs, "Logs", &["logs", bad]).interactive();
             assert_eq!(a.terminal_script(), None, "{bad:?}");

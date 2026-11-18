@@ -1,4 +1,4 @@
-//! Downloads the guest a release binary was built with (docs/phase3.md).
+//! Downloads the guest a release binary was built with.
 //!
 //! Release builds embed `REKCOD_GUEST_VERSION` and `REKCOD_GUEST_SHA256`; dev
 //! builds embed neither and use `out/guest`. Uses the system `curl`, `shasum`
@@ -23,6 +23,23 @@ pub fn release_url(base: Option<&str>, version: &str, file: &str) -> String {
         Some(b) => format!("{}/{file}", b.trim_end_matches('/')),
         None => format!("https://github.com/{REPO}/releases/download/v{version}/{file}"),
     }
+}
+
+/// `curl` for a download into `dest`: [`CURL_LIMITS`], 3 retries, and no cap on the whole
+/// transfer (a slow link still finishes). `https_only` refuses plain http and old TLS, also after a redirect;
+/// a `REKCOD_RELEASE_URL` someone points at a local server turns it off.
+pub fn download_cmd(url: &str, dest: &Path, https_only: bool) -> Command {
+    download_cmd_with(url, dest, https_only, &CURL_LIMITS, 3)
+}
+
+fn download_cmd_with(url: &str, dest: &Path, https_only: bool, limits: &[&str], retries: u32) -> Command {
+    let mut c = Command::new("curl");
+    c.arg("-fL").args(limits).args(["--retry", &retries.to_string()]);
+    if https_only {
+        c.args(["--proto", "=https", "--tlsv1.2"]);
+    }
+    c.arg("-o").arg(dest).arg(url);
+    c
 }
 
 /// First field of `shasum -a 256` output.
@@ -90,7 +107,7 @@ fn download(gv: &str, sha: &str, tmp: &Path) -> Result<()> {
     let base = std::env::var("REKCOD_RELEASE_URL").ok();
     let url = release_url(base.as_deref(), version, &file);
     eprintln!("rekcod: downloading the guest image ({file})");
-    let curl = Command::new("curl").args(CURL_LIMITS).args(["-fL", "--progress-bar", "-o"]).arg(&tarball).arg(&url).status();
+    let curl = download_cmd(&url, &tarball, base.is_none()).arg("--progress-bar").status();
     if !curl.is_ok_and(|s| s.success()) {
         // Fallback for networks where curl to GitHub fails but an authenticated gh works.
         let gh = Command::new("gh").args(["release", "download", &format!("v{version}"), "-R", REPO, "-p", &file, "-D"]).arg(tmp).status();
@@ -123,6 +140,27 @@ mod tests {
             "https://github.com/TimMikeladze/rekcod/releases/download/v0.2.0/rekcod-guest-ab12.tar.gz"
         );
         assert_eq!(release_url(Some("http://localhost:8000/"), "0.2.0", "x.tar.gz"), "http://localhost:8000/x.tar.gz");
+    }
+
+    /// A server that accepts and never answers is given up on after the stall window.
+    #[test]
+    fn stalled_download_gives_up() {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/x", l.local_addr().unwrap());
+        let held = std::thread::spawn(move || {
+            let c = l.accept();
+            std::thread::sleep(std::time::Duration::from_secs(6));
+            drop(c);
+        });
+        let t0 = std::time::Instant::now();
+        let dest = std::env::temp_dir().join(format!("rekcod-stall-{}", std::process::id()));
+        let quick = ["--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "2"];
+        let st = download_cmd_with(&url, &dest, false, &quick, 0).arg("-sS").status().unwrap();
+        assert!(!st.success() && t0.elapsed() < std::time::Duration::from_secs(5), "{st} after {:?}", t0.elapsed());
+        let _ = std::fs::remove_file(&dest);
+        held.join().unwrap();
+        let args: Vec<_> = download_cmd("https://x/y", &dest, true).get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(args.windows(2).any(|w| w == ["--proto", "=https"]) && !args.contains(&"--max-time".to_string()));
     }
 
     #[test]

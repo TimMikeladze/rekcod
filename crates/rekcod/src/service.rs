@@ -3,7 +3,7 @@
 //!
 //! Each is a LaunchAgent (`~/Library/LaunchAgents`, starts at login) or, on a server, a
 //! LaunchDaemon (`/Library/LaunchDaemons`, starts at boot with nobody logged in) that runs
-//! as the same user (docs/server.md). A name that already has a daemon stays one;
+//! as the same user. A name that already has a daemon stays one;
 //! `REKCOD_LAUNCHD=system` makes new ones daemons. Daemons need root to install, so this
 //! runs `launchctl` and the plist copy through sudo unless it is root.
 
@@ -67,47 +67,46 @@ impl RunAs {
     }
 }
 
-/// A KeepAlive job running `exe args...`, logging to `log`. `crash_only`: launchd
-/// restarts it only after a non-zero exit, so a deliberate stop sticks. `run_as` makes it a
-/// daemon for that user.
-pub fn plist_with(
-    name: &str,
-    exe: &Path,
-    args: &[String],
-    log: &Path,
-    rekcod_home: Option<&Path>,
-    crash_only: bool,
-    run_as: Option<&RunAs>,
-) -> String {
-    let argv: String = std::iter::once(exe.display().to_string())
-        .chain(args.iter().cloned())
+/// A KeepAlive job: `exe args...` with `env`, logging to `log`.
+/// `crash_only`: launchd restarts it only after a non-zero exit, so a deliberate stop
+/// sticks. `run_as` makes it a daemon for that user.
+#[derive(Debug, Clone, Default)]
+pub struct Job {
+    pub name: String,
+    pub exe: PathBuf,
+    pub args: Vec<String>,
+    pub log: PathBuf,
+    /// `REKCOD_HOME` (other homes only) and the variables in [`CARRIED`] that were set.
+    pub env: Vec<(String, String)>,
+    pub crash_only: bool,
+    pub run_as: Option<RunAs>,
+}
+
+pub fn plist_with(job: &Job) -> String {
+    let argv: String = std::iter::once(job.exe.display().to_string())
+        .chain(job.args.iter().cloned())
         .map(|a| format!("    <string>{}</string>\n", xml_escape(&a)))
         .collect();
-    let mut vars = Vec::new();
-    if let Some(h) = rekcod_home {
-        vars.push(("REKCOD_HOME", h.display().to_string()));
-    }
-    // Plain http to a non-tailnet address was allowed when this was installed; the service
-    // checks again on every call.
-    if std::env::var_os("REKCOD_INSECURE").is_some() {
-        vars.push(("REKCOD_INSECURE", "1".into()));
-    }
-    if let Some(r) = run_as {
-        vars.push(("HOME", r.home.display().to_string()));
-        vars.push(("USER", r.user.clone()));
-        vars.push(("PATH", "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".into()));
+    let mut vars: Vec<(String, String)> =
+        job.env.iter().filter(|(k, _)| !matches!(k.as_str(), "HOME" | "USER" | "PATH")).cloned().collect();
+    if let Some(r) = &job.run_as {
+        vars.push(("HOME".into(), r.home.display().to_string()));
+        vars.push(("USER".into(), r.user.clone()));
+        vars.push(("PATH".into(), "/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin".into()));
     }
     let env = if vars.is_empty() {
         String::new()
     } else {
-        let kv: String = vars.iter().map(|(k, v)| format!("<key>{k}</key><string>{}</string>", xml_escape(v))).collect();
+        let kv: String = vars.iter().map(|(k, v)| format!("<key>{}</key><string>{}</string>", xml_escape(k), xml_escape(v))).collect();
         format!("  <key>EnvironmentVariables</key>\n  <dict>{kv}</dict>\n")
     };
-    let user = run_as
+    let user = job
+        .run_as
+        .as_ref()
         .map(|r| format!("  <key>UserName</key><string>{}</string>\n  <key>GroupName</key><string>staff</string>\n", xml_escape(&r.user)))
         .unwrap_or_default();
-    let log = xml_escape(&log.display().to_string());
-    let keep_alive = if crash_only { "<dict><key>SuccessfulExit</key><false/></dict>" } else { "<true/>" };
+    let log = xml_escape(&job.log.display().to_string());
+    let keep_alive = if job.crash_only { "<dict><key>SuccessfulExit</key><false/></dict>" } else { "<true/>" };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -125,8 +124,53 @@ pub fn plist_with(
 </dict>
 </plist>
 "#,
-        label(name)
+        label(&job.name)
     )
+}
+
+/// Variables that change what a job does, copied from the `--install` run into its plist so
+/// the job behaves like the run that was tested. None of them is a secret: plists of
+/// daemons are world-readable.
+const CARRIED: &[&str] = &[
+    "REKCOD_INSECURE",
+    "REKCOD_GUEST_DIR",
+    "REKCOD_NS",
+    "REKCOD_DEBUG",
+    "REKCOD_KERNEL_CMDLINE",
+    "REKCOD_DISK_SYNC",
+    "REKCOD_BALLOON",
+    "REKCOD_NO_BALLOON",
+    "REKCOD_DOCKER_CLI",
+    "REKCOD_DASHBOARD_DIR",
+    "REKCOD_SYSTEM_SOCKET",
+    "REKCOD_NODE",
+    "DOCKER_CONFIG",
+    "S3_ENDPOINT",
+    "S3_BUCKET",
+];
+
+/// Secrets a foreground run may have used; they never go into a plist.
+const NOT_CARRIED: &[&str] = &["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "GITHUB_TOKEN"];
+
+/// [`CARRIED`] as `get` has them.
+fn carried(get: impl Fn(&str) -> Option<String>) -> Vec<(String, String)> {
+    CARRIED.iter().filter_map(|k| get(k).filter(|v| !v.is_empty()).map(|v| (k.to_string(), v))).collect()
+}
+
+/// `args` without `flag VALUE` / `flag=VALUE`, and the value.
+pub fn take_flag(args: &[String], flag: &str) -> (Vec<String>, Option<String>) {
+    let (mut out, mut value) = (Vec::with_capacity(args.len()), None);
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == flag {
+            value = it.next().cloned();
+        } else if let Some(v) = a.strip_prefix(flag).and_then(|r| r.strip_prefix('=')) {
+            value = Some(v.to_string());
+        } else {
+            out.push(a.clone());
+        }
+    }
+    (out, value)
 }
 
 /// The command line this process was started with, minus `--install`.
@@ -160,13 +204,13 @@ fn root(args: &[&str]) -> Result<Output> {
     if is_root() {
         return Ok(Command::new(args[0]).args(&args[1..]).output()?);
     }
-    let mut sudo = Command::new("sudo");
+    let mut sudo = Command::new("/usr/bin/sudo");
     if !std::io::stdin().is_terminal() {
         sudo.arg("-n");
     }
     let out = sudo.args(args).stdin(Stdio::inherit()).output()?;
     if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("password is required") {
-        bail!("installing a LaunchDaemon needs sudo; run this in a terminal (`sudo -v` first)");
+        bail!("changing a LaunchDaemon needs sudo; run this in a terminal (`sudo -v` first)");
     }
     Ok(out)
 }
@@ -177,7 +221,7 @@ pub fn can_install_daemons() -> bool {
     if is_root() {
         return true;
     }
-    let mut sudo = Command::new("sudo");
+    let mut sudo = Command::new("/usr/bin/sudo");
     sudo.arg("-v");
     if !std::io::stdin().is_terminal() {
         sudo.arg("-n");
@@ -195,6 +239,46 @@ pub fn installed(name: &str) -> bool {
     plist_path(name).is_ok_and(|p| p.exists()) || is_daemon(name)
 }
 
+/// The job's plist: the daemon's when there is one, else the agent's.
+fn job_plist(name: &str) -> Option<PathBuf> {
+    if is_daemon(name) {
+        return Some(daemon_path(name));
+    }
+    plist_path(name).ok().filter(|p| p.exists())
+}
+
+/// The `REKCOD_HOME` a plist runs its job with; none means the default home.
+fn recorded_home(plist: &Path) -> Option<PathBuf> {
+    let out = Command::new("/usr/bin/plutil")
+        .args(["-extract", "EnvironmentVariables.REKCOD_HOME", "raw", "-o", "-"])
+        .arg(plist)
+        .output()
+        .ok()?;
+    let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !h.is_empty()).then(|| PathBuf::from(h))
+}
+
+/// Whether a job recorded with `recorded` (its plist's `REKCOD_HOME`) is this home's.
+/// Labels carry no home, so another home's `--install` or `uninstall` must not touch it.
+fn owns(paths: &Paths, recorded: Option<&Path>) -> bool {
+    match recorded {
+        Some(h) => h == paths.home,
+        None => paths.is_default_home(),
+    }
+}
+
+/// Whether job `name` is installed for this rekcod home.
+pub fn installed_here(paths: &Paths, name: &str) -> bool {
+    job_plist(name).is_some_and(|p| owns(paths, recorded_home(&p).as_deref()))
+}
+
+/// The home a job installed for another rekcod home runs with, if it is one.
+fn other_home(paths: &Paths, name: &str) -> Option<String> {
+    let p = job_plist(name)?;
+    let recorded = recorded_home(&p);
+    (!owns(paths, recorded.as_deref())).then(|| recorded.map_or("~/.rekcod".into(), |h| h.display().to_string()))
+}
+
 /// Fleet services in the order `upgrade` restarts them. The controller goes first: it
 /// accepts nodes and edges one minor version behind it, never ahead.
 pub const FLEET_SERVICES: &[&str] = &["controller", "node", "edge", "storage"];
@@ -202,7 +286,7 @@ pub const FLEET_SERVICES: &[&str] = &["controller", "node", "edge", "storage"];
 /// The installed job's command line (the binary first), read back from its plist.
 pub fn job_args(name: &str) -> Option<Vec<String>> {
     let path = if is_daemon(name) { daemon_path(name) } else { plist_path(name).ok().filter(|p| p.exists())? };
-    agent_job(&path).ok().map(|(argv, _)| argv)
+    agent_job(name, &path).ok().map(|j| std::iter::once(j.exe.display().to_string()).chain(j.args).collect())
 }
 
 /// Stops the job and starts it again from its plist (`launchctl kickstart -k`), so it
@@ -223,56 +307,115 @@ pub fn kickstart(name: &str) {
     let _ = if is_daemon(name) { root(&["/bin/launchctl", "kickstart", &target]) } else { launchctl(&["kickstart", &target]) };
 }
 
-/// The path to put in a job: the one this binary was run by when that's a symlink
-/// into a Homebrew Cellar (`/opt/homebrew/bin/rekcod`), whose target changes with every
-/// `brew upgrade`; otherwise the binary's own path.
-fn stable_exe() -> Result<PathBuf> {
-    let exe = std::env::current_exe()?.canonicalize()?;
-    let argv0 = std::env::args().next().unwrap_or_default();
-    let invoked = if argv0.contains('/') {
-        Some(PathBuf::from(&argv0))
-    } else {
-        std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join(&argv0)).find(|c| c.exists()))
-    };
-    if let Some(link) = invoked.filter(|l| l.is_absolute() && std::fs::symlink_metadata(l).is_ok_and(|m| m.file_type().is_symlink()))
-        && link.canonicalize().is_ok_and(|t| t == exe)
-        && exe.components().any(|c| c.as_os_str() == "Cellar")
-    {
-        return Ok(link);
-    }
-    Ok(exe)
+/// The path to put in a job, a firewall exception or anything else that outlives this
+/// binary: for a Homebrew keg (`<prefix>/Cellar/rekcod/<version>/bin/rekcod`, gone at the
+/// next `brew upgrade`) the `<prefix>/bin/rekcod` link to it, else the binary's own path.
+pub fn stable_exe() -> Result<PathBuf> {
+    Ok(stable_path(&std::env::current_exe()?.canonicalize()?))
+}
+
+fn stable_path(exe: &Path) -> PathBuf {
+    let parts: Vec<_> = exe.components().collect();
+    let Some(i) = parts.iter().position(|c| c.as_os_str() == "Cellar") else { return exe.to_path_buf() };
+    let link: PathBuf = parts[..i].iter().collect::<PathBuf>().join("bin").join(exe.file_name().unwrap_or_default());
+    if link.canonicalize().is_ok_and(|t| t == exe) { link } else { exe.to_path_buf() }
 }
 
 fn wants_daemon(name: &str) -> bool {
     is_daemon(name) || std::env::var("REKCOD_LAUNCHD").is_ok_and(|v| v == "system")
 }
 
-pub fn install_with(paths: &Paths, name: &str, args: &[String], crash_only: bool) -> Result<()> {
-    let exe = stable_exe()?;
+/// Flags whose value is a path. launchd starts jobs in `/`, so a relative one is made
+/// absolute against where `--install` ran (not by a WorkingDirectory: that directory may
+/// be gone by the next boot, the pkg's scripts directory always is).
+const PATH_FLAGS: &[&str] = &["--db", "--data", "--backup-dir", "--storage-credentials"];
+
+fn absolute_paths(args: &[String], cwd: &Path) -> Vec<String> {
+    let abs = |v: &str| if Path::new(v).is_absolute() { v.to_string() } else { cwd.join(v).display().to_string() };
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if PATH_FLAGS.contains(&a.as_str()) {
+            out.push(a.clone());
+            if let Some(v) = it.next() {
+                out.push(abs(v));
+            }
+        } else if let Some((flag, v)) = a.split_once('=').filter(|(f, _)| PATH_FLAGS.contains(f)) {
+            out.push(format!("{flag}={}", abs(v)));
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// The job `--install` writes for `name`: this binary by its stable path, its path
+/// arguments absolute, with the environment that changes what it does.
+fn job_for(paths: &Paths, name: &str, args: &[String], crash_only: bool) -> Result<Job> {
     let log = paths.home.join("logs").join(format!("{name}.log"));
-    std::fs::create_dir_all(log.parent().context("log dir")?)?;
-    let home = (!paths.is_default_home()).then_some(paths.home.as_path());
-    if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
+    let mut env = Vec::new();
+    if !paths.is_default_home() {
+        env.push(("REKCOD_HOME".to_string(), paths.home.display().to_string()));
+    }
+    env.extend(carried(|k| std::env::var(k).ok()));
+    let left: Vec<&str> = NOT_CARRIED.iter().copied().filter(|k| std::env::var_os(k).is_some()).collect();
+    if !left.is_empty() {
+        eprintln!("rekcod: {} not written into the {name} job (secrets don't go into plists)", left.join(", "));
+    }
+    Ok(Job {
+        name: name.into(),
+        exe: stable_exe()?,
+        args: absolute_paths(args, &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
+        log,
+        env,
+        crash_only,
+        run_as: None,
+    })
+}
+
+pub fn install_with(paths: &Paths, name: &str, args: &[String], crash_only: bool) -> Result<()> {
+    let mut job = job_for(paths, name, args, crash_only)?;
+    std::fs::create_dir_all(job.log.parent().context("log dir")?)?;
+    let dry = std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some();
+    if !dry && let Some(other) = other_home(paths, name) {
+        bail!("{} is installed for the rekcod home {other}; remove it there first (`rekcod uninstall` with that REKCOD_HOME)", label(name));
+    }
+    let restarts = if crash_only { "restarts if it crashes" } else { "restarts if it exits" };
+    if dry {
         let path = paths.home.join(format!("{}.plist", label(name)));
-        std::fs::write(&path, plist_with(name, &exe, args, &log, home, crash_only, None))?;
+        std::fs::write(&path, plist_with(&job))?;
         println!("wrote {} (dry run: not loaded)", path.display());
         return Ok(());
     }
     if wants_daemon(name) {
         let run_as = RunAs::current()?;
-        install_daemon(name, &plist_with(name, &exe, args, &log, home, crash_only, Some(&run_as)))?;
+        job.run_as = Some(run_as.clone());
+        install_daemon(name, &plist_with(&job))?;
         remove_agent(name)?;
-        let restarts = if crash_only { "restarts if it crashes" } else { "restarts if it exits" };
-        println!("{name} installed: runs now and at boot as {}, {restarts}; log {}", run_as.user, log.display());
-        return Ok(());
+        println!("{name} installed: runs now and at boot as {}, {restarts}; log {}", run_as.user, job.log.display());
+    } else {
+        let path = plist_path(name)?;
+        std::fs::create_dir_all(path.parent().context("plist dir")?)?;
+        std::fs::write(&path, plist_with(&job))?;
+        load(&gui_domain(), name, &path, false)?;
+        println!("{name} installed: runs now and at login, {restarts}; log {}", job.log.display());
     }
-    let path = plist_path(name)?;
-    std::fs::create_dir_all(path.parent().context("plist dir")?)?;
-    std::fs::write(&path, plist_with(name, &exe, args, &log, home, crash_only, None))?;
-    load(&gui_domain(), name, &path, false)?;
-    let restarts = if crash_only { "restarts if it crashes" } else { "restarts if it exits" };
-    println!("{name} installed: runs now and at login, {restarts}; log {}", log.display());
+    report_early_exit(name, &job.log);
     Ok(())
+}
+
+/// A job that exits at once (a bad path, a port in use) is restarted every few seconds
+/// with nothing said: look once, after it had time to fail.
+fn report_early_exit(name: &str, log: &Path) {
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let target = format!("{}/{}", domain_of(name), label(name));
+    let Ok(out) = launchctl(&["print", &target]) else { return };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let running = text.lines().any(|l| l.trim_start().starts_with("pid = "));
+    let last = text.lines().find_map(|l| l.trim().strip_prefix("last exit code = ")).unwrap_or("");
+    if out.status.success() && !running && !last.is_empty() && last != "0" {
+        eprintln!("rekcod: {name} exited right away ({last}); see {}", log.display());
+    }
 }
 
 /// Replaces a previous registration (new arguments, or the binary moved). bootout returns
@@ -352,14 +495,27 @@ pub fn uninstall(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// The agent's `ProgramArguments` and whether it only restarts after a crash, read back
-/// from its plist (`plutil` turns it into JSON).
-fn agent_job(path: &Path) -> Result<(Vec<String>, bool)> {
-    let out = Command::new("plutil").args(["-convert", "json", "-o", "-"]).arg(path).output()?;
+/// An agent's job read back from its plist (`plutil` turns it into JSON): everything a
+/// daemon for it needs.
+fn agent_job(name: &str, path: &Path) -> Result<Job> {
+    let out = Command::new("/usr/bin/plutil").args(["-convert", "json", "-o", "-"]).arg(path).output()?;
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).with_context(|| format!("read {}", path.display()))?;
     let argv: Vec<String> =
         v["ProgramArguments"].as_array().context("no ProgramArguments")?.iter().filter_map(|a| a.as_str().map(String::from)).collect();
-    Ok((argv, v["KeepAlive"].is_object()))
+    let (exe, args) = argv.split_first().context("empty ProgramArguments")?;
+    let env = v["EnvironmentVariables"]
+        .as_object()
+        .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect())
+        .unwrap_or_default();
+    Ok(Job {
+        name: name.into(),
+        exe: exe.into(),
+        args: args.to_vec(),
+        log: v["StandardOutPath"].as_str().unwrap_or_default().into(),
+        env,
+        crash_only: v["KeepAlive"].is_object(),
+        run_as: None,
+    })
 }
 
 /// `rekcod server at-boot`: the user's LaunchAgents among `names` become LaunchDaemons
@@ -371,13 +527,9 @@ pub fn agents_to_daemons(run_as: &RunAs, names: &[&str]) -> Result<Vec<String>> 
         if !agent.exists() {
             continue;
         }
-        let (argv, crash_only) = agent_job(&agent)?;
-        let (exe, args) = argv.split_first().context("empty ProgramArguments")?;
-        let out = Command::new("plutil").args(["-extract", "StandardOutPath", "raw", "-o", "-"]).arg(&agent).output()?;
-        let log = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string());
-        let out = Command::new("plutil").args(["-extract", "EnvironmentVariables.REKCOD_HOME", "raw", "-o", "-"]).arg(&agent).output()?;
-        let home = out.status.success().then(|| PathBuf::from(String::from_utf8_lossy(&out.stdout).trim().to_string()));
-        install_daemon(name, &plist_with(name, Path::new(exe), args, &log, home.as_deref(), crash_only, Some(run_as)))?;
+        let mut job = agent_job(name, &agent)?;
+        job.run_as = Some(run_as.clone());
+        install_daemon(name, &plist_with(&job))?;
         // The agent's own domain is the user's: root unloads it there by uid.
         let uid = std::fs::metadata(&run_as.home).map(|m| std::os::unix::fs::MetadataExt::uid(&m)).unwrap_or(0);
         let _ = Command::new("/bin/launchctl").args(["bootout", &format!("gui/{uid}/{}", label(name))]).output();
@@ -397,51 +549,147 @@ mod tests {
         assert_eq!(strip(&a), ["controller", "serve", "--db", "/x/fleet.db"]);
     }
 
+    fn job(name: &str, exe: &str, args: &[&str]) -> Job {
+        Job {
+            name: name.into(),
+            exe: exe.into(),
+            args: args.iter().map(|a| a.to_string()).collect(),
+            log: "/h/logs/x.log".into(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn plist_keeps_alive_and_logs() {
-        let p = plist_with(
-            "edge",
-            Path::new("/opt/r&d/rekcod"),
-            &["edge".into(), "serve".into()],
-            Path::new("/h/logs/edge.log"),
-            Some(Path::new("/h")),
-            false,
-            None,
-        );
+        let mut j = job("edge", "/opt/r&d/rekcod", &["edge", "serve", "--data", "./rustfs"]);
+        j.env = vec![("REKCOD_HOME".into(), "/h".into()), ("REKCOD_INSECURE".into(), "1".into())];
+        let p = plist_with(&j);
         assert!(p.contains("<string>/opt/r&amp;d/rekcod</string>\n    <string>edge</string>\n    <string>serve</string>"), "{p}");
         assert!(p.contains("<key>KeepAlive</key><true/>") && p.contains("<string>dev.rekcod.edge</string>"));
-        assert!(p.contains("<key>REKCOD_HOME</key><string>/h</string>"));
+        assert!(p.contains("<key>REKCOD_HOME</key><string>/h</string><key>REKCOD_INSECURE</key><string>1</string>"));
         // plutil is the authority on whether launchd can read it.
         let f = std::env::temp_dir().join(format!("rekcod-plist-{}.plist", std::process::id()));
         std::fs::write(&f, &p).unwrap();
-        let ok = Command::new("plutil").arg("-lint").arg(&f).output().map(|o| o.status.success()).unwrap_or(true);
+        let ok = Command::new("/usr/bin/plutil").arg("-lint").arg(&f).output().map(|o| o.status.success()).unwrap_or(true);
+        // at-boot rebuilds a daemon from the agent: nothing of the job is lost on the way.
+        let back = agent_job("edge", &f).unwrap();
         std::fs::remove_file(&f).unwrap();
         assert!(ok, "plutil rejected:\n{p}");
-        let vm = plist_with("vm", Path::new("/r"), &["start".into()], Path::new("/l"), None, true, None);
-        assert!(vm.contains("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"), "{vm}");
+        assert_eq!((back.exe, back.args, back.log), (j.exe, j.args, j.log));
+        let mut env = back.env;
+        env.sort();
+        assert_eq!(env, j.env);
+        let mut vm = job("vm", "/r", &["start"]);
+        vm.crash_only = true;
+        assert!(plist_with(&vm).contains("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"));
+    }
+
+    /// A relative --db or --data in the job means what it meant where --install ran.
+    #[test]
+    fn relative_paths_become_absolute() {
+        let a: Vec<String> =
+            ["controller", "serve", "--db", "fleet.db", "--backup-dir=../b", "--storage-credentials", "/abs/c.json", "--domain", "x"]
+                .map(String::from)
+                .into();
+        assert_eq!(
+            absolute_paths(&a, Path::new("/srv")),
+            [
+                "controller",
+                "serve",
+                "--db",
+                "/srv/fleet.db",
+                "--backup-dir=/srv/../b",
+                "--storage-credentials",
+                "/abs/c.json",
+                "--domain",
+                "x"
+            ]
+        );
+        let s: Vec<String> = ["storage", "serve", "--data", "./rustfs"].map(String::from).into();
+        assert_eq!(absolute_paths(&s, Path::new("/h"))[3], "/h/./rustfs");
+    }
+
+    #[test]
+    fn only_listed_variables_reach_a_plist() {
+        let env = |k: &str| matches!(k, "REKCOD_NS" | "AWS_SECRET_ACCESS_KEY" | "GITHUB_TOKEN" | "S3_BUCKET").then(|| "v".to_string());
+        assert_eq!(carried(env), [("REKCOD_NS".to_string(), "v".to_string()), ("S3_BUCKET".into(), "v".into())]);
+        assert!(NOT_CARRIED.iter().all(|k| !CARRIED.contains(k)));
+    }
+
+    #[test]
+    fn flag_taken_out_of_args() {
+        let a: Vec<String> = ["controller", "serve", "--alert-webhook", "https://hooks/x", "--auto-approve"].map(String::from).into();
+        assert_eq!(
+            take_flag(&a, "--alert-webhook"),
+            (vec!["controller".into(), "serve".into(), "--auto-approve".into()], Some("https://hooks/x".into()))
+        );
+        let b: Vec<String> = ["serve", "--alert-webhook=https://h"].map(String::from).into();
+        assert_eq!(take_flag(&b, "--alert-webhook"), (vec!["serve".to_string()], Some("https://h".into())));
+    }
+
+    /// A Homebrew keg's path becomes the prefix's bin link to it, whatever ran it.
+    #[test]
+    fn cellar_path_becomes_the_bin_link() {
+        let t = std::env::temp_dir().join(format!("rekcod-brew-{}", std::process::id()));
+        let keg = t.join("Cellar/rekcod/1.0/bin");
+        std::fs::create_dir_all(&keg).unwrap();
+        std::fs::create_dir_all(t.join("bin")).unwrap();
+        std::fs::write(keg.join("rekcod"), "").unwrap();
+        let t = t.canonicalize().unwrap();
+        let exe = t.join("Cellar/rekcod/1.0/bin/rekcod");
+        assert_eq!(stable_path(&exe), exe, "no link yet");
+        std::os::unix::fs::symlink("../Cellar/rekcod/1.0/bin/rekcod", t.join("bin/rekcod")).unwrap();
+        assert_eq!(stable_path(&exe), t.join("bin/rekcod"));
+        assert_eq!(stable_path(Path::new("/usr/local/bin/rekcod")), Path::new("/usr/local/bin/rekcod"));
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    /// A job is this home's when its plist names this home, or names none and this is
+    /// ~/.rekcod.
+    #[test]
+    fn jobs_belong_to_the_home_in_their_plist() {
+        let dir = std::env::temp_dir().join(format!("rekcod-owns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let default = Paths { home: PathBuf::from(std::env::var_os("HOME").unwrap()).join(".rekcod") };
+        let other = Paths { home: dir.join("h") };
+        let plist = |home: Option<&Path>| {
+            let f = dir.join(format!("{}.plist", home.is_some()));
+            let mut j = job("vm", "/r", &["start"]);
+            j.env = home.map(|h| vec![("REKCOD_HOME".to_string(), h.display().to_string())]).unwrap_or_default();
+            std::fs::write(&f, plist_with(&j)).unwrap();
+            recorded_home(&f)
+        };
+        let none = plist(None);
+        assert_eq!(none, None);
+        assert!(owns(&default, none.as_deref()) && !owns(&other, none.as_deref()));
+        let h = plist(Some(&other.home));
+        assert_eq!(h.as_deref(), Some(other.home.as_path()));
+        assert!(owns(&other, h.as_deref()) && !owns(&default, h.as_deref()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A daemon names its user and gets the environment a login would have set.
     #[test]
     fn daemon_plist_runs_as_user() {
-        let r = RunAs { user: "tim".into(), home: "/Users/tim".into() };
-        let p = plist_with(
-            "node",
-            Path::new("/Users/tim/.rekcod/bin/rekcod"),
-            &["node".into(), "serve".into()],
-            Path::new("/l"),
-            None,
-            false,
-            Some(&r),
-        );
-        assert!(p.contains("<key>UserName</key><string>tim</string>") && p.contains("<key>GroupName</key><string>staff</string>"));
-        assert!(p.contains("<key>HOME</key><string>/Users/tim</string>") && p.contains("<key>USER</key><string>tim</string>"));
+        let r = RunAs { user: "me".into(), home: "/Users/me".into() };
+        let mut j = job("node", "/Users/me/.rekcod/bin/rekcod", &["node", "serve"]);
+        j.run_as = Some(r);
+        let p = plist_with(&j);
+        assert!(p.contains("<key>UserName</key><string>me</string>") && p.contains("<key>GroupName</key><string>staff</string>"));
+        assert!(p.contains("<key>HOME</key><string>/Users/me</string>") && p.contains("<key>USER</key><string>me</string>"));
         let f = std::env::temp_dir().join(format!("rekcod-daemon-{}.plist", std::process::id()));
         std::fs::write(&f, &p).unwrap();
-        let (argv, crash_only) = agent_job(&f).unwrap();
+        let back = agent_job("node", &f).unwrap();
         std::fs::remove_file(&f).unwrap();
-        assert_eq!(argv, ["/Users/tim/.rekcod/bin/rekcod", "node", "serve"]);
-        assert!(!crash_only);
+        assert_eq!(
+            (back.exe.display().to_string(), back.args.clone()),
+            ("/Users/me/.rekcod/bin/rekcod".into(), vec!["node".to_string(), "serve".into()])
+        );
+        assert!(!back.crash_only);
+        // Converting again doesn't stack a second HOME/USER/PATH.
+        let mut again = back;
+        again.run_as = j.run_as.clone();
+        assert_eq!(plist_with(&again).matches("<key>HOME</key>").count(), 1);
         assert_eq!(RunAs::current().unwrap().user, std::env::var("USER").unwrap_or_default());
     }
 }

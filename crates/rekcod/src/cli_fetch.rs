@@ -67,13 +67,7 @@ pub fn ensure_cli(rekcod_home: &Path) -> Result<PathBuf> {
 
 fn download(a: &Asset, tmp: &Path) -> Result<()> {
     let file = tmp.join(a.url.rsplit('/').next().unwrap_or("download"));
-    let ok = Command::new("curl")
-        .args(crate::fetch::CURL_LIMITS)
-        .args(["-fsSL", "-o"])
-        .arg(&file)
-        .arg(a.url)
-        .status()
-        .is_ok_and(|s| s.success());
+    let ok = crate::fetch::download_cmd(a.url, &file, true).arg("-sS").status().is_ok_and(|s| s.success());
     if !ok {
         bail!("could not download {}", a.url);
     }

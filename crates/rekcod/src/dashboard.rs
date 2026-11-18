@@ -167,6 +167,8 @@ pub fn run(paths: &Paths, foreground: bool, open_it: bool) -> Result<()> {
     let token = new_token()?;
     let url = auth_url(port, &token);
     if foreground {
+        // Under the LaunchAgent the server's output is dashboard.log; this process stays.
+        crate::lifecycle::trim_log_hourly(paths.home.join("logs/dashboard.log"));
         let mut child = command(paths, port, &token)?.spawn().context("start node")?;
         record(paths, child.id(), port, &token)?;
         // Under the LaunchAgent stderr is dashboard.log, which isn't 0600; keep the token out.

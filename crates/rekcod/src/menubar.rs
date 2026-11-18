@@ -237,7 +237,7 @@ pub fn entries(m: &Model) -> Vec<Entry> {
     } else {
         out.push(Entry::Label("rekcod is stopped".into()));
     }
-    let vm = actions::vm_actions(m.running, m.socket_installed, m.autostart);
+    let vm = actions::vm_actions(m.running, m.socket_installed, m.autostart, m.rollback);
     out.extend(vm.into_iter().map(Entry::Action));
     out.extend(actions::storage_actions(m.running, &m.containers).into_iter().map(Entry::Action));
     let hosts = actions::host_actions(&m.hosts);
@@ -940,7 +940,7 @@ fn domain() -> String {
 }
 
 pub fn install() -> Result<()> {
-    let exe = std::env::current_exe()?.canonicalize()?;
+    let exe = crate::service::stable_exe()?;
     let path = plist_path()?;
     std::fs::create_dir_all(path.parent().context("plist dir")?)?;
     // Replace a previous registration (e.g. the binary moved).
@@ -998,6 +998,7 @@ mod tests {
             sandbox: None,
             socket_installed: false,
             autostart: false,
+            rollback: true,
             sandboxes: vec![crate::actions::tests::sample_sandbox()],
             apps: vec![
                 crate::actions::tests::sample_app(),

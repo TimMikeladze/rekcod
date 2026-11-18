@@ -110,6 +110,16 @@ extern "C" fn on_resolve(
     }
 }
 
+/// Whether an SRV target is a plain host name. Anyone on the LAN can answer a query,
+/// and the target goes into ssh's argv, known_hosts and the ssh config.
+pub fn valid_target(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host
+            .split('.')
+            .all(|l| !l.is_empty() && l.len() <= 63 && !l.starts_with('-') && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'))
+}
+
 /// The instance's current host name and port.
 pub fn resolve(instance: &str, timeout: Duration) -> Result<(String, u16)> {
     let (name, ty, domain) = (CString::new(instance)?, CString::new(TYPE)?, CString::new("local.")?);
@@ -135,9 +145,13 @@ pub fn resolve(instance: &str, timeout: Duration) -> Result<(String, u16)> {
         }
     }
     unsafe { DNSServiceRefDeallocate(sd) };
-    found.host.map(|h| (h, found.port)).ok_or_else(|| {
+    let host = found.host.ok_or_else(|| {
         anyhow!("{instance} isn't answering on Bonjour; is the server on, and on the same network (mDNS doesn't cross subnets)?")
-    })
+    })?;
+    if !valid_target(&host) {
+        bail!("{instance} answered on Bonjour with {host:?}, which isn't a host name; ignoring it");
+    }
+    Ok((host, found.port))
 }
 
 /// Where to connect for `authority`: a Bonjour instance resolved now, else ordinary DNS.
@@ -164,6 +178,15 @@ mod tests {
         assert_eq!(instance_of("rekcod-3f9a1c2b7d4e.bonjour:7700"), Some("rekcod-3f9a1c2b7d4e"));
         assert_eq!(instance_of("mini.local:7700"), None);
         assert_eq!(instance_of(".bonjour"), None);
+    }
+
+    #[test]
+    fn targets_are_host_names() {
+        assert!(valid_target("Mac-Mini-2.local"));
+        assert!(valid_target("10.0.0.4"));
+        for bad in ["-oProxyCommand={a,b}", "a b.local", "x.-y.local", "a..local", "", "evil|sh;true.local", &"a".repeat(64)] {
+            assert!(!valid_target(bad), "{bad}");
+        }
     }
 
     /// Registers a throwaway instance and finds it again through mDNSResponder.

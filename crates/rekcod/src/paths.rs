@@ -57,15 +57,58 @@ pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// In a rekcod home that rekcod created (`Paths::at`).
+pub const HOME_MARKER: &str = ".rekcod-home";
+
+/// Top-level entries of a rekcod home from before [`HOME_MARKER`]; one holding anything
+/// else isn't deleted whole.
+pub const HOME_ENTRIES: &[&str] = &[
+    "bin",
+    "cli",
+    "config.json",
+    "controller",
+    "dashboard",
+    "default.sock",
+    "default.sock.asked",
+    "default.sock.original",
+    "docker",
+    "golden",
+    "guest",
+    "logs",
+    "macos",
+    "node.json",
+    "node-allow.json",
+    "remote-ws",
+    "remotes.json",
+    "run",
+    "sandbox",
+    "sandbox-token",
+    "sb",
+    "server",
+    "ssh",
+    "storage",
+    "vm",
+    ".DS_Store",
+];
+
 /// Data disk size; sparse, so only used space costs anything on the Mac.
 pub const DEFAULT_DISK_GIB: u64 = 256;
 
 /// `$REKCOD_HOME`, default `~/.rekcod`, without creating anything.
 pub fn home_dir() -> Result<PathBuf> {
-    Ok(match std::env::var_os("REKCOD_HOME") {
-        Some(h) => PathBuf::from(h),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".rekcod"),
-    })
+    match std::env::var_os("REKCOD_HOME") {
+        Some(h) => check_home(PathBuf::from(h)),
+        None => Ok(PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".rekcod")),
+    }
+}
+
+/// An absolute `REKCOD_HOME`. A relative one would mean another directory to every launchd
+/// job (they start in `/`) and to `uninstall`, which deletes the home.
+fn check_home(h: PathBuf) -> Result<PathBuf> {
+    if !h.is_absolute() {
+        bail!("REKCOD_HOME must be an absolute path, not {:?}", h.display().to_string());
+    }
+    Ok(h)
 }
 
 #[derive(Clone)]
@@ -86,8 +129,13 @@ impl Paths {
     /// Modes that can't be changed are left for `rekcod doctor` to report.
     pub fn at(home: PathBuf) -> Result<Paths> {
         use std::os::unix::fs::DirBuilderExt;
+        let fresh = !home.exists();
         for dir in ["run", "logs", "vm"] {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(home.join(dir))?;
+        }
+        if fresh {
+            // rekcod made this directory, so `uninstall` may delete it whole.
+            std::fs::write(home.join(HOME_MARKER), b"")?;
         }
         let paths = Paths { home };
         for (path, mode) in paths.private() {
@@ -202,29 +250,30 @@ impl Paths {
     /// then the repo's `out/guest` for dev builds, then (release builds) the
     /// embedded guest version under `~/.rekcod/guest/<version>`, downloaded if missing.
     pub fn guest_dir(&self) -> Result<PathBuf> {
-        let mut candidates = Vec::new();
-        if let Some(dir) = std::env::var_os("REKCOD_GUEST_DIR") {
-            candidates.push(PathBuf::from(dir));
-        }
         // A release build boots the guest it was built with; a leftover dev guest in
         // ~/.rekcod/guest must not win over it. Dev builds (no pinned guest) look there.
         #[cfg(target_os = "macos")]
-        let pinned = crate::fetch::GUEST_VERSION.is_some();
+        let pinned = crate::fetch::GUEST_VERSION;
         #[cfg(not(target_os = "macos"))]
-        let pinned = false;
-        if !pinned {
-            candidates.push(self.home.join("guest"));
+        let pinned: Option<&str> = None;
+        // (dir, whether a release build takes it only at its own guest version)
+        let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
+        if let Some(dir) = std::env::var_os("REKCOD_GUEST_DIR") {
+            candidates.push((PathBuf::from(dir), false));
+        }
+        if pinned.is_none() {
+            candidates.push((self.home.join("guest"), false));
         }
         if let Some(bin_dir) = std::env::current_exe()?.canonicalize()?.parent() {
-            candidates.push(bin_dir.join("../share/rekcod/guest"));
-            if !pinned {
-                candidates.push(bin_dir.join("../../out/guest"));
+            // The server pkg's guest. `upgrade` replaces only the binary, so after one it's
+            // an older guest than this build's.
+            candidates.push((bin_dir.join("../share/rekcod/guest"), true));
+            if pinned.is_none() {
+                candidates.push((bin_dir.join("../../out/guest"), false));
             }
         }
-        for dir in &candidates {
-            if dir.join("Image").exists() && dir.join("root.img").exists() {
-                return Ok(dir.canonicalize()?);
-            }
+        if let Some(dir) = choose_guest(&candidates, pinned) {
+            return Ok(dir.canonicalize()?);
         }
         // Release builds: the guest they were built with, downloaded on first use.
         #[cfg(target_os = "macos")]
@@ -233,9 +282,21 @@ impl Paths {
         }
         bail!(
             "guest image not found (looked in {}); build it with scripts/build.sh",
-            candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ")
+            candidates.iter().map(|(c, _)| c.display().to_string()).collect::<Vec<_>>().join(", ")
         )
     }
+}
+
+/// The first candidate with a kernel and root image whose `VERSION` is `pinned`, when the
+/// candidate asks for that check.
+fn choose_guest<'a>(candidates: &'a [(PathBuf, bool)], pinned: Option<&str>) -> Option<&'a PathBuf> {
+    candidates
+        .iter()
+        .find(|(dir, versioned)| {
+            let version = || std::fs::read_to_string(dir.join("VERSION")).unwrap_or_default();
+            dir.join("Image").exists() && dir.join("root.img").exists() && (!versioned || pinned.is_none_or(|p| version().trim() == p))
+        })
+        .map(|(d, _)| d)
 }
 
 #[cfg(test)]
@@ -270,6 +331,38 @@ mod tests {
         assert_eq!((mode(&paths.root_disk()), mode(&paths.data_disk())), (0o600, 0o600));
         assert!(paths.not_private().is_empty());
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A guest beside the binary from an older install is passed over for the one this
+    /// build pins; a dev build takes it as it is.
+    #[test]
+    fn stale_share_guest_is_skipped() {
+        let t = std::env::temp_dir().join(format!("rekcod-guest-pick-{}", std::process::id()));
+        let guest = |name: &str, v: &str| {
+            let d = t.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            for f in ["Image", "root.img"] {
+                std::fs::write(d.join(f), "").unwrap();
+            }
+            std::fs::write(d.join("VERSION"), format!("{v}\n")).unwrap();
+            d
+        };
+        let share = guest("share", "g-old");
+        let dev = guest("dev", "g-dev");
+        let c = vec![(share.clone(), true), (dev.clone(), false)];
+        assert_eq!(choose_guest(&c, Some("g-new")), Some(&dev));
+        assert_eq!(choose_guest(&c[..1], Some("g-new")), None, "falls through to the download");
+        assert_eq!(choose_guest(&c, Some("g-old")), Some(&share));
+        assert_eq!(choose_guest(&c, None), Some(&share));
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn rekcod_home_is_absolute() {
+        for bad in ["", ".", "rel/home"] {
+            assert!(check_home(bad.into()).is_err(), "{bad:?}");
+        }
+        assert_eq!(check_home("/tmp/rk".into()).unwrap(), PathBuf::from("/tmp/rk"));
     }
 
     #[test]

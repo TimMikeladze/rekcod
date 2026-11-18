@@ -415,7 +415,7 @@ fn expect_nodes(db: &mut Db) -> Result<()> {
 /// The git remote URL and HEAD commit of `dir`, for remote creates and deploys.
 pub fn git_origin(dir: &Path) -> Result<(String, String)> {
     let run = |args: &[&str]| -> Result<String> {
-        let o = Command::new("git").arg("-C").arg(dir).args(args).output()?;
+        let o = git_here().arg("-C").arg(dir).args(args).output()?;
         if !o.status.success() {
             bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
         }
@@ -451,11 +451,25 @@ pub fn check_git_source(url: &str, rev: &str) -> Result<()> {
     Ok(())
 }
 
+/// Variables that point git at a repository other than `-C`'s: a git hook (the pre-commit
+/// one running these tests, say) sets them, and `git init` there rewrites that repo.
+const GIT_REPO_VARS: &[&str] =
+    &["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"];
+
+/// `git` for the repository at `-C DIR`, whatever the environment says.
+fn git_here() -> Command {
+    let mut c = Command::new("git");
+    for v in GIT_REPO_VARS {
+        c.env_remove(v);
+    }
+    c
+}
+
 /// `git` with only network transports allowed (plus `file` under [`ALLOW_LOCAL_GIT`]),
 /// no prompts and no ext:: helpers. A server that accepts and then stalls is dropped: http
 /// below 1 KB/s for 30 s, ssh after 10 s to connect or 30 s without an answer.
 fn git_cmd() -> Command {
-    let mut c = Command::new("git");
+    let mut c = git_here();
     let protocols = if std::env::var_os(ALLOW_LOCAL_GIT).is_some() { "https:ssh:http:file" } else { "https:ssh:http" };
     c.env("GIT_ALLOW_PROTOCOL", protocols).env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null());
     c.args(["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=30"]);
@@ -675,27 +689,25 @@ pub fn close_relay(id: &str) {
     let _ = TcpStream::connect_timeout(&wake, Duration::from_secs(1));
 }
 
-/// `rekcod.toml`: `[app]`, `[resources]` and `[env]` with `key = value` lines.
-pub fn parse_toml(text: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let mut section = String::new();
-    for line in text.lines() {
-        let line = line.split(" #").next().unwrap_or("").trim();
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            section = s.trim().to_string();
-        } else if let Some((k, v)) = line.split_once('=') {
-            out.insert(format!("{section}.{}", k.trim()), v.trim().trim_matches('"').to_string());
-        }
-    }
-    out
-}
-
 /// A checkout's `rekcod.toml`, read on the Mac without following links.
 fn checkout_toml(dir: &Path) -> Result<HashMap<String, String>> {
-    Ok(parse_toml(&crate::xrun::read_project_file(dir, "rekcod.toml")?.unwrap_or_default()))
+    crate::apptoml::parse(&crate::xrun::read_project_file(dir, "rekcod.toml")?.unwrap_or_default())
+}
+
+/// The `rekcod.toml` `app deploy` sends: the one in `commit` (what the node builds), or
+/// with none (`--ref` given) the working tree's. An edited, uncommitted one is named.
+pub fn deployed_toml(dir: &Path, commit: Option<&str>) -> Result<String> {
+    let disk = std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default();
+    let Some(commit) = commit else { return Ok(disk) };
+    let o = git_here().arg("-C").arg(dir).args(["show", &format!("{commit}:rekcod.toml")]).stderr(Stdio::null()).output()?;
+    let committed = if o.status.success() { String::from_utf8(o.stdout).context("rekcod.toml isn't UTF-8")? } else { String::new() };
+    if committed != disk {
+        eprintln!(
+            "rekcod: rekcod.toml differs from the one in {}; deploying the committed one (commit and push to change it)",
+            &commit[..commit.len().min(12)]
+        );
+    }
+    Ok(committed)
 }
 
 /// Writes a generated Dockerfile into a checkout that has nothing named `Dockerfile`. A
@@ -984,7 +996,7 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         }
         None => {
             let url = a["git"]["url"].as_str().context("missing git.url")?;
-            eprintln!("rekcod: {app} r{release}: cloning {url}");
+            eprintln!("rekcod: {app} r{release}: cloning {}", crate::lifecycle::redact_userinfo(url));
             let dir = clone(paths, url, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
             // The commit's own rekcod.toml fills in whatever the deploy didn't set.
             let toml = checkout_toml(&dir)?;
@@ -5415,6 +5427,10 @@ fn mask_env(v: &mut Value) {
             *val = json!("(hidden from viewers)");
         }
     }
+    // A token in the clone URL is as secret as the env.
+    if let Some(u) = v["git"]["url"].as_str() {
+        v["git"]["url"] = json!(crate::lifecycle::redact_userinfo(u));
+    }
 }
 
 fn placement_status(c: &Controller, app: &str) -> Result<Value> {
@@ -5752,10 +5768,12 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                  from apps where ns = ?1 and (?1 <> 'default' or owner = ?2 or ?3) and destroying is null order by name",
                 &[&ns, &who.name, &who.admin],
             )?;
+            let viewer = c.role(who, ns)? < Some(Role::Member);
+            let git = |u: String| if viewer { crate::lifecycle::redact_userinfo(&u) } else { u };
             let mut list: Vec<Value> = rows
                 .iter()
                 .map(|r| json!({
-                    "name": short_name(&r.get::<String>(0)), "ns": ns, "git": r.get::<String>(1), "live_release": r.get::<Option<i32>>(2),
+                    "name": short_name(&r.get::<String>(0)), "ns": ns, "git": git(r.get::<String>(1)), "live_release": r.get::<Option<i32>>(2),
                     "instances": r.get::<i32>(3), "preview_of": r.get::<Option<String>>(4).map(|p| short_name(&p).to_string()),
                     "public": r.get::<bool>(5), "url": format!("http://{}.{}", r.get::<String>(0), c.domain), "sleeping": r.get::<bool>(6),
                 }))
@@ -5763,7 +5781,6 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             // `?detail=1`: each app's `GET /apps/{name}` too, for the dashboard's one call.
             if q.iter().any(|(k, v)| k == "detail" && v != "0") {
                 let keys: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
-                let viewer = c.role(who, ns)? < Some(Role::Member);
                 for (a, mut d) in list.iter_mut().zip(app_details(c, &keys)?) {
                     if viewer {
                         mask_env(&mut d);
@@ -8819,6 +8836,13 @@ mod tests {
                 assert_eq!(got_in, allowed.contains(&who), "{who} {method} {path}: {r:?}");
             }
         }
+        // A token in the clone URL: viewers don't get it, members do.
+        c.db.lock().unwrap().execute("update apps set git_url = 'https://u:s3cret@x/y' where name = 'web--team'", &[]).unwrap();
+        for path in ["/ns/team/apps", "/ns/team/apps?detail=1", "/ns/team/apps/web"] {
+            let seen = |who: &str| call(&url, "GET", path, Some(&format!("{who}-t")), &json!(null)).unwrap().to_string();
+            assert!(!seen("viewer").contains("s3cret") && seen("viewer").contains("x/y"), "{path}");
+            assert!(seen("member").contains("s3cret"), "{path}");
+        }
     }
 
     #[test]
@@ -9010,9 +9034,38 @@ mod tests {
         assert!(crate::daemon::reach_arg("1.2.3.4:5 rekcod.sandbox=0").is_err());
     }
 
+    /// `app deploy` sends the rekcod.toml of the commit the node builds, not an edited one.
+    #[test]
+    fn deploy_reads_the_committed_toml() {
+        let dir = std::env::temp_dir().join(format!("rekcod-toml-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = git_here()
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("rekcod.toml"), "[app]\nport = 3000\n").unwrap();
+        git(&["add", "rekcod.toml"]);
+        git(&["commit", "-q", "-m", "x"]);
+        std::fs::write(dir.join("rekcod.toml"), "[app]\nport = 9999\n").unwrap();
+        assert_eq!(deployed_toml(&dir, Some("HEAD")).unwrap(), "[app]\nport = 3000\n");
+        assert_eq!(deployed_toml(&dir, None).unwrap(), "[app]\nport = 9999\n", "--ref: the working tree's");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn toml_and_dockerfile() {
-        let t = parse_toml("[app]\nname = \"dash\"\nport = 3000 # comment\nstart = \"python3 app.py\"\n[env]\nA = \"1\"\n");
+        let t =
+            crate::apptoml::parse("[app]\nname = \"dash\"\nport = 3000 # comment\nstart = \"python3 app.py\"\n[env]\nA = \"1\"\n").unwrap();
         assert_eq!(t["app.name"], "dash");
         assert_eq!(t["app.port"], "3000");
         assert_eq!(t["env.A"], "1");

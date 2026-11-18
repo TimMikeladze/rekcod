@@ -424,13 +424,26 @@ fn known_hosts(paths: &Paths) -> PathBuf {
     root(paths).join("known_hosts")
 }
 
-fn ssh_base(paths: &Paths, ip: &str) -> Result<Command> {
-    let mut c = Command::new("ssh");
+/// Options ssh and scp share: the guest's host key pinned in [`known_hosts`], our key.
+fn ssh_options(c: &mut Command, paths: &Paths, key: &Path) {
     c.args(["-q", "-o", "StrictHostKeyChecking=accept-new", "-o"])
         .arg(format!("UserKnownHostsFile={}", known_hosts(paths).display()))
         .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-i"])
-        .arg(key(paths)?)
-        .arg(format!("{USER}@{ip}"));
+        .arg(key);
+}
+
+fn ssh_base(paths: &Paths, ip: &str) -> Result<Command> {
+    let mut c = Command::new("ssh");
+    ssh_options(&mut c, paths, &key(paths)?);
+    c.arg(format!("{USER}@{ip}"));
+    Ok(c)
+}
+
+/// `scp -r` with the same host key pinning as ssh; add the paths (`rekcod@IP:path` remote).
+pub fn scp_command(paths: &Paths) -> Result<Command> {
+    let mut c = Command::new("scp");
+    c.arg("-r");
+    ssh_options(&mut c, paths, &key(paths)?);
     Ok(c)
 }
 
@@ -666,6 +679,20 @@ pub fn run(home: PathBuf, idle_ttl: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scp_pins_host_keys_like_ssh() {
+        let paths = Paths { home: PathBuf::from("/nonexistent/rekcod") };
+        let mut c = Command::new("scp");
+        ssh_options(&mut c, &paths, Path::new("/k"));
+        let a: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let a = a.join(" ");
+        assert!(
+            a.contains("StrictHostKeyChecking=accept-new") && a.contains("UserKnownHostsFile=/nonexistent/rekcod/macos/known_hosts"),
+            "{a}"
+        );
+        assert!(!a.contains("StrictHostKeyChecking=no") && !a.contains("/dev/null"), "{a}");
+    }
 
     #[test]
     fn leases_and_input() {

@@ -6,6 +6,7 @@ import { findOffered } from "./allow"
 import { engine } from "./server/engine"
 import { fakeEngine } from "./server/fixtures"
 import { staleBinary, staleMessage } from "./server/merge"
+import { runGroup } from "./server/proc"
 import { appleScript, terminalScript, writeScript } from "./server/terminal"
 import type { Action, State } from "./types"
 
@@ -24,12 +25,12 @@ function findBin(): string {
   return "rekcod"
 }
 
-export function run(argv: string[], opts: { cwd?: string; timeout?: number } = {}) {
+export function run(argv: string[], opts: { cwd?: string; timeout?: number; env?: NodeJS.ProcessEnv } = {}) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
     execFile(
       /*turbopackIgnore: true*/ BIN,
       argv,
-      { cwd: opts.cwd, timeout: opts.timeout ?? 120_000, maxBuffer: 64 << 20 },
+      { cwd: opts.cwd, timeout: opts.timeout ?? 120_000, maxBuffer: 64 << 20, env: opts.env },
       (err, stdout, stderr) => {
         const code = err ? (typeof err.code === "number" ? err.code : 1) : 0
         resolve({ code, stdout, stderr: stderr || (err && !stderr ? String(err.message) : "") })
@@ -52,10 +53,13 @@ export async function readState(local = false): Promise<State> {
   return JSON.parse(r.stdout)
 }
 
-/** `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. */
-export async function readEngine(name: string): Promise<State> {
+/**
+ * `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. Above the
+ * 20 s rekcod gives ssh; on this timeout or `signal` its ssh is killed with it.
+ */
+export async function readEngine(name: string, signal?: AbortSignal): Promise<State> {
   if (FIXTURE) return fakeEngine(await readState(), name)
-  const r = await run(["host", "state", name], { timeout: 40_000 })
+  const r = await runGroup(BIN, ["host", "state", name], { timeout: 40_000, signal })
   if (r.code !== 0) throw new Error(`${name}: ${r.stderr.trim().split("\n").at(-1) || `exited ${r.code}`}`)
   return JSON.parse(r.stdout)
 }
@@ -90,8 +94,8 @@ export function spawnStream(a: Action) {
   return spawnRekcod(a.argv ?? [], a.dir)
 }
 
-export function spawnRekcod(argv: string[], cwd?: string) {
-  return spawn(/*turbopackIgnore: true*/ BIN, argv, { cwd, stdio: ["ignore", "pipe", "pipe"] })
+export function spawnRekcod(argv: string[], cwd?: string, env?: NodeJS.ProcessEnv) {
+  return spawn(/*turbopackIgnore: true*/ BIN, argv, { cwd, env, stdio: ["ignore", "pipe", "pipe"] })
 }
 
 /**

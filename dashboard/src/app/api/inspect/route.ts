@@ -1,4 +1,4 @@
-import { FIXTURE, run } from "@/lib/rekcod"
+import { FIXTURE, run, watcherEnv } from "@/lib/rekcod"
 import { onEngine } from "@/lib/server/engine"
 import { fakeInspect } from "@/lib/server/fixtures"
 import { bad, guarded } from "@/lib/server/readonly"
@@ -11,7 +11,8 @@ export async function GET(req: Request) {
   const a = inspectArgv(g.s, g.q.get("name"))
   if ("error" in a) return bad(a.error)
   if (FIXTURE) return Response.json(fakeInspect(g.s.containers.find((c) => c.name === a.argv[1])!))
-  const r = await run(onEngine(a.argv), { timeout: 20_000 })
+  // Docker passthrough boots a stopped VM; an open page never should.
+  const r = await run(onEngine(a.argv, g.engine), { timeout: 20_000, env: watcherEnv() })
   if (r.code !== 0) return Response.json({ error: r.stderr.trim() || `exit ${r.code}` }, { status: 502 })
   try {
     return Response.json(JSON.parse(r.stdout)[0] ?? {})

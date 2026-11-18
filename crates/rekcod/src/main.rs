@@ -637,8 +637,13 @@ enum RemoteCmd {
     Add {
         name: String,
         url: String,
-        #[arg(long)]
-        token: String,
+        /// The controller token. Anyone on this Mac can read it from the process list while
+        /// this runs; REKCOD_TOKEN or --token-file keep it off argv.
+        #[arg(long, env = "REKCOD_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// Read the token from this file (`-` for stdin) instead.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<std::path::PathBuf>,
         /// Namespace this remote's commands use (default: default).
         #[arg(long)]
         ns: Option<String>,
@@ -661,7 +666,12 @@ enum NodeCmd {
     /// Register with a controller and start serving (saves ~/.rekcod/node.json).
     Join {
         controller: String,
-        join_token: String,
+        /// The controller's join token; REKCOD_JOIN_TOKEN or --token-file keep it off argv.
+        #[arg(env = "REKCOD_JOIN_TOKEN", hide_env_values = true)]
+        join_token: Option<String>,
+        /// Read the join token from this file (`-` for stdin) instead.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<std::path::PathBuf>,
         /// Address the node API listens on.
         #[arg(long, default_value = "127.0.0.1:7701")]
         listen: String,
@@ -1248,6 +1258,7 @@ enum ServerCmd {
         #[arg(long, requires = "edge_only")]
         remote: Option<String>,
         /// Existing controller's join token, required when this Mac has not joined yet.
+        /// REKCOD_JOIN_TOKEN keeps it off argv.
         #[arg(long, requires = "edge_only")]
         join_token: Option<String>,
         /// Listen here instead of the Tailscale IP.
@@ -1346,8 +1357,9 @@ fn main() {
         Cmd::Macos(MacosCmd::Ls) => macos::list(&paths),
         Cmd::Macos(MacosCmd::Rm { name }) => macos::remove(&paths, &name),
         Cmd::Macos(MacosCmd::Run { home, idle_ttl }) => macos::run(home, idle_ttl),
-        Cmd::Remote(RemoteCmd::Add { name, url, token, ns, ca_fingerprint }) => {
-            fleet::remote_add(&paths, &name, &url, &token, ns.as_deref(), ca_fingerprint.as_deref())
+        Cmd::Remote(RemoteCmd::Add { name, url, token, token_file, ns, ca_fingerprint }) => {
+            fleet::token_arg(token, token_file.as_deref(), "--token (or REKCOD_TOKEN)")
+                .and_then(|token| fleet::remote_add(&paths, &name, &url, &token, ns.as_deref(), ca_fingerprint.as_deref()))
         }
         Cmd::Remote(RemoteCmd::Ls) => {
             fleet::remote_list(&paths);
@@ -1355,18 +1367,22 @@ fn main() {
         }
         Cmd::Remote(RemoteCmd::Rm { name }) => fleet::remote_rm(&paths, &name),
         Cmd::Remote(RemoteCmd::Use { name }) => fleet::remote_use(&paths, &name),
-        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install, ca_fingerprint, zone }) => fleet::node_join(
-            &paths,
-            &controller,
-            &join_token,
-            fleet::NodeJoinOptions {
-                listen: &listen,
-                advertise: advertise.as_deref(),
-                install,
-                ca_fingerprint: ca_fingerprint.as_deref(),
-                zone: zone.as_deref(),
-            },
-        ),
+        Cmd::Node(NodeCmd::Join { controller, join_token, token_file, listen, advertise, install, ca_fingerprint, zone }) => {
+            fleet::token_arg(join_token, token_file.as_deref(), "JOIN_TOKEN (or REKCOD_JOIN_TOKEN)").and_then(|join_token| {
+                fleet::node_join(
+                    &paths,
+                    &controller,
+                    &join_token,
+                    fleet::NodeJoinOptions {
+                        listen: &listen,
+                        advertise: advertise.as_deref(),
+                        install,
+                        ca_fingerprint: ca_fingerprint.as_deref(),
+                        zone: zone.as_deref(),
+                    },
+                )
+            })
+        }
         Cmd::Node(NodeCmd::Serve { install: true }) => service::install(&paths, "node", &["node".into(), "serve".into()]),
         Cmd::Node(NodeCmd::Serve { install: false }) => fleet::node_serve(&paths),
         Cmd::Node(NodeCmd::Uninstall) => service::uninstall("node"),
@@ -1499,6 +1515,9 @@ fn main() {
         }
         Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token }) => {
             if edge_only {
+                // Read here, not as the flag's clap `env`: an exported variable would make a
+                // plain setup fail `requires = "edge_only"`.
+                let join_token = join_token.or_else(|| std::env::var("REKCOD_JOIN_TOKEN").ok().filter(|t| !t.is_empty()));
                 server::setup_edge(
                     &paths,
                     remote.as_deref().context("--edge-only requires --remote")?,
@@ -1994,6 +2013,30 @@ mod tests {
         // The node's 64 KiB window moved past the start of what was shown.
         assert_eq!(super::new_output("xxhello\n", "hello\nworld\n"), "world\n");
         assert_eq!(super::new_output("gone", "fresh\n"), "fresh\n");
+    }
+
+    #[test]
+    fn tokens_can_stay_off_argv() {
+        use clap::{CommandFactory, Parser};
+        let env_of = |path: &[&str], arg: &str| {
+            let mut c = Args::command();
+            for p in path {
+                c = c.find_subcommand(p).unwrap().clone();
+            }
+            let a = c.get_arguments().find(|a| a.get_id() == arg).unwrap().clone();
+            (a.get_env().map(|e| e.to_string_lossy().to_string()), a.is_hide_env_values_set())
+        };
+        assert_eq!(env_of(&["remote", "add"], "token"), (Some("REKCOD_TOKEN".into()), true));
+        assert_eq!(env_of(&["node", "join"], "join_token"), (Some("REKCOD_JOIN_TOKEN".into()), true));
+        assert!(Args::try_parse_from(["rekcod", "remote", "add", "x", "https://h:7700", "--token-file", "-"]).is_ok());
+        assert!(Args::try_parse_from(["rekcod", "node", "join", "https://h:7700", "--token-file", "/t"]).is_ok());
+        assert!(Args::try_parse_from(["rekcod", "node", "join", "https://h:7700", "jt", "--listen", "127.0.0.1:1"]).is_ok());
+        let f = std::env::temp_dir().join(format!("rekcod-token-{}", std::process::id()));
+        std::fs::write(&f, "from-file\n").unwrap();
+        assert_eq!(fleet::token_arg(Some("from-env".into()), Some(&f), "x").unwrap(), "from-file");
+        assert_eq!(fleet::token_arg(Some(" argv ".into()), None, "x").unwrap(), "argv");
+        assert!(fleet::token_arg(None, None, "--token").unwrap_err().to_string().contains("--token"));
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]

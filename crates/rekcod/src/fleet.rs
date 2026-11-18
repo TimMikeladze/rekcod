@@ -77,6 +77,7 @@ pub fn send_within(
 ) -> Result<(u16, BufReader<crate::tls::Stream>)> {
     let addr = authority(base)?;
     let sock = crate::bonjour::socket_addr(&addr)?;
+    check_resolved(base, &addr, sock.ip())?;
     let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).with_context(|| format!("connect {base}"))?;
     tcp.set_read_timeout(timeout)?;
     tcp.set_write_timeout(Some(QUICK))?;
@@ -162,18 +163,57 @@ fn remotes_file(paths: &Paths) -> PathBuf {
 
 pub fn remotes(paths: &Paths) -> Remotes {
     let r: Remotes = std::fs::read(remotes_file(paths)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    for rem in r.remotes.values() {
-        if let (Some(ca), Ok(a)) = (&rem.ca, authority(&rem.url)) {
-            let _ = crate::tls::trust(&a, ca);
+    for (name, rem) in &r.remotes {
+        if let (Some(ca), Ok(a)) = (&rem.ca, authority(&rem.url))
+            && let Err(e) = crate::tls::trust(&a, ca)
+        {
+            // Still listed, so it can be removed or added again.
+            eprintln!("rekcod: remote {name}: not trusting its saved CA ({e:#}); add it again with --ca-fingerprint");
         }
     }
     r
+}
+
+/// Saved CAs that aren't a single certificate, for `rekcod doctor`: remotes by name, and
+/// `node.json`.
+pub fn refused_cas(paths: &Paths) -> Vec<String> {
+    let r: Remotes = std::fs::read(remotes_file(paths)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut out: Vec<String> = r
+        .remotes
+        .iter()
+        .filter(|(_, rem)| rem.ca.as_deref().is_some_and(|ca| crate::tls::ca_cert(ca).is_err()))
+        .map(|(n, _)| format!("remote {n}"))
+        .collect();
+    let node: Option<NodeConfig> = std::fs::read(paths.home.join("node.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if node.and_then(|n| n.ca).is_some_and(|ca| crate::tls::ca_cert(&ca).is_err()) {
+        out.push("node.json".into());
+    }
+    out
 }
 
 pub fn remote(paths: &Paths, name: Option<&str>) -> Result<Remote> {
     let r = remotes(paths);
     let name = name.map(String::from).or(r.default.clone()).ok_or_else(|| anyhow!("no remote; `rekcod remote add NAME URL --token T`"))?;
     r.remotes.get(&name).cloned().ok_or_else(|| anyhow!("no remote {name}"))
+}
+
+/// A token from `--token-file` (`-`: stdin), else from the argument or its environment
+/// variable. The file wins, so a token exported in the shell doesn't get in its way.
+pub fn token_arg(value: Option<String>, file: Option<&Path>, what: &str) -> Result<String> {
+    let t = match file {
+        Some(f) if f == Path::new("-") => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).context("reading the token from stdin")?;
+            s
+        }
+        Some(f) => std::fs::read_to_string(f).with_context(|| format!("reading the token from {}", f.display()))?,
+        None => value.unwrap_or_default(),
+    };
+    let t = t.trim();
+    if t.is_empty() {
+        bail!("no token: pass {what} or --token-file PATH");
+    }
+    Ok(t.to_string())
 }
 
 pub fn remote_add(paths: &Paths, name: &str, url: &str, token: &str, ns: Option<&str>, ca_fingerprint: Option<&str>) -> Result<()> {
@@ -242,7 +282,9 @@ pub fn remote_list(paths: &Paths) {
     let r = remotes(paths);
     for (name, rem) in &r.remotes {
         let star = if r.default.as_deref() == Some(name) { "*" } else { " " };
-        println!("{star} {name:<12} {}  ns={}", rem.url, rem.ns.as_deref().unwrap_or("default"));
+        let bad = rem.ca.as_deref().is_some_and(|ca| crate::tls::ca_cert(ca).is_err());
+        let flag = if bad { "  CA REFUSED: add it again with --ca-fingerprint" } else { "" };
+        println!("{star} {name:<12} {}  ns={}{flag}", rem.url, rem.ns.as_deref().unwrap_or("default"));
     }
 }
 
@@ -262,27 +304,65 @@ fn hostname() -> Vec<String> {
 }
 
 /// Plain `http://` is for loopback and tailnet addresses (Tailscale encrypts those); anything
-/// else needs https, or `REKCOD_INSECURE=1` for a network you trust.
+/// else needs https, or `REKCOD_INSECURE=1` for a network you trust. A name passes when every
+/// address it resolves to does; `send_within` checks the address again before each request.
 pub fn check_plain_http(authority: &str, what: &str) -> Result<()> {
     if std::env::var_os("REKCOD_INSECURE").is_some() {
         return Ok(());
     }
     let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h).trim_matches(['[', ']']);
-    let ok = |ip: IpAddr| match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
-    };
-    let tailnet_name = host.ends_with(".ts.net") || host == "localhost";
     let ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
         Err(_) => (host, 0).to_socket_addrs().map(|a| a.map(|s| s.ip()).collect()).unwrap_or_default(),
     };
-    if tailnet_name || (!ips.is_empty() && ips.iter().all(|ip| ok(*ip))) {
+    if plain_http_ok(host, &ips) {
         return Ok(());
     }
     bail!(
         "{what} at http://{authority} would send tokens in clear text; use https, a loopback or tailnet address, or set REKCOD_INSECURE=1"
     )
+}
+
+/// Whether `host`, resolved to `ips`, may be sent tokens over plain http. A `.ts.net` name
+/// counts only by its addresses: with Tailscale off, another resolver answers it.
+fn plain_http_ok(host: &str, ips: &[IpAddr]) -> bool {
+    host == "localhost" || (!ips.is_empty() && ips.iter().all(|ip| plain_http_ip(*ip)))
+}
+
+/// Before a request with a token: a plain http name was checked when it was added, but it may
+/// resolve elsewhere now (Tailscale off, another network's resolver). An IP address can't change.
+fn check_resolved(base: &str, authority: &str, ip: IpAddr) -> Result<()> {
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h).trim_matches(['[', ']']);
+    if !base.starts_with("http://") || host.parse::<IpAddr>().is_ok() || plain_http_ip(ip) || std::env::var_os("REKCOD_INSECURE").is_some()
+    {
+        return Ok(());
+    }
+    bail!("{base} resolves to {ip}, not a loopback or tailnet address; not sending a token in clear text (REKCOD_INSECURE=1 allows it)")
+}
+
+fn plain_http_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
+}
+
+/// Tells `tls::connect` which node answers at each https address. Nodes that joined before
+/// node certificates named the node hold one for their host; the controller accepts that from
+/// those nodes only, recorded the first time it starts.
+fn expect_nodes(db: &mut Db) -> Result<()> {
+    if db.query_opt("select 1 from config where key = 'host_named_nodes'", &[])?.is_none() {
+        let ids: Vec<String> = db.query("select id from nodes where url like 'https://%'", &[])?.iter().map(|r| r.get(0)).collect();
+        db.execute("insert into config values ('host_named_nodes', ?1)", &[&ids.join(" ")])?;
+    }
+    let host_named: String = db.query_one("select value from config where key = 'host_named_nodes'", &[])?.get(0);
+    for r in db.query("select id, url from nodes where url like 'https://%'", &[])? {
+        let (id, url): (String, String) = (r.get(0), r.get(1));
+        if let Ok(a) = authority(&url) {
+            crate::tls::expect_node(&a, &id, host_named.split(' ').any(|h| h == id));
+        }
+    }
+    Ok(())
 }
 
 /// The git remote URL and HEAD commit of `dir`, for remote creates and deploys.
@@ -1239,6 +1319,10 @@ struct NodeConfig {
     cert: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key: Option<String>,
+    /// When `cert` expires (Unix seconds); missing on nodes that joined before renewal, which
+    /// ask for a new certificate at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cert_expires: Option<i64>,
 }
 
 pub struct NodeJoinOptions<'a> {
@@ -1286,6 +1370,7 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, options: Nod
         ca,
         cert: r["cert"].as_str().map(String::from),
         key: r["key"].as_str().map(String::from),
+        cert_expires: r["cert_expires"].as_i64(),
     };
     if r["state"] == "pending" {
         eprintln!("rekcod: waiting for an admin: `rekcod node approve {}`", cfg.id);
@@ -1295,7 +1380,11 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, options: Nod
     if install {
         return crate::service::install(paths, "node", &["node".into(), "serve".into()]);
     }
-    node_serve(paths)
+    // Serve as `node serve`, so the join token on this process's argv doesn't stay in the
+    // process list for as long as the node runs. REKCOD_HOME carries through the environment.
+    use std::os::unix::process::CommandExt;
+    let e = Command::new(std::env::current_exe()?).args(["node", "serve"]).env_remove("REKCOD_JOIN_TOKEN").exec();
+    Err(anyhow!(e).context("running rekcod node serve"))
 }
 
 pub fn node_serve(paths: &Paths) -> Result<()> {
@@ -1305,7 +1394,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     // launchd's soft limit of 256 descriptors; each relay and forwarded connection takes some.
     crate::daemon::raise_fd_limit();
     if let Some(ca) = &cfg.ca {
-        crate::tls::trust_by_default(ca)?;
+        crate::tls::trust_by_default(ca).context("node.json's controller CA; join again (`rekcod node join`)")?;
     }
     let tls = match (&cfg.cert, &cfg.key) {
         (Some(c), Some(k)) => Some(crate::tls::server_config(c, k)?),
@@ -1314,6 +1403,8 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             None
         }
     };
+    // The heartbeat thread swaps in a renewed certificate; connections after that get it.
+    let tls = Arc::new(RwLock::new(tls));
     let ip = if addr.ip().is_unspecified() { IpAddr::from([0, 0, 0, 0]) } else { addr.ip() };
     let _ = NODE_IP.set(ip);
     let host = authority(&cfg.advertise).ok().and_then(|a| a.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']']).to_string()));
@@ -1346,6 +1437,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     }
     let hb_paths = paths.clone();
     let (controller, id, secret) = (cfg.controller.clone(), cfg.id.clone(), cfg.secret.clone());
+    let (hb_tls, mut cert_expires) = (tls.clone(), cfg.cert.as_ref().map(|_| cfg.cert_expires.unwrap_or(0)));
     std::thread::spawn(move || {
         loop {
             let sbs: Vec<Value> = sandbox::list(&hb_paths)
@@ -1361,11 +1453,22 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             // Readings that fail go as null; the controller keeps them unknown.
             let disk = crate::cli::disk_gib(&hb_paths.home);
             let (disk_total, disk_free) = (disk.map(|d| d.0), disk.map(|d| d.1));
+            let renew = cert_expires.is_some_and(|t| t < now() + crate::tls::RENEW_WITHIN.as_secs() as i64);
             let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs,
                               "cpus": crate::cli::sysctl_u64("hw.ncpu"), "load": load_average(),
-                              "disk_total_gib": disk_total, "disk_free_gib": disk_free, "now": now()});
+                              "disk_total_gib": disk_total, "disk_free_gib": disk_free, "now": now(), "renew_cert": renew});
             match call_within(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body, QUICK) {
                 Ok(v) => {
+                    if let (Some(c), Some(k), Some(t)) = (v["cert"].as_str(), v["key"].as_str(), v["cert_expires"].as_i64()) {
+                        match renew_node_cert(&hb_paths, c, k, t) {
+                            Ok(cfg) => {
+                                *hb_tls.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cfg);
+                                cert_expires = Some(t);
+                                eprintln!("rekcod: new node certificate, valid until {t} (Unix time)");
+                            }
+                            Err(e) => eprintln!("rekcod: renewing the node certificate: {e:#}"),
+                        }
+                    }
                     let mut ips: Vec<IpAddr> =
                         v["ingress"].as_array().into_iter().flatten().filter_map(|i| i.as_str()?.parse().ok()).collect();
                     // The controller's health checks come from wherever its URL points.
@@ -1402,7 +1505,8 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     let l = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
     eprintln!("rekcod: node {} serving sandboxes on {} ({})", cfg.id, cfg.listen, cfg.advertise);
     for s in l.incoming().flatten() {
-        let (p, t, tls) = (paths.clone(), cfg.secret.clone(), tls.clone());
+        let tls = tls.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let (p, t) = (paths.clone(), cfg.secret.clone());
         let _ = s.set_read_timeout(Some(crate::sandbox_api::READ_TIMEOUT));
         crate::sandbox_api::spawn_limited(move || -> Result<()> {
             let stream = crate::tls::accept(tls.as_ref(), s)?;
@@ -1410,6 +1514,16 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Saves a certificate the controller renewed into `node.json` and returns its server config.
+fn renew_node_cert(paths: &Paths, cert: &str, key: &str, expires: i64) -> Result<Arc<rustls::ServerConfig>> {
+    let server = crate::tls::server_config(cert, key)?;
+    let file = paths.home.join("node.json");
+    let mut cfg: NodeConfig = serde_json::from_slice(&std::fs::read(&file)?)?;
+    (cfg.cert, cfg.key, cfg.cert_expires) = (Some(cert.into()), Some(key.into()), Some(expires));
+    crate::paths::write_private(&file, &serde_json::to_vec_pretty(&cfg)?)?;
+    Ok(server)
 }
 
 /// Deletes clones in `remote-ws/` no sandbox uses and finished job directories, once older
@@ -2536,7 +2650,9 @@ fn proxy(node_url: &str, secret: &str, req: &crate::sandbox_api::Request, path: 
     let q: Vec<String> = req.query.iter().map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v))).collect();
     let path = if q.is_empty() { path.to_string() } else { format!("{path}?{}", q.join("&")) };
     let addr = authority(node_url)?;
-    let tcp = TcpStream::connect(&addr).with_context(|| format!("connect node {node_url}"))?;
+    let sock = crate::bonjour::socket_addr(&addr)?;
+    check_resolved(node_url, &addr, sock.ip())?;
+    let tcp = TcpStream::connect(sock).with_context(|| format!("connect node {node_url}"))?;
     let mut s = crate::tls::connect(node_url, &addr, tcp)?;
     write!(
         s,
@@ -2653,9 +2769,10 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                             bail!("{host} is one of the controller's own names");
                         }
                         // Named for the node, not the host it advertised (`tls::node_name`).
-                        let (cert, key) = ca.issue(&[crate::tls::node_name(&id)])?;
+                        let (cert, key, expires) = ca.issue_until(&[crate::tls::node_name(&id)])?;
                         reply["cert"] = json!(cert);
                         reply["key"] = json!(key);
+                        reply["cert_expires"] = json!(expires);
                     }
                     (None, true) => bail!("this controller serves plain http; join it with an http:// address"),
                     (_, false) => check_plain_http(&a, "the node")?,
@@ -2669,12 +2786,12 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                     if pending >= 20 {
                         bail!("20 nodes are already waiting for approval; approve or remove some first");
                     }
-                    // The controller finds a node's expected certificate by its address.
-                    if https
-                        && db
-                            .query("select url from nodes", &[])?
-                            .iter()
-                            .any(|r| authority(&r.get::<String>(0)).is_ok_and(|o| o.eq_ignore_ascii_case(&a)))
+                    // The controller finds a node's expected certificate by its address, so no
+                    // two nodes share one, whatever their schemes.
+                    if db
+                        .query("select url from nodes", &[])?
+                        .iter()
+                        .any(|r| authority(&r.get::<String>(0)).is_ok_and(|o| o.eq_ignore_ascii_case(&a)))
                     {
                         bail!("another node already registered {a}");
                     }
@@ -2697,7 +2814,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         }
         ("POST", ["nodes", id, "heartbeat"]) => {
             let r = (|| {
-                let (_, sec, state) = c.node(id)?;
+                let (url, sec, state) = c.node(id)?;
                 if !crate::sandbox_api::ct_eq(sec.as_bytes(), bearer.as_bytes()) {
                     bail!("bad node secret");
                 }
@@ -2771,7 +2888,19 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                     .filter(|(_, t)| **t > now() - 600)
                     .map(|(ip, _)| ip.to_string())
                     .collect();
-                Ok(json!({"ingress": ingress, "delete": delete}))
+                let mut reply = json!({"ingress": ingress, "delete": delete});
+                // The node asks once its certificate is near its end (`tls::RENEW_WITHIN`); the
+                // new one names the same node, so the controller's check of it doesn't change.
+                if body["renew_cert"] == true
+                    && let (Some(ca), true) = (&c.node_ca, url.starts_with("https://"))
+                {
+                    let (cert, key, expires) = ca.issue_until(&[crate::tls::node_name(id)])?;
+                    reply["cert"] = json!(cert);
+                    reply["key"] = json!(key);
+                    reply["cert_expires"] = json!(expires);
+                    eprintln!("rekcod: node {id}: issued a new certificate");
+                }
+                Ok(reply)
             })();
             return json_reply(&mut w, r);
         }
@@ -2841,8 +2970,9 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         ("DELETE", ["nodes", id]) => admin_only().and_then(|_| {
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(gone) = db.query_opt("delete from nodes where id = ?1 returning url", &[id])? else { bail!("no node {id}") };
-            if let Ok(a) = authority(&gone.get::<String>(0)) {
-                crate::tls::forget_node(&a);
+            let url: String = gone.get(0);
+            if let (true, Ok(a)) = (url.starts_with("https://"), authority(&url)) {
+                crate::tls::forget_node(&a, id);
             }
             db.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping', 'starting')", &[id])?;
             db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[id])?;
@@ -5866,6 +5996,100 @@ mod job_and_node_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The controller dials a node by its address. Registration refuses a second node there
+    /// in either scheme; a row that got in anyway (an older release, a restore) going away must
+    /// not change which node the controller expects.
+    #[test]
+    fn removing_a_node_keeps_another_nodes_certificate_at_that_address() {
+        let (url, c) = serve({
+            let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+            ctl.node_ca = Some(crate::tls::test_node_ca());
+            ctl
+        });
+        let mut db = c.db.lock().unwrap();
+        db.execute("insert or replace into config values ('join_token', 'jt')", &[]).unwrap();
+        db.execute("insert into tokens (token, name, admin, hashed) values (?1, 'admin', 1, 1)", &[&hash_token("admin-t")]).unwrap();
+        drop(db);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap();
+        let reg = |u: &str| call(&url, "POST", "/nodes/register", None, &json!({"join_token": "jt", "url": u, "mem_total_mib": 1024}));
+        let node = reg(&format!("https://{a}")).unwrap();
+        crate::tls::test_https_server(l, node["cert"].as_str().unwrap(), node["key"].as_str().unwrap());
+        let e = reg(&format!("http://{a}")).unwrap_err().to_string();
+        assert!(e.contains("already registered"), "{e}");
+        assert!(call(&format!("https://{a}"), "GET", "/", None, &Value::Null).is_ok());
+        c.db.lock()
+            .unwrap()
+            .execute("insert into nodes (id, url, secret, state) values ('n-dup', ?1, 's', 'ready')", &[&format!("https://{a}")])
+            .unwrap();
+        call(&url, "DELETE", "/nodes/n-dup", Some("admin-t"), &Value::Null).unwrap();
+        let r = call(&format!("https://{a}"), "GET", "/", None, &Value::Null);
+        assert!(r.is_ok(), "still dials the node by its name: {r:?}");
+        // Removing the node itself forgets it: its address has no CA of its own.
+        call(&url, "DELETE", &format!("/nodes/{}", node["id"].as_str().unwrap()), Some("admin-t"), &Value::Null).unwrap();
+        assert!(call(&format!("https://{a}"), "GET", "/", None, &Value::Null).is_err());
+    }
+
+    /// A node whose certificate is near its end asks in its heartbeat and gets a new one for
+    /// the same node, which it saves to node.json.
+    #[test]
+    fn a_heartbeat_renews_a_node_certificate_on_request() {
+        let dir = temp("node-renew");
+        let ca = crate::tls::ensure_node_ca(&dir).unwrap();
+        let ca_pem = ca.pem.clone();
+        let (url, _c) = serve({
+            let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+            ctl.node_ca = Some(ca);
+            ctl.db.lock().unwrap().execute("insert or replace into config values ('join_token', 'jt')", &[]).unwrap();
+            ctl
+        });
+        let n = call(&url, "POST", "/nodes/register", None, &json!({"join_token": "jt", "url": "https://127.0.0.1:17994"})).unwrap();
+        let (id, sec) = (n["id"].as_str().unwrap(), n["secret"].as_str().unwrap());
+        assert!(n["cert_expires"].as_i64().unwrap() > now() + 700 * 86400);
+        let hb = |renew: bool| call(&url, "POST", &format!("/nodes/{id}/heartbeat"), Some(sec), &json!({"renew_cert": renew})).unwrap();
+        assert!(hb(false)["cert"].is_null(), "no certificate unless the node asks");
+        let r = hb(true);
+        let cert = r["cert"].as_str().unwrap();
+        assert_ne!(cert, n["cert"].as_str().unwrap());
+        crate::tls::verify(&ca_pem, cert, &crate::tls::node_name(id)).unwrap();
+        // The node keeps it, and its expiry, for the next start.
+        let home = Paths { home: dir.clone() };
+        std::fs::write(
+            dir.join("node.json"),
+            json!({"controller": url, "id": id, "secret": sec, "listen": "127.0.0.1:0", "advertise": "x", "cert": "old", "key": "old"})
+                .to_string(),
+        )
+        .unwrap();
+        renew_node_cert(&home, cert, r["key"].as_str().unwrap(), r["cert_expires"].as_i64().unwrap()).unwrap();
+        let saved: NodeConfig = serde_json::from_slice(&std::fs::read(dir.join("node.json")).unwrap()).unwrap();
+        assert_eq!((saved.cert.as_deref(), saved.cert_expires), (Some(cert), r["cert_expires"].as_i64()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A node from before node-named certificates holds one naming its host. The first start
+    /// after the upgrade records it, and from then on only it may present one.
+    #[test]
+    fn nodes_from_before_node_names_are_dialed_by_host() {
+        let ca = crate::tls::test_node_ca();
+        let ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        let mut db = ctl.db.lock().unwrap();
+        db.execute("delete from config where key = 'host_named_nodes'", &[]).unwrap();
+        let node = |db: &mut Db, id: &str| {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("https://{}", l.local_addr().unwrap());
+            let (cert, key) = ca.issue(&["127.0.0.1".into()]).unwrap();
+            crate::tls::test_https_server(l, &cert, &key);
+            db.execute("insert into nodes (id, url, secret, state) values (?1, ?2, 's', 'ready')", &[&id, &url]).unwrap();
+            url
+        };
+        let old = node(&mut db, "n-old");
+        expect_nodes(&mut db).unwrap();
+        let new = node(&mut db, "n-new");
+        expect_nodes(&mut db).unwrap();
+        assert!(send(&old, "GET", "/", None, b"").is_ok());
+        assert!(send(&new, "GET", "/", None, b"").is_err(), "a node that joined later must present its node name");
+    }
+
     #[test]
     fn an_older_rekcod_refuses_a_newer_database_and_migrations_keep_a_copy() {
         let dir = temp("schema");
@@ -6523,19 +6747,7 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     for f in ["join-token", "webhook-secret", "admin-token"] {
         std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o600))?;
     }
-    // Nodes that joined before node certificates named the node hold one for their host; the
-    // controller accepts that from those nodes only, recorded the first time it starts.
-    if db.query_opt("select 1 from config where key = 'host_named_nodes'", &[])?.is_none() {
-        let ids: Vec<String> = db.query("select id from nodes where url like 'https://%'", &[])?.iter().map(|r| r.get(0)).collect();
-        db.execute("insert into config values ('host_named_nodes', ?1)", &[&ids.join(" ")])?;
-    }
-    let host_named: String = db.query_one("select value from config where key = 'host_named_nodes'", &[])?.get(0);
-    for r in db.query("select id, url from nodes where url like 'https://%'", &[])? {
-        let (id, url): (String, String) = (r.get(0), r.get(1));
-        if let Ok(a) = authority(&url) {
-            crate::tls::expect_node(&a, &id, host_named.split(' ').any(|h| h == id));
-        }
-    }
+    expect_nodes(&mut db)?;
     let sealed: i64 = db.query_one("select count(*) from apps where secrets <> '{}' or storage_secret is not null", &[])?.get(0);
     let key = secret_key(&dir.join("secret-key"), sealed)?;
     let mut ctl = Controller::new(db, o.domain, o.drain_secs, key);
@@ -7048,9 +7260,23 @@ mod tests {
         assert!(authority("ftp://x").is_err());
         assert_eq!(percent_encode("/a b"), "%2Fa%20b");
         // Plain HTTP only where it can't be read in transit.
-        for ok in ["127.0.0.1:7700", "[::1]:7700", "100.101.102.103:7700", "mini.tail1.ts.net:7700", "localhost:1"] {
+        for ok in ["127.0.0.1:7700", "[::1]:7700", "100.101.102.103:7700", "localhost:1"] {
             assert!(check_plain_http(ok, "x").is_ok(), "{ok}");
         }
+        // A tailnet name passes by what it resolves to, not by its suffix.
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(plain_http_ok("mini.tail1.ts.net", &[ip("100.100.1.2")]));
+        assert!(plain_http_ok("mini.tail1.ts.net", &[ip("fd7a:115c:a1e0::1")]));
+        assert!(!plain_http_ok("mini.tail1.ts.net", &[ip("203.0.113.5")]));
+        assert!(!plain_http_ok("mini.tail1.ts.net", &[ip("100.100.1.2"), ip("203.0.113.5")]));
+        assert!(!plain_http_ok("mini.tail1.ts.net", &[]));
+        // And again before each request, by the address it resolves to then.
+        if std::env::var_os("REKCOD_INSECURE").is_none() {
+            assert!(check_resolved("http://mini.tail1.ts.net:7700", "mini.tail1.ts.net:7700", ip("203.0.113.5")).is_err());
+        }
+        assert!(check_resolved("http://mini.tail1.ts.net:7700", "mini.tail1.ts.net:7700", ip("100.100.1.2")).is_ok());
+        assert!(check_resolved("https://mini.example:7700", "mini.example:7700", ip("203.0.113.5")).is_ok());
+        assert!(check_resolved("http://10.0.0.5:7700", "10.0.0.5:7700", ip("10.0.0.5")).is_ok(), "checked when it was added");
         if std::env::var_os("REKCOD_INSECURE").is_none() {
             for bad in ["10.0.0.5:7700", "192.168.1.9:7700", "203.0.113.1:7700", "100.200.0.1:7700"] {
                 assert!(check_plain_http(bad, "x").is_err(), "{bad}");

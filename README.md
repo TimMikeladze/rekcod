@@ -280,6 +280,26 @@ run `sudo` to install services that start at boot.
 For access between networks, connect both Macs to the same Tailscale tailnet. Without
 Tailscale, rekcod uses Bonjour discovery on the LAN; both Macs need the same subnet.
 
+Server setup uses https. A plain `http://` controller or node URL is accepted only when it
+resolves to a loopback or tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48), and the
+address is checked again before every request, so a `.ts.net` name stops working while
+Tailscale is off. `REKCOD_INSECURE=1` allows plain http on a network you trust. Set it for
+every command that talks to such an address. Services installed with it set keep it;
+services installed by an older rekcod need installing again with it set.
+
+To add a remote or join a node by hand, pass tokens through a file, stdin or the
+environment. Tokens on the command line are visible to other accounts on the Mac in the
+process list:
+
+```sh
+# admin-token is from the controller's ~/.rekcod/controller/; REKCOD_TOKEN also works
+rekcod remote add mini https://mini.tail1234.ts.net:7700 --token-file - --ca-fingerprint sha256:... < admin-token
+REKCOD_JOIN_TOKEN="$(cat join-token)" rekcod node join https://mini.tail1234.ts.net:7700 --ca-fingerprint sha256:... --install
+```
+
+`--token TOKEN` and `node join URL TOKEN` still work. A `node join` without `--install`
+keeps serving in the terminal as `rekcod node serve`, without the token in its arguments.
+
 From your development Mac:
 
 ```sh
@@ -418,9 +438,18 @@ rekcod controller backups --remote mini
 controller runs on that database; stop the controller service first.
 
 These backups are stored on the server's RustFS disk. Copy them off the server for
-recovery from disk loss. Back up the server's `~/.rekcod/controller/secret-key` separately: it is
-needed to decrypt app secrets and is not included in the database backup. Application
-buckets need their own backups too.
+recovery from disk loss. Back up these files from the server's `~/.rekcod/controller/`
+separately; the database backup doesn't include them:
+
+- `secret-key` decrypts app secrets.
+- `ca.pem` and `ca.key` are the CA that remotes and edges pinned with `--ca-fingerprint`.
+- `node-ca.pem` and `node-ca.key` sign node certificates.
+
+The controller makes a CA only when both of its files are missing. With one of a pair
+missing or unreadable, or a key that doesn't match its certificate, it refuses to start
+and names the file, since a new CA would break every remote, edge and node. Node
+certificates last two years; a node asks the controller for a new one in its heartbeat
+once its certificate has 90 days left. Application buckets need their own backups too.
 
 ## Run jobs on the server
 

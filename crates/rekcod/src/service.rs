@@ -87,6 +87,11 @@ pub fn plist_with(
     if let Some(h) = rekcod_home {
         vars.push(("REKCOD_HOME", h.display().to_string()));
     }
+    // Plain http to a non-tailnet address was allowed when this was installed; the service
+    // checks again on every call.
+    if std::env::var_os("REKCOD_INSECURE").is_some() {
+        vars.push(("REKCOD_INSECURE", "1".into()));
+    }
     if let Some(r) = run_as {
         vars.push(("HOME", r.home.display().to_string()));
         vars.push(("USER", r.user.clone()));

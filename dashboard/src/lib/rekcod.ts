@@ -54,12 +54,12 @@ export async function readState(local = false): Promise<State> {
 }
 
 /**
- * `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. On this
- * timeout or `signal` the whole process group goes, the ssh under it included.
+ * `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. rekcod gives
+ * the read 40 s; past 45 s, or on `signal`, the whole process group goes, its ssh included.
  */
 export async function readEngine(name: string, signal?: AbortSignal): Promise<State> {
   if (FIXTURE) return fakeEngine(await readState(), name)
-  const r = await runGroup(BIN, ["host", "state", name], { timeout: 40_000, signal })
+  const r = await runGroup(BIN, ["host", "state", name], { timeout: 45_000, signal })
   if (r.code !== 0) throw new Error(`${name}: ${r.stderr.trim().split("\n").at(-1) || `exited ${r.code}`}`)
   return JSON.parse(r.stdout)
 }

@@ -251,7 +251,7 @@ async function switchEngine(name: string, refresh: () => void) {
     toast.error("Couldn't switch engines", { description: body.error })
     return
   }
-  // Dismissed when the new engine's state (or a failed read) arrives; a host read gives up within 40 s.
+  // Dismissed when the new engine's state (or a failed read) arrives; a host read gives up within 45 s.
   toast.loading(`Reading ${name === "local" ? "this Mac's" : `${name}'s`} engine`, { id: "engine", duration: 60_000 })
   refresh()
 }

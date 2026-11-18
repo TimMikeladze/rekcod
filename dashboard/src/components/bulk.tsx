@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from "react"
 import { X } from "lucide-react"
 import { short, useAction } from "@/components/actions"
 import { Button } from "@/components/ui/button"
-import { DESTRUCTIVE, STREAMED } from "@/lib/kinds"
+import { destructive, STREAMED } from "@/lib/kinds"
 import type { Action } from "@/lib/types"
 import { cn } from "@/lib/utils"
 
@@ -74,7 +74,7 @@ export function BulkBar({ items, noun, onClear }: { items: BulkItem[]; noun: [st
             key={a.kind}
             size="sm"
             variant="outline"
-            className={cn(DESTRUCTIVE.has(a.kind) && "border-alert-border text-alert-text hover:bg-alert-bg")}
+            className={cn(destructive(a) && "border-alert-border text-alert-text hover:bg-alert-bg")}
             onClick={() => {
               triggerMany(
                 items.map((i) => ({ a: i.actions.find((b) => b.kind === a.kind)!, subject: i.subject })),

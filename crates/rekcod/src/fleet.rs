@@ -1712,6 +1712,39 @@ struct Track {
     launching: Mutex<HashMap<String, usize>>,
     /// Apps whose recycle failed and was alerted; cleared when one succeeds.
     recycle_failed: Mutex<std::collections::HashSet<String>>,
+    /// Deploys per app running or waiting for its lock; see [`MAX_DEPLOYS_PER_APP`].
+    deploys: Mutex<HashMap<String, usize>>,
+}
+
+/// One deploy running and one waiting per app; more get a 409 instead of holding a
+/// connection slot each until their turn.
+const MAX_DEPLOYS_PER_APP: usize = 2;
+
+/// A deploy refused because the app already has one running and one queued (409).
+#[derive(Debug)]
+struct Busy(String);
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Busy {}
+
+/// A place in [`Track::deploys`] until dropped.
+struct DeploySlot<'a>(&'a Controller, String);
+
+impl Drop for DeploySlot<'_> {
+    fn drop(&mut self) {
+        let mut m = self.0.track.deploys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
 }
 
 /// A sandbox on a node that stopped answering: only a delete works on it.
@@ -2520,7 +2553,13 @@ fn json_reply(w: &mut impl Write, r: Result<Value>) -> Result<()> {
     match r {
         Ok(v) => respond(w, 200, "application/json", v.to_string().as_bytes()),
         Err(e) => {
-            let code = if e.downcast_ref::<sandbox::NoSandbox>().is_some() || e.to_string().starts_with("no ") { 404 } else { 400 };
+            let code = if e.is::<Busy>() {
+                409
+            } else if e.downcast_ref::<sandbox::NoSandbox>().is_some() || e.to_string().starts_with("no ") {
+                404
+            } else {
+                400
+            };
             respond(w, code, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes())
         }
     }
@@ -3606,6 +3645,17 @@ fn delete_instance(c: &Controller, node: &str, sandbox_id: &str) {
 /// New release from `commit` (or the app's ref), holding the app's lock: two deploys of
 /// one app at once could leave the older commit live.
 fn deploy(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &str) -> Result<Value> {
+    let _slot = {
+        let mut m = c.track.deploys.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let n = m.entry(app.name.clone()).or_default();
+        if *n >= MAX_DEPLOYS_PER_APP {
+            return Err(
+                Busy(format!("a deploy of {} is already running and another is waiting; try again once one finishes", app.short)).into()
+            );
+        }
+        *n += 1;
+        DeploySlot(c, app.name.clone())
+    };
     // Before the lock: a slow git server holds up this deploy, not the app's others.
     let commit = match commit {
         Some(c) => c,
@@ -8188,6 +8238,31 @@ mod tests {
         assert!(raw("GET", "/routes", "admin-t").starts_with("HTTP/1.1 200"));
         let cli = raw("GET", "/apps", "admin-t");
         assert!(cli.starts_with("HTTP/1.1 400") && cli.contains("this controller runs"), "{cli}");
+    }
+
+    #[test]
+    fn a_third_deploy_of_one_app_gets_a_409_instead_of_waiting() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        let app = recovery_app(&c, 1);
+        // Something holds the app (a long build): two deploys queue behind it.
+        let lock = c.app_lock("web");
+        let held = lock.lock().unwrap();
+        let queued: Vec<_> = (0..2)
+            .map(|_| {
+                let (c, app) = (c.clone(), load_app_key(&c, "web").unwrap().unwrap());
+                std::thread::spawn(move || deploy(&c, &app, Some(SHA.into()), "t").map(|_| ()))
+            })
+            .collect();
+        wait_until(|| c.track.deploys.lock().unwrap().get("web") == Some(&2));
+        assert!(deploy(&c, &app, Some(SHA.into()), "t").unwrap_err().is::<Busy>());
+        let e = call(&url, "POST", "/apps/web/deploy", Some("admin-t"), &json!({"ref": SHA})).unwrap_err().to_string();
+        assert!(e.contains("409") && e.contains("already running"), "{e}");
+        drop(held);
+        for q in queued {
+            let _ = q.join().unwrap();
+        }
+        assert!(c.track.deploys.lock().unwrap().is_empty(), "slots are given back");
     }
 
     #[test]

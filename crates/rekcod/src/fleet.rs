@@ -3148,29 +3148,6 @@ fn json_reply(w: &mut impl Write, r: Result<Value>) -> Result<()> {
     }
 }
 
-/// Answers before the request has been read to its end, then reads and drops what's left
-/// of it (the rest of the head, or a body up to 1 MiB) before the connection closes. A socket
-/// closed with unread input sends a reset, and the client can lose the answer to it.
-fn answer_early<S: Read + Write>(r: &mut BufReader<S>, req: Option<&crate::sandbox_api::Request>, code: u16, body: &[u8]) -> Result<()> {
-    respond(r.get_mut(), code, "application/json", body)?;
-    match req {
-        Some(req) => {
-            let len: u64 = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
-            let _ = std::io::copy(&mut r.by_ref().take(len.min(1 << 20)), &mut std::io::sink());
-        }
-        None => {
-            for _ in 0..100 {
-                let mut line = String::new();
-                match r.by_ref().take(16 << 10).read_line(&mut line) {
-                    Ok(n) if n > 0 && !line.trim().is_empty() => {}
-                    _ => break,
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + Write) -> Result<()> {
     serve_request(c, peer, stream, &|| {})
@@ -3182,11 +3159,11 @@ fn serve_request(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + 
     let mut r = BufReader::new(stream);
     let mut req = match crate::sandbox_api::read_head(&mut r) {
         Ok(req) => req,
-        Err(e) => return answer_early(&mut r, None, 400, json!({"error": format!("{e:#}")}).to_string().as_bytes()),
+        Err(e) => return crate::sandbox_api::answer_early(&mut r, None, 400, json!({"error": format!("{e:#}")}).to_string().as_bytes()),
     };
     // Segments are percent-decoded once, here; one that decodes to `/` would name another path.
     let Some(all) = path_segments(&req.path) else {
-        return answer_early(&mut r, Some(&req), 400, br#"{"error":"bad path"}"#);
+        return crate::sandbox_api::answer_early(&mut r, Some(&req), 400, br#"{"error":"bad path"}"#);
     };
     let all: Vec<&str> = all.iter().map(String::as_str).collect();
     // Requests that need a user token are checked before their body is read, so nobody
@@ -3210,14 +3187,14 @@ fn serve_request(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + 
     {
         let msg =
             format!("this controller runs rekcod {}, you have {v}; upgrade the older one (`rekcod upgrade`)", env!("CARGO_PKG_VERSION"));
-        return answer_early(&mut r, Some(&req), 400, json!({"error": msg}).to_string().as_bytes());
+        return crate::sandbox_api::answer_early(&mut r, Some(&req), 400, json!({"error": msg}).to_string().as_bytes());
     }
     let open = matches!(all.as_slice(), ["nodes", "register"] | ["nodes", _, "heartbeat"] | ["webhooks", "github", ..]);
     if !open {
         let bearer = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         if c.caller(bearer)?.is_none() {
             c.audit_bad_token(peer, &req.path);
-            return answer_early(&mut r, Some(&req), 401, br#"{"error":"bad token"}"#);
+            return crate::sandbox_api::answer_early(&mut r, Some(&req), 401, br#"{"error":"bad token"}"#);
         }
         // A token holder's body (up to 64 MiB) gets the per-read timeout, not the deadline.
         head_read();

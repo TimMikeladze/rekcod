@@ -569,6 +569,29 @@ impl Request {
     }
 }
 
+/// Answers before the request has been read to its end, then reads and drops what's left
+/// of it (the rest of the head, or a body up to 1 MiB) before the connection closes. A socket
+/// closed with unread input sends a reset, and the client can lose the answer to it.
+pub(crate) fn answer_early<S: Read + Write>(r: &mut BufReader<S>, req: Option<&Request>, code: u16, body: &[u8]) -> Result<()> {
+    respond(r.get_mut(), code, "application/json", body)?;
+    match req {
+        Some(req) => {
+            let len: u64 = req.header("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+            let _ = std::io::copy(&mut r.by_ref().take(len.min(1 << 20)), &mut std::io::sink());
+        }
+        None => {
+            for _ in 0..100 {
+                let mut line = String::new();
+                match r.by_ref().take(16 << 10).read_line(&mut line) {
+                    Ok(n) if n > 0 && !line.trim().is_empty() => {}
+                    _ => break,
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Constant-time comparison, so token and signature checks don't leak timing.
 pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -719,7 +742,7 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
     if let Some(t) = token {
         let auth = req.header("authorization").unwrap_or("");
         if !ct_eq(auth.as_bytes(), format!("Bearer {t}").as_bytes()) {
-            return respond(r.get_mut(), 401, "application/json", br#"{"error":"bad token"}"#);
+            return answer_early(&mut r, Some(&req), 401, br#"{"error":"bad token"}"#);
         }
     }
     // Only Content-Length bodies are read; a chunked one would arrive empty and its
@@ -1270,6 +1293,35 @@ mod tests {
     }
 
     /// Sends one request through `handle`; returns the status and body.
+    /// A socket closed with unread input sends a reset, which can cost the client the answer;
+    /// an early 401 reads the request to its end first.
+    #[test]
+    fn an_early_answer_reads_the_rest_of_the_request() {
+        // Refused before anything on disk is looked at.
+        let paths = Paths { home: std::env::temp_dir() };
+        let body = "x".repeat(200 << 10);
+        let req = format!("POST /sandboxes HTTP/1.1\r\nAuthorization: Bearer wrong\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        let len = req.len() as u64;
+        let mut io = (std::io::Cursor::new(req.into_bytes()), Vec::new());
+        struct Io<'a>(&'a mut (std::io::Cursor<Vec<u8>>, Vec<u8>));
+        impl Read for Io<'_> {
+            fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> {
+                self.0.0.read(b)
+            }
+        }
+        impl Write for Io<'_> {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.1.write(b)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        handle(&paths, &Policy::default(), Io(&mut io), Some("right")).unwrap();
+        assert!(String::from_utf8_lossy(&io.1).starts_with("HTTP/1.1 401"));
+        assert_eq!(io.0.position(), len, "the body was left unread");
+    }
+
     fn http(paths: &Paths, policy: &Policy, method: &str, path: &str, body: &str) -> (u16, String) {
         struct Pipe(std::io::Cursor<Vec<u8>>, Vec<u8>);
         impl Read for Pipe {

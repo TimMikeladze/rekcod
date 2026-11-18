@@ -450,19 +450,40 @@ pub(crate) fn stop_daemon(paths: &Paths) -> Result<bool> {
 /// Sends `sig` to the daemon and waits for it to exit (SIGUSR1: force stop the VM).
 pub(crate) fn signal_daemon(paths: &Paths, sig: libc::c_int) -> Result<bool> {
     let Some(pid) = running_pid(paths) else { return Ok(false) };
-    unsafe { libc::kill(pid, sig) };
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while unsafe { libc::kill(pid, 0) } == 0 {
-        // `rekcod x --sandbox` spawned this daemon itself: reap it, or its zombie answers kill(0).
-        if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
-            break;
-        }
-        if Instant::now() > deadline {
-            bail!("daemon (pid {pid}) did not exit; see {}", paths.daemon_log().display());
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    signal_pid(pid, sig, Duration::from_secs(45)).with_context(|| format!("see {}", paths.daemon_log().display()))?;
     Ok(true)
+}
+
+/// Sends `sig` to `pid` and waits up to `wait` for it to exit. A force stop (SIGUSR1)
+/// that doesn't end it within that time ends it with SIGKILL, which takes the VM with it.
+fn signal_pid(pid: i32, sig: libc::c_int, wait: Duration) -> Result<()> {
+    let gone = |within: Duration| {
+        let deadline = Instant::now() + within;
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            // `rekcod x --sandbox` spawned this daemon itself: reap it, or its zombie answers kill(0).
+            if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
+                break;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        true
+    };
+    unsafe { libc::kill(pid, sig) };
+    if gone(wait) {
+        return Ok(());
+    }
+    if sig != libc::SIGUSR1 {
+        bail!("daemon (pid {pid}) did not exit");
+    }
+    eprintln!("rekcod: daemon (pid {pid}) did not exit after a force stop; sending SIGKILL");
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    if !gone(Duration::from_secs(5)) {
+        bail!("daemon (pid {pid}) did not exit after SIGKILL");
+    }
+    Ok(())
 }
 
 pub fn start(
@@ -1058,6 +1079,22 @@ mod tests {
         }
         assert_eq!(pid_of(&daemon, 0), None, "gone");
         std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn a_force_stop_that_hangs_ends_in_sigkill() {
+        // A daemon whose shutdown is stuck: it ignores both signals.
+        let stuck = || Command::new("/bin/sh").args(["-c", "trap '' TERM USR1; sleep 30 & wait"]).spawn().unwrap();
+        let (mut a, b) = (stuck(), stuck());
+        std::thread::sleep(Duration::from_millis(200));
+        let err = signal_pid(a.id() as i32, libc::SIGTERM, Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("did not exit"), "{err}");
+        assert!(a.try_wait().unwrap().is_none(), "a plain stop leaves it running");
+        // Reaped by signal_pid, as a sandbox daemon `rekcod x` spawned would be.
+        signal_pid(b.id() as i32, libc::SIGUSR1, Duration::from_millis(300)).unwrap();
+        assert_ne!(unsafe { libc::kill(b.id() as i32, 0) }, 0);
+        let _ = a.kill();
+        let _ = a.wait();
     }
 
     #[test]

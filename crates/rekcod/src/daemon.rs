@@ -126,6 +126,12 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let t0 = Instant::now();
     // Held until we exit: a second daemon on the same disk fails here.
     let _pid_lock = paths.hold_pid_file()?;
+    // A stop request goes through `shutdown` (or force stop), also while booting:
+    // left at its default, SIGTERM would end the daemon with the VM and its disks mid-write.
+    let mut term = signal(SignalKind::terminate())?;
+    let mut int = signal(SignalKind::interrupt())?;
+    // `rekcod sandbox rm`, `rekcod stop --force`: skip the graceful shutdown.
+    let mut kill = signal(SignalKind::user_defined1())?;
     let _ = std::fs::remove_file(paths.last_exit());
     raise_fd_limit();
     crate::lifecycle::trim_log_hourly(paths.daemon_log());
@@ -236,24 +242,44 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         None => None,
     };
     log!("kernel command line: {}", cfg.cmdline);
-    vm.start().await?;
-    vm.map_elastic();
-    log!("VM started ({} CPUs, {} MiB + {} MiB elastic, rosetta={})", cfg.cpus, cfg.memory_mib, cfg.elastic_mib, vm.rosetta);
-
-    // Docker socket first so `rekcod start` can poll it while the guest boots.
-    let sock = paths.socket();
-    let _ = std::fs::remove_file(&sock);
-    let listener = crate::paths::with_umask(0o077, || UnixListener::bind(&sock)).with_context(|| format!("bind {}", sock.display()))?;
-    tokio::spawn(docker_proxy(vm.clone(), listener));
-    if fresh {
-        tokio::spawn(forget_fresh_disk(vm.clone(), paths.data_fresh()));
-    }
-
-    let caps = match wait_for_agent(&vm, opts.repair, &paths.console_log()).await {
+    let boot = async {
+        vm.start().await?;
+        vm.map_elastic();
+        log!("VM started ({} CPUs, {} MiB + {} MiB elastic, rosetta={})", cfg.cpus, cfg.memory_mib, cfg.elastic_mib, vm.rosetta);
+        // Docker socket first so `rekcod start` can poll it while the guest boots.
+        let sock = paths.socket();
+        let _ = std::fs::remove_file(&sock);
+        let listener = crate::paths::with_umask(0o077, || UnixListener::bind(&sock)).with_context(|| format!("bind {}", sock.display()))?;
+        tokio::spawn(docker_proxy(vm.clone(), listener));
+        if fresh {
+            tokio::spawn(forget_fresh_disk(vm.clone(), paths.data_fresh()));
+        }
+        wait_for_agent(&vm, opts.repair, &paths.console_log()).await
+    };
+    let stop = tokio::select! {
+        caps = boot => match caps {
+            Ok(caps) => Ok(caps),
+            Err(e) => {
+                cleanup(&paths);
+                return Err(e);
+            }
+        },
+        _ = term.recv() => Err(false),
+        _ = int.recv() => Err(false),
+        _ = kill.recv() => Err(true),
+    };
+    let caps = match stop {
         Ok(caps) => caps,
-        Err(e) => {
+        Err(force) => {
+            log!("asked to stop while booting");
+            if force {
+                force_stop(&vm).await;
+            } else {
+                shutdown(&vm, &mut kill).await;
+            }
             cleanup(&paths);
-            return Err(e);
+            clean_exit(&paths);
+            return Ok(());
         }
     };
     let fs_cache = caps.split_whitespace().any(|c| c == CAP_FS_NOTIFY);
@@ -328,18 +354,13 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     tokio::spawn(dns_bridge(vm.clone(), dns));
     tokio::spawn(port_forwarder(vm.clone(), status.clone(), !opts.no_autoports));
 
-    let mut term = signal(SignalKind::terminate())?;
-    let mut int = signal(SignalKind::interrupt())?;
-    // `rekcod sandbox rm`: nothing on the disk is kept, so skip the graceful shutdown.
-    let mut kill = signal(SignalKind::user_defined1())?;
     let mut tick = tokio::time::interval(Duration::from_millis(500));
     loop {
         tokio::select! {
             _ = term.recv() => break,
             _ = int.recv() => break,
             _ = kill.recv() => {
-                log!("force stop");
-                let _ = vm.force_stop().await;
+                force_stop(&vm).await;
                 cleanup(&paths);
                 clean_exit(&paths);
                 return Ok(());
@@ -352,11 +373,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
                     log!("idle for {ttl}s, stopping");
                     break;
                 }
-                // vm.state() waits on the VM's dispatch queue, which a stuck VM can hold.
-                let probe = vm.clone();
-                let Ok(Ok(s)) = tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(move || probe.state())).await else {
-                    continue;
-                };
+                let Some(s) = probe_state(&vm).await else { continue };
                 if matches!(s, State::Stopped | State::Error) {
                     log!("guest stopped on its own ({s:?})");
                     cleanup(&paths);
@@ -366,10 +383,28 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             }
         }
     }
-    shutdown(&vm).await;
+    shutdown(&vm, &mut kill).await;
     cleanup(&paths);
     clean_exit(&paths);
     Ok(())
+}
+
+/// The VM's state, or None if its dispatch queue (which `vm.state()` waits on) didn't
+/// answer within 2 s: a stuck VM can hold it.
+async fn probe_state(vm: &Vm) -> Option<State> {
+    let probe = vm.clone();
+    tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(move || probe.state())).await.ok()?.ok()
+}
+
+/// Powers the VM off now. Bounded: when the VM's queue is stuck the daemon exits anyway,
+/// which ends the VM with it.
+async fn force_stop(vm: &Vm) {
+    log!("force stop");
+    match tokio::time::timeout(Duration::from_secs(10), vm.force_stop()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log!("force stop failed: {e:#}"),
+        Err(_) => log!("force stop did not answer within 10s; exiting"),
+    }
 }
 
 /// Tells `rekcod start --foreground` (the login agent) that this stop was on purpose.
@@ -404,24 +439,33 @@ fn cleanup(paths: &Paths) {
     }
 }
 
-async fn shutdown(vm: &Vm) {
+/// Asks the guest to power off and waits up to 30 s, then forces it. SIGUSR1 while it
+/// waits forces it at once.
+async fn shutdown(vm: &Vm, kill: &mut tokio::signal::unix::Signal) {
     log!("shutting down guest");
-    let asked = control(vm, Control::Shutdown).await;
-    if let Err(e) = &asked {
-        log!("graceful shutdown request failed: {e:#}");
-    }
-    // The guest waits up to 18 s for dockerd (which gives containers 10 s), then unmounts.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while asked.is_ok() && Instant::now() < deadline {
-        if matches!(vm.state(), State::Stopped | State::Error) {
-            log!("guest powered off");
-            return;
+    let graceful = async {
+        if let Err(e) = control(vm, Control::Shutdown).await {
+            log!("graceful shutdown request failed: {e:#}");
+            return false;
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    log!("forcing VM stop");
-    if let Err(e) = vm.force_stop().await {
-        log!("force stop failed: {e:#}");
+        // The guest waits up to 18 s for dockerd (which gives containers 10 s), then unmounts.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if matches!(probe_state(vm).await, Some(State::Stopped | State::Error)) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        false
+    };
+    let done = tokio::select! {
+        done = graceful => done,
+        _ = kill.recv() => false,
+    };
+    if done {
+        log!("guest powered off");
+    } else {
+        force_stop(vm).await;
     }
 }
 

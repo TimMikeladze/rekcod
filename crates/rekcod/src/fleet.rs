@@ -709,7 +709,7 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         }
         None => {
             let url = a["git"]["url"].as_str().context("missing git.url")?;
-            eprintln!("rekcod: {app} r{release}: cloning {url}");
+            eprintln!("rekcod: {app} r{release}: cloning {}", crate::lifecycle::redact_userinfo(url));
             let dir = clone(paths, url, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
             // The commit's own rekcod.toml fills in whatever the deploy didn't set.
             let toml = checkout_toml(&dir)?;
@@ -3986,6 +3986,10 @@ fn mask_env(v: &mut Value) {
             *val = json!("(hidden from viewers)");
         }
     }
+    // A token in the clone URL is as secret as the env.
+    if let Some(u) = v["git"]["url"].as_str() {
+        v["git"]["url"] = json!(crate::lifecycle::redact_userinfo(u));
+    }
 }
 
 fn placement_status(c: &Controller, app: &str) -> Result<Value> {
@@ -4300,10 +4304,12 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                  from apps where ns = ?1 and (?1 <> 'default' or owner = ?2 or ?3) and destroying is null order by name",
                 &[&ns, &who.name, &who.admin],
             )?;
+            let viewer = c.role(who, ns)? < Some(Role::Member);
+            let git = |u: String| if viewer { crate::lifecycle::redact_userinfo(&u) } else { u };
             let mut list: Vec<Value> = rows
                 .iter()
                 .map(|r| json!({
-                    "name": short_name(&r.get::<String>(0)), "ns": ns, "git": r.get::<String>(1), "live_release": r.get::<Option<i32>>(2),
+                    "name": short_name(&r.get::<String>(0)), "ns": ns, "git": git(r.get::<String>(1)), "live_release": r.get::<Option<i32>>(2),
                     "instances": r.get::<i32>(3), "preview_of": r.get::<Option<String>>(4).map(|p| short_name(&p).to_string()),
                     "public": r.get::<bool>(5), "url": format!("http://{}.{}", r.get::<String>(0), c.domain), "sleeping": r.get::<bool>(6),
                 }))
@@ -4311,7 +4317,6 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             // `?detail=1`: each app's `GET /apps/{name}` too, for the dashboard's one call.
             if q.iter().any(|(k, v)| k == "detail" && v != "0") {
                 let keys: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
-                let viewer = c.role(who, ns)? < Some(Role::Member);
                 for (a, mut d) in list.iter_mut().zip(app_details(c, &keys)?) {
                     if viewer {
                         mask_env(&mut d);
@@ -6318,6 +6323,13 @@ mod tests {
                 };
                 assert_eq!(got_in, allowed.contains(&who), "{who} {method} {path}: {r:?}");
             }
+        }
+        // A token in the clone URL: viewers don't get it, members do.
+        c.db.lock().unwrap().execute("update apps set git_url = 'https://u:s3cret@x/y' where name = 'web--team'", &[]).unwrap();
+        for path in ["/ns/team/apps", "/ns/team/apps?detail=1", "/ns/team/apps/web"] {
+            let seen = |who: &str| call(&url, "GET", path, Some(&format!("{who}-t")), &json!(null)).unwrap().to_string();
+            assert!(!seen("viewer").contains("s3cret") && seen("viewer").contains("x/y"), "{path}");
+            assert!(seen("member").contains("s3cret"), "{path}");
         }
     }
 

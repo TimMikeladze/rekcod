@@ -767,6 +767,29 @@ fn internet_check(paths: &Paths, status: &serde_json::Value) -> Result<Check> {
     })
 }
 
+/// `text` with the credentials taken out of every URL in it: an http(s) URL's user part
+/// (`https://TOKEN@host` is a token too), and any `user:password@`. `ssh://git@host` stays.
+/// A git URL with a token in it otherwise reaches node logs, viewers and doctor bundles.
+pub fn redact_userinfo(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let (head, tail) = rest.split_at(i + 3);
+        out.push_str(head);
+        let scheme = head[..i].rsplit(|c: char| !c.is_ascii_alphanumeric() && c != '+').next().unwrap_or("").to_ascii_lowercase();
+        let end = tail.find(|c: char| c.is_whitespace() || "/?#\"'<>".contains(c)).unwrap_or(tail.len());
+        match tail[..end].rfind('@') {
+            Some(at) if scheme.starts_with("http") || tail[..at].contains(':') => {
+                out.push_str("***@");
+                rest = &tail[at + 1..];
+            }
+            _ => rest = tail,
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// A tarball of status, versions, logs (last 2000 lines each) and config. No tokens or keys.
 fn write_bundle(paths: &Paths) -> Result<PathBuf> {
     let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
@@ -778,7 +801,7 @@ fn write_bundle(paths: &Paths) -> Result<PathBuf> {
         std::fs::write(dir.join("config.json"), c)?;
     }
     for e in std::fs::read_dir(paths.home.join("logs")).into_iter().flatten().flatten() {
-        let text = String::from_utf8_lossy(&std::fs::read(e.path()).unwrap_or_default()).to_string();
+        let text = redact_userinfo(&String::from_utf8_lossy(&std::fs::read(e.path()).unwrap_or_default()));
         let lines: Vec<&str> = text.lines().collect();
         std::fs::write(dir.join(e.file_name()), lines[lines.len().saturating_sub(2000)..].join("\n"))?;
     }
@@ -848,6 +871,16 @@ mod tests {
         let other = docker_checks(&seen(Some("tcp://10.0.0.9:2375"), "rekcod"));
         assert!(other.iter().any(|c| c.name == "DOCKER_HOST" && !c.ok));
         assert!(!docker_checks(&seen(None, "orbstack"))[0].ok);
+    }
+
+    #[test]
+    fn credentials_come_out_of_urls() {
+        let line = "rekcod: blog r3: cloning https://x-access-token:ghp_secret@github.com/org/repo.git at main";
+        assert_eq!(redact_userinfo(line), "rekcod: blog r3: cloning https://***@github.com/org/repo.git at main");
+        assert_eq!(redact_userinfo("git ssh://git@host/r http://a:b@c:1/x?y=z@w"), "git ssh://git@host/r http://***@c:1/x?y=z@w");
+        assert_eq!(redact_userinfo("(https://ghp_x@github.com/o/r)"), "(https://***@github.com/o/r)");
+        assert_eq!(redact_userinfo("ssh://me:pw@host/r"), "ssh://***@host/r");
+        assert_eq!(redact_userinfo("https://github.com/org/repo, me@example.com"), "https://github.com/org/repo, me@example.com");
     }
 
     #[test]

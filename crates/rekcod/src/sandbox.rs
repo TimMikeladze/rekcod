@@ -924,6 +924,15 @@ fn freeze(s: &Sandbox, name: &str) -> Result<PathBuf> {
     if pause {
         let _ = s.docker()?.args(["unpause", WS]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
+    if r.is_err()
+        && let Some(p) = unreadable(&s.ws(), Path::new(""))
+    {
+        let _ = std::fs::remove_dir_all(&tmp);
+        bail!(
+            "{} in the workspace can't be read (its mode leaves the owner out); `chmod u+rwX` it in the sandbox",
+            printable_name(&p.to_string_lossy())
+        );
+    }
     r?;
     std::fs::rename(&tmp, &dst)?;
     Ok(dst)
@@ -945,7 +954,7 @@ pub fn printable(text: &str) -> String {
 
 /// What `diff` showed: the change list, the patch, and the review ID `apply --reviewed`
 /// takes to write exactly that.
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct Review {
     pub changes: Vec<Change>,
     pub patch: String,
@@ -1546,13 +1555,73 @@ pub fn stop(paths: &Paths, id: &str) -> Result<()> {
 
 fn remove(s: &Sandbox) -> Result<()> {
     crate::cli::signal_daemon(&s.paths, libc::SIGUSR1)?;
-    // The daemon deletes its own run files as it exits, which can race the walk here.
-    let mut r = std::fs::remove_dir_all(&s.paths.home);
-    if r.as_ref().is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
-        std::thread::sleep(std::time::Duration::from_millis(200));
-        r = std::fs::remove_dir_all(&s.paths.home).or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) });
+    let home = &s.paths.home;
+    // meta.json goes last: a sandbox that fails to go stays listed, and `rm` can be retried.
+    let rest = || -> std::io::Result<()> {
+        for e in std::fs::read_dir(home)? {
+            let e = e?;
+            if e.file_name() == "meta.json" {
+                continue;
+            }
+            let r = if e.file_type()?.is_dir() { std::fs::remove_dir_all(e.path()) } else { std::fs::remove_file(e.path()) };
+            match r {
+                // The daemon deletes its own run files as it exits, which races the walk.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                r => r?,
+            }
+        }
+        Ok(())
+    };
+    let r = match rest() {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // A `chmod 000` the sandbox made in its workspace.
+            open_up(home);
+            rest()
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            rest()
+        }
+        r => r,
+    };
+    r.and_then(|_| std::fs::remove_file(Sandbox::meta_file(home)))
+        .and_then(|_| std::fs::remove_dir(home))
+        .or_else(|e| if e.kind() == std::io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+        .with_context(|| format!("remove {}", home.display()))
+}
+
+/// Gives the owner rwx on every directory under `dir`, not following links, so it can be
+/// listed and emptied.
+fn open_up(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(m) = std::fs::symlink_metadata(dir) else { return };
+    if !m.is_dir() {
+        return;
     }
-    r.with_context(|| format!("remove {}", s.paths.home.display()))
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(m.permissions().mode() | 0o700));
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        open_up(&e.path());
+    }
+}
+
+/// The first entry under `dir` its owner can't read (a file) or list (a directory), which
+/// makes `clonefile` fail with nothing but "Permission denied".
+fn unreadable(dir: &Path, rel: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    for e in std::fs::read_dir(dir.join(rel)).ok()?.flatten() {
+        let r = rel.join(e.file_name());
+        let Ok(m) = e.metadata() else { continue };
+        let mode = m.permissions().mode();
+        if m.is_dir() && mode & 0o500 != 0o500 || m.is_file() && mode & 0o400 == 0 {
+            return Some(r);
+        }
+        if m.is_dir()
+            && let Some(p) = unreadable(dir, &r)
+        {
+            return Some(p);
+        }
+    }
+    None
 }
 
 /// Removes the sandboxes without printing: on `rekcod mcp` stdout carries JSON-RPC.
@@ -1942,6 +2011,35 @@ mod tests {
             assert!(names.contains(&to.to_string()) && !names.contains(&from.to_string()), "{names:?}");
             assert_eq!(std::fs::read_to_string(project.join("other")).unwrap(), "o2");
         }
+    }
+
+    #[test]
+    fn hostile_workspace_entries_neither_hang_nor_stick() {
+        let (paths, _, m, ws) = setup("hostile", &[("f", "x")]);
+        // A link to a FIFO is shown as a link; nothing opens the FIFO.
+        let fifo = std::ffi::CString::new(ws.join("pipe").as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o644) }, 0);
+        symlink("pipe", ws.join("lnk")).unwrap();
+        std::fs::write(ws.join("big"), vec![b'a'; (MAX_DIFF_FILE + 1) as usize]).unwrap();
+        let (p, id) = (paths.clone(), m.id.clone());
+        let t = std::thread::spawn(move || patch(&p, &id).unwrap());
+        let t0 = Instant::now();
+        while !t.is_finished() && t0.elapsed() < std::time::Duration::from_secs(10) {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(t.is_finished(), "diff hung");
+        let r = t.join().unwrap();
+        assert_eq!(paths_of(&r.changes), vec![('A', "big"), ('A', "lnk")]);
+        assert!(r.patch.contains("+pipe\n") && r.patch.contains("rekcod: not shown, over 4 MiB"), "{}", r.patch);
+        // A directory the sandbox chmods to 000: diff names it, rm still removes everything.
+        std::fs::remove_file(ws.join("lnk")).unwrap();
+        std::fs::create_dir_all(ws.join("sub/deep")).unwrap();
+        std::fs::write(ws.join("sub/deep/x"), "x").unwrap();
+        std::fs::set_permissions(ws.join("sub"), std::fs::Permissions::from_mode(0o000)).unwrap();
+        let e = patch(&paths, &m.id).unwrap_err().to_string();
+        assert!(e.contains("sub in the workspace"), "{e}");
+        rm(&paths, std::slice::from_ref(&m.id), false).unwrap();
+        assert!(!root(&paths).join(&m.id).exists());
     }
 
     #[test]

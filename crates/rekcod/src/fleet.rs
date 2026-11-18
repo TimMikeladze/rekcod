@@ -1839,7 +1839,7 @@ impl Controller {
         // App instances run as sandboxes but are reached through apps, never directly: a
         // viewer could otherwise read an instance's files, a member exec into it.
         let r = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
-            "select node, owner, state from sandboxes where id = ?1 and ns = ?2 and id not in (select sandbox from instances)",
+            "select node, owner, state from sandboxes where id = ?1 and ns = ?2 and state <> 'creating' and id not in (select sandbox from instances)",
             &[&id, &ns],
         )?;
         let Some(r) = r else { bail!(sandbox::NoSandbox(id.into())) };
@@ -1866,16 +1866,16 @@ impl Controller {
         let sql = format!(
             "select
                coalesce((select sum(max(instances, 1) * max(cpus, 1)) {APPS}), 0)
-             + coalesce((select sum(cpus) from sandboxes s where ns = ?1 and state = 'running'
+             + coalesce((select sum(cpus) from sandboxes s where ns = ?1 and state in ('running', 'creating')
                            and not exists(select 1 from instances i where i.sandbox = s.id)), 0)
              + coalesce((select sum(coalesce(json_extract(spec, '$.cpus'), 2)) from jobs where ns = ?1
                            and state in {JOB_ACTIVE_SQL}), 0),
                coalesce((select sum(max(instances, 1) * max(memory_gib, 1)) {APPS}), 0)
-             + coalesce((select sum(memory_gib) from sandboxes s where ns = ?1 and state = 'running'
+             + coalesce((select sum(memory_gib) from sandboxes s where ns = ?1 and state in ('running', 'creating')
                            and not exists(select 1 from instances i where i.sandbox = s.id)), 0)
              + coalesce((select sum(coalesce(json_extract(spec, '$.memory_gib'), 2)) from jobs where ns = ?1
                            and state in {JOB_ACTIVE_SQL}), 0),
-               (select count(*) from sandboxes s where ns = ?1 and state = 'running'
+               (select count(*) from sandboxes s where ns = ?1 and state in ('running', 'creating')
                   and not exists(select 1 from instances i where i.sandbox = s.id))
              + (select count(*) from jobs where ns = ?1 and state in {JOB_ACTIVE_SQL})"
         );
@@ -2342,8 +2342,10 @@ fn sweep(c: &Arc<Controller>) -> Result<()> {
          where state = 'building'",
         &[&now()],
     )?;
-    // Those deploys ended, so the quota they were admitted with is free again.
+    // Those deploys ended, so the quota they were admitted with is free again; so did
+    // sandbox creates still waiting on their node.
     db.execute("update apps set deploying = 0 where deploying <> 0", &[])?;
+    db.execute("delete from sandboxes where state = 'creating'", &[])?;
     let stale = db.query("select node, sandbox from instances where state in ('starting', 'draining')", &[])?;
     drop(db);
     if n > 0 || !stale.is_empty() {
@@ -2909,7 +2911,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         ("GET", ["sandboxes"]) => (|| {
             c.allow(&who, &ns, Role::Viewer)?;
             let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
-                "select id, node, owner, state, created from sandboxes s where state <> 'removed' and ns = ?1
+                "select id, node, owner, state, created from sandboxes s where state not in ('removed', 'creating') and ns = ?1
                    and (?1 <> 'default' or owner = ?2 or ?3) and not exists(select 1 from instances i where i.sandbox = s.id)
                  order by created",
                 &[&ns, &who.name, &who.admin],
@@ -2940,21 +2942,24 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                                 .query_one("select cpus, memory_gib from sandboxes where id = ?1", &[id])?;
                         (r.get(0), r.get(1))
                     };
-                    let ql = c.quota_lock(&ns);
-                    let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    c.check_cap(&who.name, who.max)?;
-                    c.check_quota(&ns, "", cpus, gib, 1)?;
-                    let mut v = call(&url, "POST", &node_path, Some(&sec), &body)?;
-                    let child = v["id"].as_str().context("node returned no id")?.to_string();
-                    let node: String =
-                        c.db.lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .query_one("select node from sandboxes where id = ?1", &[id])?
-                            .get(0);
-                    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-                        "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
-                        &[&child, &node, &who.name, &now(), &ns, &cpus, &gib],
-                    )?;
+                    let node: String = c.db().query_one("select node from sandboxes where id = ?1", &[id])?.get(0);
+                    let reserved = {
+                        let ql = c.quota_lock(&ns);
+                        let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        c.check_cap(&who.name, who.max)?;
+                        c.check_quota(&ns, "", cpus, gib, 1)?;
+                        reserve_sandbox(c, &node, &who.name, &ns, cpus, gib)?
+                    };
+                    let v = call(&url, "POST", &node_path, Some(&sec), &body)
+                        .and_then(|v| v["id"].as_str().map(String::from).context("node returned no id").map(|child| (v, child)));
+                    let (mut v, child) = match v {
+                        Ok(x) => x,
+                        Err(e) => {
+                            reserved.release(c);
+                            return Err(e);
+                        }
+                    };
+                    reserved.created(c, &child)?;
                     c.audit(&ns, &who.name, "fork", &child, true);
                     v["node"] = json!(node);
                     Ok(v)
@@ -3060,7 +3065,7 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
         return respond(w, 404, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
     }
     let ql = c.quota_lock(ns);
-    let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Err(e) = c.check_cap(&who.name, who.max) {
         return err(w, format!("{e:#}"));
     }
@@ -3077,19 +3082,48 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
         let what = if macos { format!("a free macOS slot and {mib} MiB") } else { format!("{mib} MiB free") };
         return err(w, format!("no node has {what}"));
     };
+    // The node clones before it answers, which can take minutes: reserve, then call it
+    // without the namespace's quota lock, so deploys and jobs there don't wait on it.
+    let reserved = reserve_sandbox(c, &node, &who.name, ns, cpus, gib)?;
+    drop(quota);
     let mut v = match call(&url, "POST", "/sandboxes", Some(&sec), &body) {
         Ok(v) => v,
-        Err(e) => return err(w, format!("node {node}: {e:#}")),
+        Err(e) => {
+            reserved.release(c);
+            return err(w, format!("node {node}: {e:#}"));
+        }
     };
     let id = v["id"].as_str().unwrap_or("").to_string();
-    c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
-        "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
-        &[&id, &node, &who.name, &now(), &ns, &cpus, &gib],
-    )?;
+    reserved.created(c, &id)?;
     c.audit(ns, &who.name, "create", &id, true);
     v["node"] = json!(node);
     v["ns"] = json!(ns);
     respond(w, 201, "application/json", v.to_string().as_bytes())
+}
+
+/// A sandbox row in state `creating`: counted by quotas and caps while its node works,
+/// hidden from listings, removed by `sweep` if the controller stops first.
+struct Reserved(String);
+
+fn reserve_sandbox(c: &Controller, node: &str, owner: &str, ns: &str, cpus: i64, gib: i64) -> Result<Reserved> {
+    let id = format!("creating-{}", sandbox::new_id()?);
+    c.db().execute(
+        "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'creating', ?4, ?5, ?6, ?7)",
+        &[&id, &node, &owner, &now(), &ns, &cpus, &gib],
+    )?;
+    Ok(Reserved(id))
+}
+
+impl Reserved {
+    /// The node made it: the row takes its ID.
+    fn created(self, c: &Controller, id: &str) -> Result<()> {
+        c.db().execute("update sandboxes set id = ?2, state = 'running', created = ?3 where id = ?1", &[&self.0, &id, &now()])?;
+        Ok(())
+    }
+
+    fn release(self, c: &Controller) {
+        let _ = c.db().execute("delete from sandboxes where id = ?1", &[&self.0]);
+    }
 }
 
 // ------------------------------------------------------------- namespaces
@@ -5511,6 +5545,39 @@ mod job_and_node_tests {
 
     fn spec() -> Value {
         json!({"cmd": ["sleep", "1000"], "git": {"url": "https://example.invalid/repo"}})
+    }
+
+    #[test]
+    fn a_slow_sandbox_create_reserves_its_quota_without_holding_the_namespace() {
+        let (url, c) = serve(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        c.db().execute("insert into tokens (token, name, hashed) values (?1, 'alice', 1)", &[&hash_token("alice-t")]).unwrap();
+        c.db().execute("update namespaces set max_sandboxes = 1 where name = 'default'", &[]).unwrap();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let wait = Mutex::new(wait);
+        worker(&c, "n1", move |m, p| {
+            (m == "POST" && p == "/sandboxes").then(|| {
+                let _ = wait.lock().unwrap().recv_timeout(Duration::from_secs(10));
+                (200, json!({"id": "sb-slow"}))
+            })
+        });
+        let body = json!({"git": {"url": "https://example.invalid/r", "ref": "main"}});
+        let first = {
+            let (url, body) = (url.clone(), body.clone());
+            std::thread::spawn(move || call(&url, "POST", "/sandboxes", Some("alice-t"), &body))
+        };
+        wait_for("the reservation", || c.db().query_opt("select 1 from sandboxes where state = 'creating'", &[]).unwrap().is_some());
+        // The namespace isn't locked meanwhile, and the reserved row counts.
+        let t0 = Instant::now();
+        assert!(upsert_app(&c, "default", &Caller::user("bob"), &json!({"name": "web", "git": {"url": "u"}}), None).is_ok());
+        let e = call(&url, "POST", "/sandboxes", Some("alice-t"), &body).unwrap_err().to_string();
+        assert!(e.contains("1 of 1") || e.contains("quota"), "{e}");
+        assert!(t0.elapsed() < Duration::from_secs(5), "waited on the slow create");
+        assert_eq!(call(&url, "GET", "/sandboxes", Some("alice-t"), &Value::Null).unwrap(), json!([]));
+        go.send(()).unwrap();
+        assert_eq!(first.join().unwrap().unwrap()["id"], "sb-slow");
+        let rows: Vec<(String, String)> =
+            c.db().query("select id, state from sandboxes", &[]).unwrap().iter().map(|r| (r.get(0), r.get(1))).collect();
+        assert_eq!(rows, [("sb-slow".to_string(), "running".to_string())]);
     }
 
     #[test]

@@ -839,13 +839,16 @@ enum ControllerCmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
-    /// Replace fleet.db with a backup (the latest unless KEY); stop the controller first.
+    /// Replace fleet.db with a backup (the latest in RustFS unless KEY, or --from FILE); stop the controller first.
     Restore {
         key: Option<String>,
         #[arg(long)]
         db: Option<std::path::PathBuf>,
         #[arg(long)]
         storage_credentials: Option<std::path::PathBuf>,
+        /// A backup file (from --backup-dir, or copied off the server) instead of RustFS.
+        #[arg(long, conflicts_with_all = ["key", "storage_credentials"])]
+        from: Option<std::path::PathBuf>,
     },
     /// Change an existing token's cap (admin token); applies to every token with that name.
     Limit {
@@ -1420,8 +1423,8 @@ fn main() {
         ),
         Cmd::Controller(ControllerCmd::Backup { remote }) => remote_call(&paths, &remote, "POST", "/backups", &serde_json::json!({})),
         Cmd::Controller(ControllerCmd::Backups { remote }) => remote_call(&paths, &remote, "GET", "/backups", &serde_json::Value::Null),
-        Cmd::Controller(ControllerCmd::Restore { key, db, storage_credentials }) => {
-            fleet::controller_restore(&paths, db, key.as_deref(), storage_credentials)
+        Cmd::Controller(ControllerCmd::Restore { key, db, storage_credentials, from }) => {
+            fleet::controller_restore(&paths, db, key.as_deref(), storage_credentials, from)
         }
         Cmd::Storage(StorageCmd::Serve { install: true, .. }) => service::install(&paths, "storage", &service::args_without_install()),
         Cmd::Storage(StorageCmd::Serve { listen, data, .. }) => storage::serve(&paths, &listen, data.as_deref()),

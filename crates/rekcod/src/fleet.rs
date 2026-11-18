@@ -1629,11 +1629,14 @@ impl Controller {
         let Some(url) = self.alert_webhook.clone() else { return };
         let body = json!({"text": format!("rekcod: {msg}"), "domain": self.domain}).to_string();
         std::thread::spawn(move || {
-            let _ = Command::new("curl")
+            let sent = Command::new("curl")
                 .args(["-sf", "-m", "10", "-X", "POST", "-H", "Content-Type: application/json", "-d", &body, &url])
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status();
+            if !sent.as_ref().is_ok_and(|s| s.success()) {
+                eprintln!("rekcod: the alert webhook didn't take the alert ({sent:?})");
+            }
         });
     }
 
@@ -1928,6 +1931,15 @@ fn metrics(c: &Controller) -> Result<String> {
         &format!("select app, sum(errors) from traffic where minute = {} group by app", now() / 60 - 1),
         "app",
     )?;
+    // A rule on these notices backups that stopped working, webhook or not.
+    for (name, kind, help, key) in [
+        ("rekcod_last_backup_timestamp_seconds", "gauge", "When the last backup succeeded (Unix time); 0 when none has.", "last_backup_ok"),
+        ("rekcod_backup_failures_total", "counter", "Backups that failed.", "backup_failures"),
+    ] {
+        let v: i64 =
+            db.query_opt("select value from config where key = ?1", &[&key])?.and_then(|r| r.get::<String>(0).parse().ok()).unwrap_or(0);
+        out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {v}\n"));
+    }
     Ok(out)
 }
 
@@ -5350,6 +5362,126 @@ mod job_and_node_tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A database with rows only in its WAL, as a controller stopped by a signal leaves it.
+    fn with_late_rows(path: &Path, token: &str) {
+        let mut db = Db::open(path).unwrap();
+        db.execute("insert or replace into config values ('join_token', ?1)", &[&token]).unwrap();
+        db.execute("insert into config values ('late', 'yes')", &[]).unwrap();
+        // Never closed, so never checkpointed.
+        std::mem::forget(db);
+    }
+
+    #[test]
+    fn restore_keeps_the_old_wal_with_the_old_database() {
+        let dir = temp("restore-wal");
+        let backup = dir.join("backup.db");
+        {
+            let mut db = Db::open(&dir.join("src.db")).unwrap();
+            db.execute("insert into config values ('join_token', 'from-backup')", &[]).unwrap();
+        }
+        rusqlite::Connection::open(dir.join("src.db")).unwrap().execute("vacuum into ?1", [backup.display().to_string()]).unwrap();
+        for name in ["fleet.db", "fleet.sqlite"] {
+            let target = dir.join(name);
+            with_late_rows(&target, "current");
+            let copy = dir.join(format!("{name}.backup"));
+            std::fs::copy(&backup, &copy).unwrap();
+            restore_file(&copy, &target).unwrap();
+            let restored = rusqlite::Connection::open(&target).unwrap();
+            let late: Option<String> = restored.query_row("select value from config where key = 'late'", [], |r| r.get(0)).ok();
+            assert_eq!(late, None, "{name}: the old WAL was replayed into the restored database");
+            let kept = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.path())
+                .find(|p| {
+                    let p = p.to_string_lossy();
+                    p.contains(&format!("{name}.before-restore-")) && !p.ends_with("-wal") && !p.ends_with("-shm")
+                })
+                .unwrap();
+            let late: String = rusqlite::Connection::open(&kept)
+                .unwrap()
+                .query_row("select value from config where key = 'late'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(late, "yes", "{name}: the kept database lost its last writes");
+        }
+        // Not while a controller has it open.
+        let target = dir.join("fleet.db");
+        let held = hold_db(&target).unwrap();
+        let copy = dir.join("again.db");
+        std::fs::copy(&backup, &copy).unwrap();
+        assert!(restore_file(&copy, &target).unwrap_err().to_string().contains("stop it first"));
+        drop(held);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn restore_from_a_file_needs_no_storage() {
+        let dir = temp("restore-from");
+        let home = dir.join("home");
+        let paths = Paths { home: home.clone() };
+        let file = dir.join("fleet-20261118T100000Z.db");
+        {
+            let mut db = Db::open(&dir.join("src.db")).unwrap();
+            db.execute("insert into config values ('join_token', 'from-file')", &[]).unwrap();
+            db.execute("insert into instances values ('web', 1, 'sb1', 'n1', 'ep', 'live')", &[]).unwrap();
+        }
+        rusqlite::Connection::open(dir.join("src.db")).unwrap().execute("vacuum into ?1", [file.display().to_string()]).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        controller_restore(&paths, None, None, None, Some(file.clone())).unwrap();
+        let mut db = Db::open(&home.join("controller/fleet.db")).unwrap();
+        assert_eq!(db.query_one("select value from config where key = 'join_token'", &[]).unwrap().get::<String>(0), "from-file");
+        assert_eq!(db.query_one("select state from instances", &[]).unwrap().get::<String>(0), "lost");
+        assert_eq!(std::fs::read(&file).unwrap(), before, "the operator's file is copied, not changed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failing_backup_dir_doesnt_stop_the_upload() {
+        let dir = temp("backup-dir");
+        let db_path = dir.join("fleet.db");
+        Db::open(&db_path).unwrap().execute("insert into config values ('join_token', 'jt')", &[]).unwrap();
+        let m = crate::s3::mock::start();
+        let mut ctl = Controller::new(Db::open(&db_path).unwrap(), "apps.test".into(), 0, [7; 32]);
+        ctl.db_path = db_path.clone();
+        ctl.storage = Some(m.s3.clone());
+        // A path under a regular file: the directory can't be made.
+        std::fs::write(dir.join("file"), b"").unwrap();
+        ctl.backup_dir = Some(dir.join("file/backups"));
+        let e = backup(&ctl).unwrap_err().to_string();
+        assert!(e.contains("--backup-dir") && e.contains("was saved to rekcod-backups"), "{e}");
+        assert!(m.keys().iter().any(|k| k.starts_with("rekcod-backups/fleet-")), "{:?}", m.keys());
+        assert!(metrics(&ctl).unwrap().contains("rekcod_backup_failures_total 1"));
+
+        // A directory it can make: 0700, each copy 0600, and the last success in /metrics.
+        use std::os::unix::fs::PermissionsExt;
+        ctl.backup_dir = Some(dir.join("backups"));
+        let out = backup(&ctl).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let copy = dir.join("backups").join(out["backup"].as_str().unwrap());
+        assert_eq!((mode(&dir.join("backups")), mode(&copy)), (0o700, 0o600));
+        assert!(!std::fs::read_dir(&dir).unwrap().flatten().any(|e| e.file_name().to_string_lossy().contains(".backup-")));
+        assert!(!metrics(&ctl).unwrap().contains("rekcod_last_backup_timestamp_seconds 0\n"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backups_are_kept_hourly_then_daily_then_weekly() {
+        // Hourly for 60 days, newest last.
+        let t0 = 1_790_000_000u64;
+        let keys: Vec<String> = (0..60 * 24).map(|h| format!("fleet-{}.db", crate::s3::amz_date(t0 + h * 3600))).collect();
+        let gone = expired_backups(&keys);
+        let kept: Vec<&String> = keys.iter().filter(|k| !gone.contains(k)).collect();
+        // 48 hours (2 to 3 days), the days before them back to 14, then weeks back to 8;
+        // the newest of a day or week may already be kept as an hourly or daily one.
+        assert!((48 + 11 + 5..=48 + 12 + 6).contains(&kept.len()), "{} kept", kept.len());
+        assert!(keys[keys.len() - 48..].iter().all(|k| !gone.contains(k)), "the newest 48 stay");
+        let oldest = kept.iter().min().unwrap();
+        assert!(**oldest < keys[keys.len() - 24 * 40], "weeklies go back more than a month: {oldest}");
+        assert!(gone.contains(&keys[0]), "60 days back is past 8 weeks");
+        // Names it can't read are never deleted.
+        assert!(expired_backups(&["fleet-garbage.db".to_string()]).is_empty());
+    }
 }
 
 /// HMAC-SHA256 of the body, as GitHub sends it in `X-Hub-Signature-256`.
@@ -5460,7 +5592,11 @@ const PREVIEW_LABEL: &str = "rekcod-preview";
 const RELEASES: &str = "rekcod-releases";
 const CACHE: &str = "rekcod-cache";
 const BACKUPS: &str = "rekcod-backups";
-const KEEP_BACKUPS: usize = 48;
+/// Backups kept: the newest 48 (two days of hourly ones), then the newest of each of the last
+/// 14 days and of each of the last 8 weeks.
+const KEEP_HOURLY: usize = 48;
+const KEEP_DAILY: usize = 14;
+const KEEP_WEEKLY: usize = 8;
 
 /// `app-<app key>`; a hash of the key when that isn't a valid bucket name (too long). New
 /// apps can't have a 32-hex key (`looks_hashed`), so the two spellings don't meet, and
@@ -5710,45 +5846,154 @@ fn drop_release_store(c: &Controller, app: &str) -> Result<()> {
     gone(s.delete(CACHE, &format!("{app}.tar.zst")))
 }
 
-/// Uploads `fleet.db` (a `VACUUM INTO` copy, so nothing stops) as `fleet-<UTC time>.db` and
-/// keeps the newest 48. `controller/secret-key` isn't in it: keep that somewhere else.
+/// Backup names (`fleet-YYYYMMDDTHHMMSSZ.db`) to delete under [`KEEP_HOURLY`],
+/// [`KEEP_DAILY`] and [`KEEP_WEEKLY`]. Names that don't parse are never deleted.
+fn expired_backups(keys: &[String]) -> Vec<String> {
+    // Days since 1970 for a `YYYYMMDD` (Howard Hinnant's days-from-civil).
+    let day = |k: &str| -> Option<i64> {
+        let d = k.strip_prefix("fleet-")?.get(..8)?;
+        let (y, m, dd): (i64, i64, i64) = (d.get(..4)?.parse().ok()?, d.get(4..6)?.parse().ok()?, d.get(6..)?.parse().ok()?);
+        let y = if m <= 2 { y - 1 } else { y };
+        let era = y.div_euclid(400);
+        let yoe = y - era * 400;
+        let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + dd - 1;
+        Some(era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468)
+    };
+    let mut dated: Vec<(&String, i64)> = keys.iter().filter_map(|k| day(k).map(|d| (k, d))).collect();
+    // Newest first: the names sort by time.
+    dated.sort_by(|a, b| b.0.cmp(a.0));
+    let mut keep: std::collections::HashSet<&String> = dated.iter().take(KEEP_HOURLY).map(|(k, _)| *k).collect();
+    for (period, count) in [(1, KEEP_DAILY), (7, KEEP_WEEKLY)] {
+        let mut seen = Vec::new();
+        for (k, d) in &dated {
+            let p = d.div_euclid(period);
+            if !seen.contains(&p) {
+                if seen.len() == count {
+                    break;
+                }
+                seen.push(p);
+                keep.insert(k);
+            }
+        }
+    }
+    dated.iter().filter(|(k, _)| !keep.contains(k)).map(|(k, _)| (*k).clone()).collect()
+}
+
+/// `<db><suffix>`: SQLite names its side files (`-wal`, `-shm`) by appending to the whole
+/// file name, whatever its extension.
+fn side_file(db: &Path, suffix: &str) -> PathBuf {
+    let mut s = db.as_os_str().to_owned();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+/// Held by a running controller on `<db>.lock`; `controller restore` refuses while it is.
+fn hold_db(db: &Path) -> Result<std::fs::File> {
+    let lock = side_file(db, ".lock");
+    if crate::paths::locked(&lock) {
+        bail!("another controller is using {}", db.display());
+    }
+    crate::paths::lock(&lock)
+}
+
+/// Copies `tmp` into `dir` as `key`, 0600, through a temporary name so a crash can't leave
+/// a truncated file that sorts as the newest, then applies retention there.
+fn backup_to_dir(dir: &Path, tmp: &Path, key: &str) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    if !dir.exists() {
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    }
+    let part = dir.join(format!(".{key}.part"));
+    let _ = std::fs::remove_file(&part);
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&part)?;
+    let copied = std::io::copy(&mut std::fs::File::open(tmp)?, &mut f).and_then(|_| f.sync_all());
+    if let Err(e) = copied {
+        let _ = std::fs::remove_file(&part);
+        return Err(e.into());
+    }
+    std::fs::rename(&part, dir.join(key))?;
+    let names: Vec<String> = std::fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("fleet-"))
+        .collect();
+    for n in expired_backups(&names) {
+        let _ = std::fs::remove_file(dir.join(n));
+    }
+    Ok(())
+}
+
+/// Uploads `tmp` as `key` to the backups bucket, then applies retention there; returns how
+/// many it keeps.
+fn backup_to_s3(s: &crate::s3::S3, tmp: &Path, key: &str) -> Result<usize> {
+    s.create_bucket(BACKUPS)?;
+    s.put(BACKUPS, key, crate::s3::Body::File(tmp))?;
+    let all: Vec<String> = s.list(BACKUPS, "fleet-")?.into_iter().map(|o| o.key).collect();
+    let old = expired_backups(&all);
+    if !old.is_empty() {
+        s.delete_many(BACKUPS, &old.iter().map(|k| (k.clone(), None)).collect::<Vec<_>>())?;
+    }
+    Ok(all.len() - old.len())
+}
+
+/// Copies `fleet.db` (a `VACUUM INTO` copy, so nothing stops) as `fleet-<UTC time>.db` to
+/// RustFS and to `--backup-dir`, each on its own: one failing doesn't stop the other, and
+/// the error names the one that failed. `controller/secret-key` isn't in it: keep that
+/// somewhere else. The copies hold node secrets and the join token, so they're 0600.
 fn backup(c: &Controller) -> Result<Value> {
     let s = c.storage.as_ref();
     if s.is_none() && c.backup_dir.is_none() {
         bail!("no backup target: start the controller with --storage or --backup-dir");
     }
-    let tmp = std::env::temp_dir().join(format!("rekcod-fleet-{}.db", sandbox::new_id()?));
-    let path = tmp.display().to_string();
+    // Next to the database (the 0700 controller directory by default), never in /tmp.
+    let tmp = side_file(&c.db_path, &format!(".backup-{}", sandbox::new_id()?));
     let r = (|| -> Result<Value> {
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            // VACUUM INTO takes an empty file; made here first, it is 0600 from the start.
+            std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+        }
         // Its own connection: WAL lets it read while requests keep using the main one.
-        rusqlite::Connection::open(&c.db_path)?.execute("vacuum into ?1", [&path])?;
+        rusqlite::Connection::open(&c.db_path)?.execute("vacuum into ?1", [tmp.display().to_string()])?;
         let key = format!("fleet-{}.db", crate::s3::amz_date(now() as u64));
+        let mut out = json!({"backup": key});
+        let mut failed = Vec::new();
         // A copy off the RustFS disk (which on a server is the controller's own disk).
         if let Some(dir) = &c.backup_dir {
-            std::fs::create_dir_all(dir)?;
-            std::fs::copy(&tmp, dir.join(&key))?;
-            let mut local: Vec<PathBuf> = std::fs::read_dir(dir)?
-                .flatten()
-                .map(|e| e.path())
-                .filter(|p| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with("fleet-")))
-                .collect();
-            local.sort();
-            for p in &local[..local.len().saturating_sub(KEEP_BACKUPS)] {
-                let _ = std::fs::remove_file(p);
+            match backup_to_dir(dir, &tmp, &key) {
+                Ok(()) => out["dir"] = json!(dir),
+                Err(e) => failed.push(format!("--backup-dir {}: {e:#}", dir.display())),
             }
         }
-        let Some(s) = s else { return Ok(json!({"backup": key, "dir": c.backup_dir})) };
-        s.create_bucket(BACKUPS)?;
-        s.put(BACKUPS, &key, crate::s3::Body::File(&tmp))?;
-        let mut all: Vec<String> = s.list(BACKUPS, "fleet-")?.into_iter().map(|o| o.key).collect();
-        all.sort();
-        let old = all.len().saturating_sub(KEEP_BACKUPS);
-        for k in &all[..old] {
-            s.delete(BACKUPS, k)?;
+        if let Some(s) = s {
+            match backup_to_s3(s, &tmp, &key) {
+                Ok(kept) => {
+                    out["bucket"] = json!(BACKUPS);
+                    out["kept"] = json!(kept);
+                }
+                Err(e) => failed.push(format!("{BACKUPS} on {}: {e:#}", s.endpoint)),
+            }
         }
-        Ok(json!({"backup": key, "bucket": BACKUPS, "kept": all.len() - old}))
+        if failed.is_empty() {
+            return Ok(out);
+        }
+        let saved = [out.get("dir").map(|_| "--backup-dir"), out.get("bucket").map(|_| BACKUPS)].into_iter().flatten().collect::<Vec<_>>();
+        bail!(
+            "{}{}",
+            failed.join("; "),
+            if saved.is_empty() { String::new() } else { format!(" ({key} was saved to {})", saved.join(" and ")) }
+        )
     })();
     let _ = std::fs::remove_file(&tmp);
+    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    match &r {
+        Ok(_) => db.execute("insert or replace into config values ('last_backup_ok', ?1)", &[&now().to_string()])?,
+        Err(_) => db.execute(
+            "insert into config values ('backup_failures', '1')
+             on conflict(key) do update set value = cast(value as integer) + 1",
+            &[],
+        )?,
+    };
     r
 }
 
@@ -5769,28 +6014,48 @@ fn backup_due(c: &Controller) -> Result<()> {
 }
 
 /// `rekcod controller restore`: puts a backup in place of fleet.db (the old file is kept
-/// next to it). The controller must be stopped; it needs the same `controller/secret-key`.
-pub fn controller_restore(paths: &Paths, db: Option<PathBuf>, key: Option<&str>, creds: Option<PathBuf>) -> Result<()> {
-    let s = crate::storage::read_credentials(&creds.unwrap_or_else(|| crate::storage::credentials_file(paths)))?;
-    let key = match key {
-        Some(k) => k.to_string(),
-        None => {
-            let mut all: Vec<String> = s.list(BACKUPS, "fleet-")?.into_iter().map(|o| o.key).collect();
-            all.sort();
-            all.pop().context("no backups in rekcod-backups")?
-        }
-    };
+/// next to it): the latest in RustFS, the one named `key` there, or the file `from` (a
+/// `--backup-dir` copy, or one copied off the server), which needs no storage. The
+/// controller must be stopped; it needs the same `controller/secret-key`.
+pub fn controller_restore(
+    paths: &Paths,
+    db: Option<PathBuf>,
+    key: Option<&str>,
+    creds: Option<PathBuf>,
+    from: Option<PathBuf>,
+) -> Result<()> {
     let db = db.unwrap_or_else(|| paths.home.join("controller").join("fleet.db"));
     std::fs::create_dir_all(db.parent().context("no parent")?)?;
     let tmp = db.with_extension("restoring");
-    let r = s.get(BACKUPS, &key, &mut std::fs::File::create(&tmp)?).and_then(|_| restore_file(&tmp, &db));
+    let (what, r) = match from {
+        // A copy: restoring changes the file it restores.
+        Some(f) => {
+            let r =
+                std::fs::copy(&f, &tmp).with_context(|| format!("read {}", f.display())).map(|_| ()).and_then(|()| restore_file(&tmp, &db));
+            (f.display().to_string(), r)
+        }
+        None => {
+            let s = crate::storage::read_credentials(&creds.unwrap_or_else(|| crate::storage::credentials_file(paths)))
+                .context("restoring from RustFS needs its keys; --from FILE restores a backup file instead")?;
+            let key = match key {
+                Some(k) => k.to_string(),
+                None => {
+                    let mut all: Vec<String> = s.list(BACKUPS, "fleet-")?.into_iter().map(|o| o.key).collect();
+                    all.sort();
+                    all.pop().context("no backups in rekcod-backups")?
+                }
+            };
+            let r = s.get(BACKUPS, &key, &mut std::fs::File::create(&tmp)?).and_then(|_| restore_file(&tmp, &db));
+            (key, r)
+        }
+    };
     if r.is_err() {
-        for ext in ["restoring", "restoring-wal", "restoring-shm"] {
-            let _ = std::fs::remove_file(db.with_extension(ext));
+        for f in [tmp.clone(), side_file(&tmp, "-wal"), side_file(&tmp, "-shm")] {
+            let _ = std::fs::remove_file(f);
         }
     }
-    r.with_context(|| format!("{key}: nothing was replaced"))?;
-    println!("restored {key} to {}; start the controller again", db.display());
+    r.with_context(|| format!("{what}: nothing was replaced"))?;
+    println!("restored {what} to {}; start the controller again", db.display());
     Ok(())
 }
 
@@ -5834,19 +6099,33 @@ fn check_backup(path: &Path) -> Result<()> {
 }
 
 /// Puts the backup at `tmp` in place of `db` once it checks out; the old file is kept as
-/// `fleet.db.before-restore-<time>`.
+/// `<db>.before-restore-<time>`, with the writes its WAL held folded in (or the WAL kept
+/// beside it). Refused while a controller has `db` open.
 fn restore_file(tmp: &Path, db: &Path) -> Result<()> {
     check_backup(tmp)?;
+    let lock = side_file(db, ".lock");
+    if crate::paths::locked(&lock) {
+        bail!("a controller is running on {}; stop it first", db.display());
+    }
+    let _held = crate::paths::lock(&lock)?;
     // Whatever ran when the backup was taken may not run now: the first reconcile checks
     // each instance and takes back the ones that answer.
     Db::open(tmp)?.execute("update instances set state = 'lost' where state in ('live', 'sleeping', 'starting')", &[])?;
     if db.exists() {
-        let keep = db.with_extension(format!("db.before-restore-{}", now()));
+        // A controller stopped by a signal leaves its last writes in the WAL.
+        if let Ok(old) = rusqlite::Connection::open(db) {
+            let _ = old.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
+        }
+        let keep = side_file(db, &format!(".before-restore-{}", now()));
         std::fs::rename(db, &keep)?;
+        // Moved, not deleted: SQLite would replay a WAL left here into the restored file.
+        for suffix in ["-wal", "-shm"] {
+            let f = side_file(db, suffix);
+            if f.exists() {
+                std::fs::rename(&f, side_file(&keep, suffix))?;
+            }
+        }
         eprintln!("rekcod: the old database is at {}", keep.display());
-    }
-    for ext in ["db-wal", "db-shm"] {
-        let _ = std::fs::remove_file(db.with_extension(ext));
     }
     std::fs::rename(tmp, db)?;
     Ok(())
@@ -5900,6 +6179,8 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     let dir = paths.home.join("controller");
     std::fs::create_dir_all(&dir)?;
     let db_path = o.db.clone().unwrap_or_else(|| dir.join("fleet.db"));
+    // `controller restore` refuses while this is held.
+    let _running = hold_db(&db_path)?;
     let mut db = Db::open(&db_path)?;
     for (key, file) in [("join_token", "join-token"), ("webhook_secret", "webhook-secret")] {
         let v = match db.query_opt("select value from config where key = ?1", &[&key])? {
@@ -6046,6 +6327,9 @@ fn graceful_exit(c: Option<Arc<Controller>>) {
                     std::thread::sleep(Duration::from_millis(200));
                 }
             }
+            // `exit` skips closing the database: fold the WAL into fleet.db now.
+            let db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _ = db.0.query_row("pragma wal_checkpoint(truncate)", [], |_| Ok(()));
         }
         std::process::exit(0);
     });

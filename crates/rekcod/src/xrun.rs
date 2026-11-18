@@ -441,7 +441,17 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
             bail!("--secret {s}: not set in this shell's environment");
         }
     }
-    let target = if opts.sandbox { sandbox_boot(paths, &project)? } else { main_boot(paths)? };
+    // Held (shared) for as long as this run uses the sandbox VM; see [`only_user`].
+    let mut users = None;
+    let target = if opts.sandbox {
+        let sb = sandbox_paths(paths)?;
+        let lock = users_lock(&sb)?;
+        let sb = sandbox_boot(paths, &project, &lock)?;
+        users = Some(lock);
+        sb
+    } else {
+        main_boot(paths)?
+    };
     let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
     let git = if opts.sandbox { git_entries(&project, &plan.local_dirs) } else { GitEntries::new() };
     let args = docker_args(&project, cmd, &plan, &opts, tty, &git);
@@ -464,9 +474,11 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
         }
     });
     let status = docker.status().context("run docker")?;
-    if !opts.keep {
+    // Another `rekcod x --sandbox` still using the VM keeps it up.
+    if !opts.keep && users.as_ref().is_some_and(only_user) {
         let _ = crate::cli::stop_daemon(&target);
     }
+    drop(users);
     let made = new_git_entries(&git, &git_entries(&project, &plan.local_dirs));
     if !made.is_empty() {
         // A bind can't cover a .git that didn't exist yet.
@@ -499,17 +511,52 @@ pub fn sandbox_paths(paths: &Paths) -> Result<Paths> {
     Paths::at(paths.home.join("sandbox"))
 }
 
-/// Boots the sandbox VM for `project`, replacing one running for another directory.
-fn sandbox_boot(paths: &Paths, project: &Path) -> Result<Paths> {
+/// A shared `flock` on the sandbox VM's `run/x-users`, held by every `rekcod x --sandbox`
+/// from before it boots the VM until its command ends.
+fn users_lock(sb: &Paths) -> Result<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = sb.home.join("run/x-users");
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path)?;
+    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_SH) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| format!("lock {}", path.display()));
+    }
+    Ok(f)
+}
+
+/// Whether the holder of `lock` is the VM's only user: it trades its shared lock for an
+/// exclusive one, which succeeds only when nobody else holds one. Keeps the lock either way
+/// (exclusive on true, shared again on false).
+fn only_user(lock: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return true;
+    }
+    // A failed conversion may have dropped the shared lock.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH) };
+    false
+}
+
+/// Boots the sandbox VM for `project`, replacing one running for another directory when no
+/// other `rekcod x --sandbox` uses it (`users` is this run's shared lock).
+fn sandbox_boot(paths: &Paths, project: &Path, users: &std::fs::File) -> Result<Paths> {
     let sb = sandbox_paths(paths)?;
     if crate::cli::running_pid(&sb).is_some() {
         let status: serde_json::Value =
             std::fs::read(sb.status_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-        if status["project"].as_str().map(PathBuf::from).as_deref() == Some(project) {
+        let running = status["project"].as_str().map(PathBuf::from);
+        if running.as_deref() == Some(project) {
             return Ok(sb);
         }
+        if !only_user(users) {
+            bail!(
+                "the sandbox VM is running `rekcod x --sandbox` for {}; one directory at a time, so wait for that to finish",
+                running.map(|p| p.display().to_string()).unwrap_or_else(|| "another directory".into())
+            );
+        }
         eprintln!("rekcod: restarting the sandbox VM for {}", project.display());
-        crate::cli::stop_daemon(&sb)?;
+        let stopped = crate::cli::stop_daemon(&sb);
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(users), libc::LOCK_SH) };
+        stopped?;
     }
     let t0 = Instant::now();
     eprintln!("rekcod: starting a sandbox VM that sees only {}", project.display());
@@ -669,6 +716,20 @@ mod tests {
         std::fs::write(dir.join("sub/vendor/.git"), "gitdir: /tmp/evil").unwrap();
         let made = new_git_entries(&git, &git_entries(&dir, &["node_modules"]));
         assert_eq!(made, vec![PathBuf::from("new/.git"), PathBuf::from("sub/vendor/.git")]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_vm_stops_only_after_its_last_user() {
+        let dir = std::env::temp_dir().join(format!("rekcod-x-users-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let sb = Paths::at(dir.clone()).unwrap();
+        let (a, b) = (users_lock(&sb).unwrap(), users_lock(&sb).unwrap());
+        assert!(!only_user(&a));
+        // A's failed try left it a shared lock: B isn't alone either.
+        assert!(!only_user(&b));
+        drop(b);
+        assert!(only_user(&a));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

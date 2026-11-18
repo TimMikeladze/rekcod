@@ -181,9 +181,14 @@ pub fn expect_node(authority: &str, id: &str, host_named: bool) {
         .insert(authority.to_ascii_lowercase(), (id.to_string(), host_named));
 }
 
-pub fn forget_node(authority: &str) {
+/// Drops what the controller expects at `authority`, if that's node `id`: another node's row
+/// at the same address going away leaves this one's expectation alone.
+pub fn forget_node(authority: &str, id: &str) {
     if let Some(m) = NODES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
-        m.remove(&authority.to_ascii_lowercase());
+        let key = authority.to_ascii_lowercase();
+        if m.get(&key).is_some_and(|(n, _)| n == id) {
+            m.remove(&key);
+        }
     }
 }
 
@@ -441,6 +446,45 @@ pub fn fetch_ca(base: &str, want: &str) -> Result<String> {
     Ok(pem_of(&der))
 }
 
+/// The node CA every test that dials a node through `connect` shares: `trust_by_default`
+/// takes the first CA it's given for the life of the process.
+#[cfg(test)]
+pub(crate) fn test_node_ca() -> Ca {
+    static DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+    let dir = DIR.get_or_init(|| {
+        let d = std::env::temp_dir().join(format!("rekcod-test-node-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        trust_by_default(&ensure_node_ca(&d).unwrap().pem).unwrap();
+        d
+    });
+    ensure_node_ca(dir).unwrap()
+}
+
+/// Reads a request head. A test server must read all of it: closing with some unread resets
+/// the connection before the client reads the reply.
+#[cfg(test)]
+fn read_head(s: ServerStream) -> std::io::BufReader<ServerStream> {
+    let mut r = std::io::BufReader::new(s);
+    let mut line = String::new();
+    while std::io::BufRead::read_line(&mut r, &mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
+        line.clear();
+    }
+    r
+}
+
+/// Serves `cert` on a listener; each connection reads a request and gets `200 {}`.
+#[cfg(test)]
+pub(crate) fn test_https_server(l: std::net::TcpListener, cert: &str, key: &str) {
+    let server = server_config(cert, key).unwrap();
+    std::thread::spawn(move || {
+        for tcp in l.incoming().flatten() {
+            let Ok(s) = accept(Some(&server), tcp) else { continue };
+            let _ = read_head(s).get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -506,9 +550,9 @@ mod tests {
         let body = bundle.clone();
         std::thread::spawn(move || {
             for tcp in l.incoming().flatten() {
-                let Ok(mut s) = accept(Some(&server), tcp) else { continue };
-                let _ = s.read(&mut [0u8; 4096]);
-                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let Ok(s) = accept(Some(&server), tcp) else { continue };
+                let _ =
+                    write!(read_head(s).get_mut(), "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
             }
         });
         let err = fetch_ca(&format!("https://{addr}"), &real.fingerprint().unwrap()).unwrap_err();

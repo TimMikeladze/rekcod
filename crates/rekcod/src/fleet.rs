@@ -307,6 +307,24 @@ pub fn check_plain_http(authority: &str, what: &str) -> Result<()> {
     )
 }
 
+/// Tells `tls::connect` which node answers at each https address. Nodes that joined before
+/// node certificates named the node hold one for their host; the controller accepts that from
+/// those nodes only, recorded the first time it starts.
+fn expect_nodes(db: &mut Db) -> Result<()> {
+    if db.query_opt("select 1 from config where key = 'host_named_nodes'", &[])?.is_none() {
+        let ids: Vec<String> = db.query("select id from nodes where url like 'https://%'", &[])?.iter().map(|r| r.get(0)).collect();
+        db.execute("insert into config values ('host_named_nodes', ?1)", &[&ids.join(" ")])?;
+    }
+    let host_named: String = db.query_one("select value from config where key = 'host_named_nodes'", &[])?.get(0);
+    for r in db.query("select id, url from nodes where url like 'https://%'", &[])? {
+        let (id, url): (String, String) = (r.get(0), r.get(1));
+        if let Ok(a) = authority(&url) {
+            crate::tls::expect_node(&a, &id, host_named.split(' ').any(|h| h == id));
+        }
+    }
+    Ok(())
+}
+
 /// The git remote URL and HEAD commit of `dir`, for remote creates and deploys.
 pub fn git_origin(dir: &Path) -> Result<(String, String)> {
     let run = |args: &[&str]| -> Result<String> {
@@ -2360,12 +2378,12 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                     if pending >= 20 {
                         bail!("20 nodes are already waiting for approval; approve or remove some first");
                     }
-                    // The controller finds a node's expected certificate by its address.
-                    if https
-                        && db
-                            .query("select url from nodes", &[])?
-                            .iter()
-                            .any(|r| authority(&r.get::<String>(0)).is_ok_and(|o| o.eq_ignore_ascii_case(&a)))
+                    // The controller finds a node's expected certificate by its address, so no
+                    // two nodes share one, whatever their schemes.
+                    if db
+                        .query("select url from nodes", &[])?
+                        .iter()
+                        .any(|r| authority(&r.get::<String>(0)).is_ok_and(|o| o.eq_ignore_ascii_case(&a)))
                     {
                         bail!("another node already registered {a}");
                     }
@@ -2515,8 +2533,9 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         ("DELETE", ["nodes", id]) => admin_only().and_then(|_| {
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let Some(gone) = db.query_opt("delete from nodes where id = ?1 returning url", &[id])? else { bail!("no node {id}") };
-            if let Ok(a) = authority(&gone.get::<String>(0)) {
-                crate::tls::forget_node(&a);
+            let url: String = gone.get(0);
+            if let (true, Ok(a)) = (url.starts_with("https://"), authority(&url)) {
+                crate::tls::forget_node(&a, id);
             }
             db.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping', 'starting')", &[id])?;
             db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[id])?;
@@ -5335,6 +5354,64 @@ mod job_and_node_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The controller dials a node by its address. Registration refuses a second node there
+    /// in either scheme; a row that got in anyway (an older release, a restore) going away must
+    /// not change which node the controller expects.
+    #[test]
+    fn removing_a_node_keeps_another_nodes_certificate_at_that_address() {
+        let (url, c) = serve({
+            let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+            ctl.node_ca = Some(crate::tls::test_node_ca());
+            ctl
+        });
+        let mut db = c.db.lock().unwrap();
+        db.execute("insert or replace into config values ('join_token', 'jt')", &[]).unwrap();
+        db.execute("insert into tokens (token, name, admin, hashed) values (?1, 'admin', 1, 1)", &[&hash_token("admin-t")]).unwrap();
+        drop(db);
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = l.local_addr().unwrap();
+        let reg = |u: &str| call(&url, "POST", "/nodes/register", None, &json!({"join_token": "jt", "url": u, "mem_total_mib": 1024}));
+        let node = reg(&format!("https://{a}")).unwrap();
+        crate::tls::test_https_server(l, node["cert"].as_str().unwrap(), node["key"].as_str().unwrap());
+        let e = reg(&format!("http://{a}")).unwrap_err().to_string();
+        assert!(e.contains("already registered"), "{e}");
+        assert!(call(&format!("https://{a}"), "GET", "/", None, &Value::Null).is_ok());
+        c.db.lock()
+            .unwrap()
+            .execute("insert into nodes (id, url, secret, state) values ('n-dup', ?1, 's', 'ready')", &[&format!("https://{a}")])
+            .unwrap();
+        call(&url, "DELETE", "/nodes/n-dup", Some("admin-t"), &Value::Null).unwrap();
+        let r = call(&format!("https://{a}"), "GET", "/", None, &Value::Null);
+        assert!(r.is_ok(), "still dials the node by its name: {r:?}");
+        // Removing the node itself forgets it: its address has no CA of its own.
+        call(&url, "DELETE", &format!("/nodes/{}", node["id"].as_str().unwrap()), Some("admin-t"), &Value::Null).unwrap();
+        assert!(call(&format!("https://{a}"), "GET", "/", None, &Value::Null).is_err());
+    }
+
+    /// A node from before node-named certificates holds one naming its host. The first start
+    /// after the upgrade records it, and from then on only it may present one.
+    #[test]
+    fn nodes_from_before_node_names_are_dialed_by_host() {
+        let ca = crate::tls::test_node_ca();
+        let ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        let mut db = ctl.db.lock().unwrap();
+        db.execute("delete from config where key = 'host_named_nodes'", &[]).unwrap();
+        let node = |db: &mut Db, id: &str| {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("https://{}", l.local_addr().unwrap());
+            let (cert, key) = ca.issue(&["127.0.0.1".into()]).unwrap();
+            crate::tls::test_https_server(l, &cert, &key);
+            db.execute("insert into nodes (id, url, secret, state) values (?1, ?2, 's', 'ready')", &[&id, &url]).unwrap();
+            url
+        };
+        let old = node(&mut db, "n-old");
+        expect_nodes(&mut db).unwrap();
+        let new = node(&mut db, "n-new");
+        expect_nodes(&mut db).unwrap();
+        assert!(send(&old, "GET", "/", None, b"").is_ok());
+        assert!(send(&new, "GET", "/", None, b"").is_err(), "a node that joined later must present its node name");
+    }
+
     #[test]
     fn restore_takes_only_a_whole_fleet_database() {
         let dir = temp("restore");
@@ -5942,19 +6019,7 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     for f in ["join-token", "webhook-secret", "admin-token"] {
         std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o600))?;
     }
-    // Nodes that joined before node certificates named the node hold one for their host; the
-    // controller accepts that from those nodes only, recorded the first time it starts.
-    if db.query_opt("select 1 from config where key = 'host_named_nodes'", &[])?.is_none() {
-        let ids: Vec<String> = db.query("select id from nodes where url like 'https://%'", &[])?.iter().map(|r| r.get(0)).collect();
-        db.execute("insert into config values ('host_named_nodes', ?1)", &[&ids.join(" ")])?;
-    }
-    let host_named: String = db.query_one("select value from config where key = 'host_named_nodes'", &[])?.get(0);
-    for r in db.query("select id, url from nodes where url like 'https://%'", &[])? {
-        let (id, url): (String, String) = (r.get(0), r.get(1));
-        if let Ok(a) = authority(&url) {
-            crate::tls::expect_node(&a, &id, host_named.split(' ').any(|h| h == id));
-        }
-    }
+    expect_nodes(&mut db)?;
     let sealed: i64 = db.query_one("select count(*) from apps where secrets <> '{}' or storage_secret is not null", &[])?.get(0);
     let key = secret_key(&dir.join("secret-key"), sealed)?;
     let mut ctl = Controller::new(db, o.domain, o.drain_secs, key);

@@ -161,7 +161,7 @@ fn root(args: &[&str]) -> Result<Output> {
     }
     let out = sudo.args(args).stdin(Stdio::inherit()).output()?;
     if !out.status.success() && String::from_utf8_lossy(&out.stderr).contains("password is required") {
-        bail!("installing a LaunchDaemon needs sudo; run this in a terminal (`sudo -v` first)");
+        bail!("changing a LaunchDaemon needs sudo; run this in a terminal (`sudo -v` first)");
     }
     Ok(out)
 }
@@ -188,6 +188,46 @@ pub fn install(paths: &Paths, name: &str, args: &[String]) -> Result<()> {
 
 pub fn installed(name: &str) -> bool {
     plist_path(name).is_ok_and(|p| p.exists()) || is_daemon(name)
+}
+
+/// The job's plist: the daemon's when there is one, else the agent's.
+fn job_plist(name: &str) -> Option<PathBuf> {
+    if is_daemon(name) {
+        return Some(daemon_path(name));
+    }
+    plist_path(name).ok().filter(|p| p.exists())
+}
+
+/// The `REKCOD_HOME` a plist runs its job with; none means the default home.
+fn recorded_home(plist: &Path) -> Option<PathBuf> {
+    let out = Command::new("/usr/bin/plutil")
+        .args(["-extract", "EnvironmentVariables.REKCOD_HOME", "raw", "-o", "-"])
+        .arg(plist)
+        .output()
+        .ok()?;
+    let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !h.is_empty()).then(|| PathBuf::from(h))
+}
+
+/// Whether a job recorded with `recorded` (its plist's `REKCOD_HOME`) is this home's.
+/// Labels carry no home, so another home's `--install` or `uninstall` must not touch it.
+fn owns(paths: &Paths, recorded: Option<&Path>) -> bool {
+    match recorded {
+        Some(h) => h == paths.home,
+        None => paths.is_default_home(),
+    }
+}
+
+/// Whether job `name` is installed for this rekcod home.
+pub fn installed_here(paths: &Paths, name: &str) -> bool {
+    job_plist(name).is_some_and(|p| owns(paths, recorded_home(&p).as_deref()))
+}
+
+/// The home a job installed for another rekcod home runs with, if it is one.
+fn other_home(paths: &Paths, name: &str) -> Option<String> {
+    let p = job_plist(name)?;
+    let recorded = recorded_home(&p);
+    (!owns(paths, recorded.as_deref())).then(|| recorded.map_or("~/.rekcod".into(), |h| h.display().to_string()))
 }
 
 /// Starts the job now if it isn't running (no-op otherwise).
@@ -225,7 +265,11 @@ pub fn install_with(paths: &Paths, name: &str, args: &[String], crash_only: bool
     let log = paths.home.join("logs").join(format!("{name}.log"));
     std::fs::create_dir_all(log.parent().context("log dir")?)?;
     let home = (!paths.is_default_home()).then_some(paths.home.as_path());
-    if std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some() {
+    let dry = std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some();
+    if !dry && let Some(other) = other_home(paths, name) {
+        bail!("{} is installed for the rekcod home {other}; remove it there first (`rekcod uninstall` with that REKCOD_HOME)", label(name));
+    }
+    if dry {
         let path = paths.home.join(format!("{}.plist", label(name)));
         std::fs::write(&path, plist_with(name, &exe, args, &log, home, crash_only, None))?;
         println!("wrote {} (dry run: not loaded)", path.display());
@@ -392,6 +436,28 @@ mod tests {
         assert!(ok, "plutil rejected:\n{p}");
         let vm = plist_with("vm", Path::new("/r"), &["start".into()], Path::new("/l"), None, true, None);
         assert!(vm.contains("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"), "{vm}");
+    }
+
+    /// A job is this home's when its plist names this home, or names none and this is
+    /// ~/.rekcod.
+    #[test]
+    fn jobs_belong_to_the_home_in_their_plist() {
+        let dir = std::env::temp_dir().join(format!("rekcod-owns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let default = Paths { home: PathBuf::from(std::env::var_os("HOME").unwrap()).join(".rekcod") };
+        let other = Paths { home: dir.join("h") };
+        let plist = |home: Option<&Path>| {
+            let f = dir.join(format!("{}.plist", home.is_some()));
+            std::fs::write(&f, plist_with("vm", Path::new("/r"), &["start".into()], Path::new("/l"), home, true, None)).unwrap();
+            recorded_home(&f)
+        };
+        let none = plist(None);
+        assert_eq!(none, None);
+        assert!(owns(&default, none.as_deref()) && !owns(&other, none.as_deref()));
+        let h = plist(Some(&other.home));
+        assert_eq!(h.as_deref(), Some(other.home.as_path()));
+        assert!(owns(&other, h.as_deref()) && !owns(&default, h.as_deref()));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A daemon names its user and gets the environment a login would have set.

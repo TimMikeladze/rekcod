@@ -196,6 +196,22 @@ pub fn parse_hosts(raw: &str) -> (Vec<Host>, bool) {
     (hosts, local_current)
 }
 
+/// The docker contexts `host add` created (`rekcod uninstall` removes them with the key
+/// they need).
+pub fn contexts() -> Vec<String> {
+    let Ok(o) = docker::run(&["context", "ls", "--format", "{{json .}}"]) else { return Vec::new() };
+    owned_contexts(&String::from_utf8_lossy(&o.stdout))
+}
+
+fn owned_contexts(raw: &str) -> Vec<String> {
+    raw.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|v| v["Name"].as_str().is_some_and(|n| n.starts_with(PREFIX)))
+        .filter(|v| v["Description"].as_str().is_some_and(|d| d.starts_with(DESCRIPTION)))
+        .filter_map(|v| v["Name"].as_str().map(String::from))
+        .collect()
+}
+
 /// The hosts, and whether the local `rekcod` context is the current one.
 pub fn list() -> (Vec<Host>, bool) {
     match docker::run(&["context", "ls", "--format", "{{json .}}"]) {
@@ -901,6 +917,15 @@ mod tests {
         let (hosts, local) = parse_hosts(raw);
         assert!(!local);
         assert_eq!(hosts, [Host { name: "mac-mini".into(), endpoint: "ssh://me@mac-mini".into(), current: true, bonjour: None }]);
+    }
+
+    #[test]
+    fn only_contexts_host_add_made() {
+        let raw = r#"{"Name":"rekcod","Description":"rekcod VM"}
+{"Name":"rekcod-mini","Description":"rekcod host bonjour=x fp=y hostkey=ssh-ed25519:A"}
+{"Name":"rekcod-other","Description":"made by hand"}
+{"Name":"desktop","Description":"rekcod host"}"#;
+        assert_eq!(owned_contexts(raw), ["rekcod-mini"]);
     }
 
     #[test]

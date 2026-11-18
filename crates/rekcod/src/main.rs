@@ -199,10 +199,11 @@ enum Cmd {
         check: bool,
     },
     /// Stop rekcod and remove everything it set up: launchd jobs, the socket route, the
-    /// docker context, the ~/.zshenv block, firewall exceptions, pmset (as `server setup`
-    /// found it), and ~/.rekcod.
+    /// docker contexts, the ~/.zshenv block, firewall exceptions, pmset (as `server setup`
+    /// found it), and ~/.rekcod. Exits non-zero, keeping ~/.rekcod, when a step fails.
+    /// Under another REKCOD_HOME only that home's VM, sandboxes, jobs and directory.
     Uninstall {
-        /// Keep ~/.rekcod (VM disks, volumes, snapshots).
+        /// Keep ~/.rekcod (VM disks, volumes, snapshots, stopped agent sandboxes).
         #[arg(long)]
         keep_data: bool,
         /// Don't ask first.

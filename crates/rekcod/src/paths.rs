@@ -62,10 +62,19 @@ pub const DEFAULT_DISK_GIB: u64 = 256;
 
 /// `$REKCOD_HOME`, default `~/.rekcod`, without creating anything.
 pub fn home_dir() -> Result<PathBuf> {
-    Ok(match std::env::var_os("REKCOD_HOME") {
-        Some(h) => PathBuf::from(h),
-        None => PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".rekcod"),
-    })
+    match std::env::var_os("REKCOD_HOME") {
+        Some(h) => check_home(PathBuf::from(h)),
+        None => Ok(PathBuf::from(std::env::var_os("HOME").context("HOME not set")?).join(".rekcod")),
+    }
+}
+
+/// An absolute `REKCOD_HOME`. A relative one would mean another directory to every launchd
+/// job (they start in `/`) and to `uninstall`, which deletes the home.
+fn check_home(h: PathBuf) -> Result<PathBuf> {
+    if !h.is_absolute() {
+        bail!("REKCOD_HOME must be an absolute path, not {:?}", h.display().to_string());
+    }
+    Ok(h)
 }
 
 #[derive(Clone)]
@@ -270,6 +279,14 @@ mod tests {
         assert_eq!((mode(&paths.root_disk()), mode(&paths.data_disk())), (0o600, 0o600));
         assert!(paths.not_private().is_empty());
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn rekcod_home_is_absolute() {
+        for bad in ["", ".", "rel/home"] {
+            assert!(check_home(bad.into()).is_err(), "{bad:?}");
+        }
+        assert_eq!(check_home("/tmp/rk".into()).unwrap(), PathBuf::from("/tmp/rk"));
     }
 
     #[test]

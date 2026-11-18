@@ -986,6 +986,13 @@ enum AppCmd {
     Recycle {
         name: String,
     },
+    /// The app's GitHub webhook: the payload URL and secret for the repository's settings
+    /// (pull request events deploy previews). Made the first time; `--rotate` makes a new secret.
+    Webhook {
+        name: String,
+        #[arg(long)]
+        rotate: bool,
+    },
     /// Serve an app on the edge's public listener.
     Public {
         name: String,
@@ -1805,6 +1812,14 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
         AppCmd::Ls => remote_call(paths, remote, "GET", "/apps", &serde_json::Value::Null),
         AppCmd::Wake { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/wake"), &json!({})),
         AppCmd::Recycle { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/recycle"), &json!({})),
+        AppCmd::Webhook { name, rotate } => {
+            let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+            let method = if rotate { "POST" } else { "GET" };
+            let mut v = fleet::call(&r.url, method, &r.scoped(format!("/apps/{name}/webhook")), Some(&r.token), &json!({}))?;
+            v["payload_url"] = json!(format!("{}{}", r.url.trim_end_matches('/'), v["path"].as_str().unwrap_or("")));
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
         AppCmd::Public { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/visibility"), &json!({"public": true})),
         AppCmd::Private { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/visibility"), &json!({"public": false})),
         AppCmd::Status { name } => remote_call(paths, remote, "GET", &format!("/apps/{name}"), &serde_json::Value::Null),

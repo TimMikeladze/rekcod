@@ -377,6 +377,40 @@ your DNS. Marking an app public alone does not create the tunnel.
 Private apps are excluded from that public listener and remain accessible through
 the private edge on the configured tailnet or LAN.
 
+### Deploy pull request previews
+
+Each app has its own GitHub webhook. Print its payload URL and secret:
+
+```sh
+rekcod app webhook blog --remote mini
+```
+
+In the repository's settings, add a webhook with that payload URL and secret, content
+type `application/json`, and the "Pull requests" event. The secret is made the first
+time you ask for it and is stored encrypted like app secrets; `--rotate` replaces it,
+and the old one stops working. The hook only acts on events for the repository the app
+deploys from.
+
+Opening or pushing to a pull request deploys `blog-pr-N` from the PR's head commit,
+with the base app's env (not its secrets) and its own empty bucket if the app has one.
+Closing the PR destroys it. Previews stay private and sleep after 15 minutes unless the
+app sets `idle_stop`; they're removed after a week.
+
+A pull request from a fork runs someone else's code with the app's env and internet
+access, so it deploys only when a maintainer adds the `rekcod-preview` label, and only
+the head commit at that moment. A later push needs the label again: remove it and add it.
+With `GITHUB_TOKEN` set in the controller's environment, rekcod comments the preview URL
+on the PR and removes the label after each fork deploy. `GITHUB_API_URL` points it at
+GitHub Enterprise (default `https://api.github.com`).
+
+GitHub signs the body of each delivery. An identical body is handled once, and an event
+older than one already handled for that PR is ignored, so a replayed `closed` can't
+remove a reopened preview. A delivery that failed (no node had room, say) isn't recorded,
+so GitHub's Redeliver runs it again.
+
+The controller used to have one webhook secret for every app at `/webhooks/github`. That
+route is gone; set each repository's hook up again with `app webhook`.
+
 ### Back up the controller
 
 Server setup configures RustFS for release images, build caches and hourly controller

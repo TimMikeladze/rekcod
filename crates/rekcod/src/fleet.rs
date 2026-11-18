@@ -2055,6 +2055,8 @@ fn cleanup(c: &Arc<Controller>) -> Result<()> {
     {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         db.execute("delete from audit where ts < ?1", &[&cutoff])?;
+        db.execute("delete from deliveries where ts < ?1", &[&cutoff])?;
+        db.execute("delete from pr_seen where app not in (select name from apps)", &[])?;
         db.execute(&format!("delete from jobs where state not in {JOB_ACTIVE_SQL} and coalesce(finished, created) < ?1"), &[&cutoff])?;
         db.execute("update releases set log = '' where state in ('old', 'failed') and created < ?1", &[&cutoff])?;
     }
@@ -2356,7 +2358,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             format!("this controller runs rekcod {}, you have {v}; upgrade the older one (`rekcod upgrade`)", env!("CARGO_PKG_VERSION"));
         return respond(r.get_mut(), 400, "application/json", json!({"error": msg}).to_string().as_bytes());
     }
-    let open = matches!(all.as_slice(), ["nodes", "register"] | ["nodes", _, "heartbeat"] | ["webhooks", "github"]);
+    let open = matches!(all.as_slice(), ["nodes", "register"] | ["nodes", _, "heartbeat"] | ["webhooks", "github", ..]);
     if !open {
         let bearer = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         if c.caller(bearer)?.is_none() {
@@ -2519,7 +2521,10 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             })();
             return json_reply(&mut w, r);
         }
-        ("POST", ["webhooks", "github"]) => return json_reply(&mut w, github_webhook(c, &req)),
+        ("POST", ["webhooks", "github", hook_ns, app]) => return json_reply(&mut w, github_webhook(c, hook_ns, app, &req)),
+        ("POST", ["webhooks", "github"]) => {
+            return json_reply(&mut w, Err(anyhow!("the fleet-wide webhook is gone; each app has its own: `rekcod app webhook APP`")));
+        }
         _ => {}
     }
 
@@ -4537,6 +4542,25 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             let Some(commit) = live_commit(c, &app.name)? else { return Ok(json!({"updated": col})) };
             deploy(c, &load(name, Role::Member)?, Some(commit), &who.name)
         }
+        // The app's GitHub webhook: made on first ask, new with POST (the old one stops working).
+        ("GET", ["apps", name, "webhook"]) | ("POST", ["apps", name, "webhook"]) => {
+            let app = load(name, Role::Member)?;
+            if c.db().query_opt("select 1 from apps where name = ?1 and preview_of is not null", &[&app.name])?.is_some() {
+                bail!("{name} is a preview; its base app has the webhook");
+            }
+            let stored: Option<String> = c.db().query_one("select webhook_secret from apps where name = ?1", &[&app.name])?.get(0);
+            let secret = match stored {
+                Some(s) if method == "GET" => c.open_sealed(ns, &s)?,
+                _ => {
+                    let s = secret()?;
+                    c.db().execute("update apps set webhook_secret = ?2 where name = ?1", &[&app.name, &c.seal(ns, &s)?])?;
+                    c.audit(ns, &who.name, "webhook secret", name, true);
+                    s
+                }
+            };
+            Ok(json!({"app": name, "ns": ns, "path": format!("/webhooks/github/{ns}/{name}"), "secret": secret,
+                      "content_type": "application/json", "events": ["pull_request"]}))
+        }
         ("GET", ["apps", name, "releases", n]) => {
             let app = load(name, Role::Viewer)?;
             let n: i32 = n.parse().map_err(|_| anyhow!("release numbers are integers"))?;
@@ -5566,95 +5590,158 @@ pub fn github_signature(secret: &str, body: &[u8]) -> String {
     format!("sha256={}", m.finalize().into_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>())
 }
 
-/// Pull request events: deploy `<app>-pr-<n>` on push, destroy it on close.
-fn github_webhook(c: &Arc<Controller>, req: &crate::sandbox_api::Request) -> Result<Value> {
-    let secret = c.config("webhook_secret")?.context("no webhook secret")?;
-    let sig = req.headers.iter().find(|(k, _)| k == "x-hub-signature-256").map(|(_, v)| v.as_str()).unwrap_or("");
-    use crate::sandbox_api::ct_eq;
-    if !ct_eq(sig.as_bytes(), github_signature(&secret, &req.body).as_bytes()) {
-        bail!("bad signature");
+/// `/webhooks/github/NS/APP`, signed with that app's secret (`rekcod app webhook APP`):
+/// pull request events deploy `<app>-pr-<n>` on push and destroy it on close.
+fn github_webhook(c: &Arc<Controller>, ns: &str, app_name: &str, req: &crate::sandbox_api::Request) -> Result<Value> {
+    // One answer for an unknown app and a bad signature: the hook URL names apps.
+    let refuse = || anyhow!("bad signature");
+    let key = app_key(ns, app_name);
+    let row = c.db().query_opt("select webhook_secret from apps where name = ?1 and preview_of is null and destroying is null", &[&key])?;
+    let sealed: String = row.and_then(|r| r.get::<Option<String>>(0)).ok_or_else(refuse)?;
+    let secret = c.open_sealed(ns, &sealed)?;
+    let sig = req.header("x-hub-signature-256").unwrap_or("");
+    if !crate::sandbox_api::ct_eq(sig.as_bytes(), github_signature(&secret, &req.body).as_bytes()) {
+        return Err(refuse());
     }
-    let event = req.headers.iter().find(|(k, _)| k == "x-github-event").map(|(_, v)| v.as_str()).unwrap_or("");
+    let event = req.header("x-github-event").unwrap_or("");
+    if event == "ping" {
+        return Ok(json!({"pong": app_name}));
+    }
     if event != "pull_request" {
         return Ok(json!({"ignored": event}));
     }
-    // A signed body replayed later would redeploy (or destroy) a preview; each delivery once.
-    if let Some(id) = req.header("x-github-delivery") {
-        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        db.execute("delete from deliveries where ts < ?1", &[&(now() - 86400)])?;
-        if db.execute("insert or ignore into deliveries values (?1, ?2)", &[&id, &now()])? == 0 {
-            return Ok(json!({"ignored": "delivery already handled"}));
-        }
+    if req.header("x-github-delivery").is_none() {
+        bail!("missing X-GitHub-Delivery");
     }
+    let app = load_app_key(c, &key)?.ok_or_else(refuse)?;
     let b: Value = serde_json::from_slice(&req.body)?;
     let pr = b["number"].as_i64().context("no PR number")?;
-    let urls = [b["repository"]["clone_url"].as_str().unwrap_or(""), b["repository"]["html_url"].as_str().unwrap_or("")];
-    let base = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_opt(
-        "select name, owner, ns from apps where preview_of is null and destroying is null and (git_url = ?1 or git_url = ?2 or git_url = ?3)
-         order by created, name limit 1",
-        &[&urls[0], &urls[1], &format!("{}.git", urls[1])],
-    )?;
-    let Some(base) = base else { return Ok(json!({"ignored": "no app for this repository"})) };
-    let (base, owner, ns): (String, String, String) = (base.get(0), base.get(1), base.get(2));
-    let preview = format!("{}-pr-{pr}", short_name(&base));
+    let repo = [b["repository"]["clone_url"].as_str(), b["repository"]["html_url"].as_str()];
+    let html_git = repo[1].map(|u| format!("{u}.git"));
+    if !repo.iter().flatten().any(|u| *u == app.git_url) && html_git.as_deref() != Some(app.git_url.as_str()) {
+        bail!("this hook is for {app_name}, which deploys {}; the event is for another repository", app.git_url);
+    }
+    let preview = format!("{}-pr-{pr}", app.short);
     // Previews belong to the base app's owner.
+    let owner: String = c.db().query_one("select owner from apps where name = ?1", &[&app.name])?.get(0);
     let who = Caller { name: owner, ..Caller::system("github") };
-    // A fork's code runs with the base app's env and the internet; only with a maintainer's label.
+    // GitHub signs the body, not the delivery ID: an exact replay has the same body. Events
+    // older than one already handled for this PR (a replayed `closed` after a reopen) are
+    // ignored too. Both are recorded only once the event was handled, so a redelivery of
+    // one that failed runs again.
+    use sha2::Digest;
+    let digest = hex(&sha2::Sha256::digest(&req.body));
+    let updated = b["pull_request"]["updated_at"].as_str().unwrap_or("").to_string();
+    let seen = |c: &Controller| -> Result<Option<Value>> {
+        let mut db = c.db();
+        if db.query_opt("select 1 from deliveries where id = ?1", &[&digest])?.is_some() {
+            return Ok(Some(json!({"ignored": "delivery already handled"})));
+        }
+        let newer = db.query_opt("select 1 from pr_seen where app = ?1 and pr = ?2 and updated > ?3", &[&app.name, &pr, &updated])?;
+        Ok(newer.map(|_| json!({"ignored": "an event newer than this one was already handled"})))
+    };
+    let record = |c: &Controller| -> Result<()> {
+        let mut db = c.db();
+        db.execute("insert or ignore into deliveries values (?1, ?2)", &[&digest, &now()])?;
+        db.execute(
+            "insert into pr_seen values (?1, ?2, ?3) on conflict (app, pr) do update set updated = max(updated, ?3)",
+            &[&app.name, &pr, &updated],
+        )?;
+        Ok(())
+    };
     let fork = b["pull_request"]["head"]["repo"]["full_name"] != b["repository"]["full_name"];
-    let labelled = b["pull_request"]["labels"].as_array().into_iter().flatten().any(|l| l["name"] == PREVIEW_LABEL);
+    let preview_key = app_key(ns, &preview);
     match b["action"].as_str().unwrap_or("") {
         "closed" => {
-            // Only the preview of this base app, never another app that happens to have that name.
-            let key = app_key(&ns, &preview);
-            let is_preview =
-                c.db.lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .query_opt("select 1 from apps where name = ?1 and preview_of = ?2", &[&key, &base])?;
-            if is_preview.is_none() {
-                return Ok(json!({"ignored": format!("{preview} isn't a preview of {}", short_name(&base))}));
+            if let Some(v) = seen(c)? {
+                return Ok(v);
             }
-            destroy_app(c, &key)
+            // Only the preview of this base app, never another app that happens to have that name.
+            let is_preview = c.db().query_opt("select 1 from apps where name = ?1 and preview_of = ?2", &[&preview_key, &app.name])?;
+            if is_preview.is_none() {
+                record(c)?;
+                return Ok(json!({"ignored": format!("{preview} isn't a preview of {}", app.short)}));
+            }
+            let v = destroy_app(c, &preview_key)?;
+            record(c)?;
+            Ok(v)
         }
-        "opened" | "synchronize" | "reopened" | "labeled" if fork && !labelled => {
-            Ok(json!({"ignored": format!("pull request from a fork; add the {PREVIEW_LABEL} label to deploy it")}))
+        // A fork's code runs with the base app's env and the internet. A maintainer's label
+        // approves the head it was put on; a later push needs the label again.
+        "opened" | "synchronize" | "reopened" if fork => {
+            Ok(json!({"ignored": format!("pull request from a fork; add the {PREVIEW_LABEL} label to deploy this head")}))
         }
+        "labeled" if b["label"]["name"] != PREVIEW_LABEL => Ok(json!({"ignored": "another label"})),
+        "labeled" if !fork => Ok(json!({"ignored": "labels only matter for forks"})),
         "opened" | "synchronize" | "reopened" | "labeled" => {
-            let app = load_app_key(c, &base)?.context("base app gone")?;
             let head = b["pull_request"]["head"]["sha"].as_str().context("no head sha")?;
-            let head_repo = b["pull_request"]["head"]["repo"]["clone_url"].as_str().unwrap_or(&app.git_url);
+            let head_repo =
+                if fork { b["pull_request"]["head"]["repo"]["clone_url"].as_str().context("no head repo")? } else { &app.git_url };
             let cfg = json!({
                 "name": preview, "git": {"url": head_repo, "ref": head}, "port": app.port, "instances": 1,
                 "cpus": app.cpus, "memory_gib": app.memory_gib, "health": app.health, "start": app.start, "env": app.env,
                 // Previews sleep after 15 minutes unless the base app picks its own idle time.
                 "idle_stop_secs": if app.idle_stop > 0 { app.idle_stop } else { 900 },
                 // Its own empty bucket, deleted with the preview.
-                "bucket": c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query_one("select bucket from apps where name = ?1", &[&base])?.get::<bool>(0),
+                "bucket": c.db().query_one("select bucket from apps where name = ?1", &[&app.name])?.get::<bool>(0),
             });
-            // Under the preview's lock from the upsert until it's live, so two deliveries for one
+            // Under the preview's lock from the check until it's live, so two deliveries for one
             // pull request don't interleave.
-            let lock = c.app_lock(&app_key(&ns, &preview));
+            let lock = c.app_lock(&preview_key);
             let guard = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let admitted = upsert_app(c, &ns, &who, &cfg, Some(&base))?;
-            let v = deploy_locked(c, &load_app(c, &ns, &preview, &who, Role::Member)?, Some(head.into()), "github")?;
+            if let Some(v) = seen(c)? {
+                return Ok(v);
+            }
+            let admitted = upsert_app(c, ns, &who, &cfg, Some(&app.name))?;
+            let v = deploy_locked(c, &load_app(c, ns, &preview, &who, Role::Member)?, Some(head.into()), "github")?;
+            record(c)?;
             drop((admitted, guard));
-            if let (Ok(token), Some(api)) = (std::env::var("GITHUB_TOKEN"), b["pull_request"]["comments_url"].as_str()) {
-                let body = json!({"body": format!("Preview: {}", v["url"].as_str().unwrap_or(""))}).to_string();
-                // The header goes in on stdin: on argv, `ps` would show the token to every user.
-                if let Ok(mut child) = Command::new("curl")
-                    .args(["-sf", "-X", "POST", "-H", "@-", "-d", &body, api])
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::null())
-                    .spawn()
-                {
-                    if let Some(mut stdin) = child.stdin.take() {
-                        let _ = writeln!(stdin, "Authorization: Bearer {token}");
-                    }
-                    let _ = child.wait();
+            let full_name = b["repository"]["full_name"].as_str().unwrap_or("");
+            if let Some(api) = github_api(full_name, pr) {
+                let comment = json!({"body": format!("Preview: {}", v["url"].as_str().unwrap_or(""))}).to_string();
+                github_call("POST", &format!("{api}/comments"), Some(&comment));
+                if fork {
+                    github_call("DELETE", &format!("{api}/labels/{PREVIEW_LABEL}"), None);
                 }
             }
             Ok(v)
         }
         a => Ok(json!({"ignored": a})),
+    }
+}
+
+/// `https://api.github.com/repos/OWNER/REPO/issues/N` for a repository's full name, or None
+/// when `GITHUB_TOKEN` isn't set or the name isn't OWNER/REPO. The host comes from
+/// `GITHUB_API_URL` (GitHub Enterprise), never from the event.
+fn github_api(full_name: &str, pr: i64) -> Option<String> {
+    std::env::var_os("GITHUB_TOKEN")?;
+    github_api_url(&std::env::var("GITHUB_API_URL").unwrap_or_else(|_| "https://api.github.com".into()), full_name, pr)
+}
+
+fn github_api_url(base: &str, full_name: &str, pr: i64) -> Option<String> {
+    let part =
+        |s: &str| !s.is_empty() && s != "." && s != ".." && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'));
+    let (owner, repo) = full_name.split_once('/').filter(|(o, r)| part(o) && part(r))?;
+    let base = base.trim_end_matches('/');
+    let rest = base.strip_prefix("https://")?;
+    let host = rest.split('/').next().unwrap_or("");
+    (!host.is_empty() && !base.contains(['@', '?', '#', ' '])).then(|| format!("{base}/repos/{owner}/{repo}/issues/{pr}"))
+}
+
+/// One GitHub API call with `GITHUB_TOKEN`, best effort. The header goes in on stdin: on
+/// argv, `ps` would show the token to every user.
+fn github_call(method: &str, url: &str, body: Option<&str>) {
+    let Ok(token) = std::env::var("GITHUB_TOKEN") else { return };
+    let mut cmd = Command::new("curl");
+    cmd.args(["-sf", "--proto", "=https", "-m", "10", "-X", method, "-H", "@-", "-H", "Accept: application/vnd.github+json"]);
+    if let Some(b) = body {
+        cmd.args(["-d", b]);
+    }
+    if let Ok(mut child) = cmd.arg(url).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "Authorization: Bearer {token}");
+        }
+        let _ = child.wait();
     }
 }
 
@@ -6097,17 +6184,15 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
     std::fs::create_dir_all(&dir)?;
     let db_path = o.db.clone().unwrap_or_else(|| dir.join("fleet.db"));
     let mut db = Db::open(&db_path)?;
-    for (key, file) in [("join_token", "join-token"), ("webhook_secret", "webhook-secret")] {
-        let v = match db.query_opt("select value from config where key = ?1", &[&key])? {
-            Some(r) => r.get::<String>(0),
-            None => {
-                let v = secret()?;
-                db.execute("insert into config values (?1, ?2)", &[&key, &v])?;
-                v
-            }
-        };
-        std::fs::write(dir.join(file), &v)?;
-    }
+    let join = match db.query_opt("select value from config where key = 'join_token'", &[])? {
+        Some(r) => r.get::<String>(0),
+        None => {
+            let v = secret()?;
+            db.execute("insert into config values ('join_token', ?1)", &[&v])?;
+            v
+        }
+    };
+    std::fs::write(dir.join("join-token"), &join)?;
     // fleet.db only has the hash; the plaintext lives in admin-token. Without either, a new one.
     let have_admin = db.query_opt("select 1 from tokens where admin and name = 'admin'", &[])?.is_some();
     let file = std::fs::read_to_string(dir.join("admin-token")).unwrap_or_default().trim().to_string();
@@ -6121,7 +6206,10 @@ pub fn controller_serve(paths: &Paths, o: ControllerOptions) -> Result<()> {
         std::fs::write(dir.join("admin-token"), &t)?;
     }
     use std::os::unix::fs::PermissionsExt;
-    for f in ["join-token", "webhook-secret", "admin-token"] {
+    // The fleet-wide webhook secret is gone (apps have their own); so is its file.
+    let _ = std::fs::remove_file(dir.join("webhook-secret"));
+    db.execute("delete from config where key = 'webhook_secret'", &[])?;
+    for f in ["join-token", "admin-token"] {
         std::fs::set_permissions(dir.join(f), std::fs::Permissions::from_mode(0o600))?;
     }
     // Nodes that joined before node certificates named the node hold one for their host; the
@@ -6744,63 +6832,164 @@ mod tests {
         assert!(load_app_key(&c, &long).unwrap().is_some());
     }
 
-    /// A signed `pull_request` delivery for PR `pr` of `https://github.com/a/foo`.
+    /// A `pull_request` delivery for PR `pr` of `https://github.com/a/foo`, signed with `whs`.
     fn pr_event(action: &str, pr: i64, delivery: &str) -> crate::sandbox_api::Request {
         let repo = json!({"full_name": "a/foo", "clone_url": "https://github.com/a/foo", "html_url": "https://github.com/a/foo"});
         let body = json!({"action": action, "number": pr, "repository": repo,
-                          "pull_request": {"head": {"sha": "b".repeat(40), "repo": repo}, "labels": []}})
-        .to_string()
-        .into_bytes();
-        let headers = [
-            ("x-hub-signature-256", github_signature("whs", &body)),
-            ("x-github-event", "pull_request".into()),
-            ("x-github-delivery", delivery.into()),
-        ];
+                          "pull_request": {"head": {"sha": "b".repeat(40), "repo": repo}, "labels": [], "updated_at": "2026-11-18T10:00:00Z"}});
+        hook_request("whs", &body, Some(delivery))
+    }
+
+    fn hook_request(secret: &str, body: &Value, delivery: Option<&str>) -> crate::sandbox_api::Request {
+        let body = body.to_string().into_bytes();
+        let mut headers = vec![("x-hub-signature-256", github_signature(secret, &body)), ("x-github-event", "pull_request".into())];
+        headers.extend(delivery.map(|d| ("x-github-delivery", d.to_string())));
         crate::sandbox_api::Request {
             method: "POST".into(),
-            path: "/webhooks/github".into(),
+            path: "/webhooks/github/default/foo".into(),
             query: vec![],
             headers: headers.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
             body,
         }
     }
 
-    #[test]
-    fn pull_request_events_never_take_over_an_app_with_the_preview_name() {
+    /// `foo` (alice's, https://github.com/a/foo) with webhook secret `whs`.
+    fn hooked_controller() -> Arc<Controller> {
         let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
-        c.db.lock().unwrap().execute("insert into config values ('webhook_secret', 'whs')", &[]).unwrap();
         upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "foo", "git": {"url": "https://github.com/a/foo"}}), None)
             .unwrap();
+        let sealed = c.seal("default", "whs").unwrap();
+        c.db().execute("update apps set webhook_secret = ?1 where name = 'foo'", &[&sealed]).unwrap();
+        c
+    }
+
+    fn app_exists(c: &Controller, name: &str) -> bool {
+        c.db().query_opt("select 1 from apps where name = ?1", &[&name]).unwrap().is_some()
+    }
+
+    #[test]
+    fn pull_request_events_never_take_over_an_app_with_the_preview_name() {
+        let c = hooked_controller();
         // Bob's own app, which happens to have the name PR 3's preview would get.
         upsert_app(&c, "default", &Caller::user("bob"), &json!({"name": "foo-pr-3", "git": {"url": "https://github.com/b/other"}}), None)
             .unwrap();
         let sealed = c.seal("default", "bob's secret").unwrap();
-        c.db.lock()
-            .unwrap()
-            .execute("update apps set secrets = ?1 where name = 'foo-pr-3'", &[&json!({"TOKEN": sealed}).to_string()])
-            .unwrap();
+        c.db().execute("update apps set secrets = ?1 where name = 'foo-pr-3'", &[&json!({"TOKEN": sealed}).to_string()]).unwrap();
         let bob = || {
-            let r =
-                c.db.lock()
-                    .unwrap()
-                    .query_one("select owner, git_url, git_ref, preview_of, secrets from apps where name = 'foo-pr-3'", &[])
-                    .unwrap();
+            let r = c.db().query_one("select owner, git_url, git_ref, preview_of, secrets from apps where name = 'foo-pr-3'", &[]).unwrap();
             (r.get::<String>(0), r.get::<String>(1), r.get::<String>(2), r.get::<Option<String>>(3), r.get::<String>(4))
         };
         let before = bob();
         for (i, action) in ["opened", "synchronize"].into_iter().enumerate() {
-            let e = github_webhook(&c, &pr_event(action, 3, &format!("d{i}"))).unwrap_err().to_string();
+            let e = github_webhook(&c, "default", "foo", &pr_event(action, 3, &format!("d{i}"))).unwrap_err().to_string();
             assert!(e.contains("isn't a preview of foo"), "{action}: {e}");
             assert_eq!(bob(), before, "{action}");
         }
-        assert_eq!(c.db.lock().unwrap().query_one("select count(*) from releases", &[]).unwrap().get::<i64>(0), 0);
+        assert_eq!(c.db().query_one("select count(*) from releases", &[]).unwrap().get::<i64>(0), 0);
         // A name nobody has becomes a preview as before (its deploy fails here: no nodes).
         for (i, action) in ["opened", "synchronize"].into_iter().enumerate() {
-            let e = github_webhook(&c, &pr_event(action, 4, &format!("e{i}"))).unwrap_err().to_string();
+            let e = github_webhook(&c, "default", "foo", &pr_event(action, 4, &format!("e{i}"))).unwrap_err().to_string();
             assert!(!e.contains("isn't a preview"), "{action}: {e}");
         }
-        let r = c.db.lock().unwrap().query_one("select owner, preview_of from apps where name = 'foo-pr-4'", &[]).unwrap();
+        let r = c.db().query_one("select owner, preview_of from apps where name = 'foo-pr-4'", &[]).unwrap();
         assert_eq!((r.get::<String>(0), r.get::<Option<String>>(1)), ("alice".into(), Some("foo".into())));
+    }
+
+    #[test]
+    fn a_webhook_acts_only_for_its_own_app_and_repository() {
+        let c = hooked_controller();
+        upsert_app(&c, "default", &Caller::user("bob"), &json!({"name": "bar", "git": {"url": "https://github.com/b/bar"}}), None).unwrap();
+        let bar = c.seal("default", "bar-secret").unwrap();
+        c.db().execute("update apps set webhook_secret = ?1 where name = 'bar'", &[&bar]).unwrap();
+        // Signed with foo's secret, sent to bar's hook; and an app with no hook made yet.
+        for (path_app, secret) in [("bar", "whs"), ("nope", "whs"), ("foo", "bar-secret")] {
+            let e = github_webhook(&c, "default", path_app, &hook_request(secret, &json!({}), Some("d"))).unwrap_err().to_string();
+            assert_eq!(e, "bad signature", "{path_app}");
+        }
+        // foo's own secret, naming bar's repository.
+        let mut ev = pr_event("opened", 5, "d5");
+        let mut body: Value = serde_json::from_slice(&ev.body).unwrap();
+        body["repository"]["clone_url"] = json!("https://github.com/b/bar");
+        body["repository"]["html_url"] = json!("https://github.com/b/bar");
+        ev = hook_request("whs", &body, Some("d5"));
+        let e = github_webhook(&c, "default", "foo", &ev).unwrap_err().to_string();
+        assert!(e.contains("another repository"), "{e}");
+        assert!(!app_exists(&c, "foo-pr-5"));
+        // The comment goes to the configured API, built from the repository's name; the
+        // event's own URLs aren't used.
+        assert_eq!(github_api_url("https://api.github.com", "a/foo", 7).as_deref(), Some("https://api.github.com/repos/a/foo/issues/7"));
+        assert_eq!(
+            github_api_url("https://ghe.example/api/v3/", "a/foo", 7).as_deref(),
+            Some("https://ghe.example/api/v3/repos/a/foo/issues/7")
+        );
+        for bad in ["a/../x", "a/b/c", "a", "a/b?x", "evil.example/#"] {
+            assert_eq!(github_api_url("https://api.github.com", bad, 7), None, "{bad}");
+        }
+        assert_eq!(github_api_url("http://api.github.com", "a/foo", 7), None);
+    }
+
+    #[test]
+    fn a_fork_deploys_only_the_head_a_maintainer_labelled() {
+        let c = hooked_controller();
+        let fork = |action: &str, label: Option<&str>| {
+            let repo = json!({"full_name": "a/foo", "clone_url": "https://github.com/a/foo", "html_url": "https://github.com/a/foo"});
+            let head = json!({"full_name": "m/foo", "clone_url": "https://github.com/m/foo"});
+            let mut body = json!({"action": action, "number": 9, "repository": repo,
+                "pull_request": {"head": {"sha": "c".repeat(40), "repo": head}, "labels": [{"name": PREVIEW_LABEL}],
+                                 "updated_at": format!("2026-11-18T10:00:0{}Z", action.len() % 10)}});
+            if let Some(l) = label {
+                body["label"] = json!({"name": l});
+            }
+            hook_request("whs", &body, Some(action))
+        };
+        for action in ["opened", "synchronize", "reopened"] {
+            let v = github_webhook(&c, "default", "foo", &fork(action, None)).unwrap();
+            assert!(v["ignored"].as_str().unwrap().contains("fork"), "{action}: {v}");
+        }
+        assert!(github_webhook(&c, "default", "foo", &fork("labeled", Some("bug"))).unwrap()["ignored"].is_string());
+        assert!(!app_exists(&c, "foo-pr-9"));
+        // The label itself deploys (and fails here: no nodes).
+        let e = github_webhook(&c, "default", "foo", &fork("labeled", Some(PREVIEW_LABEL))).unwrap_err().to_string();
+        assert!(e.contains("placed 0") || e.contains("no node"), "{e}");
+        let url: String = c.db().query_one("select git_url from apps where name = 'foo-pr-9'", &[]).unwrap().get(0);
+        assert_eq!(url, "https://github.com/m/foo");
+    }
+
+    #[test]
+    fn replayed_or_older_events_do_nothing_and_failed_ones_can_be_redelivered() {
+        let c = hooked_controller();
+        let closed = |updated: &str| {
+            let mut ev: Value = serde_json::from_slice(&pr_event("closed", 7, "x").body).unwrap();
+            ev["pull_request"]["updated_at"] = json!(updated);
+            ev
+        };
+        let preview = || {
+            upsert_app(
+                &c,
+                "default",
+                &Caller::user("alice"),
+                &json!({"name": "foo-pr-7", "git": {"url": "https://github.com/a/foo"}}),
+                Some("foo"),
+            )
+            .unwrap();
+        };
+        let e = github_webhook(&c, "default", "foo", &hook_request("whs", &closed("2026-11-18T10:00:02Z"), None)).unwrap_err();
+        assert!(e.to_string().contains("X-GitHub-Delivery"), "{e}");
+        preview();
+        github_webhook(&c, "default", "foo", &hook_request("whs", &closed("2026-11-18T10:00:02Z"), Some("d-1"))).unwrap();
+        assert!(!app_exists(&c, "foo-pr-7"));
+        // Reopened; the same signed body under another delivery ID, then an older close.
+        preview();
+        for (body, id) in [(closed("2026-11-18T10:00:02Z"), "d-2"), (closed("2026-11-18T10:00:01Z"), "d-3")] {
+            let v = github_webhook(&c, "default", "foo", &hook_request("whs", &body, Some(id))).unwrap();
+            assert!(v["ignored"].is_string(), "{v}");
+            assert!(app_exists(&c, "foo-pr-7"), "{id}");
+        }
+        // A deploy that fails isn't recorded: GitHub's Redeliver tries it again.
+        for _ in 0..2 {
+            let e = github_webhook(&c, "default", "foo", &pr_event("opened", 8, "d-9")).unwrap_err().to_string();
+            assert!(!e.contains("already handled"), "{e}");
+        }
     }
 
     #[test]

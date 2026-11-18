@@ -147,10 +147,10 @@ check "secret value isn't shown" sh -c '"$0" app secret set --remote admin hello
 check "logs" sh -c '"$0" app logs --remote admin hello | grep -q GET' "$R"
 
 body=$(printf '{"action":"opened","number":7,"repository":{"clone_url":"%s","html_url":"x"},"pull_request":{"head":{"sha":"%s","repo":{"clone_url":"%s"}}}}' "$url" "$v2" "$url")
-ws=$(cat "$C/controller/webhook-secret")
+ws=$(cr app webhook --remote admin hello | sed -n 's/.*"secret": "\(.*\)".*/\1/p')
 sig="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$ws" | awk '{print $NF}')"
-hook() { curl -s -m 120 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: $2" -d "$1" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github; }
-check "webhook with a bad signature is refused" sh -c '! curl -sf -m 5 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: sha256=00" -d "{}" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github'
+hook() { curl -s -m 120 -X POST -H "X-GitHub-Event: pull_request" -H "X-GitHub-Delivery: $RANDOM$RANDOM" -H "X-Hub-Signature-256: $2" -d "$1" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github/default/hello; }
+check "webhook with a bad signature is refused" sh -c '! curl -sf -m 5 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: sha256=00" -d "{}" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github/default/hello'
 hook "$body" "$sig" >>"$C/hook.log"; echo >>"$C/hook.log"
 sleep 2.5
 check "PR preview deployed (inherits env)" sh -c 'test "$(curl -s -m 3 -H "Host: hello-pr-7.apps.test" http://127.0.0.1:18088/)" = "v2 hi"'

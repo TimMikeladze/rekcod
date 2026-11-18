@@ -42,6 +42,7 @@ pub enum Kind {
     AppPrivate,
     AppWake,
     AppRecycle,
+    AppWebhook,
     JobLogs,
     JobCancel,
     NsUse,
@@ -97,7 +98,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 78] = [
+    pub const ALL: [Kind; 79] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -126,6 +127,7 @@ impl Kind {
         Kind::AppPrivate,
         Kind::AppWake,
         Kind::AppRecycle,
+        Kind::AppWebhook,
         Kind::JobLogs,
         Kind::JobCancel,
         Kind::NsUse,
@@ -636,6 +638,8 @@ pub struct RemoteApp {
     pub public: bool,
     /// Scaled to zero; the next request (or `app wake`) starts it.
     pub sleeping: bool,
+    /// A pull request preview; its base app has the webhook.
+    pub preview: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -781,6 +785,7 @@ pub fn parse_apps(v: &Value) -> Vec<RemoteApp> {
             live_release: a["live_release"].as_i64(),
             public: a["public"].as_bool().unwrap_or(false),
             sleeping: a["sleeping"].as_bool().unwrap_or(false),
+            preview: !a["preview_of"].is_null(),
         })
         .collect()
 }
@@ -1453,7 +1458,7 @@ pub fn sandbox_actions(s: &AgentSandbox) -> Vec<Action> {
 
 pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
     let n = a.name.as_str();
-    vec![
+    let mut out = vec![
         Action {
             kind: Kind::AppOpen,
             label: format!("Open {}", a.url),
@@ -1479,7 +1484,12 @@ pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
         },
         Action::rekcod(Kind::AppDestroy, "Destroy", &["app", "destroy", n])
             .confirm(format!("Destroy {n}? Its instances and release history are deleted.")),
-    ]
+    ];
+    if !a.preview {
+        // Interactive: it prints the secret to paste into GitHub.
+        out.push(Action::rekcod(Kind::AppWebhook, "GitHub webhook (URL and secret)", &["app", "webhook", n]).interactive());
+    }
+    out
 }
 
 pub fn job_actions(j: &RemoteJob) -> Vec<Action> {
@@ -1637,7 +1647,14 @@ pub mod tests {
     }
 
     pub fn sample_app() -> RemoteApp {
-        RemoteApp { name: "dash".into(), url: "http://dash.apps.test".into(), live_release: Some(3), public: false, sleeping: false }
+        RemoteApp {
+            name: "dash".into(),
+            url: "http://dash.apps.test".into(),
+            live_release: Some(3),
+            public: false,
+            sleeping: false,
+            preview: false,
+        }
     }
 
     pub fn sample_job() -> RemoteJob {

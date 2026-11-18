@@ -790,7 +790,7 @@ pub fn cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
         let ip = s.guest(paths)?;
         let remote = |a: &str| a.strip_prefix(&format!("{WS}:")).map(|p| format!("{}@{ip}:{p}", crate::macos::USER));
         let args: Vec<String> = args.iter().map(|a| remote(a).unwrap_or_else(|| a.clone())).collect();
-        let ok = crate::macos::scp_command(paths)?.args(&args).status()?.success();
+        let ok = crate::macos::scp_command(paths, &ip)?.args(&args).status()?.success();
         if !ok {
             bail!("scp failed");
         }

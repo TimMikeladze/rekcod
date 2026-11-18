@@ -68,20 +68,38 @@ pub fn action_from_json(v: &Value) -> Option<Action> {
     })
 }
 
-/// Lists the dashboard's pages and the Engine submenu map over.
-const ENGINE_LISTS: &[&str] = &[
-    "containers",
-    "ports",
-    "projects",
-    "sandboxes",
-    "images",
-    "volumes",
-    "networks",
-    "vm_actions",
-    "storage_actions",
-    "engine_actions",
-    "disk_actions",
+/// The lists the dashboard's pages and the Engine submenu map over: each item's identifying
+/// field, which must be there (a string, or a number for a port), and its fields that must be
+/// arrays.
+const ENGINE_LISTS: &[(&str, &str, &[&str])] = &[
+    ("containers", "name", &["ports", "volumes", "networks", "actions"]),
+    ("ports", "port", &["actions"]),
+    ("projects", "name", &["snapshots", "actions"]),
+    ("sandboxes", "id", &["actions"]),
+    ("images", "id", &["tags", "containers", "actions"]),
+    ("volumes", "name", &["containers", "actions"]),
+    ("networks", "name", &["containers", "actions"]),
 ];
+
+/// Action lists outside any item.
+const ENGINE_ACTIONS: &[&str] = &["vm_actions", "storage_actions", "engine_actions", "disk_actions"];
+
+/// `v[key]` as a list of objects that have `id` and whose `arrays` fields are arrays: items
+/// without `id` go, a missing or mistyped array becomes empty.
+fn shape_list(v: &mut Value, key: &str, id: &str, arrays: &[&str]) {
+    let Some(Value::Array(list)) = v.get_mut(key) else {
+        v[key] = json!([]);
+        return;
+    };
+    list.retain(|x| x.get(id).is_some_and(|i| i.is_string() || i.is_u64()));
+    for x in list {
+        for a in arrays {
+            if !x[*a].is_array() {
+                x[*a] = json!([]);
+            }
+        }
+    }
+}
 
 /// An action from a host's `rekcod state` this Mac will run: a kind this binary knows, string
 /// argv, inputs it can check, and no control character anywhere (a Terminal acts on those).
@@ -128,6 +146,11 @@ pub fn check_remote(v: &mut Value, host: &str) {
             }
             Value::Object(o) if o.contains_key("kind") && o.contains_key("label") && o.contains_key("argv") => {
                 o.remove("url");
+                // One outside a list, which the retain above didn't see: nothing to run.
+                if !remote_action_ok(o) {
+                    o.remove("argv");
+                    return;
+                }
                 let kind = o["kind"].as_str().and_then(actions::Kind::from_name);
                 let interactive = o.get("interactive").and_then(Value::as_bool).unwrap_or(false);
                 o.insert("interactive".into(), (interactive && kind.is_some_and(actions::Kind::may_be_interactive)).into());
@@ -153,14 +176,25 @@ pub fn check_remote(v: &mut Value, host: &str) {
             _ => {}
         }
     }
-    let Some(o) = v.as_object_mut() else { return };
-    for k in ENGINE_LISTS {
-        match o.get_mut(*k) {
-            Some(Value::Array(a)) => a.retain(Value::is_object),
-            _ => {
-                o.insert((*k).into(), json!([]));
-            }
+    if !v.is_object() {
+        return;
+    }
+    for (key, id, arrays) in ENGINE_LISTS {
+        shape_list(v, key, id, arrays);
+    }
+    for p in v["projects"].as_array_mut().into_iter().flatten() {
+        shape_list(p, "snapshots", "name", &["volumes", "actions"]);
+    }
+    for k in ENGINE_ACTIONS {
+        if !v[*k].is_array() {
+            v[*k] = json!([]);
         }
+    }
+    if !v["status"].is_object() {
+        v["status"] = json!({});
+    }
+    if !v["running"].is_boolean() {
+        v["running"] = false.into();
     }
     walk(v, host);
 }
@@ -536,6 +570,17 @@ mod tests {
         assert_eq!(v["containers"], json!([]));
         assert_eq!(v["networks"], json!([]));
         assert_eq!(v["projects"][0]["actions"], json!([]));
+        assert_eq!(v["projects"][0]["snapshots"], json!([]));
+        assert_eq!(v["status"], json!({}));
+
+        // What the pages index into is there, and an item they can't name is gone.
+        let mut v = json!({"running": "yes", "containers": [{"name": "x"}, {"image": "no name"}],
+                           "lone": {"kind": "VmStop", "label": "Stop", "argv": ["stop", "\u{3}"]}});
+        check_remote(&mut v, "mini");
+        assert_eq!(v["containers"], json!([{"name": "x", "ports": [], "volumes": [], "networks": [], "actions": []}]));
+        assert_eq!(v["running"], false);
+        assert_eq!(v["vm_actions"], json!([]));
+        assert!(v["lone"].get("argv").is_none());
     }
 
     /// Nothing this binary writes is dropped by the check a host's state goes through.

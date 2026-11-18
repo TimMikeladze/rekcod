@@ -54,8 +54,8 @@ export async function readState(local = false): Promise<State> {
 }
 
 /**
- * `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. Above the
- * 20 s rekcod gives ssh; on this timeout or `signal` its ssh is killed with it.
+ * `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. On this
+ * timeout or `signal` the whole process group goes, the ssh under it included.
  */
 export async function readEngine(name: string, signal?: AbortSignal): Promise<State> {
   if (FIXTURE) return fakeEngine(await readState(), name)

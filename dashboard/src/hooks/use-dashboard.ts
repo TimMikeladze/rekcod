@@ -85,7 +85,6 @@ export function useDashboard(): DashData {
     let retry: ReturnType<typeof setTimeout> | undefined
     let poll: ReturnType<typeof setInterval> | null = null
     let stopped = false
-    let connects = 0
     // Stats samples and activity entries the stream couldn't deliver (lib/server/sse.ts).
     const resync = () => {
       loadStats(windowRef.current)
@@ -129,8 +128,8 @@ export function useDashboard(): DashData {
         if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`)
         setLive(true)
         stopPolling()
-        // The first connect follows the first load; a reconnect has missed what came meanwhile.
-        if (connects++) resync()
+        // What came while it was down, or what the first load missed if the server was starting.
+        resync()
         await readEvents(r.body, onEvent)
       } catch {}
       if (stopped) return

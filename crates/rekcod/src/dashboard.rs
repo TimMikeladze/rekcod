@@ -74,9 +74,14 @@ fn answers(port: u16) -> bool {
 }
 
 /// Nothing holds `port` on 127.0.0.1 or on `[::1]`, so `localhost:PORT` typed by hand reaches
-/// the dashboard too (it redirects to 127.0.0.1).
+/// the dashboard too (it redirects to 127.0.0.1). A Mac without IPv6 loopback has no `[::1]`
+/// for anyone to take.
 fn port_free(port: u16) -> bool {
-    TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("::1", port)).is_ok()
+    let v6 = match TcpListener::bind(("::1", port)) {
+        Ok(_) => true,
+        Err(e) => e.kind() == std::io::ErrorKind::AddrNotAvailable,
+    };
+    TcpListener::bind(("127.0.0.1", port)).is_ok() && v6
 }
 
 /// 32 random bytes as hex.

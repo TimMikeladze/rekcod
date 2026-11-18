@@ -68,6 +68,8 @@ pub struct Settings {
     /// Peers allowed to send a PROXY v2 header on a `proxy_protocol` listener; anyone else
     /// is disconnected.
     pub proxy_protocol_from: Vec<ipnet::IpNet>,
+    /// How long a request for a sleeping app waits for it to wake.
+    pub wake_wait: Duration,
 }
 
 impl Default for Settings {
@@ -81,6 +83,7 @@ impl Default for Settings {
             trusted_proxies,
             client_ip_header: None,
             proxy_protocol_from: vec![],
+            wake_wait: Duration::from_secs(120),
         }
     }
 }
@@ -112,7 +115,9 @@ pub struct Edge {
     /// still routes (`~/.rekcod/edge-routes.json`).
     cache: Option<std::path::PathBuf>,
     /// One wake per host at a time; other requests for it wait on the same one.
-    waking: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    waking: Mutex<HashMap<String, Waking>>,
+    /// How long a request waits for a wake before it gets a 503.
+    wake_wait: Duration,
     /// When a host's last wake failed: it gets 503s, not another wake, for [`WAKE_BACKOFF`].
     wake_failed: Mutex<HashMap<String, std::time::Instant>>,
 }
@@ -120,6 +125,16 @@ pub struct Edge {
 /// After a failed wake, how long the edge answers 503 instead of asking again. Public
 /// traffic would otherwise turn into a rebuild loop.
 const WAKE_BACKOFF: Duration = Duration::from_secs(30);
+/// Requests waiting on one host's wake; more get a 503 at once.
+const WAKE_WAITERS: usize = 256;
+
+/// A wake in flight. It runs in its own task, so it finishes (and records a failure for
+/// the backoff) even when every request that waited for it has gone.
+struct Waking {
+    /// `Some(endpoints)` once it's over; empty when it failed.
+    done: tokio::sync::watch::Receiver<Option<Vec<String>>>,
+    waiters: Arc<tokio::sync::Semaphore>,
+}
 
 impl Edge {
     pub fn new(remote: Option<Remote>, s: Settings) -> Arc<Edge> {
@@ -140,6 +155,7 @@ impl Edge {
             stats: Default::default(),
             cache: None,
             waking: Default::default(),
+            wake_wait: s.wake_wait,
             wake_failed: Default::default(),
         })
     }
@@ -211,52 +227,71 @@ impl Edge {
         self.wake_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).is_some_and(|t| t.elapsed() < WAKE_BACKOFF)
     }
 
-    /// Asks the controller to wake the app and waits (up to its health timeout, or a rebuild).
-    async fn wake(&self, host: &str, route: &Route) -> Vec<String> {
+    /// Asks the controller to wake the app and waits for it, at most `wake_wait`. `failed`
+    /// are endpoints this request just couldn't reach: the table listing them again doesn't
+    /// mean the app is up.
+    async fn wake(self: &Arc<Self>, host: &str, route: &Route, failed: &[String]) -> Vec<String> {
         let Some(r) = self.remote.clone() else { return vec![] };
-        if self.backing_off(host) {
-            return vec![];
+        let (mut done, waiters) = {
+            let mut waking = self.waking.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            match waking.get(host) {
+                Some(w) => (w.done.clone(), w.waiters.clone()),
+                None => {
+                    if self.backing_off(host) {
+                        return vec![];
+                    }
+                    // Woken since this request read the table, by a wake that's over now.
+                    if let Some(eps) =
+                        self.table.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).map(|r| r.endpoints.clone())
+                        && !eps.is_empty()
+                        && eps != failed
+                    {
+                        return eps;
+                    }
+                    let (tx, done) = tokio::sync::watch::channel(None);
+                    let waiters = Arc::new(tokio::sync::Semaphore::new(WAKE_WAITERS));
+                    waking.insert(host.to_string(), Waking { done: done.clone(), waiters: waiters.clone() });
+                    tokio::spawn(self.clone().run_wake(r, host.to_string(), route.clone(), tx));
+                    (done, waiters)
+                }
+            }
+        };
+        let Ok(_waiter) = waiters.try_acquire_owned() else { return vec![] };
+        match tokio::time::timeout(self.wake_wait, done.wait_for(Option::is_some)).await {
+            Ok(Ok(eps)) => eps.clone().unwrap_or_default(),
+            _ => vec![],
         }
-        let lock = self.waking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(host.to_string()).or_default().clone();
-        let _one = lock.lock().await;
-        // Woken by whoever held the lock before us.
-        if let Some(eps) = self.table.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).map(|r| r.endpoints.clone())
-            && !eps.is_empty()
-        {
-            return eps;
-        }
-        // Or their wake failed while we waited: the backoff covers us too.
-        if self.backing_off(host) {
-            return vec![];
-        }
+    }
+
+    /// The controller call behind [`Edge::wake`]; it may take minutes when the app is rebuilt.
+    async fn run_wake(self: Arc<Self>, r: Remote, host: String, route: Route, tx: tokio::sync::watch::Sender<Option<Vec<String>>>) {
         let ns = if route.ns.is_empty() { "default".to_string() } else { route.ns.clone() };
         let app = route.app.clone();
         let path = format!("/ns/{ns}/apps/{app}/wake");
         let v = tokio::task::spawn_blocking(move || call(&r.url, "POST", &path, Some(&r.token), &Value::Null)).await;
-        match v.map_err(anyhow::Error::from).and_then(|v| v) {
-            Ok(v) => {
-                let eps: Vec<String> =
-                    v["endpoints"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
-                if let Some(r) = self.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(host) {
-                    r.endpoints = eps.clone();
-                }
-                if eps.is_empty() {
-                    self.wake_failed
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(host.to_string(), std::time::Instant::now());
-                }
-                eps
-            }
+        let eps = match v.map_err(anyhow::Error::from).and_then(|v| v) {
+            Ok(v) => v["endpoints"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect(),
             Err(e) => {
                 eprintln!("rekcod: edge: wake {app}: {e:#}");
-                self.wake_failed
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .insert(host.to_string(), std::time::Instant::now());
                 vec![]
             }
+        };
+        if !eps.is_empty()
+            && let Some(r) = self.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).get_mut(&host)
+        {
+            r.endpoints = eps.clone();
         }
+        if eps.is_empty() {
+            self.wake_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(host.clone(), Instant::now());
+        }
+        self.waking.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&host);
+        let _ = tx.send(Some(eps));
+    }
+
+    /// For a 503 while `host` is asleep: the backoff left, or a few seconds.
+    fn retry_after(&self, host: &str) -> u64 {
+        let failed = self.wake_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).copied();
+        failed.map_or(5, |t| WAKE_BACKOFF.saturating_sub(t.elapsed()).as_secs().max(1))
     }
 
     /// An edge-wide 429 for `ip`; enough of them ban its address (its /64 for IPv6) here now
@@ -511,7 +546,7 @@ fn over_limit(e: &hyper::Error) -> bool {
     false
 }
 
-async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: IpAddr, peer: IpAddr, opts: Listener) -> Response<Body> {
+async fn forward(edge: &Arc<Edge>, mut req: Request<Incoming>, host: &str, client: IpAddr, peer: IpAddr, opts: Listener) -> Response<Body> {
     let route =
         edge.table.read().unwrap_or_else(std::sync::PoisonError::into_inner).get(host).filter(|r| r.public || !opts.public_only).cloned();
     let Some(route) = route else {
@@ -542,7 +577,7 @@ async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: Ip
     let mut eps = route.endpoints.clone();
     if eps.is_empty() && !route.app.is_empty() {
         // Asleep: hold this request while the controller starts it.
-        eps = edge.wake(host, &route).await;
+        eps = edge.wake(host, &route, &[]).await;
     }
     // Twice: the second pass after a wake, for an app that went to sleep since the last
     // route refresh.
@@ -590,12 +625,14 @@ async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: Ip
             };
         }
         if pass == 0 && !route.app.is_empty() {
-            eps = edge.wake(host, &route).await;
+            eps = edge.wake(host, &route, &eps).await;
         } else {
             break;
         }
     }
-    text(StatusCode::SERVICE_UNAVAILABLE, format!("{host} didn't come up\n"))
+    let mut r = text(StatusCode::SERVICE_UNAVAILABLE, format!("{host} didn't come up\n"));
+    r.headers_mut().insert(header::RETRY_AFTER, edge.retry_after(host).into());
+    r
 }
 
 #[cfg(test)]
@@ -992,8 +1029,8 @@ mod tests {
         assert!(status.starts_with("HTTP/1.1 413"), "{status}");
     }
 
-    #[tokio::test]
-    async fn a_burst_during_a_failed_wake_asks_the_controller_once() {
+    /// A controller whose `/wake` answers `(status, body)` after `delay`; counts the wakes.
+    async fn controller(delay: Duration, status: u16, body: String) -> (Remote, Arc<AtomicU64>) {
         let controller = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", controller.local_addr().unwrap());
         let wakes = Arc::new(AtomicU64::new(0));
@@ -1001,7 +1038,7 @@ mod tests {
         tokio::spawn(async move {
             loop {
                 let (s, _) = controller.accept().await.unwrap();
-                let w = w.clone();
+                let (w, body) = (w.clone(), body.clone());
                 tokio::spawn(async move {
                     let mut r = BufReader::new(s);
                     let mut first = String::new();
@@ -1014,22 +1051,34 @@ mod tests {
                     if first.contains("/wake") {
                         w.fetch_add(1, Ordering::SeqCst);
                     }
-                    // A slow failure, so the burst queues behind it.
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    let body = r#"{"error":"build failed"}"#;
-                    let resp =
-                        format!("HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    tokio::time::sleep(delay).await;
+                    let resp = format!("HTTP/1.1 {status} X\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                     let _ = r.get_mut().write_all(resp.as_bytes()).await;
                 });
             }
         });
-        let remote = Remote { url, token: "t".into(), ns: None, ca: None };
-        let edge = Edge::new(Some(remote), fast());
+        (Remote { url, token: "t".into(), ns: None, ca: None }, wakes)
+    }
+
+    fn sleeping(edge: &Arc<Edge>, eps: &[&str]) {
         edge.table
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert("a.test".into(), Route { app: "a".into(), sleeping: true, ..route(&[], false) });
+            .insert("a.test".into(), Route { app: "a".into(), sleeping: true, ..route(eps, false) });
+    }
+
+    #[tokio::test]
+    async fn a_burst_during_a_failed_wake_asks_the_controller_once() {
+        // A slow failure, so the burst queues behind it.
+        let (remote, wakes) = controller(Duration::from_millis(300), 500, r#"{"error":"build failed"}"#.into()).await;
+        let edge = Edge::new(Some(remote), fast());
+        sleeping(&edge, &[]);
         let addr = edge_on(&edge, Listener::default()).await;
+        // The first client gives up while the wake runs; the wake and its backoff go on.
+        let mut quitter = dial(&addr).await;
+        quitter.get_mut().write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(quitter);
         let burst: Vec<_> = (0..8)
             .map(|_| {
                 let addr = addr.clone();
@@ -1040,6 +1089,41 @@ mod tests {
             assert_eq!(r.await.unwrap(), 503);
         }
         assert_eq!(get(&mut dial(&addr).await, "a.test", "").await.0, 503);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_slow_wake_answers_503_at_the_bound() {
+        let (remote, wakes) = controller(Duration::from_secs(3), 200, r#"{"endpoints":[]}"#.into()).await;
+        let edge = Edge::new(Some(remote), Settings { wake_wait: Duration::from_millis(300), ..fast() });
+        sleeping(&edge, &[]);
+        let addr = edge_on(&edge, Listener::default()).await;
+        let mut s = dial(&addr).await;
+        let t = Instant::now();
+        s.get_mut().write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+        let mut head = String::new();
+        while !head.ends_with("\r\n\r\n") {
+            let mut line = String::new();
+            s.read_line(&mut line).await.unwrap();
+            head.push_str(&line.to_ascii_lowercase());
+        }
+        assert!(head.starts_with("http/1.1 503") && head.contains("retry-after: 5"), "{head}");
+        assert!(t.elapsed() < Duration::from_secs(2), "{:?}", t.elapsed());
+        // The wake itself goes on: a second request joins it rather than starting another.
+        assert_eq!(get(&mut dial(&addr).await, "a.test", "").await.0, 503);
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn an_app_that_slept_since_the_last_refresh_is_woken() {
+        let live = instance("live").await;
+        let dead = TcpListener::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().to_string();
+        let (remote, wakes) = controller(Duration::ZERO, 200, format!(r#"{{"endpoints":["{live}"]}}"#)).await;
+        let edge = Edge::new(Some(remote), fast());
+        sleeping(&edge, &[&dead]);
+        let addr = edge_on(&edge, Listener::default()).await;
+        let (code, body) = get(&mut dial(&addr).await, "a.test", "").await;
+        assert_eq!((code, app(&body)), (200, "live"));
         assert_eq!(wakes.load(Ordering::SeqCst), 1);
     }
 

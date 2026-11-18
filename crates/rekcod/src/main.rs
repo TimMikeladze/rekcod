@@ -1481,7 +1481,8 @@ fn main() {
                 .map(|h| hyper::header::HeaderName::from_bytes(h.trim().to_ascii_lowercase().as_bytes()))
                 .transpose()
                 .map_err(|e| anyhow::anyhow!("--client-ip-header: {e}"))?;
-            let settings = edge::Settings { rate, burst, access_log, trusted_proxies, client_ip_header, proxy_protocol_from };
+            let settings =
+                edge::Settings { rate, burst, access_log, trusted_proxies, client_ip_header, proxy_protocol_from, ..Default::default() };
             let o = edge::Options { listen, public_listen, proxy_protocol, settings };
             edge::serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), o)
         }

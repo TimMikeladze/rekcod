@@ -938,15 +938,18 @@ fn freeze(s: &Sandbox, name: &str) -> Result<PathBuf> {
     Ok(dst)
 }
 
-/// Bytes a terminal would act on (escape sequences can hide lines from the reviewer),
-/// shown as `^[` style text instead. Newlines and tabs stay.
+/// Bytes a terminal would act on (escape sequences can hide lines from the reviewer), and
+/// the bidirectional controls that reorder what it shows, as `^[` or `\u{..}` text
+/// instead. Newlines and tabs stay.
 pub fn printable(text: &str) -> String {
     text.chars()
         .map(|c| match c {
             '\n' | '\t' => c.to_string(),
             c if (c as u32) < 0x20 => format!("^{}", ((c as u8) + 0x40) as char),
             '\u{7f}' => "^?".into(),
-            c if ('\u{80}'..='\u{9f}').contains(&c) => format!("\\u{{{:x}}}", c as u32),
+            c if matches!(c, '\u{80}'..='\u{9f}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') => {
+                format!("\\u{{{:x}}}", c as u32)
+            }
             c => c.to_string(),
         })
         .collect()
@@ -1320,7 +1323,8 @@ fn check_links(dir: &Dir, from: &Dir, src: &Path, ch: &[Change]) -> Result<()> {
         let Some(why) = leaves(&p, &target, &after) else { continue };
         let theirs = !written.contains(p.as_path()) && dir.read_link(&p).ok().as_ref() == Some(&target);
         if !theirs || leaves(&p, &target, &before).is_none() {
-            bail!("refusing symlink {} -> {}: {why}; nothing was applied", p.display(), target.display());
+            let (p, target) = (printable_name(&p.to_string_lossy()), printable_name(&target.to_string_lossy()));
+            bail!("refusing symlink {p} -> {target}: {why}; nothing was applied");
         }
     }
     Ok(())
@@ -1339,7 +1343,11 @@ fn replaced_dirs(dir: &Dir, ch: &[Change]) -> Result<Vec<PathBuf>> {
         }
         let mut tree = dir.tree(rel)?;
         if let Some((p, _)) = tree.iter().find(|(p, k)| *k != 'd' && !deleted.contains(p.as_path())) {
-            bail!("{} is a directory in the project holding {}, which apply doesn't remove; nothing was applied", c.path, p.display());
+            bail!(
+                "{} is a directory in the project holding {}, which apply doesn't remove; nothing was applied",
+                printable_name(&c.path),
+                printable_name(&p.to_string_lossy())
+            );
         }
         tree.reverse();
         out.extend(tree.into_iter().filter(|(_, k)| *k == 'd').map(|(p, _)| p));
@@ -1354,7 +1362,7 @@ fn replaced_dirs(dir: &Dir, ch: &[Change]) -> Result<Vec<PathBuf>> {
 /// still leave it partial). Deletions go first, so a file can take a directory's place.
 fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest: Option<&mut Manifest>) -> Result<()> {
     if let Some(c) = ch.iter().find(|c| Path::new(&c.path).iter().any(is_git)) {
-        bail!("refusing {}: it's inside .git; nothing was applied", c.path);
+        bail!("refusing {}: it's inside .git; nothing was applied", printable_name(&c.path));
     }
     check_links(dir, from, src, ch)?;
     let replaced = replaced_dirs(dir, ch)?;
@@ -1422,6 +1430,7 @@ fn apply_from(mut s: Sandbox, src: &Path, ch: Vec<Change>, check: bool) -> Resul
     let mut manifest = s.manifest();
     let bad = conflicts(&s.meta.project, manifest.as_ref(), s.meta.created, &ch);
     if !bad.is_empty() {
+        let bad: Vec<String> = bad.iter().map(|p| printable_name(p)).collect();
         bail!("changed in {} since the sandbox copied it: {}", s.meta.project.display(), bad.join(", "));
     }
     if check {
@@ -1446,7 +1455,7 @@ fn apply_from(mut s: Sandbox, src: &Path, ch: Vec<Change>, check: bool) -> Resul
 
 pub fn print_changes(ch: &[Change]) {
     for c in ch {
-        println!("{} {}", c.kind, c.path);
+        println!("{} {}", c.kind, printable_name(&c.path));
     }
 }
 
@@ -1762,6 +1771,8 @@ mod tests {
         assert_eq!(printable("ok\n\tx"), "ok\n\tx");
         assert_eq!(printable("a\x1b[2Kb\r"), "a^[[2Kb^M");
         assert_eq!(printable("\u{9b}"), "\\u{9b}");
+        assert_eq!(printable("a\u{202e}b\u{2066}"), "a\\u{202e}b\\u{2066}");
+        assert_eq!(printable_name("x\ny\tz"), "x^Jy^Iz");
     }
 
     #[test]
@@ -2040,6 +2051,18 @@ mod tests {
         assert!(e.contains("sub in the workspace"), "{e}");
         rm(&paths, std::slice::from_ref(&m.id), false).unwrap();
         assert!(!root(&paths).join(&m.id).exists());
+    }
+
+    #[test]
+    fn the_patch_shows_what_apply_writes() {
+        let (paths, project, m, ws) = setup("shown", &[("f", "x\n"), ("g", "y\n")]);
+        // A content line naming the project path stays as written.
+        let line = format!("rm -rf data{}/keep\na{}/x\n", project.display(), project.display());
+        std::fs::write(ws.join("f"), &line).unwrap();
+        std::fs::set_permissions(ws.join("g"), std::fs::Permissions::from_mode(0o666)).unwrap();
+        let p = patch(&paths, &m.id).unwrap().patch;
+        assert!(p.contains(&format!("+rm -rf data{}/keep\n+a{}/x\n", project.display(), project.display())), "{p}");
+        assert!(p.contains("diff --git a/g b/g\nold mode 100644\nnew mode 100666\n"), "{p}");
     }
 
     #[test]

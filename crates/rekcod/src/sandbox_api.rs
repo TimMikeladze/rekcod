@@ -364,8 +364,10 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
                 os: text(args, "os")?.map(String::from),
                 // Never from the API: it opens a hole to the Mac and LAN.
                 reach: vec![],
-                publish: None,
-                no_autoports: false,
+                // A tenant's sandbox on a node opens no ports on the node Mac: they'd sit
+                // among app instances' ports, which a sleeping instance leaves free.
+                publish: policy.node.then(Vec::new),
+                no_autoports: policy.node,
             };
             let meta = sandbox::create(paths, o)?;
             if policy.node {

@@ -1019,6 +1019,9 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         // Set by the controller only for apps with a bucket; never taken from the app's env,
         // which the app's owner controls.
         reach: storage_reach(a["storage_endpoint"].as_str()),
+        // Its VM opens the app's port on the Mac and nothing else.
+        publish: Some(vec![hp]),
+        no_autoports: true,
         ..Default::default()
     };
     let meta = sandbox::create(paths, o)?;
@@ -1323,7 +1326,7 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
         .unwrap_or_else(|| "alpine:3.24".into());
     // Whichever it came from (the spec, the commit's files), `docker run` takes it as an
     // argument: one starting with `-` would be an option.
-    check_image(&image)?;
+    sandbox::check_image(&image)?;
     let o = sandbox::CreateOptions {
         dir: Some(src.to_path_buf()),
         name: Some(id.to_string()),
@@ -1333,6 +1336,10 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
         memory_gib: a["memory_gib"].as_u64().unwrap_or(2),
         allow_hosts: vec!["*".into()],
         ttl_secs: 0,
+        // A job opens no ports on the node Mac, where they could take a sleeping app
+        // instance's port (RT-03).
+        publish: Some(vec![]),
+        no_autoports: true,
         ..Default::default()
     };
     let sb = host.create(id, o)?;
@@ -1375,23 +1382,11 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
     r
 }
 
-/// A container image reference as `docker run` takes it: `[a-zA-Z0-9][a-zA-Z0-9._/:@-]*`,
-/// at most 255 bytes. The same rule as local sandboxes (SB-19).
-fn check_image(image: &str) -> Result<()> {
-    let ok = image.len() <= 255
-        && image.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
-        && image.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/:@-".contains(&b));
-    if !ok {
-        bail!("bad image {:?}: use a reference like debian:trixie-slim or ghcr.io/org/app@sha256:...", image.escape_debug().to_string());
-    }
-    Ok(())
-}
-
-/// A spec's `image`, when it has one: a string that [`check_image`] accepts.
+/// A spec's `image`, when it has one: a string that [`sandbox::check_image`] accepts.
 fn spec_image(spec: &Value) -> Result<()> {
     match &spec["image"] {
         Value::Null => Ok(()),
-        Value::String(i) => check_image(i),
+        Value::String(i) => sandbox::check_image(i),
         v => bail!("image must be a string, not {v}"),
     }
 }
@@ -6519,8 +6514,9 @@ mod job_and_node_tests {
         created: AtomicUsize,
         removed: Mutex<Vec<String>>,
         work: PathBuf,
-        /// Each created sandbox's idle TTL.
+        /// Each created sandbox's idle TTL, published ports and autoports switch.
         ttls: Mutex<Vec<u64>>,
+        ports: Mutex<Vec<(Option<Vec<u16>>, bool)>>,
     }
 
     impl FakeHost {
@@ -6533,6 +6529,7 @@ mod job_and_node_tests {
                 removed: Mutex::new(vec![]),
                 work: work.to_path_buf(),
                 ttls: Mutex::new(vec![]),
+                ports: Mutex::new(vec![]),
             })
         }
         fn step(&self, stage: &str) {
@@ -6555,6 +6552,7 @@ mod job_and_node_tests {
         fn create(&self, _: &str, o: sandbox::CreateOptions) -> Result<String> {
             self.created.fetch_add(1, Ordering::SeqCst);
             self.ttls.lock().unwrap().push(o.ttl_secs);
+            self.ports.lock().unwrap().push((o.publish.clone(), o.no_autoports));
             self.step("create");
             Ok("fake-sb".into())
         }
@@ -6623,9 +6621,9 @@ mod job_and_node_tests {
 
     #[test]
     fn a_job_image_that_isnt_a_reference_never_reaches_docker() {
-        assert!(check_image("ghcr.io/org/app@sha256:abc").is_ok() && check_image("node:22-slim").is_ok());
+        assert!(sandbox::check_image("ghcr.io/org/app@sha256:abc").is_ok() && sandbox::check_image("node:22-slim").is_ok());
         for bad in ["--privileged", "-v/:/host", "", "a b", "img\n", "café"] {
-            assert!(check_image(bad).is_err(), "{bad:?}");
+            assert!(sandbox::check_image(bad).is_err(), "{bad:?}");
         }
         let home = temp("job-image");
         let paths = Paths { home: home.clone() };
@@ -6640,13 +6638,15 @@ mod job_and_node_tests {
     /// A job's sandbox has no idle TTL, so the daemon never powers it off under a command
     /// that runs for hours with nothing else touching the sandbox.
     #[test]
-    fn a_job_sandbox_has_no_idle_ttl() {
+    fn a_job_sandbox_has_no_idle_ttl_and_opens_no_ports() {
         let home = temp("job-ttl");
         let paths = Paths { home: home.clone() };
         let host = FakeHost::new("", &home.join("work"));
         run_job_on(host.clone(), &paths, &json!({"id": "j-ttl", "git": {"url": "u"}, "cmd": ["x"], "ttl_secs": 60})).unwrap();
         finished(&paths, "j-ttl");
         assert_eq!(*host.ttls.lock().unwrap(), [0]);
+        // And its VM opens no ports on the node Mac (RT-03).
+        assert_eq!(*host.ports.lock().unwrap(), [(Some(vec![]), true)]);
         let _ = std::fs::remove_dir_all(&home);
     }
 

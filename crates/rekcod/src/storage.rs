@@ -37,18 +37,31 @@ fn random_key(n: usize) -> Result<String> {
     Ok(s)
 }
 
+/// 0600 from the start, written whole (temp file and rename); unchanged contents aren't
+/// rewritten.
 fn write_private(path: &Path, data: &[u8]) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
+    if std::fs::read(path).is_ok_and(|old| old == data) {
+        return Ok(());
+    }
     std::fs::create_dir_all(path.parent().context("no parent")?)?;
-    std::fs::write(path, data)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    Ok(())
+    crate::paths::write_private(path, data)
 }
 
 /// The keys in `file`, if it exists.
 pub fn read_credentials(file: &Path) -> Result<S3> {
     let b = std::fs::read(file).with_context(|| format!("no storage credentials at {}", file.display()))?;
-    Ok(serde_json::from_slice(&b)?)
+    serde_json::from_slice(&b).with_context(|| format!("{} isn't valid storage credentials", file.display()))
+}
+
+/// The root keys in `file`, or new ones when there is no such file. Any other failure is an
+/// error: new keys would lock out every client that has the old ones.
+fn root_keys(file: &Path) -> Result<S3> {
+    match std::fs::metadata(file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Ok(S3 { endpoint: String::new(), access_key: format!("rekcod-{}", random_key(8)?), secret_key: random_key(40)?, region: None })
+        }
+        _ => read_credentials(file).context("fix or restore it; it holds the keys every client of this RustFS uses"),
+    }
 }
 
 /// `~/.rekcod/bin/rustfs-<version>`, downloading the pinned release first if needed.
@@ -61,13 +74,20 @@ pub fn ensure_binary(paths: &Paths) -> Result<PathBuf> {
         }
         return Ok(bin);
     }
-    let tmp = paths.home.join("bin").join(format!(".rustfs-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
+    let parent = paths.home.join("bin");
+    std::fs::create_dir_all(&parent)?;
+    // `server setup` and a service start can both get here on a fresh Mac.
+    let _lock = crate::paths::lock(&parent.join(".rustfs-download.lock"))?;
+    if bin.exists() {
+        return Ok(bin);
+    }
+    crate::fetch::clear_stale(&parent, ".rustfs-");
+    let tmp = parent.join(format!(".rustfs-{}", std::process::id()));
     std::fs::create_dir_all(&tmp)?;
     let r = (|| -> Result<()> {
         eprintln!("rekcod: downloading RustFS {RUSTFS_VERSION}");
         let zip = tmp.join("rustfs.zip");
-        if !Command::new("curl").args(["-fsSL", "-o"]).arg(&zip).arg(RUSTFS_ZIP).status()?.success() {
+        if !Command::new("curl").args(crate::fetch::CURL_LIMITS).args(["-fsSL", "-o"]).arg(&zip).arg(RUSTFS_ZIP).status()?.success() {
             bail!("could not download {RUSTFS_ZIP}");
         }
         let out = Command::new("shasum").args(["-a", "256"]).arg(&zip).output()?;
@@ -133,34 +153,44 @@ pub fn serve(paths: &Paths, listen: &str, data: Option<&Path>) -> Result<()> {
     if addr.ip().is_unspecified() {
         bail!("--listen {listen}: give the address clients use (the Tailscale IP), not 0.0.0.0");
     }
+    // App keys and presigned URLs cross this link; RustFS here speaks plain HTTP.
+    crate::fleet::check_plain_http(listen, "storage")?;
     let data = data.map(Path::to_path_buf).unwrap_or_else(|| dir(paths).join("data"));
     std::fs::create_dir_all(&data)?;
     let file = credentials_file(paths);
-    let mut creds = match read_credentials(&file) {
-        Ok(c) => c,
-        Err(_) => {
-            S3 { endpoint: String::new(), access_key: format!("rekcod-{}", random_key(8)?), secret_key: random_key(40)?, region: None }
-        }
-    };
+    let mut creds = root_keys(&file)?;
     creds.endpoint = format!("http://{addr}");
     write_private(&file, &serde_json::to_vec_pretty(&creds)?)?;
     let bin = ensure_binary(paths)?;
     eprintln!("rekcod: RustFS {RUSTFS_VERSION} on {} (data {}, keys {})", creds.endpoint, data.display(), file.display());
     use std::os::unix::process::CommandExt;
-    let err = Command::new(bin)
-        .args(["server", "--address", listen])
-        .arg(&data)
-        .env("RUSTFS_ACCESS_KEY", &creds.access_key)
-        .env("RUSTFS_SECRET_KEY", &creds.secret_key)
-        .exec();
+    let err = rustfs_command(&bin, listen, &data, &creds).exec();
     Err(err).context("exec rustfs")
+}
+
+/// RustFS on `listen` only. Its console is off: RustFS 1.0.1 otherwise also serves the
+/// console, the S3 API and the admin API on `*:9001`, every interface.
+fn rustfs_command(bin: &Path, listen: &str, data: &Path, creds: &S3) -> Command {
+    let mut cmd = Command::new(bin);
+    cmd.args(["server", "--address", listen])
+        .arg(data)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
+        .env("RUSTFS_ACCESS_KEY", &creds.access_key)
+        .env("RUSTFS_SECRET_KEY", &creds.secret_key);
+    cmd
 }
 
 // ------------------------------------------------------------------ local dev
 
 fn docker(paths: &Paths, args: &[&str]) -> Result<String> {
+    docker_env(paths, args, &[])
+}
+
+/// `docker args` with `env` in the CLI's environment: `-e NAME` takes the value from there,
+/// so secrets stay out of the process list.
+fn docker_env(paths: &Paths, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
     let mut cmd = crate::docker::any_cli(paths)?;
-    let out = cmd.args(["-H", &paths.docker_host()]).args(args).stdin(Stdio::null()).output()?;
+    let out = cmd.args(["-H", &paths.docker_host()]).args(args).envs(env.iter().copied()).stdin(Stdio::null()).output()?;
     if !out.status.success() {
         bail!("docker {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim());
     }
@@ -203,12 +233,7 @@ pub fn local_running(paths: &Paths) -> bool {
 /// prints the env block. Running it again prints the block for the running one.
 pub fn up(paths: &Paths) -> Result<()> {
     if !local_running(paths) {
-        let mut creds = read_credentials(&local_file(paths)).unwrap_or(S3 {
-            endpoint: String::new(),
-            access_key: format!("rekcod-{}", random_key(8)?),
-            secret_key: random_key(40)?,
-            region: None,
-        });
+        let mut creds = root_keys(&local_file(paths))?;
         // A stopped one keeps its port and data; a port taken since then means a new one.
         let _ = docker(paths, &["rm", "-f", LOCAL_CONTAINER]);
         let old = creds.endpoint.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
@@ -217,7 +242,7 @@ pub fn up(paths: &Paths) -> Result<()> {
             None => free_port_from(9000)?,
         };
         creds.endpoint = format!("http://127.0.0.1:{port}");
-        docker(
+        docker_env(
             paths,
             &[
                 "run",
@@ -231,15 +256,16 @@ pub fn up(paths: &Paths) -> Result<()> {
                 "-v",
                 "rekcod-storage:/data",
                 "-e",
-                &format!("RUSTFS_ACCESS_KEY={}", creds.access_key),
+                "RUSTFS_ACCESS_KEY",
                 "-e",
-                &format!("RUSTFS_SECRET_KEY={}", creds.secret_key),
+                "RUSTFS_SECRET_KEY",
                 "-e",
                 "RUSTFS_VOLUMES=/data",
                 "-e",
                 "RUSTFS_ADDRESS=:9000",
                 LOCAL_IMAGE,
             ],
+            &[("RUSTFS_ACCESS_KEY", &creds.access_key), ("RUSTFS_SECRET_KEY", &creds.secret_key)],
         )?;
         write_private(&local_file(paths), &serde_json::to_vec_pretty(&creds)?)?;
         let t0 = std::time::Instant::now();
@@ -266,24 +292,89 @@ pub fn env(paths: &Paths) -> Result<()> {
     Ok(())
 }
 
-/// Where `snap --push/--pull` go: `$S3_ENDPOINT`/`$S3_BUCKET` with the `AWS_*` keys if set,
-/// else the local RustFS and bucket `rekcod-snaps`.
+/// Where `snap --push/--pull` go: `$S3_ENDPOINT`/`$S3_BUCKET` with the `AWS_*` keys (and
+/// `AWS_REGION`) if set, else the local RustFS and bucket `rekcod-snaps`. A plain `http://`
+/// endpoint must be on loopback or the tailnet (or `REKCOD_INSECURE=1`): volume archives
+/// would cross the network unencrypted.
 pub fn snap_target(paths: &Paths) -> Result<(S3, String)> {
     let var = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-    if let (Some(endpoint), Some(access_key), Some(secret_key)) =
-        (var("S3_ENDPOINT"), var("AWS_ACCESS_KEY_ID"), var("AWS_SECRET_ACCESS_KEY"))
-    {
-        let bucket = var("S3_BUCKET").context("S3_ENDPOINT is set but S3_BUCKET isn't")?;
-        return Ok((S3 { endpoint, access_key, secret_key, region: var("AWS_REGION") }, bucket));
+    if let Some(t) = env_target(&var)? {
+        return Ok(t);
     }
     let s = local(paths)?;
     s.create_bucket("rekcod-snaps")?;
     Ok((s, "rekcod-snaps".into()))
 }
 
+fn env_target(var: &dyn Fn(&str) -> Option<String>) -> Result<Option<(S3, String)>> {
+    let (Some(endpoint), Some(access_key), Some(secret_key)) = (var("S3_ENDPOINT"), var("AWS_ACCESS_KEY_ID"), var("AWS_SECRET_ACCESS_KEY"))
+    else {
+        return Ok(None);
+    };
+    let bucket = var("S3_BUCKET").context("S3_ENDPOINT is set but S3_BUCKET isn't")?;
+    let endpoint = endpoint.trim_end_matches('/').to_string();
+    match (endpoint.strip_prefix("http://"), endpoint.starts_with("https://")) {
+        (Some(authority), _) => crate::fleet::check_plain_http(authority, "S3_ENDPOINT")?,
+        (None, true) => {}
+        _ => bail!("S3_ENDPOINT={endpoint}: use an https:// or http:// URL"),
+    }
+    Ok(Some((S3 { endpoint, access_key, secret_key, region: var("AWS_REGION") }, bucket)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rustfs_serves_only_its_listen_address() {
+        let creds = S3 { endpoint: String::new(), access_key: "ak".into(), secret_key: "sk".into(), region: None };
+        let cmd = rustfs_command(Path::new("/bin/rustfs"), "127.0.0.1:7710", Path::new("/data"), &creds);
+        let envs: Vec<_> =
+            cmd.get_envs().map(|(k, v)| (k.to_string_lossy().into_owned(), v.map(|v| v.to_string_lossy().into_owned()))).collect();
+        assert!(envs.contains(&("RUSTFS_CONSOLE_ENABLE".into(), Some("false".into()))), "{envs:?}");
+        let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args, ["server", "--address", "127.0.0.1:7710", "/data"]);
+        assert!(!args.iter().any(|a| a.contains("sk")), "the secret goes in the environment");
+    }
+
+    #[test]
+    fn unreadable_credentials_are_an_error_not_new_keys() {
+        let dir = std::env::temp_dir().join(format!("rekcod-storage-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("credentials.json");
+        let made = root_keys(&file).unwrap();
+        assert!(made.access_key.starts_with("rekcod-") && made.secret_key.len() == 40);
+        write_private(&file, &serde_json::to_vec(&made).unwrap()).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+        assert_eq!(root_keys(&file).unwrap().secret_key, made.secret_key);
+        std::fs::write(&file, b"").unwrap();
+        assert!(root_keys(&file).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn snapshot_stores_over_https_or_a_private_link() {
+        let env =
+            |pairs: &'static [(&'static str, &'static str)]| move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string());
+        let base: &[(&str, &str)] = &[("AWS_ACCESS_KEY_ID", "a"), ("AWS_SECRET_ACCESS_KEY", "s"), ("S3_BUCKET", "b")];
+        assert!(env_target(&env(base)).unwrap().is_none());
+        let https = [base, &[("S3_ENDPOINT", "https://s3.eu-west-1.amazonaws.com/"), ("AWS_REGION", "eu-west-1")]].concat().leak();
+        let (s3, bucket) = env_target(&env(https)).unwrap().unwrap();
+        assert_eq!(
+            (s3.endpoint.as_str(), s3.region.as_deref(), bucket.as_str()),
+            ("https://s3.eu-west-1.amazonaws.com", Some("eu-west-1"), "b")
+        );
+        let tailnet = [base, &[("S3_ENDPOINT", "http://100.100.1.2:9000")]].concat().leak();
+        assert!(env_target(&env(tailnet)).unwrap().is_some());
+        if std::env::var_os("REKCOD_INSECURE").is_none() {
+            let lan = [base, &[("S3_ENDPOINT", "http://192.168.1.10:9000")]].concat().leak();
+            assert!(env_target(&env(lan)).is_err());
+        }
+        let ftp = [base, &[("S3_ENDPOINT", "ftp://x")]].concat().leak();
+        assert!(env_target(&env(ftp)).is_err());
+    }
 
     #[test]
     fn lzma_path_swapped_in_place() {

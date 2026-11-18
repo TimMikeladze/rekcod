@@ -5501,8 +5501,16 @@ impl Controller {
 
     /// `--storage URL` with the keys in `creds` (saved to fleet.db), else what fleet.db has.
     fn load_storage(&self, url: Option<&str>, creds: &Path) -> Result<Option<crate::s3::S3>> {
+        // App keys, fleet.db backups and release images go over this link.
+        let private = |endpoint: &str| match endpoint.strip_prefix("http://") {
+            Some(authority) => check_plain_http(authority.trim_end_matches('/'), "storage").context(
+                "run `rekcod server setup` again (it keeps RustFS on loopback unless the address is on the tailnet), or use https",
+            ),
+            None => Ok(()),
+        };
         let s = match url {
             Some(url) => {
+                private(url)?;
                 let mut s = crate::storage::read_credentials(creds)?;
                 s.endpoint = url.trim_end_matches('/').to_string();
                 let sealed = self.seal("default", &s.secret_key)?;
@@ -5518,6 +5526,7 @@ impl Controller {
                 else {
                     return Ok(None);
                 };
+                private(&endpoint)?;
                 crate::s3::S3 { endpoint, access_key, secret_key: self.open_sealed("default", &sealed)?, region: None }
             }
         };
@@ -6451,6 +6460,10 @@ mod tests {
             for bad in ["10.0.0.5:7700", "192.168.1.9:7700", "203.0.113.1:7700", "100.200.0.1:7700"] {
                 assert!(check_plain_http(bad, "x").is_err(), "{bad}");
             }
+            // Storage too: app keys and fleet.db backups go over it. Nothing is saved.
+            let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+            assert!(c.load_storage(Some("http://192.168.1.10:7710"), Path::new("/nonexistent")).is_err());
+            assert_eq!(c.config("storage_url").unwrap(), None);
         }
     }
 

@@ -282,8 +282,12 @@ fn firewall_allows(listapps: &str, exe: &str) -> bool {
     false
 }
 
-/// With the application firewall on, other Macs' connections to the controller and edge
-/// are accepted and then get no data back.
+fn storage_takes_outside_connections(l: &Layout) -> bool {
+    l.storage_listen.parse::<std::net::SocketAddr>().is_ok_and(|a| !a.ip().is_loopback())
+}
+
+/// With the application firewall on, other Macs' connections to the controller, edge and
+/// storage are accepted and then get no data back.
 fn firewall(exe: &Path) {
     let out = |arg: &str| Command::new(SOCKETFILTERFW).arg(arg).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
     if !out("--getglobalstate").is_ok_and(|s| s.contains("enabled")) {
@@ -296,9 +300,7 @@ fn firewall(exe: &Path) {
     let cmds = firewall_allow(&exe);
     if !can_sudo() {
         let line = cmds.iter().map(|c| format!("sudo {}", c.join(" "))).collect::<Vec<_>>().join(" && ");
-        eprintln!(
-            "rekcod: the firewall is on and blocks other Macs from the controller and edge; run once (sudo needs a terminal):\n  {line}"
-        );
+        eprintln!("rekcod: the firewall is on and blocks other Macs from {exe}; run once (sudo needs a terminal):\n  {line}");
         return;
     }
     eprintln!("rekcod: the firewall is on; letting {exe} accept connections");
@@ -351,9 +353,12 @@ pub fn layout(net: &Net) -> Layout {
                 Net::Tailnet { name: Some(n), .. } => n.clone(),
                 _ => ip.clone(),
             };
+            // RustFS speaks plain HTTP: on a tailnet address Tailscale encrypts it, anywhere
+            // else it stays on loopback and only this Mac's node uses it.
+            let storage = if crate::fleet::check_plain_http(&format!("{ip}:7710"), "storage").is_ok() { ip.as_str() } else { "127.0.0.1" };
             Layout {
-                storage_listen: format!("{ip}:7710"),
-                storage_url: format!("http://{ip}:7710"),
+                storage_listen: format!("{storage}:7710"),
+                storage_url: format!("http://{storage}:7710"),
                 controller_listen: format!("{ip}:7700"),
                 tls_name: Some(host),
                 bonjour: false,
@@ -554,6 +559,11 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
     let daemons = prepare_services(paths, &exe, no_power)?;
 
     let ctl = paths.home.join("controller");
+    // Other Macs' nodes and apps dial RustFS directly; with the firewall on, its own binary
+    // needs the same exception as rekcod (after `ensure_binary` patched and signed it).
+    if storage_takes_outside_connections(&l) && std::env::var_os("REKCOD_NO_LAUNCHCTL").is_none() {
+        firewall(&crate::storage::ensure_binary(paths)?);
+    }
     // RustFS first: the controller reads its keys on start.
     run(&exe, &["storage", "serve", "--listen", &l.storage_listen, "--install"])?;
     let creds = crate::storage::credentials_file(paths);
@@ -1034,6 +1044,14 @@ mod tests {
         assert_eq!(t.tls_name.as_deref(), Some("mini.tail1.ts.net"));
         assert_eq!((t.node_listen.as_str(), t.bonjour), ("100.64.0.9:7701", false));
         assert_eq!(layout(&Net::Fixed("10.0.0.4".into())).tls_name.as_deref(), Some("10.0.0.4"));
+        // RustFS speaks plain HTTP: a tailnet address may carry it, a LAN one may not.
+        assert_eq!(t.storage_url, "http://100.64.0.9:7710");
+        assert!(storage_takes_outside_connections(&t) && !storage_takes_outside_connections(&l));
+        if std::env::var_os("REKCOD_INSECURE").is_none() {
+            let f = layout(&Net::Fixed("10.0.0.4".into()));
+            assert_eq!((f.storage_listen.as_str(), f.storage_url.as_str()), ("127.0.0.1:7710", "http://127.0.0.1:7710"));
+            assert_eq!(f.controller_listen, "10.0.0.4:7700");
+        }
     }
 
     /// The test binary has no entitlements, like a plain `cargo build`: what gets sent is a

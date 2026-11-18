@@ -320,7 +320,7 @@ pub fn start(fd: OwnedFd, policy: Arc<Policy>, log: Logger) -> io::Result<Handle
         notify: Arc::new(Notify::new()),
         udp_tx,
         ident: 0,
-        logged: HashMap::new(),
+        logged: rekcod_proto::LogLimit::new(Duration::from_secs(10), 20, "rekcod-egress: "),
     };
     Ok(Handle(tokio::spawn(stack.run(fd, udp_rx))))
 }
@@ -730,8 +730,8 @@ struct Stack {
     notify: Arc<Notify>,
     udp_tx: mpsc::Sender<UdpBack>,
     ident: u16,
-    /// Denials logged recently, so a retry loop doesn't flood daemon.log.
-    logged: HashMap<String, Instant>,
+    /// So a retry loop, or guest root trying every address, doesn't flood daemon.log.
+    logged: rekcod_proto::LogLimit,
 }
 
 fn now() -> smoltcp::time::Instant {
@@ -788,15 +788,9 @@ impl Stack {
     }
 
     fn deny(&mut self, what: String) {
-        let now = Instant::now();
-        if self.logged.len() > 1024 {
-            self.logged.retain(|_, t| now.duration_since(*t) < Duration::from_secs(10));
+        for line in self.logged.lines(format!("rekcod-egress: {what}"), Instant::now()) {
+            (self.log)(line);
         }
-        if self.logged.get(&what).is_some_and(|t| now.duration_since(*t) < Duration::from_secs(10)) {
-            return;
-        }
-        (self.log)(format!("rekcod-egress: {what}"));
-        self.logged.insert(what, now);
     }
 
     /// Sends queued frames to the VM; true if its buffer is full and some are left.

@@ -217,10 +217,15 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let vm = Vm::create(&cfg)?;
     // The VM holds its own copy of its end.
     cfg.net = Net::None;
-    let dns_filter = match (&opts.project, &allow) {
-        (Some(_), Some(a)) => Some(Arc::new(DnsFilter { allow: a.clone(), resolved: resolved.clone() })),
-        _ => None,
-    };
+    let dns = Arc::new(DnsPolicy {
+        sandbox: opts.project.is_some(),
+        filter: match (&opts.project, &allow) {
+            (Some(_), Some(a)) => Some(DnsFilter { allow: a.clone(), resolved: resolved.clone() }),
+            _ => None,
+        },
+        limit: Mutex::new(rekcod_proto::LogLimit::new(Duration::from_secs(10), 20, "rekcod-egress: ")),
+        log: Arc::new(|line| log!("{line}")),
+    });
     let _net = match host_net {
         Some(fd) => {
             let policy =
@@ -319,7 +324,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     if fs_cache {
         tokio::spawn(warm_recent(vm.clone(), paths.warm_paths()));
     }
-    tokio::spawn(dns_bridge(vm.clone(), dns_filter));
+    tokio::spawn(dns_bridge(vm.clone(), dns));
     tokio::spawn(port_forwarder(vm.clone(), status.clone(), !opts.no_autoports));
 
     let mut term = signal(SignalKind::terminate())?;
@@ -742,39 +747,67 @@ struct DnsFilter {
     resolved: Arc<netstack::Resolved>,
 }
 
-impl DnsFilter {
+/// What the DNS bridge answers. Sandboxes get standard queries for one plain name only
+/// ([`rekcod_proto::dns_plain_query`]), whether or not they have an allowlist.
+struct DnsPolicy {
+    sandbox: bool,
+    filter: Option<DnsFilter>,
+    /// Refusals are logged through this: a guest can send them as fast as it likes.
+    limit: Mutex<rekcod_proto::LogLimit>,
+    log: netstack::Logger,
+}
+
+impl DnsPolicy {
     async fn answer(&self, query: &[u8]) -> Option<Vec<u8>> {
-        match dns::query_name(query) {
-            Some(name) if rekcod_proto::host_allowed(&self.allow, &name) => {
-                let answer = resolve(query).await?;
-                for (ip, ttl) in dns::answer_a(&answer) {
-                    self.resolved.record(ip, ttl);
-                }
-                Some(answer)
+        let name = dns::query_name(query);
+        let refuse = if self.sandbox && !rekcod_proto::dns_plain_query(query) {
+            true
+        } else if let Some(f) = &self.filter {
+            !name.as_deref().is_some_and(|n| rekcod_proto::host_allowed(&f.allow, n))
+        } else {
+            false
+        };
+        if refuse {
+            let line = format!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain query)"));
+            let lines = self.limit.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lines(line, Instant::now());
+            for l in lines {
+                (self.log)(l);
             }
-            name => {
-                log!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain question)"));
-                dns::refused(query)
+            return dns::refused(query);
+        }
+        let answer = resolve(query).await?;
+        if let Some(f) = &self.filter {
+            for (ip, ttl) in dns::answer_a(&answer) {
+                f.resolved.record(ip, ttl);
             }
         }
+        Some(answer)
     }
 }
 
 /// Answers the guest's DNS queries with the Mac's current resolvers.
-async fn dns_bridge(vm: Vm, filter: Option<Arc<DnsFilter>>) {
+async fn dns_bridge(vm: Vm, policy: Arc<DnsPolicy>) {
     loop {
-        if let Err(e) = dns_session(&vm, &filter).await {
+        let session = async { dns_session(vm.connect(DNS_PORT).await?, &policy).await };
+        if let Err(e) = session.await {
             log!("dns bridge: {e:#}");
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
 
-async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
-    let (mut rd, mut wr) = tokio::io::split(vm.connect(DNS_PORT).await?);
-    let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    // Queries resolving at once; more wait, so a flood can't spawn tasks without limit.
-    let in_flight = Arc::new(tokio::sync::Semaphore::new(256));
+/// Queries answered at once, and answers waiting for the guest to read them. A guest that
+/// sends without reading fills both and then isn't read either, so its answers can't pile
+/// up on the Mac.
+const DNS_IN_FLIGHT: usize = 256;
+
+async fn dns_session<S>(stream: S, policy: &Arc<DnsPolicy>) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+{
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(DNS_IN_FLIGHT);
+    let in_flight = Arc::new(tokio::sync::Semaphore::new(DNS_IN_FLIGHT));
     let writer = tokio::spawn(async move {
         while let Some(frame) = rx.recv().await {
             if wr.write_all(&frame).await.is_err() {
@@ -789,16 +822,13 @@ async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
             let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
-            let filter = filter.clone();
+            let policy = policy.clone();
             let permit = in_flight.clone().acquire_owned().await?;
             tokio::spawn(async move {
+                // Held until the answer is queued.
                 let _permit = permit;
-                let answer = match &filter {
-                    Some(f) => f.answer(&query).await,
-                    None => resolve(&query).await,
-                };
-                if let Some(frame) = answer.as_deref().and_then(frame) {
-                    let _ = tx.send(frame);
+                if let Some(frame) = policy.answer(&query).await.as_deref().and_then(frame) {
+                    let _ = tx.send(frame).await;
                 }
             });
         }
@@ -834,25 +864,36 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
         servers = dns::nameservers(&resolv, dns::if_index);
     }
     for server in servers {
-        let local: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
-        let Ok(sock) = UdpSocket::bind(local).await else { continue };
-        if sock.send_to(query, server).await.is_err() {
-            continue;
-        }
-        let mut buf = vec![0u8; 4096];
-        if let Ok(Ok((n, _))) = tokio::time::timeout(Duration::from_secs(2), sock.recv_from(&mut buf)).await {
-            buf.truncate(n);
-            // Truncated (TC): the full answer only comes over TCP.
-            if buf.len() > 2
-                && buf[2] & 0x02 != 0
-                && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
-            {
-                return Some(full);
-            }
-            return Some(buf);
+        if let Some(answer) = ask_resolver(query, server, Duration::from_secs(2)).await {
+            return Some(answer);
         }
     }
     None
+}
+
+/// One resolver's answer to `query`. The socket is connected, so only `server` is heard,
+/// and a datagram that doesn't answer this query is ignored.
+async fn ask_resolver(query: &[u8], server: SocketAddr, wait: Duration) -> Option<Vec<u8>> {
+    let local: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
+    let sock = UdpSocket::bind(local).await.ok()?;
+    sock.connect(server).await.ok()?;
+    sock.send(query).await.ok()?;
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut buf = vec![0u8; 4096];
+    loop {
+        let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf)).await.ok()?.ok()?;
+        let answer = &buf[..n];
+        if !dns::answers(query, answer) {
+            continue;
+        }
+        // Truncated (TC): the full answer only comes over TCP.
+        if answer[2] & 0x02 != 0
+            && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
+        {
+            return Some(full);
+        }
+        return Some(answer.to_vec());
+    }
 }
 
 async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
@@ -862,6 +903,9 @@ async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
     tcp.read_exact(&mut len).await?;
     let mut answer = vec![0u8; u16::from_be_bytes(len) as usize];
     tcp.read_exact(&mut answer).await?;
+    if !dns::answers(query, &answer) {
+        bail!("the resolver's answer is for another query");
+    }
     Ok(answer)
 }
 
@@ -1701,6 +1745,66 @@ mod tests {
         assert_eq!(WatchScope::Within(app.clone()).filter(binds.clone()), [app.clone(), app.join("src")].into());
         assert!(WatchScope::Nothing.filter(binds).is_empty(), "a copy-mode sandbox watches nothing");
         std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    fn dns_query(id: u16, name: &str, flags: u8) -> Vec<u8> {
+        let mut q = vec![(id >> 8) as u8, id as u8, flags, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for l in name.split('.') {
+            q.push(l.len() as u8);
+            q.extend_from_slice(l.as_bytes());
+        }
+        q.extend_from_slice(&[0, 0, 1, 0, 1]);
+        q
+    }
+
+    #[tokio::test]
+    async fn a_guest_that_never_reads_dns_answers_stops_being_read() {
+        let logged = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let l = logged.clone();
+        let policy = Arc::new(DnsPolicy {
+            sandbox: true,
+            filter: Some(DnsFilter { allow: vec!["npmjs.org".into()], resolved: Arc::default() }),
+            limit: Mutex::new(rekcod_proto::LogLimit::new(Duration::from_secs(10), 20, "rekcod-egress: ")),
+            log: Arc::new(move |_| {
+                l.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }),
+        });
+        let (ours, mut guest) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move { dns_session(ours, &policy).await });
+        let flood = async {
+            for i in 0..10_000u16 {
+                // Refused at once: a name off the list, or an UPDATE.
+                let q = if i % 2 == 0 { dns_query(i, &format!("n{i}.evil.example"), 1) } else { dns_query(i, "npmjs.org", 0x28) };
+                guest.write_all(&frame(&q).unwrap()).await.unwrap();
+            }
+        };
+        assert!(tokio::time::timeout(Duration::from_secs(3), flood).await.is_err(), "the bridge kept reading");
+        assert!(logged.load(std::sync::atomic::Ordering::Relaxed) <= 20, "{logged:?} lines");
+    }
+
+    #[tokio::test]
+    async fn a_resolver_answer_comes_from_the_resolver_and_answers_the_query() {
+        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let query = dns_query(0x1234, "npmjs.org", 1);
+        let q = query.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (n, client) = server.recv_from(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], &q[..]);
+            // Someone else races the resolver, then the resolver sends a stale answer first.
+            let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut fake = q.clone();
+            fake[2] |= 0x80;
+            forger.send_to(&fake, client).await.unwrap();
+            let mut stale = fake.clone();
+            stale[1] ^= 1;
+            server.send_to(&stale, client).await.unwrap();
+            fake[3] = 3; // NXDOMAIN, from the real resolver this time
+            server.send_to(&fake, client).await.unwrap();
+        });
+        let answer = ask_resolver(&query, addr, Duration::from_secs(5)).await.unwrap();
+        assert_eq!((answer[1], answer[3]), (0x34, 3));
     }
 
     #[tokio::test]

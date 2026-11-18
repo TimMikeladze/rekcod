@@ -1246,6 +1246,7 @@ fn cancel_point(id: &str) -> Result<()> {
 fn job_body(host: &dyn JobHost, id: &str, a: &Value, log: std::fs::File) -> Result<i32> {
     let cmd: Vec<String> = a["cmd"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
     crate::sandbox_api::check_env(&job_env(a))?;
+    spec_image(a)?;
     let src = host.clone(id, a["git"]["url"].as_str().context("missing git.url")?, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
     let r = job_in_checkout(host, id, a, &cmd, &src, log);
     let _ = std::fs::remove_dir_all(&src);
@@ -1259,6 +1260,9 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
         .map(String::from)
         .or_else(|| crate::xrun::plan(src, cmd).map(|p| p.image))
         .unwrap_or_else(|| "alpine:3.24".into());
+    // Whichever it came from (the spec, the commit's files), `docker run` takes it as an
+    // argument: one starting with `-` would be an option.
+    check_image(&image)?;
     let o = sandbox::CreateOptions {
         dir: Some(src.to_path_buf()),
         name: Some(id.to_string()),
@@ -1308,6 +1312,27 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
     })();
     host.remove(&sb);
     r
+}
+
+/// A container image reference as `docker run` takes it: `[a-zA-Z0-9][a-zA-Z0-9._/:@-]*`,
+/// at most 255 bytes. The same rule as local sandboxes (SB-19).
+fn check_image(image: &str) -> Result<()> {
+    let ok = image.len() <= 255
+        && image.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && image.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/:@-".contains(&b));
+    if !ok {
+        bail!("bad image {:?}: use a reference like debian:trixie-slim or ghcr.io/org/app@sha256:...", image.escape_debug().to_string());
+    }
+    Ok(())
+}
+
+/// A spec's `image`, when it has one: a string that [`check_image`] accepts.
+fn spec_image(spec: &Value) -> Result<()> {
+    match &spec["image"] {
+        Value::Null => Ok(()),
+        Value::String(i) => check_image(i),
+        v => bail!("image must be a string, not {v}"),
+    }
 }
 
 /// A job spec's `env` entries; anything that isn't a string is an error for `check_env`.
@@ -3112,7 +3137,23 @@ fn serve_request(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + 
     }
     head_read();
     let mut w = r.into_inner();
-    let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+    // A body that isn't a JSON object is refused: read as `{}`, its fields (`force`, a
+    // spec's settings) would be dropped without a word.
+    let body: Value = match req.body.iter().all(u8::is_ascii_whitespace) {
+        true => json!({}),
+        false => match serde_json::from_slice::<Value>(&req.body) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => return respond(&mut w, 400, "application/json", br#"{"error":"the body must be a JSON object"}"#),
+            Err(e) => {
+                return respond(
+                    &mut w,
+                    400,
+                    "application/json",
+                    json!({"error": format!("the body isn't JSON: {e}")}).to_string().as_bytes(),
+                );
+            }
+        },
+    };
     // `/ns/NS/apps/...`; the same paths without the prefix are the `default` namespace.
     let (ns, seg) = match all.as_slice() {
         ["ns", ns, rest @ ..] if !rest.is_empty() => (ns.to_string(), rest.to_vec()),
@@ -3634,7 +3675,7 @@ fn serve_request(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + 
         }),
         (_, ["namespaces", ..]) => namespaces_route(c, &who, &req.method, &seg, &body),
         (_, ["jobs", ..]) | (_, ["schedules", ..]) => jobs_route(c, &who, &ns, &req.method, &seg, &body, &req.query),
-        ("POST", ["sandboxes"]) => create_sandbox(c, &who, &ns, &req, &mut w).map(|_| Value::Null),
+        ("POST", ["sandboxes"]) => create_sandbox(c, &who, &ns, &body, &mut w).map(|_| Value::Null),
         ("GET", ["sandboxes"]) => (|| {
             c.allow(&who, &ns, Role::Viewer)?;
             let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
@@ -3789,9 +3830,12 @@ fn create_body(b: &Value) -> Value {
     out
 }
 
-fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sandbox_api::Request, w: &mut impl Write) -> Result<()> {
+fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, b: &Value, w: &mut impl Write) -> Result<()> {
     let err = |w: &mut _, msg: String| respond(w, 400, "application/json", json!({"error": msg}).to_string().as_bytes());
-    let body = create_body(&serde_json::from_slice(&req.body).unwrap_or(json!({})));
+    let body = create_body(b);
+    if let Err(e) = spec_image(&body) {
+        return err(w, format!("{e:#}"));
+    }
     let (Some(url), Some(rev)) = (body["git"]["url"].as_str(), body["git"]["ref"].as_str()) else {
         return err(w, "remote sandboxes need git.url (and git.ref)".into());
     };
@@ -6029,6 +6073,7 @@ fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, sche
         bail!("jobs need git.url (and git.ref)");
     }
     crate::sandbox_api::check_env(&job_env(spec))?;
+    spec_image(spec)?;
     let (cpus, gib) = job_resources(spec)?;
     let id = format!("j-{}", sandbox::new_id()?);
     let node = {
@@ -6268,6 +6313,7 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 bail!("jobs need git.url (and git.ref)");
             }
             crate::sandbox_api::check_env(&job_env(b))?;
+            spec_image(b)?;
             job_resources(b)?;
             let key = app_key(ns, name);
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6412,6 +6458,8 @@ mod job_and_node_tests {
         created: AtomicUsize,
         removed: Mutex<Vec<String>>,
         work: PathBuf,
+        /// Each created sandbox's idle TTL.
+        ttls: Mutex<Vec<u64>>,
     }
 
     impl FakeHost {
@@ -6423,6 +6471,7 @@ mod job_and_node_tests {
                 created: AtomicUsize::new(0),
                 removed: Mutex::new(vec![]),
                 work: work.to_path_buf(),
+                ttls: Mutex::new(vec![]),
             })
         }
         fn step(&self, stage: &str) {
@@ -6442,8 +6491,9 @@ mod job_and_node_tests {
             std::fs::create_dir_all(&d)?;
             Ok(d)
         }
-        fn create(&self, _: &str, _: sandbox::CreateOptions) -> Result<String> {
+        fn create(&self, _: &str, o: sandbox::CreateOptions) -> Result<String> {
             self.created.fetch_add(1, Ordering::SeqCst);
+            self.ttls.lock().unwrap().push(o.ttl_secs);
             self.step("create");
             Ok("fake-sb".into())
         }
@@ -6507,6 +6557,35 @@ mod job_and_node_tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_job_image_that_isnt_a_reference_never_reaches_docker() {
+        assert!(check_image("ghcr.io/org/app@sha256:abc").is_ok() && check_image("node:22-slim").is_ok());
+        for bad in ["--privileged", "-v/:/host", "", "a b", "img\n", "café"] {
+            assert!(check_image(bad).is_err(), "{bad:?}");
+        }
+        let home = temp("job-image");
+        let paths = Paths { home: home.clone() };
+        let host = FakeHost::new("", &home.join("work"));
+        run_job_on(host.clone(), &paths, &json!({"id": "j-img", "git": {"url": "u"}, "cmd": ["x"], "image": "--privileged"})).unwrap();
+        let v = finished(&paths, "j-img");
+        assert!(v["error"].as_str().unwrap().contains("bad image"), "{v}");
+        assert_eq!(host.created.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A job's sandbox has no idle TTL, so the daemon never powers it off under a command
+    /// that runs for hours with nothing else touching the sandbox.
+    #[test]
+    fn a_job_sandbox_has_no_idle_ttl() {
+        let home = temp("job-ttl");
+        let paths = Paths { home: home.clone() };
+        let host = FakeHost::new("", &home.join("work"));
+        run_job_on(host.clone(), &paths, &json!({"id": "j-ttl", "git": {"url": "u"}, "cmd": ["x"], "ttl_secs": 60})).unwrap();
+        finished(&paths, "j-ttl");
+        assert_eq!(*host.ttls.lock().unwrap(), [0]);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -9803,6 +9882,28 @@ mod tests {
     }
 
     #[test]
+    fn a_body_that_isnt_a_json_object_is_refused_not_read_as_empty() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        call(&url, "POST", "/namespaces", Some("admin-t"), &json!({"name": "team"})).unwrap();
+        let addr = url.trim_start_matches("http://");
+        let raw = |method: &str, path: &str, body: &str| {
+            let mut s = TcpStream::connect(addr).unwrap();
+            write!(s, "{method} {path} HTTP/1.1\r\nAuthorization: Bearer admin-t\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let mut reply = String::new();
+            let _ = s.read_to_string(&mut reply);
+            reply
+        };
+        for body in [r#"{"force": tru"#, "[1]", "\"x\""] {
+            let reply = raw("DELETE", "/namespaces/team", body);
+            assert!(reply.starts_with("HTTP/1.1 400"), "{body}: {reply}");
+        }
+        assert!(c.db().query_opt("select 1 from namespaces where name = 'team'", &[]).unwrap().is_some());
+        // An empty body is still an empty object.
+        assert!(raw("DELETE", "/namespaces/team", "").starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
     fn token_caps_stay_in_range_and_a_panicking_duty_runs_again() {
         let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
         add_token(&c, "admin-t", "admin", true, "member", false, None);
@@ -9872,7 +9973,14 @@ mod tests {
         let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
         add_token(&c, "alice-t", "alice", false, "member", false, None);
         let base = json!({"name": "nightly", "every_secs": 3600, "cmd": ["true"], "git": {"url": "https://example.invalid/r"}});
-        for (field, value) in [("cpus", json!(-1)), ("memory_gib", json!(10_000)), ("cmd", json!([])), ("env", json!(["HOME"]))] {
+        for (field, value) in [
+            ("cpus", json!(-1)),
+            ("memory_gib", json!(10_000)),
+            ("cmd", json!([])),
+            ("env", json!(["HOME"])),
+            ("image", json!("--privileged")),
+            ("image", json!(7)),
+        ] {
             let mut b = base.clone();
             b[field] = value.clone();
             let e = call(&url, "POST", "/jobs", Some("alice-t"), &b).unwrap_err().to_string();
@@ -9885,6 +9993,12 @@ mod tests {
         once["env"] = json!(["A=1", "GITHUB_TOKEN"]);
         let e = call(&url, "POST", "/jobs", Some("alice-t"), &once).unwrap_err().to_string();
         assert!(e.contains("(400)") && e.contains("GITHUB_TOKEN"), "{e}");
+        once["env"] = json!([]);
+        once["image"] = json!("-v/:/host");
+        assert!(call(&url, "POST", "/jobs", Some("alice-t"), &once).unwrap_err().to_string().contains("bad image"));
+        let create = json!({"git": {"url": "https://example.invalid/r", "ref": "main"}, "image": "--privileged"});
+        let e = call(&url, "POST", "/sandboxes", Some("alice-t"), &create).unwrap_err().to_string();
+        assert!(e.contains("bad image"), "{e}");
         assert_eq!(c.db.lock().unwrap().query_one("select count(*) from jobs", &[]).unwrap().get::<i64>(0), 0);
         call(&url, "POST", "/jobs", Some("alice-t"), &base).unwrap();
     }

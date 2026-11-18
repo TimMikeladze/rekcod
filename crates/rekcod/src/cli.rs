@@ -259,9 +259,20 @@ pub(crate) fn exclude_from_backups(dir: &std::path::Path) {
     }
 }
 
+/// The last `lines` lines of a log, read from its last 64 KiB only (a console log can be
+/// tens of MB).
 fn tail(path: &std::path::Path, lines: usize) -> String {
-    let text = std::fs::read_to_string(path).unwrap_or_default();
-    let all: Vec<&str> = text.lines().collect();
+    use std::io::{Seek, SeekFrom};
+    const WINDOW: u64 = 64 << 10;
+    let Ok(mut f) = std::fs::File::open(path) else { return String::new() };
+    let len = f.metadata().map_or(0, |m| m.len());
+    let mut bytes = Vec::new();
+    if f.seek(SeekFrom::Start(len.saturating_sub(WINDOW))).is_err() || f.take(WINDOW).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    // Kernel output can hold bytes that aren't UTF-8; the window may start mid-line.
+    let text = String::from_utf8_lossy(&bytes);
+    let all: Vec<&str> = text.lines().skip(usize::from(len > WINDOW)).collect();
     all[all.len().saturating_sub(lines)..].join("\n")
 }
 
@@ -1112,6 +1123,22 @@ mod tests {
         }
         assert_eq!(pid_of(&daemon, 0), None, "gone");
         std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn tail_reads_only_the_end_of_a_big_log() {
+        let p = std::env::temp_dir().join(format!("rekcod-tail-{}", std::process::id()));
+        let text: String = (0..200_000).map(|i| format!("line {i}\n")).collect();
+        assert!(text.len() > 1 << 20);
+        std::fs::write(&p, text).unwrap();
+        assert_eq!(tail(&p, 3), "line 199997\nline 199998\nline 199999");
+        // More lines than the window holds: only whole lines from it.
+        let many = tail(&p, 100_000);
+        assert!(many.len() <= 64 << 10 && many.starts_with("line ") && many.ends_with("line 199999"));
+        std::fs::write(&p, "a\nb\n").unwrap();
+        assert_eq!(tail(&p, 5), "a\nb");
+        std::fs::remove_file(&p).unwrap();
+        assert_eq!(tail(&p, 5), "");
     }
 
     #[test]

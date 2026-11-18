@@ -57,26 +57,44 @@ const RESOLVED_GRACE: Duration = Duration::from_secs(600);
 pub type Logger = Arc<dyn Fn(String) + Send + Sync>;
 
 /// Addresses the daemon's DNS bridge handed this VM for allowed names, until they expire.
+/// The ports an allowlist entry named for that name (`db.example.com:5432`) are kept with
+/// the address: raw TCP may use them.
 #[derive(Default)]
-pub struct Resolved(Mutex<HashMap<Ipv4Addr, Instant>>);
+pub struct Resolved(Mutex<HashMap<(Ipv4Addr, u16), Instant>>);
+
+/// Key for the address itself, with no raw port.
+const ANY_PORT: u16 = 0;
 
 impl Resolved {
-    pub fn record(&self, ip: Ipv4Addr, ttl: u32) {
-        self.record_until(ip, Instant::now() + Duration::from_secs(ttl.min(86_400).into()) + RESOLVED_GRACE);
+    #[cfg(test)]
+    fn record(&self, ip: Ipv4Addr, ttl: u32) {
+        self.record_ports(ip, ttl, &[]);
     }
 
-    fn record_until(&self, ip: Ipv4Addr, until: Instant) {
+    /// `ip` answered for a name whose allowlist entries name `raw_ports`.
+    pub fn record_ports(&self, ip: Ipv4Addr, ttl: u32, raw_ports: &[u16]) {
+        let until = Instant::now() + Duration::from_secs(ttl.min(86_400).into()) + RESOLVED_GRACE;
+        for port in std::iter::once(ANY_PORT).chain(raw_ports.iter().copied()) {
+            self.record_until(ip, port, until);
+        }
+    }
+
+    fn record_until(&self, ip: Ipv4Addr, port: u16, until: Instant) {
         let mut m = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if m.len() > 4096 {
             let now = Instant::now();
             m.retain(|_, t| *t > now);
         }
-        let t = m.entry(ip).or_insert(until);
+        let t = m.entry((ip, port)).or_insert(until);
         *t = (*t).max(until);
     }
 
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).get(&ip).is_some_and(|t| *t > Instant::now())
+        self.raw_port(ip, ANY_PORT)
+    }
+
+    fn raw_port(&self, ip: Ipv4Addr, port: u16) -> bool {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner).get(&(ip, port)).is_some_and(|t| *t > Instant::now())
     }
 }
 
@@ -188,6 +206,10 @@ impl Policy {
         // and clients fall back to TCP). DNS goes over vsock.
         if !tcp {
             return Verdict::Refuse("UDP can't be checked against the allowlist");
+        }
+        // An entry with this port (`db.example.com:5432`) named one of this address's names.
+        if self.resolved.raw_port(ip, dst.port()) {
+            return Verdict::Allow;
         }
         match dst.port() {
             p if self.tls_ports.contains(&p) => Verdict::Tls,
@@ -1525,6 +1547,19 @@ mod tests {
         assert_eq!(out.2, (Err("reset"), vec!["rekcod-egress: refused tls (no SNI) at 127.0.0.1".to_string()]));
     }
 
+    /// An allowlist entry naming the echo server's port lets anything through on it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_port_on_the_allowlist_carries_raw_tcp() {
+        let to = echo_server().await;
+        let resolved = Arc::new(Resolved::default());
+        resolved.record_ports(*to.ip(), 30, &[to.port()]);
+        let (mut g, _h, logs) = net(with_loopback(Policy::new(Some(vec![format!("db.test:{}", to.port())]), vec![], resolved)));
+        let got = tokio::task::spawn_blocking(move || g.exchange(to, b"\0\0\0\x08\x04\xd2\x16\x2f")).await.unwrap();
+        assert_eq!(got, Ok(b"\0\0\0\x08\x04\xd2\x16\x2f".to_vec()));
+        // The guest's end closes when the exchange returns; nothing else is logged.
+        assert!(logs.lock().unwrap().iter().all(|l| l.contains("network card closed")), "{:?}", logs.lock().unwrap());
+    }
+
     /// The echo server's port is neither 443 nor 80, so the first bytes pick the check.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn other_ports_are_checked_by_what_they_carry() {
@@ -1659,6 +1694,12 @@ mod tests {
         // A CDN serves every site it fronts on its other ports too (Cloudflare: 2053, 8443, 8080...).
         assert_eq!(p.check(true, "104.16.1.1:8443".parse().unwrap()), Verdict::Sniff);
         assert_eq!(p.check(true, "104.16.1.1:8080".parse().unwrap()), Verdict::Sniff);
+        // An entry naming a port (`db.example.com:5432`): raw TCP there, only there.
+        resolved.record_ports("104.16.2.2".parse().unwrap(), 60, &[5432]);
+        assert_eq!(p.check(true, "104.16.2.2:5432".parse().unwrap()), Verdict::Allow);
+        assert_eq!(p.check(true, "104.16.2.2:5433".parse().unwrap()), Verdict::Sniff);
+        assert_eq!(p.check(true, "104.16.1.1:5432".parse().unwrap()), Verdict::Sniff, "another name's address");
+        assert!(matches!(p.check(false, "104.16.2.2:5432".parse().unwrap()), Verdict::Refuse(_)), "TCP only");
         for port in [443, 8443, 22] {
             assert!(matches!(p.check(false, SocketAddrV4::new("104.16.1.1".parse().unwrap(), port)), Verdict::Refuse(_)), "udp {port}");
         }
@@ -1683,7 +1724,7 @@ mod tests {
     fn resolved_addresses_expire() {
         let r = Resolved::default();
         let ip = Ipv4Addr::new(93, 184, 216, 34);
-        r.record_until(ip, Instant::now() - Duration::from_secs(1));
+        r.record_until(ip, ANY_PORT, Instant::now() - Duration::from_secs(1));
         assert!(!r.contains(ip));
         r.record(ip, 0);
         assert!(r.contains(ip), "TTL 0 still gets the grace period");

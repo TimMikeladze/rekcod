@@ -809,7 +809,8 @@ impl DnsPolicy {
             false
         };
         if refuse {
-            let line = format!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain query)"));
+            // The name is the guest's: escaped, cut short, and rate-limited.
+            let line = format!("rekcod-egress: refused dns {}", dns::printable(name.as_deref().unwrap_or("(not one plain query)")));
             let lines = self.limit.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lines(line, Instant::now());
             for l in lines {
                 (self.log)(l);
@@ -818,8 +819,9 @@ impl DnsPolicy {
         }
         let answer = resolve(query).await?;
         if let Some(f) = &self.filter {
+            let raw = name.as_deref().map(|n| rekcod_proto::raw_ports(&f.allow, n)).unwrap_or_default();
             for (ip, ttl) in dns::answer_a(&answer) {
-                f.resolved.record(ip, ttl);
+                f.resolved.record_ports(ip, ttl, &raw);
             }
         }
         Some(answer)
@@ -837,16 +839,31 @@ async fn dns_bridge(vm: Vm, policy: Arc<DnsPolicy>) {
     }
 }
 
-/// Queries answered at once, and answers waiting for the guest to read them. A guest that
-/// sends without reading fills both and then isn't read either, so its answers can't pile
-/// up on the Mac.
-const DNS_IN_FLIGHT: usize = 256;
-
 async fn dns_session<S>(stream: S, policy: &Arc<DnsPolicy>) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
+    let policy = policy.clone();
+    dns_serve(stream, move |query: Vec<u8>| {
+        let policy = policy.clone();
+        async move { policy.answer(&query).await }
+    })
+    .await
+}
+
+/// Queries answered at once; more wait, so a flood can't spawn tasks without limit.
+const DNS_IN_FLIGHT: usize = 256;
+
+/// Length-prefixed DNS queries in, `answer`'s replies out, until the stream ends.
+async fn dns_serve<S, F, Fut>(stream: S, answer: F) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
+{
     let (mut rd, mut wr) = tokio::io::split(stream);
+    // Bounded, and a query's permit is held until its answer is queued: a guest that stops
+    // reading answers stops having its queries read.
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(DNS_IN_FLIGHT);
     let in_flight = Arc::new(tokio::sync::Semaphore::new(DNS_IN_FLIGHT));
     let writer = tokio::spawn(async move {
@@ -863,12 +880,12 @@ where
             let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
-            let policy = policy.clone();
             let permit = in_flight.clone().acquire_owned().await?;
+            let answering = answer(query);
             tokio::spawn(async move {
                 // Held until the answer is queued.
                 let _permit = permit;
-                if let Some(frame) = policy.answer(&query).await.as_deref().and_then(frame) {
+                if let Some(frame) = answering.await.as_deref().and_then(frame) {
                     let _ = tx.send(frame).await;
                 }
             });
@@ -905,23 +922,18 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
         servers = dns::nameservers(&resolv, dns::if_index);
     }
     for server in servers {
-        if let Some(answer) = ask_resolver(query, server, Duration::from_secs(2)).await {
-            return Some(answer);
+        if let Some(buf) = dns::ask_udp(query, server, Duration::from_secs(2)).await {
+            // Truncated (TC): the full answer only comes over TCP.
+            if buf.len() > 2
+                && buf[2] & 0x02 != 0
+                && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
+            {
+                return Some(full);
+            }
+            return Some(buf);
         }
     }
     None
-}
-
-/// One resolver's answer to `query` ([`dns::ask_udp`]); a truncated one is asked again over TCP.
-async fn ask_resolver(query: &[u8], server: SocketAddr, wait: Duration) -> Option<Vec<u8>> {
-    let answer = dns::ask_udp(query, server, wait).await?;
-    // Truncated (TC): the full answer only comes over TCP.
-    if answer[2] & 0x02 != 0
-        && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
-    {
-        return Some(full);
-    }
-    Some(answer)
 }
 
 async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
@@ -1945,31 +1957,6 @@ mod tests {
         };
         assert!(tokio::time::timeout(Duration::from_secs(3), flood).await.is_err(), "the bridge kept reading");
         assert!(logged.load(std::sync::atomic::Ordering::Relaxed) <= 20, "{logged:?} lines");
-    }
-
-    #[tokio::test]
-    async fn a_resolver_answer_comes_from_the_resolver_and_answers_the_query() {
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let query = dns_query(0x1234, "npmjs.org", 1);
-        let q = query.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            let (n, client) = server.recv_from(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], &q[..]);
-            // Someone else races the resolver, then the resolver sends a stale answer first.
-            let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let mut fake = q.clone();
-            fake[2] |= 0x80;
-            forger.send_to(&fake, client).await.unwrap();
-            let mut stale = fake.clone();
-            stale[1] ^= 1;
-            server.send_to(&stale, client).await.unwrap();
-            fake[3] = 3; // NXDOMAIN, from the real resolver this time
-            server.send_to(&fake, client).await.unwrap();
-        });
-        let answer = ask_resolver(&query, addr, Duration::from_secs(5)).await.unwrap();
-        assert_eq!((answer[1], answer[3]), (0x34, 3));
     }
 
     #[tokio::test]

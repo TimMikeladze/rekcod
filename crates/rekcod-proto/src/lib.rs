@@ -177,14 +177,62 @@ impl Control {
     }
 }
 
+/// One allowlist entry: its name pattern, and the TCP port when it names one
+/// (`db.example.com:5432`). An entry whose port doesn't parse names no port and, with the
+/// colon left in, no host either.
+pub fn allow_entry(entry: &str) -> (&str, Option<u16>) {
+    match entry.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) => {
+            match port.parse::<u16>() {
+                Ok(p) if p > 0 => (host, Some(p)),
+                _ => (entry, None),
+            }
+        }
+        _ => (entry, None),
+    }
+}
+
+/// Whether `entry` is something the allowlist understands: `*`, a name, `*.name`, either
+/// of those with `:PORT`.
+pub fn valid_allow_entry(entry: &str) -> bool {
+    let (host, port) = allow_entry(entry);
+    if host == "*" {
+        return port.is_none();
+    }
+    let name = host.strip_prefix("*.").unwrap_or(host);
+    !name.is_empty() && name.split('.').all(|l| !l.is_empty() && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'))
+}
+
+fn name_matches(pattern: &str, port: Option<u16>, name: &str) -> bool {
+    let p = pattern.to_ascii_lowercase();
+    (p == "*" && port.is_none()) || p == name || p.strip_prefix("*.").is_some_and(|base| name.ends_with(&format!(".{base}")))
+}
+
 /// Agent sandbox egress allowlist (`rekcod.allow=` on the kernel command line): exact
-/// names, `*.example.com` for any subdomain, `*` for everything.
+/// names, `*.example.com` for any subdomain, `*` for everything. An entry with a port
+/// (`db.example.com:5432`) allows the name too.
 pub fn host_allowed(allow: &[String], name: &str) -> bool {
     let name = name.trim_end_matches('.').to_ascii_lowercase();
-    allow.iter().any(|p| {
-        let p = p.to_ascii_lowercase();
-        p == "*" || p == name || p.strip_prefix("*.").is_some_and(|base| name.ends_with(&format!(".{base}")))
+    allow.iter().any(|e| {
+        let (pattern, port) = allow_entry(e);
+        name_matches(pattern, port, &name)
     })
+}
+
+/// The TCP ports `name`'s addresses may carry anything on, not only TLS or HTTP: the ports
+/// of the entries that name it (`db.example.com:5432`).
+pub fn raw_ports(allow: &[String], name: &str) -> Vec<u16> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let mut ports: Vec<u16> = allow
+        .iter()
+        .filter_map(|e| match allow_entry(e) {
+            (pattern, Some(port)) if name_matches(pattern, Some(port), &name) => Some(port),
+            _ => None,
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
 }
 
 /// A DNS query's one question: its name, dotted, and the offset just past it. None unless
@@ -320,6 +368,25 @@ mod tests {
         assert_eq!((r[2] & 0x80, r[3] & 0x0f, &r[4..12]), (0x80, 5, &[0, 1, 0, 0, 0, 0, 0, 0][..]));
         assert_eq!(dns_refused(&[1, 2, 3]), None);
         assert_eq!(dns_refused(&update[..12]).unwrap()[4..12], [0; 8]);
+    }
+
+    #[test]
+    fn allowlist_entries_may_name_a_port() {
+        let allow: Vec<String> =
+            ["registry.npmjs.org", "db.example.com:5432", "*.corp.example:22000", "x.io:99999"].map(String::from).into();
+        assert!(host_allowed(&allow, "db.example.com"), "a port entry allows the name");
+        assert!(host_allowed(&allow, "git.corp.example"));
+        assert!(!host_allowed(&allow, "x.io"), "a port that doesn't parse names nothing");
+        assert_eq!(raw_ports(&allow, "DB.example.com."), [5432]);
+        assert_eq!(raw_ports(&allow, "git.corp.example"), [22000]);
+        assert!(raw_ports(&allow, "registry.npmjs.org").is_empty());
+        assert!(!host_allowed(&["*:5432".into()], "anything.example"), "no port for every name");
+        for ok in ["*", "a.com", "*.a.com", "a.com:5432", "*.a.com:1"] {
+            assert!(valid_allow_entry(ok), "{ok}");
+        }
+        for bad in ["*:5432", "a.com:0", "a.com:99999", "a.com:", "", "a..com", "a com", "http://a.com"] {
+            assert!(!valid_allow_entry(bad), "{bad}");
+        }
     }
 
     #[test]

@@ -315,7 +315,10 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
     }
     let free = crate::cli::free_disk_gib(&paths.home).unwrap_or(0);
     add("free disk on the Mac", free >= 10, format!("{free} GiB"), "free some space; the VM's disk fails when the Mac's fills");
-    let console = std::fs::read(paths.console_log()).unwrap_or_default();
+    // boot.sh reports a disk error before anything else runs: the first 4 MiB hold it.
+    let mut console = Vec::new();
+    let _ = std::fs::File::open(paths.console_log())
+        .and_then(|f| std::io::Read::read_to_end(&mut std::io::Read::take(f, 4 << 20), &mut console));
     let disk_err = String::from_utf8_lossy(&console).lines().find(|l| l.contains("data disk error")).map(String::from);
     add("data disk", disk_err.is_none(), disk_err.unwrap_or("no errors this boot".into()), "rekcod stop && rekcod start --repair");
     // Paths::at already took group and other access off these; what's left it couldn't.

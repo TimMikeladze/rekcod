@@ -567,6 +567,9 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     if let Some(os) = o.os.as_deref().filter(|os| *os != "macos" && *os != "linux") {
         bail!("--os takes linux or macos, not {os}");
     }
+    if let Some(h) = o.allow_hosts.iter().find(|h| !rekcod_proto::valid_allow_entry(h)) {
+        bail!("--allow-host {h}: takes a name, *.name, either with :PORT, or *");
+    }
     if macos && (o.offline || !o.allow_hosts.is_empty()) {
         // The macOS guest has plain NAT: no allowlist, and the Mac and LAN are reachable.
         bail!("--offline and --allow-host don't apply to macOS sandboxes; their network isn't filtered");

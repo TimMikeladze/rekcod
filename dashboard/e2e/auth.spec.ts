@@ -45,6 +45,15 @@ test.describe("signed out", () => {
   })
 })
 
+test("pages may run only this origin's scripts and connect only to it", async ({ request }) => {
+  const csp = (await request.get("/containers")).headers()["content-security-policy"]
+  expect(csp).toContain("script-src 'self' 'unsafe-inline'")
+  expect(csp).toContain("connect-src 'self'")
+  expect(csp).toContain("frame-ancestors 'none'")
+  const auth = (await request.get(`/auth?token=${TOKEN}`)).headers()["content-security-policy"]
+  expect(auth).toMatch(/script-src 'sha256-[A-Za-z0-9+/=]+'/)
+})
+
 test("signed in, the API answers to the header", async ({ request }) => {
   expect((await request.get("/api/state", { headers: { authorization: `Bearer ${TOKEN}` } })).status()).toBe(200)
 })

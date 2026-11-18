@@ -288,6 +288,24 @@ fn firewall_allows(listapps: &str, exe: &str) -> bool {
     false
 }
 
+/// For `doctor`: when this Mac's RustFS listens beyond loopback and the firewall is on,
+/// whether the RustFS binary may accept connections, and what was checked. None when
+/// neither applies.
+pub fn storage_firewall(paths: &Paths) -> Option<(bool, String)> {
+    let creds = crate::storage::read_credentials(&crate::storage::credentials_file(paths)).ok()?;
+    let listen = creds.endpoint.strip_prefix("http://")?.parse::<std::net::SocketAddr>().ok()?;
+    if listen.ip().is_loopback() {
+        return None;
+    }
+    let out = |arg: &str| Command::new(SOCKETFILTERFW).arg(arg).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    if !out("--getglobalstate").is_ok_and(|s| s.contains("enabled")) {
+        return None;
+    }
+    let bin = crate::storage::binary_path(paths).display().to_string();
+    let ok = out("--listapps").is_ok_and(|s| firewall_allows(&s, &bin));
+    Some((ok, format!("{bin} on {listen}")))
+}
+
 fn storage_takes_outside_connections(l: &Layout) -> bool {
     l.storage_listen.parse::<std::net::SocketAddr>().is_ok_and(|a| !a.ip().is_loopback())
 }
@@ -1004,6 +1022,7 @@ fn pass_through(src: impl Read, mut out: impl Write) -> Result<Option<(String, S
 
 /// Runs `server setup` over SSH, streaming its output, and returns the remote it printed.
 /// `ssh` should have `-t` when this terminal is one, so sudo can prompt.
+#[allow(clippy::too_many_arguments)]
 pub fn remote_setup(
     dest: &str,
     mut ssh: Command,
@@ -1012,9 +1031,13 @@ pub fn remote_setup(
     addr: Option<&str>,
     lan: bool,
     no_power: bool,
+    backup_dir: Option<&str>,
 ) -> Result<(String, String, Option<String>)> {
     if !shell_safe(domain) || addr.is_some_and(|a| !shell_safe(a)) || bin.contains('\'') {
         bail!("--domain and --addr take letters, digits and - . : only");
+    }
+    if backup_dir.is_some_and(|d| !shell_safe(d) || !d.starts_with('/')) {
+        bail!("--backup-dir takes an absolute path on the server of letters, digits and - . _ / only");
     }
     let mut cmd = format!("'{bin}' server setup --domain {domain}");
     if let Some(a) = addr {
@@ -1025,6 +1048,9 @@ pub fn remote_setup(
     }
     if no_power {
         cmd += " --no-power";
+    }
+    if let Some(d) = backup_dir {
+        cmd += &format!(" --backup-dir '{d}'");
     }
     eprintln!("rekcod: running `rekcod server setup` on {dest}; sudo there asks for the password of that Mac's account");
     let mut child = ssh.arg(cmd).stdout(Stdio::piped()).spawn().context("run ssh")?;
@@ -1156,9 +1182,11 @@ mod tests {
         std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let mut sh = Command::new("sh");
         sh.arg("-c");
-        let r = remote_setup("mini", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), false, true);
+        let r = remote_setup("mini", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), false, true, Some("/Volumes/B/rekcod"));
         std::fs::remove_file(&bin).unwrap();
         assert_eq!(r.unwrap(), ("http://mini:7700".into(), "tok".into(), None));
+        let relative = remote_setup("mini", Command::new("true"), "/x", "apps.test", None, false, true, Some("backups"));
+        assert!(relative.unwrap_err().to_string().contains("absolute"));
     }
 
     #[test]
@@ -1167,7 +1195,7 @@ mod tests {
         let r = pass_through(&b"Password:ok\r\nremote http://s:7700 t\r\nreminder\n"[..], &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "Password:ok\r\nreminder\n");
         assert_eq!(r, Some(("http://s:7700".into(), "t".into(), None)));
-        assert!(remote_setup("s", Command::new("true"), "/x", "a.com'; rm -rf ~", None, false, true).is_err());
+        assert!(remote_setup("s", Command::new("true"), "/x", "a.com'; rm -rf ~", None, false, true, None).is_err());
     }
 
     #[test]

@@ -1811,7 +1811,8 @@ const MIGRATIONS: &[&str] = &[
     // load against it.
     "alter table apps add column storage_key_prev text;
      alter table apps add column storage_secret_prev text;
-     alter table releases add column stored text;",
+     alter table releases add column stored text;
+     alter table apps add column destroy_error text;",
 ];
 
 /// A node's state as shown: `drain` for a drained node that answers.
@@ -4509,6 +4510,8 @@ fn launch_instances(
                         st["toml_sha256"] = json!(t);
                         st["image_put"] = Value::Null;
                         st["toml_put"] = Value::Null;
+                        st["cache_put"] = Value::Null;
+                        st["cache_get"] = Value::Null;
                     }
                     if let Some(h) = v["health"].as_str().filter(|_| app.health == "/") {
                         result.health = h.to_string();
@@ -4906,6 +4909,106 @@ fn destroy_app(c: &Arc<Controller>, name: &str) -> Result<Value> {
     finish_destroy(c, name, generation).inspect_err(|e| c.alert(&format!("{e:#}")))
 }
 
+/// [`destroy_app`] for a request: its instances go now, under the app's lock; the bucket,
+/// stored images and the row go on a thread of their own, since a big bucket takes a while.
+/// Until then `GET /apps/NAME` answers with `destroying` and any cleanup error, and the name
+/// stays taken.
+fn destroy_app_in_background(c: &Arc<Controller>, name: &str) -> Result<Value> {
+    if c.storage.is_none() {
+        return destroy_app(c, name);
+    }
+    let generation = {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db.0.transaction()?;
+        let generation = next_generation(&tx)?;
+        let marked =
+            tx.execute("update apps set destroying = ?2, generation = ?3 where name = ?1", rusqlite::params![name, now(), generation])?;
+        if marked == 0 {
+            bail!("no app {}", short_name(name));
+        }
+        tx.commit()?;
+        generation
+    };
+    {
+        let lock = c.app_lock(name);
+        let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        delete_instances_of(c, name)?;
+    }
+    let (c2, name2) = (c.clone(), name.to_string());
+    std::thread::spawn(move || {
+        if let Err(e) = finish_storage(&c2, &name2, generation) {
+            eprintln!("rekcod: {e:#}");
+            c2.alert(&format!("{e:#}"));
+        }
+    });
+    Ok(json!({"destroyed": short_name(name), "storage": "deleting in the background; `rekcod app status` shows it until it's done"}))
+}
+
+fn delete_instances_of(c: &Arc<Controller>, name: &str) -> Result<()> {
+    let rows =
+        c.db.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query("select node, sandbox from instances where app = ?1 and state <> 'removed'", &[&name])?;
+    for r in rows {
+        delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
+    }
+    Ok(())
+}
+
+/// Apps whose storage a [`finish_storage`] is removing right now: a retry leaves them be.
+static CLEANING: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// The storage half of a destroy: bucket, keys and stored images, then the row. On failure
+/// the row stays `destroying` with the error in `destroy_error`, and `retry_destroys` tries
+/// again in a minute.
+fn finish_storage(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Value> {
+    {
+        let mut cleaning = CLEANING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if cleaning.iter().any(|n| n == name) {
+            return Ok(json!({"destroyed": short_name(name), "storage": "being deleted"}));
+        }
+        cleaning.push(name.to_string());
+    }
+    let r = (|| -> Result<Value> {
+        let storage = drop_bucket(c, name).and_then(|_| drop_release_store(c, name));
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(e) = storage {
+            let e = format!("{e:#}");
+            db.execute(
+                "update apps set destroying = ?2, destroy_error = ?3 where name = ?1 and generation = ?4",
+                &[&name, &now(), &e, &generation],
+            )?;
+            bail!(
+                "{}: its instances are gone, but storage cleanup failed: {e}. The controller retries every minute; the name stays taken until that works",
+                short_name(name)
+            );
+        }
+        remove_rows(&mut db, name, generation, &[])?;
+        Ok(json!({"destroyed": short_name(name)}))
+    })();
+    CLEANING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|n| n != name);
+    r
+}
+
+/// The app's rows, once nothing of it is left to remove, plus `leftover` for a later
+/// controller with storage.
+fn remove_rows(db: &mut Db, name: &str, generation: i64, leftover: &[(Option<String>, Option<String>)]) -> Result<()> {
+    // Kept logs and traffic too: someone else may make an app of this name next.
+    let tx = db.0.transaction()?;
+    for t in ["releases", "instances", "instance_logs", "traffic"] {
+        tx.execute(&format!("delete from {t} where app = ?1"), [name])?;
+    }
+    for (bucket, key) in leftover {
+        tx.execute(
+            "insert into leftover_storage (bucket, storage_key, app, since) values (?1, ?2, ?3, ?4)",
+            rusqlite::params![bucket, key, name, now()],
+        )?;
+    }
+    tx.execute("delete from apps where name = ?1 and generation = ?2", rusqlite::params![name, generation])?;
+    tx.commit()?;
+    Ok(())
+}
+
 /// Deletes a `destroying` app's instances, then its storage: bucket access revoked before the
 /// bucket goes, stored images and build cache. The row goes last, only once all of that
 /// worked; until then the name stays taken and `retry_destroys` tries again. The caller holds
@@ -4919,44 +5022,20 @@ fn finish_destroy(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Va
     if marked.is_none() {
         return Ok(json!({"destroyed": name}));
     }
-    let rows =
-        c.db.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .query("select node, sandbox from instances where app = ?1 and state <> 'removed'", &[&name])?;
-    for r in rows {
-        delete_instance(c, &r.get::<String>(0), &r.get::<String>(1));
-    }
+    delete_instances_of(c, name)?;
     // Without --storage nothing can reach RustFS; the key, bucket and stored images are left
     // for later.
-    let leftover = if c.storage.is_none() { leftover_storage(c, name)? } else { vec![] };
-    let storage = if c.storage.is_none() { Ok(()) } else { drop_bucket(c, name).and_then(|_| drop_release_store(c, name)) };
-    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Err(e) = storage {
-        db.execute("update apps set destroying = ?2 where name = ?1", &[&name, &now()])?;
-        bail!(
-            "{}: its instances are gone, but storage cleanup failed: {e:#}. The controller retries every minute; the name stays taken until that works",
-            short_name(name)
-        );
+    if c.storage.is_some() {
+        return finish_storage(c, name, generation);
     }
-    // Kept logs and traffic too: someone else may make an app of this name next.
-    let tx = db.0.transaction()?;
-    for t in ["releases", "instances", "instance_logs", "traffic"] {
-        tx.execute(&format!("delete from {t} where app = ?1"), [name])?;
-    }
-    for (bucket, key) in &leftover {
-        tx.execute(
-            "insert into leftover_storage (bucket, storage_key, app, since) values (?1, ?2, ?3, ?4)",
-            rusqlite::params![bucket, key, name, now()],
-        )?;
-    }
+    let leftover = leftover_storage(c, name)?;
+    remove_rows(&mut c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner), name, generation, &leftover)?;
     if !leftover.is_empty() {
         eprintln!(
             "rekcod: {}: the controller has no --storage, so what it has in RustFS stays until one with storage runs",
             short_name(name)
         );
     }
-    tx.execute("delete from apps where name = ?1 and generation = ?2", rusqlite::params![name, generation])?;
-    tx.commit()?;
     Ok(json!({"destroyed": name}))
 }
 
@@ -5573,6 +5652,17 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             deploy(c, &load(&admitted.short, Role::Member)?, None, &who.name)
         }
         ("GET", ["apps", name]) => {
+            // Being destroyed: its storage cleanup is still going, or failed and is retried.
+            let gone = c.db().query_opt(
+                "select owner, destroying, destroy_error from apps where name = ?1 and destroying is not null",
+                &[&app_key(ns, name)],
+            )?;
+            if let Some(r) = gone
+                && c.allow(who, ns, Role::Viewer).is_ok()
+                && can_touch(who, ns, &r.get::<String>(0))
+            {
+                return Ok(json!({"name": name, "ns": ns, "destroying": r.get::<i64>(1), "storage_error": r.get::<Option<String>>(2)}));
+            }
             let mut v = app_status(c, &load(name, Role::Viewer)?)?;
             if c.role(who, ns)? < Some(Role::Member) {
                 mask_env(&mut v);
@@ -5780,19 +5870,21 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 && c.allow(who, ns, Role::Member).is_ok()
                 && can_touch(who, ns, &r.get::<String>(0))
             {
-                let r = destroy_app(c, &key);
+                let r = destroy_app_in_background(c, &key);
                 c.audit(ns, &who.name, "destroy", name, r.is_ok());
-                r?;
-                return Ok(json!({"destroyed": name, "ns": ns}));
+                let mut v = r?;
+                v["ns"] = json!(ns);
+                return Ok(v);
             }
             let app = load(name, Role::Member)?;
             if !b["force"].as_bool().unwrap_or(false) && bucket_has_objects(c, &app.name)? == Some(true) {
                 bail!("{name}'s bucket {} isn't empty; destroy --force deletes its objects too", app_bucket(&app.name));
             }
-            let r = destroy_app(c, &app.name);
+            let r = destroy_app_in_background(c, &app.name);
             c.audit(ns, &who.name, "destroy", name, r.is_ok());
-            r?;
-            Ok(json!({"destroyed": name, "ns": ns}))
+            let mut v = r?;
+            v["ns"] = json!(ns);
+            Ok(v)
         }
         _ => Err(anyhow!("no such endpoint")),
     }
@@ -7198,7 +7290,7 @@ fn github_webhook(c: &Arc<Controller>, ns: &str, app_name: &str, req: &crate::sa
                 record(c)?;
                 return Ok(json!({"ignored": format!("{preview} isn't a preview of {}", app.short)}));
             }
-            let v = destroy_app(c, &preview_key)?;
+            let v = destroy_app_in_background(c, &preview_key)?;
             record(c)?;
             Ok(v)
         }
@@ -7376,8 +7468,10 @@ impl Controller {
 }
 
 /// For a node: where the image of `app` at `commit` goes, and whether it's there already.
-/// Presigned URLs live this long: long enough for a slow build, then useless.
+/// Presigned upload URLs live this long: long enough for a slow build, then useless. Download
+/// URLs are used as the instance starts and get an hour.
 const STORE_URL_SECS: u64 = 6 * 3600;
+const STORE_GET_SECS: u64 = 3600;
 
 fn release_store(c: &Controller, app: &str, commit: &str) -> Value {
     let Some(s) = &c.storage else { return Value::Null };
@@ -7395,7 +7489,7 @@ fn release_store(c: &Controller, app: &str, commit: &str) -> Value {
         s.create_bucket(CACHE)?;
         let key = format!("{app}/{commit}");
         let (image, toml, cache) = (format!("{key}.tar.zst"), format!("{key}.json"), format!("{app}.tar.zst"));
-        let url = |m: &str, b: &str, k: &str| s.presign_method(m, b, k, STORE_URL_SECS);
+        let url = |m: &str, b: &str, k: &str| s.presign_method(m, b, k, if m == "PUT" { STORE_URL_SECS } else { STORE_GET_SECS });
         // What the node that pushed it reported; a stored image nobody recorded is rebuilt.
         let sums: Option<Value> =
             c.db.lock()
@@ -7417,9 +7511,10 @@ fn release_store(c: &Controller, app: &str, commit: &str) -> Value {
             cached,
             image_sha256: sum("image_sha256").filter(|_| cached),
             toml_sha256: sum("toml_sha256").filter(|_| cached),
-            cache_get: Some(url("GET", CACHE, &cache)?),
-            cache_put: Some(url("PUT", CACHE, &cache)?),
-            cache_stored: s.exists(CACHE, &cache)?,
+            // The build cache is for a build; a stored release isn't built.
+            cache_get: (!cached).then(|| url("GET", CACHE, &cache)).transpose()?,
+            cache_put: (!cached).then(|| url("PUT", CACHE, &cache)).transpose()?,
+            cache_stored: !cached && s.exists(CACHE, &cache)?,
         })?)
     })();
     r.unwrap_or_else(|e| {
@@ -9221,15 +9316,30 @@ mod tests {
                 .unwrap()
                 .map(|r| (r.get::<bool>(0), r.get::<Option<String>>(1)))
         };
-        let destroy = || call(&url, "DELETE", "/apps/web", Some("alice-t"), &json!({"force": true}));
+        // The storage half runs after the request returns: done when the row is gone or the
+        // cleanup recorded its error.
+        let destroy = || -> Result<(), String> {
+            c.db.lock().unwrap().execute("update apps set destroy_error = null where name = 'web'", &[]).unwrap();
+            call(&url, "DELETE", "/apps/web", Some("alice-t"), &json!({"force": true})).map_err(|e| e.to_string())?;
+            let t0 = Instant::now();
+            loop {
+                let err = c.db.lock().unwrap().query_opt("select destroy_error from apps where name = 'web'", &[]).unwrap();
+                match err.map(|r| r.get::<Option<String>>(0)) {
+                    None => return Ok(()),
+                    Some(Some(e)) => return Err(e),
+                    Some(None) if t0.elapsed() > Duration::from_secs(10) => panic!("the destroy never finished"),
+                    Some(None) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        };
         let retry = || {
             c.db.lock().unwrap().execute("update apps set destroying = 0 where destroying is not null", &[]).unwrap();
             retry_destroys(&c).unwrap();
         };
 
         // The bucket's DELETE fails: the key and policy are already revoked, the row stays.
-        let e = destroy().unwrap_err().to_string();
-        assert!(e.contains("storage cleanup failed") && e.contains("503"), "{e}");
+        let e = destroy().unwrap_err();
+        assert!(e.contains("delete bucket app-web") && e.contains("503"), "{e}");
         let log = seen.lock().unwrap().clone();
         let at = |p: &str| log.iter().position(|l| l.starts_with(p)).unwrap_or_else(|| panic!("no {p} in {log:?}"));
         assert!(at("DELETE /rustfs/admin/v3/remove-user?accessKey=app-k1") < at("DELETE /rustfs/admin/v3/remove-canned-policy"));
@@ -9237,7 +9347,9 @@ mod tests {
         assert_eq!(row(), Some((true, None)));
         // Not an app anyone sees, routes to or can make again meanwhile.
         assert_eq!(call(&url, "GET", "/apps", Some("alice-t"), &Value::Null).unwrap(), json!([]));
-        assert!(call(&url, "GET", "/apps/web", Some("alice-t"), &Value::Null).unwrap_err().to_string().contains("no app web"));
+        // Only its status, with the error, while the cleanup is retried.
+        let status = call(&url, "GET", "/apps/web", Some("alice-t"), &Value::Null).unwrap();
+        assert!(status["destroying"].is_i64() && status["storage_error"].as_str().unwrap().contains("503"), "{status}");
         let again = upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}}), None);
         assert!(again.map(|_| ()).unwrap_err().to_string().contains("being destroyed"));
         // Still failing: the retry leaves it as it was.
@@ -9254,7 +9366,7 @@ mod tests {
         c.db.lock().unwrap().execute("update apps set storage_key = 'app-k2' where name = 'web'", &[]).unwrap();
         seen.lock().unwrap().clear();
         *fail.lock().unwrap() = vec![("DELETE /rustfs/admin/v3/remove-user", 503)];
-        assert!(destroy().unwrap_err().to_string().contains("revoke the app's storage key"));
+        assert!(destroy().unwrap_err().contains("revoke the app's storage key"));
         assert_eq!(row(), Some((true, Some("app-k2".into()))));
         *fail.lock().unwrap() = vec![("DELETE /rustfs/admin/v3/remove-canned-policy", 503)];
         retry();
@@ -9317,6 +9429,32 @@ mod tests {
         let sc = Controller { db: std::mem::replace(&mut *c.db.lock().unwrap(), Db::open(Path::new(":memory:")).unwrap()).into(), ..sc };
         // A new `web` loads nothing the old one stored, until the leftovers are removed.
         assert!(release_store(&sc, "web", &"a".repeat(40)).is_null());
+    }
+
+    #[test]
+    fn a_destroy_removes_storage_in_the_background_and_shows_it() {
+        let fail = Arc::new(Mutex::new(vec![("DELETE /app-web?", 503)]));
+        let (c, _) = storage_controller(fail.clone());
+        upsert_app(&c, "default", &Caller::user("alice"), &json!({"name": "web", "git": {"url": "u"}, "bucket": true}), None).unwrap();
+        c.db.lock().unwrap().execute("update apps set storage_key = 'app-k1' where name = 'web'", &[]).unwrap();
+        let alice = Caller::user("alice");
+        let route = |m: &str| apps_route(&c, &alice, "default", m, &["apps", "web"], &json!({"force": true}), &[]);
+        let v = route("DELETE").unwrap();
+        assert!(v["storage"].as_str().unwrap().contains("background"), "{v}");
+        let t0 = Instant::now();
+        let shown = loop {
+            let v = route("GET").unwrap();
+            if !v["storage_error"].is_null() || t0.elapsed() > Duration::from_secs(10) {
+                break v;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(shown["destroying"].is_i64() && shown["storage_error"].as_str().unwrap().contains("delete bucket app-web"), "{shown}");
+        // The retry finishes it.
+        fail.lock().unwrap().clear();
+        let generation: i64 = c.db.lock().unwrap().query_one("select generation from apps where name = 'web'", &[]).unwrap().get(0);
+        finish_destroy(&c, "web", generation).unwrap();
+        assert!(route("GET").unwrap_err().to_string().contains("no app"));
     }
 
     #[test]
@@ -9387,7 +9525,7 @@ mod tests {
             )
             .unwrap();
         let st: ReleaseStore = serde_json::from_value(release_store(&c, "web", &sha)).unwrap();
-        assert!(st.cached && st.image_put.is_none() && st.toml_put.is_none());
+        assert!(st.cached && st.image_put.is_none() && st.toml_put.is_none() && st.cache_put.is_none());
         assert_eq!((st.image_sha256.as_deref(), st.toml_sha256.as_deref()), (Some("11"), Some("22")));
     }
 

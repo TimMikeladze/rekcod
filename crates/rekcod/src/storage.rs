@@ -64,9 +64,14 @@ fn root_keys(file: &Path) -> Result<S3> {
     }
 }
 
-/// `~/.rekcod/bin/rustfs-<version>`, downloading the pinned release first if needed.
+/// Where the pinned RustFS binary lives: `~/.rekcod/bin/rustfs-<version>`.
+pub fn binary_path(paths: &Paths) -> PathBuf {
+    paths.home.join("bin").join(format!("rustfs-{RUSTFS_VERSION}"))
+}
+
+/// [`binary_path`], downloading the pinned release first if needed.
 pub fn ensure_binary(paths: &Paths) -> Result<PathBuf> {
-    let bin = paths.home.join("bin").join(format!("rustfs-{RUSTFS_VERSION}"));
+    let bin = binary_path(paths);
     if bin.exists() {
         // Downloaded before rekcod patched it, on a Mac without Homebrew's xz.
         if !Path::new(BREW_LZMA).exists() {

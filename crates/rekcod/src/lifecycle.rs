@@ -326,6 +326,15 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
         if open.is_empty() { "home, run/, logs/ and vm/ 700, VM disks 600".into() } else { open.join(", ") },
         "sudo chown -R \"$(whoami)\" ~/.rekcod, then any rekcod command sets the modes again",
     );
+    // Other Macs' nodes and apps reach RustFS directly; the firewall would accept and stall them.
+    if let Some((ok, what)) = crate::server::storage_firewall(paths) {
+        add(
+            "firewall lets RustFS through",
+            ok,
+            what,
+            "sudo /usr/libexec/ApplicationFirewall/socketfilterfw --add ~/.rekcod/bin/rustfs-* && sudo /usr/libexec/ApplicationFirewall/socketfilterfw --unblockapp ~/.rekcod/bin/rustfs-*",
+        );
+    }
     let certs = crate::fleet::cert_expiries(paths);
     if !certs.is_empty() {
         let soon = crate::fleet::expiring(&certs, crate::fleet::now());

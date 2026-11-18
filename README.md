@@ -129,6 +129,9 @@ copy fails part way (the VM's disk fills up, say), rekcod copies `pre-restore` b
 before starting the containers again. If that fails too, the containers stay stopped
 and the error prints the command to run once there's room.
 
+Before stopping anything, restore checks that the VM's disk has room for the
+`pre-restore` copy and the snapshot, and refuses with the sizes when it doesn't.
+
 Restore refuses while a project container is paused (`docker unpause` it first), and
 save refuses while one is restarting. Saves and restores of one project take turns,
 whatever the snapshot names, so a menu bar save waits for a terminal restore.
@@ -543,14 +546,28 @@ a second copy somewhere else, give setup a directory on another disk or a synced
 
 ```sh
 rekcod server setup --domain apps.example.com --backup-dir /Volumes/Backup/rekcod
+rekcod host add mini me@mac-mini --server --domain apps.example.com --backup-dir /Volumes/Backup/rekcod
 ```
 
 A running controller takes `--backup-dir DIR` too. Each backup goes to RustFS and to
 the directory independently; when one fails, the other still gets it and the error
 names the one that failed. The copies are `fleet-<UTC time>.db`, mode 0600 in a 0700
-directory: they hold node secrets and the join token in plain text. Both places keep
-the newest 48 (two days of hourly backups), then the newest of each of the last 14
-days and 8 weeks.
+directory. Both places keep the newest 48 (two days of hourly backups), then the newest
+of each of the last 14 days and 8 weeks.
+
+A backup file is a plain SQLite database. Store it like a secret: a synced folder or a
+shared disk gives whoever reads it what's in plain text there:
+
+- each node's secret (`nodes.secret`), the bearer the controller uses on node APIs,
+  which create sandboxes and run commands
+- the join token, which lets a new node into the fleet
+- app env values (not secrets), git URLs, including any credentials written into them,
+  and app, release, job and audit history
+- token hashes (SHA-256, not the tokens)
+
+App secrets, per-app webhook secrets, app bucket keys and the RustFS root secret are in
+it sealed with `controller/secret-key`, so they're readable only with that file. Keep
+`secret-key` apart from the backups.
 
 `GET /metrics` has `rekcod_last_backup_timestamp_seconds` (the last successful backup)
 and `rekcod_backup_failures_total`, so a Prometheus rule can catch backups that stopped
@@ -733,7 +750,13 @@ rekcod app storage blog rotate --remote mini
 keeps working until the new release is live and the old instances have drained, then
 it's revoked, along with URLs signed with it. If the redeploy fails, the app keeps the
 old key. A destroy revokes the key and deletes the bucket, every object version in it
-included.
+included. The instances go before `app destroy` returns; the bucket and stored images
+are deleted after, in the background. Until that's done `rekcod app status NAME`
+shows `destroying` and, if a delete failed, the error; the controller retries every
+minute, and the name stays taken until it works.
+
+`rekcod doctor` on the server checks that the firewall lets RustFS through when it
+listens beyond loopback; other Macs' connections would otherwise be accepted and stall.
 
 On a LAN server (`--lan`, or `--addr` with an address outside the tailnet) RustFS
 listens on the server's loopback, because it speaks plain HTTP. Bucket apps then run

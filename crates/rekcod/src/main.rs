@@ -1241,6 +1241,10 @@ enum HostCmd {
         /// Only the server; no docker context.
         #[arg(long, requires = "server")]
         no_docker: bool,
+        /// Also copy the controller's hourly backups to this directory on the server (another
+        /// disk, a synced folder); an absolute path there.
+        #[arg(long, requires = "server")]
+        backup_dir: Option<String>,
     },
     /// Hosts (docker contexts rekcod-*); * marks the one in use.
     Ls {
@@ -1585,8 +1589,8 @@ fn main() {
         Cmd::Shell => cli::shell(&paths),
         Cmd::Compact => cli::compact(&paths),
         Cmd::Host(HostCmd::Add { name, dest, no_use, server: false, .. }) => host::add(&paths, &name, &dest, !no_use),
-        Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, lan, no_power, no_docker, .. }) => {
-            let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker };
+        Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, lan, no_power, no_docker, backup_dir, .. }) => {
+            let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker, backup_dir };
             host::add_server(&paths, &name, &dest, !no_use, &f)
         }
         Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token, backup_dir }) => {

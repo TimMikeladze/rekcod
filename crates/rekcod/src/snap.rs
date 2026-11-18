@@ -402,6 +402,32 @@ fn ensure_helper(d: &dyn Engine) -> Result<()> {
     Ok(())
 }
 
+/// Fails unless the VM's volume disk has room for `volumes` once more, with 10% to spare:
+/// sizes from `du`, free space from `df`, in one helper container.
+fn check_room(d: &dyn Engine, volumes: &[&str], what: &str) -> Result<()> {
+    if volumes.is_empty() {
+        return Ok(());
+    }
+    ensure_helper(d)?;
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into(), "--network".into(), "none".into()];
+    for (i, v) in volumes.iter().enumerate() {
+        args.extend(["-v".into(), format!("{v}:/v/{i}:ro")]);
+    }
+    let script = "echo $(du -sck /v/* | tail -1 | cut -f1) $(df -Pk /v/0 | tail -1 | awk '{print $4}')";
+    args.extend([HELPER_IMAGE.into(), "sh".into(), "-c".into(), script.into()]);
+    let out = d.docker(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let mut n = out.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
+    let (Some(need), Some(free)) = (n.next(), n.next()) else { bail!("can't read the VM's free space from {out:?}") };
+    if need + need / 10 > free {
+        bail!(
+            "{what} needs about {} MiB on the VM's disk and {} MiB are free; free some (docker system prune, rekcod snap rm) or grow the disk",
+            need / 1024 + 1,
+            free / 1024
+        );
+    }
+    Ok(())
+}
+
 /// Replaces each `to` volume's contents with its `from` volume's, in one helper container.
 fn copy_volumes(d: &dyn Engine, pairs: &[(String, String)]) -> Result<()> {
     ensure_helper(d)?;
@@ -931,6 +957,13 @@ fn restore_with(
             d.docker(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
         }
     }
+    // `pre-restore` copies the live volumes, then the snapshot is copied over them: room
+    // for both, checked before anything stops.
+    let mut sizes: Vec<&str> = snap.volumes.values().map(String::as_str).collect();
+    if name != PRE_RESTORE {
+        sizes.extend(snap.volumes.keys().map(String::as_str));
+    }
+    check_room(d, &sizes, &format!("restoring `{name}`"))?;
     let running = to_stop(d, &project)?;
     let start = |ids: &[String]| {
         if !ids.is_empty()
@@ -1056,6 +1089,8 @@ mod tests {
         run_fails_part_way: Option<String>,
         /// Every command, as run.
         log: Vec<String>,
+        /// KiB the VM's disk has free, for the room check (plenty when unset).
+        free_kib: Option<u64>,
     }
 
     /// Docker as far as snapshots use it, in memory. "Tar" is the volume's bytes as they are.
@@ -1195,6 +1230,11 @@ mod tests {
                 }
                 ["stop", ids @ ..] => set(&mut w, ids, "exited"),
                 ["image", "inspect", _] => Ok(String::new()),
+                ["run", .., "sh", "-c", script] if script.contains("du -sck") => {
+                    let mounts = args.windows(2).filter(|p| p[0] == "-v").map(|p| p[1].split(':').next().unwrap());
+                    let need: usize = mounts.map(|m| w.vols.get(m).map_or(0, |v| v.data.len())).sum();
+                    Ok(format!("{} {}", need.div_ceil(1024), w.free_kib.unwrap_or(1 << 30)))
+                }
                 ["run", ..] => {
                     let mounts: Vec<&str> = args.windows(2).filter(|p| p[0] == "-v").map(|p| p[1].split(':').next().unwrap()).collect();
                     if w.run_fails_part_way.as_deref().is_some_and(|m| line.contains(m)) {
@@ -1574,6 +1614,22 @@ mod tests {
         assert!(log.iter().any(|l| l == "stop c1 c2"), "{log:?}");
         assert_eq!(d.data("shop_pg"), b"v1");
         assert_eq!([d.state("c1"), d.state("c2")], ["running"; 2]);
+    }
+
+    #[test]
+    fn a_restore_without_room_stops_nothing() {
+        let _serial = serial();
+        let d = Fake::new(1000);
+        d.volume("shop_pg", "shop", &vec![1u8; 600 * 1024]);
+        d.container("c1", "shop");
+        save_with(&d, Some("shop"), Some("big"), LOCAL).unwrap();
+        // 600 KiB live plus 600 KiB of snapshot, and 1000 KiB free.
+        d.w.lock().unwrap().free_kib = Some(1000);
+        let e = restore_with(&d, Some("shop"), Some("big"), LOCAL).unwrap_err();
+        assert!(e.to_string().contains("1000 KiB") || e.to_string().contains("MiB are free"), "{e:#}");
+        assert_eq!(d.state("c1"), "running");
+        d.w.lock().unwrap().free_kib = Some(1400);
+        restore_with(&d, Some("shop"), Some("big"), LOCAL).unwrap();
     }
 
     #[test]

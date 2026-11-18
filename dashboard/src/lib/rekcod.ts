@@ -6,6 +6,8 @@ import { findOffered } from "./allow"
 import { engine } from "./server/engine"
 import { fakeEngine } from "./server/fixtures"
 import { staleBinary, staleMessage } from "./server/merge"
+import { runGroup } from "./server/proc"
+import { appleScript, terminalScript, writeScript } from "./server/terminal"
 import type { Action, State } from "./types"
 
 // REKCOD_BIN picks the binary (`rekcod dashboard` sets it to itself); REKCOD_STATE_FILE serves
@@ -23,12 +25,12 @@ function findBin(): string {
   return "rekcod"
 }
 
-export function run(argv: string[], opts: { cwd?: string; timeout?: number } = {}) {
+export function run(argv: string[], opts: { cwd?: string; timeout?: number; env?: NodeJS.ProcessEnv } = {}) {
   return new Promise<{ code: number; stdout: string; stderr: string }>((resolve) => {
     execFile(
       /*turbopackIgnore: true*/ BIN,
       argv,
-      { cwd: opts.cwd, timeout: opts.timeout ?? 120_000, maxBuffer: 64 << 20 },
+      { cwd: opts.cwd, timeout: opts.timeout ?? 120_000, maxBuffer: 64 << 20, env: opts.env },
       (err, stdout, stderr) => {
         const code = err ? (typeof err.code === "number" ? err.code : 1) : 0
         resolve({ code, stdout, stderr: stderr || (err && !stderr ? String(err.message) : "") })
@@ -51,10 +53,13 @@ export async function readState(local = false): Promise<State> {
   return JSON.parse(r.stdout)
 }
 
-/** `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. */
-export async function readEngine(name: string): Promise<State> {
+/**
+ * `rekcod host state NAME`: that Mac's engine, its actions rewritten to run there. rekcod gives
+ * up after 20 s and reaps its ssh; past 45 s, or on `signal`, the whole process group goes.
+ */
+export async function readEngine(name: string, signal?: AbortSignal): Promise<State> {
   if (FIXTURE) return fakeEngine(await readState(), name)
-  const r = await run(["host", "state", name], { timeout: 40_000 })
+  const r = await runGroup(BIN, ["host", "state", name], { timeout: 45_000, signal })
   if (r.code !== 0) throw new Error(`${name}: ${r.stderr.trim().split("\n").at(-1) || `exited ${r.code}`}`)
   return JSON.parse(r.stdout)
 }
@@ -73,16 +78,14 @@ export async function offered(argv: unknown): Promise<Action | null> {
   return findOffered(await readEngine(name), argv)
 }
 
-/** Opens Terminal.app running the action's command line, as the menu bar does. */
-export function inTerminal(a: Action) {
-  const q = (s: string) => (/^[A-Za-z0-9_\-./:=@+,]+$/.test(s) ? s : `'${s.replace(/'/g, `'\\''`)}'`)
-  let line = [BIN, ...(a.argv ?? [])].map(q).join(" ")
-  if (a.dir) line = `cd ${q(a.dir)} && ${line}`
-  const escaped = line.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
-  spawn(/*turbopackIgnore: true*/ "/usr/bin/osascript", ["-e", `tell application "Terminal"\nactivate\ndo script "${escaped}"\nend tell`], {
-    stdio: "ignore",
-    detached: true,
-  }).unref()
+/** Opens Terminal.app running the action's command line, as the menu bar does (server/terminal.ts). */
+export function inTerminal(a: Action): string | null {
+  const script = terminalScript(BIN, a.argv ?? [], a.dir)
+  if (!script) return "the command has control characters"
+  const as = appleScript(writeScript(script))
+  if (!as) return "the script's path has control characters"
+  spawn(/*turbopackIgnore: true*/ "/usr/bin/osascript", ["-e", as], { stdio: "ignore", detached: true }).unref()
+  return null
 }
 
 export { STREAMED } from "./kinds"
@@ -91,8 +94,8 @@ export function spawnStream(a: Action) {
   return spawnRekcod(a.argv ?? [], a.dir)
 }
 
-export function spawnRekcod(argv: string[], cwd?: string) {
-  return spawn(/*turbopackIgnore: true*/ BIN, argv, { cwd, stdio: ["ignore", "pipe", "pipe"] })
+export function spawnRekcod(argv: string[], cwd?: string, env?: NodeJS.ProcessEnv) {
+  return spawn(/*turbopackIgnore: true*/ BIN, argv, { cwd, env, stdio: ["ignore", "pipe", "pipe"] })
 }
 
 /**

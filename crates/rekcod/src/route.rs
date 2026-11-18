@@ -1,5 +1,4 @@
-//! Decides whether `rekcod <args>` is a rekcod command or a docker one
-//! (docs/cli-passthrough.md).
+//! Decides whether `rekcod <args>` is a rekcod command or a docker one.
 
 /// rekcod's own top-level commands that docker doesn't have.
 const OWN: &[&str] = &[

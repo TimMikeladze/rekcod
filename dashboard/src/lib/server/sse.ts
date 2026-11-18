@@ -12,9 +12,11 @@ type Send = (event: string, data: unknown) => void
  * and returns the unsubscribe, which runs when the page goes away or is dropped.
  *
  * While the page reads, frames go straight out. Once HIGH_WATER bytes wait unread, each
- * event keeps only its newest frame (each activity entry its own) until the page catches up:
- * `state` and `stats` are whole snapshots, so the newest is all a late page needs. More than
- * MAX_PENDING waiting frames errors the stream, which drops the page.
+ * event keeps only its newest frame (each activity entry its own) until the page catches up.
+ * `state` is a whole snapshot, so the newest is all a late page needs. `stats` carries one
+ * tick's sample, so when one is replaced the page gets a `resync` after the backlog and
+ * reloads the history. More than MAX_PENDING waiting frames errors the stream, which drops the
+ * page; it reloads what it missed when it reconnects (hooks/use-dashboard.ts).
  */
 export function eventStream(signal: AbortSignal, setup: (send: Send, ping: () => void) => () => void): ReadableStream<Uint8Array> {
   const enc = new TextEncoder()
@@ -22,6 +24,7 @@ export function eventStream(signal: AbortSignal, setup: (send: Send, ping: () =>
   let ctl: ReadableStreamDefaultController<Uint8Array>
   let closed = false
   let teardown = () => {}
+  let lost = false
   const room = () => !closed && (ctl.desiredSize ?? 0) > 0
   const stop = () => {
     if (closed) return
@@ -34,6 +37,7 @@ export function eventStream(signal: AbortSignal, setup: (send: Send, ping: () =>
     const frame = enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)
     if (!pending.size && room()) return ctl.enqueue(frame)
     const key = event === "activity" ? `activity ${(data as { id?: unknown })?.id}` : event
+    if (event === "stats" && pending.has(key)) lost = true
     pending.delete(key)
     pending.set(key, frame)
     if (pending.size > MAX_PENDING) {
@@ -62,6 +66,10 @@ export function eventStream(signal: AbortSignal, setup: (send: Send, ping: () =>
           if (!room()) break
           pending.delete(key)
           ctl.enqueue(frame)
+        }
+        if (lost && !pending.size && !closed) {
+          lost = false
+          ctl.enqueue(enc.encode("event: resync\ndata: {}\n\n"))
         }
       },
       cancel: stop,

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
+import vectors from "../../fixtures/input-vectors.json"
 import fixture from "../../fixtures/state.json"
 import { fill, invalid, splitValues } from "./inputs"
-import type { Action, State } from "./types"
+import type { Action, Input, InputKind, State } from "./types"
 
 const s = fixture as unknown as State
 const engine = (kind: string) => s.engine_actions!.find((a) => a.kind === kind)! as Action & { argv: string[] }
@@ -25,10 +26,21 @@ describe("fill", () => {
     const clone = s.volumes[0].actions.find((a) => a.kind === "VolumeClone")!
     const f = fill(clone.argv!, clone.inputs!, { target: ["copy"] })
     expect("argv" in f && f.argv).toContain("copy:/to")
+    // Taken as is, every time the slot appears, as Rust's `str::replace` does.
+    const env: Input = { key: "t", label: "T", kind: "env", optional: false, multiple: false, flag: null, placeholder: "" }
+    expect(fill(["{t}:{t}"], [env], { t: ["A=$&-$'"] })).toEqual({ argv: ["A=$&-$':A=$&-$'"] })
   })
 })
 
 describe("invalid", () => {
+  it("gives actions::invalid's answers (fixtures/input-vectors.json)", () => {
+    for (const [k, v, valid] of vectors as [InputKind, string, boolean][]) expect(invalid(k, v) === null, `${k} ${JSON.stringify(v)}`).toBe(valid)
+  })
+
+  it("refuses a kind it doesn't know", () => {
+    expect(invalid("bogus" as never, "x")).not.toBeNull()
+  })
+
   it("matches actions::invalid", () => {
     for (const [k, v] of [
       ["image", "ghcr.io/me/app:1.2"],

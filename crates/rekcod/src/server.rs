@@ -1,4 +1,4 @@
-//! This Mac as a server: a one-machine fleet that runs headless.
+//! This Mac as a server: a one-machine fleet that runs headless (README.md, "Self-host apps on a Mac").
 //!
 //! `rekcod server setup` runs on the server; `rekcod host add --server` runs it over SSH from
 //! your Mac and adds the remote it prints.

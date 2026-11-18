@@ -1,4 +1,4 @@
-//! Self-hosted fleet and app hosting (docs/platform.md, tracks 2 and 3).
+//! Self-hosted fleet and app hosting (README.md, "Self-host apps on a Mac").
 //!
 //! - `rekcod controller serve`: the sandbox API for many Macs, plus apps. State in SQLite.
 //! - `rekcod node join|serve`: runs on each Mac; serves `sandbox_api` on its address with a
@@ -636,7 +636,11 @@ static RELAY_CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::At
 
 /// Forwards `ip:ext` (0 picks one) to the Mac's `127.0.0.1:port` for sandbox `id`, until
 /// [`close_relay`]; returns the bound port.
-fn start_relay(id: &str, ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
+/// Relays `ext` to the instance's port on loopback. While `home` has [`ASLEEP_MARKER`] the
+/// port belongs to nobody: a job's sandbox or anything else may have taken it, so clients are
+/// closed rather than sent there.
+fn start_relay(id: &str, home: &Path, ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
+    let asleep = home.join(ASLEEP_MARKER);
     close_relay(id);
     let l = TcpListener::bind((ip, ext))?;
     let addr = l.local_addr()?;
@@ -656,6 +660,9 @@ fn start_relay(id: &str, ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
             }
             if RELAY_CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_RELAY_CONNECTIONS {
                 RELAY_CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+                continue;
+            }
+            if asleep.exists() {
                 continue;
             }
             let _ = c.set_read_timeout(None);
@@ -740,7 +747,7 @@ pub fn generated_dockerfile(dir: &Path, start: &str) -> Result<String> {
     Ok(format!("FROM {}\nWORKDIR /app\nCOPY . /app\n{install}CMD {}\n", plan.image, serde_json::to_string(&cmd)?))
 }
 
-/// Where a release's image is kept in RustFS (docs/rustfs.md): `<bucket>/<key>.tar.zst` is
+/// Where a release's image is kept in RustFS: `<bucket>/<key>.tar.zst` is
 /// `docker save | zstd`, `<key>.json` the commit's rekcod.toml. Sent by the controller.
 /// Where a node keeps and finds a release's image, as presigned URLs: nodes never see the
 /// RustFS root keys, so one node can't read other apps' buckets or the backups. A stored
@@ -859,6 +866,34 @@ fn push_dir(url: &str, dir: &Path, tmp: &Path) -> Result<()> {
     crate::s3::url_put(url, crate::s3::Body::File(tmp))
 }
 
+/// SHA-256 over every regular file under `dir` (relative path and contents, in path order),
+/// so two trees with the same files match whatever their modification times.
+fn dir_digest(dir: &Path) -> Result<String> {
+    use sha2::Digest;
+    fn walk(base: &Path, d: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for e in std::fs::read_dir(d)? {
+            let e = e?;
+            let t = e.file_type()?;
+            if t.is_dir() {
+                walk(base, &e.path(), out)?;
+            } else if t.is_file() {
+                out.push(e.path().strip_prefix(base).map(Path::to_path_buf).unwrap_or_default());
+            }
+        }
+        Ok(())
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files)?;
+    files.sort();
+    let mut h = sha2::Sha256::new();
+    for f in files {
+        h.update(f.to_string_lossy().as_bytes());
+        h.update([0]);
+        h.update(sha256_file(&dir.join(&f))?.as_bytes());
+    }
+    Ok(hex(&h.finalize()))
+}
+
 /// The reverse of `push_dir`.
 fn pull_dir(url: &str, dir: &Path, tmp: &Path) -> Result<()> {
     crate::s3::url_get(url, &mut std::fs::File::create(tmp)?)?;
@@ -903,7 +938,9 @@ fn build_image(paths: &Paths, sb: &str, image: &str, dir: &Path, st: Option<&Rel
                 }
                 bail!("build failed: {}", tail(&out.stderr));
             }
-            if let Err(e) = push_dir(put, &to, &tmp) {
+            // A build that added nothing leaves the stored cache as it is.
+            let unchanged = had && dir_digest(&from).ok().is_some_and(|f| dir_digest(&to).ok() == Some(f));
+            if !unchanged && let Err(e) = push_dir(put, &to, &tmp) {
                 eprintln!("rekcod: build cache for {}: {e:#}", st.name);
             }
             Ok(None)
@@ -980,6 +1017,8 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
     {
         env.insert("S3_ENDPOINT".into(), json!(vm_endpoint(e)));
     }
+    // Chosen before the sandbox exists: its VM may open this port on the Mac and no other.
+    let hp = free_port()?;
     let o = sandbox::CreateOptions {
         dir: Some(dir.clone()),
         name: Some(format!("{app}-r{release}-{}", &sandbox::new_id()?[..4])),
@@ -992,6 +1031,9 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
         // Set by the controller only for apps with a bucket; never taken from the app's env,
         // which the app's owner controls.
         reach: storage_reach(a["storage_endpoint"].as_str()),
+        // Its VM opens the app's port on the Mac and nothing else.
+        publish: Some(vec![hp]),
+        no_autoports: true,
         ..Default::default()
     };
     let meta = sandbox::create(paths, o)?;
@@ -1011,7 +1053,6 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
                 }
             }
         }
-        let hp = free_port()?;
         let (mut d, _) = sandbox::docker_cmd(paths, &meta.id)?;
         d.args(["run", "-d", "--name", "app", "--restart", "unless-stopped", "-p", &format!("127.0.0.1:{hp}:{port}")]);
         let env_file = sandbox::home(paths, &meta.id)?.join("run-env");
@@ -1029,8 +1070,12 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        // Something answering on the port isn't enough: it has to be this sandbox's daemon.
+        if !wait_holds_port(paths, &meta.id, hp, HOLD_WAIT) {
+            bail!("port {hp} is held by something else on this node");
+        }
         let ip = *NODE_IP.get().unwrap_or(&IpAddr::from([127, 0, 0, 1]));
-        let ext = start_relay(&meta.id, ip, 0, hp)?;
+        let ext = start_relay(&meta.id, &sandbox::home(paths, &meta.id)?, ip, 0, hp)?;
         std::fs::write(sandbox::home(paths, &meta.id)?.join("instance.json"), json!({"hp": hp, "ext": ext}).to_string())?;
         let host = NODE_HOST.get().cloned().unwrap_or_else(|| ip.to_string());
         Ok(json!({"sandbox": meta.id, "endpoint": format!("{host}:{ext}"), "health": toml.get("app.health"), "pushed": pushed.is_some(),
@@ -1090,6 +1135,18 @@ pub fn instance_logs(paths: &Paths, id: &str) -> Result<String> {
 /// Node op: boots a sleeping instance's VM and starts its app container again; returns
 /// once the published port is back on the Mac.
 pub fn wake_instance(paths: &Paths, id: &str) -> Result<Value> {
+    wake_instance_with(paths, id, HOLD_WAIT, &|| {
+        let (mut d, _) = sandbox::docker_cmd(paths, id)?;
+        let out = d.args(["start", "app"]).stdin(Stdio::null()).output()?;
+        if !out.status.success() {
+            bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    })
+}
+
+/// [`wake_instance`] with the `docker start app` step given, so tests can run it without a VM.
+fn wake_instance_with(paths: &Paths, id: &str, hold_wait: Duration, start: &dyn Fn() -> Result<()>) -> Result<Value> {
     let home = sandbox::home(paths, id)?;
     let _ = std::fs::remove_file(home.join(ASLEEP_MARKER));
     let v: Value = serde_json::from_slice(&std::fs::read(home.join("instance.json"))?)?;
@@ -1097,15 +1154,11 @@ pub fn wake_instance(paths: &Paths, id: &str) -> Result<Value> {
     let t0 = Instant::now();
     // dockerd may still be coming up right after the boot.
     loop {
-        let (mut d, _) = sandbox::docker_cmd(paths, id)?;
-        let out = d.args(["start", "app"]).stdin(Stdio::null()).output()?;
-        if out.status.success() {
-            break;
+        match start() {
+            Ok(()) => break,
+            Err(e) if t0.elapsed() > Duration::from_secs(30) => bail!("start failed: {e:#}"),
+            Err(_) => std::thread::sleep(Duration::from_millis(300)),
         }
-        if t0.elapsed() > Duration::from_secs(30) {
-            bail!("start failed: {}", String::from_utf8_lossy(&out.stderr).trim());
-        }
-        std::thread::sleep(Duration::from_millis(300));
     }
     while TcpStream::connect(("127.0.0.1", hp)).is_err() {
         if t0.elapsed() > Duration::from_secs(20) {
@@ -1113,7 +1166,48 @@ pub fn wake_instance(paths: &Paths, id: &str) -> Result<Value> {
         }
         std::thread::sleep(Duration::from_millis(100));
     }
+    // While it slept, something else (a job's autoports, any process) may have taken the
+    // port; the relay would then hand that the app's traffic.
+    if !wait_holds_port(paths, id, hp, hold_wait) {
+        bail!("port {hp} is held by something else on this node");
+    }
     Ok(json!({"woken": id, "ms": t0.elapsed().as_millis() as u64}))
+}
+
+/// How long after the port answers the daemon may take to list it in run/status.json (it
+/// opens the listener first, then writes the file).
+const HOLD_WAIT: Duration = Duration::from_secs(5);
+
+/// [`holds_port`], asked again until `within` has passed.
+fn wait_holds_port(paths: &Paths, id: &str, hp: u16, within: Duration) -> bool {
+    let t0 = Instant::now();
+    loop {
+        if holds_port(paths, id, hp) {
+            return true;
+        }
+        if t0.elapsed() >= within {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Whether sandbox `id`'s running daemon has `hp` open on 127.0.0.1: its run/status.json
+/// is from the daemon whose pid file is locked now, and lists the port without an error.
+fn holds_port(paths: &Paths, id: &str, hp: u16) -> bool {
+    let Ok(home) = sandbox::home(paths, id) else { return false };
+    let sb = Paths { home };
+    let Some(status) = std::fs::read(sb.status_file()).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) else {
+        return false;
+    };
+    let Some(pid) = crate::cli::running_pid(&sb) else { return false };
+    status["pid"].as_i64() == Some(pid as i64)
+        && status["ports"].as_array().into_iter().flatten().any(|p| {
+            p["port"].as_u64() == Some(hp as u64)
+                && p["address"] == "127.0.0.1"
+                && p["proto"] == "tcp"
+                && p.get("error").is_none_or(Value::is_null)
+        })
 }
 
 fn job_dir(paths: &Paths, id: &str) -> Result<PathBuf> {
@@ -1228,6 +1322,7 @@ fn cancel_point(id: &str) -> Result<()> {
 fn job_body(host: &dyn JobHost, id: &str, a: &Value, log: std::fs::File) -> Result<i32> {
     let cmd: Vec<String> = a["cmd"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
     crate::sandbox_api::check_env(&job_env(a))?;
+    spec_image(a)?;
     let src = host.clone(id, a["git"]["url"].as_str().context("missing git.url")?, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
     let r = job_in_checkout(host, id, a, &cmd, &src, log);
     let _ = std::fs::remove_dir_all(&src);
@@ -1241,6 +1336,9 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
         .map(String::from)
         .or_else(|| crate::xrun::plan(src, cmd).map(|p| p.image))
         .unwrap_or_else(|| "alpine:3.24".into());
+    // Whichever it came from (the spec, the commit's files), `docker run` takes it as an
+    // argument: one starting with `-` would be an option.
+    sandbox::check_image(&image)?;
     let o = sandbox::CreateOptions {
         dir: Some(src.to_path_buf()),
         name: Some(id.to_string()),
@@ -1250,6 +1348,10 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
         memory_gib: a["memory_gib"].as_u64().unwrap_or(2),
         allow_hosts: vec!["*".into()],
         ttl_secs: 0,
+        // A job opens no ports on the node Mac, where they could take a sleeping app
+        // instance's port (RT-03).
+        publish: Some(vec![]),
+        no_autoports: true,
         ..Default::default()
     };
     let sb = host.create(id, o)?;
@@ -1290,6 +1392,15 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
     })();
     host.remove(&sb);
     r
+}
+
+/// A spec's `image`, when it has one: a string that [`sandbox::check_image`] accepts.
+fn spec_image(spec: &Value) -> Result<()> {
+    match &spec["image"] {
+        Value::Null => Ok(()),
+        Value::String(i) => sandbox::check_image(i),
+        v => bail!("image must be a string, not {v}"),
+    }
 }
 
 /// A job spec's `env` entries; anything that isn't a string is an error for `check_env`.
@@ -1559,7 +1670,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             continue;
         };
         let (hp, ext) = (v["hp"].as_u64().unwrap_or(0) as u16, v["ext"].as_u64().unwrap_or(0) as u16);
-        if let Err(e) = start_relay(&l.meta.id, ip, ext, hp) {
+        if let Err(e) = start_relay(&l.meta.id, &home, ip, ext, hp) {
             eprintln!("rekcod: relay for {}: {e:#}", l.meta.id);
         }
         if !home.join(ASLEEP_MARKER).exists() {
@@ -1731,7 +1842,7 @@ const LEGACY_MIGRATIONS: &[&str] = &[
     "alter table apps add column idle_stop integer not null default 0",
     "alter table apps add column recycle integer not null default 0",
     "alter table apps add column last_request integer not null default 0",
-    // Namespaces (docs/namespaces.md). Rows from before them belong to `default`.
+    // Namespaces (README.md, "Give people access"). Rows from before them belong to `default`.
     "alter table apps add column ns text not null default 'default'",
     "alter table sandboxes add column ns text not null default 'default'",
     "alter table sandboxes add column cpus integer not null default 0",
@@ -1739,13 +1850,13 @@ const LEGACY_MIGRATIONS: &[&str] = &[
     "alter table jobs add column ns text not null default 'default'",
     "alter table schedules add column ns text not null default 'default'",
     "alter table audit add column ns text not null default 'default'",
-    // Per-app edge settings (docs/edge-http.md).
+    // Per-app edge settings (README.md, "Edge limits and client addresses").
     "alter table apps add column http text not null default '{}'",
-    // Per-app buckets (docs/rustfs.md); the secret is sealed like app secrets.
+    // Per-app buckets (README.md, "Run S3-compatible storage"); the secret is sealed like app secrets.
     "alter table apps add column bucket integer not null default 0",
     "alter table apps add column storage_key text",
     "alter table apps add column storage_secret text",
-    // Release detail (docs/dashboard.md): who deployed, when it finished, the deploy log.
+    // Release detail: who deployed, when it finished, the deploy log.
     "alter table releases add column who text not null default ''",
     "alter table releases add column finished integer",
     "alter table releases add column log text not null default ''",
@@ -1765,7 +1876,7 @@ const LEGACY_MIGRATIONS: &[&str] = &[
 /// Numbered migrations: entry i takes `PRAGMA user_version` from i + 1 to i + 2. A failure
 /// stops startup, rather than surfacing later as a missing column.
 const MIGRATIONS: &[&str] = &[
-    // Tokens stored as SHA-256 (docs/fleet-hardening.md); `hashed` marks converted rows.
+    // Tokens stored as SHA-256; `hashed` marks converted rows.
     "alter table tokens add column hashed integer not null default 0;
      alter table tokens add column expires integer;
      alter table tokens add column default_role text not null default 'member';
@@ -1790,7 +1901,7 @@ const MIGRATIONS: &[&str] = &[
      alter table nodes_new rename to nodes;",
     "alter table nodes add column zone text not null default '';
      alter table apps add column spread text not null default 'soft';",
-    // App lifecycle (docs/fleet-hardening.md, "Apps"). `generation` is new whenever a row is
+    // App lifecycle. `generation` is new whenever a row is
     // made or destroyed, so a deploy started for an earlier app of that name can't register
     // into it. `destroying` is when cleanup was last tried, null for a live app. `deploying`
     // counts admitted deploys still running; the quota holds their resources.
@@ -1967,6 +2078,8 @@ struct Controller {
     node_ca: Option<crate::tls::Ca>,
     /// Names in the controller's own certificate, never issued to a node.
     own_names: Vec<String>,
+    /// Apps whose storage a destroy is removing right now (`finish_storage`).
+    cleaning: Mutex<std::collections::HashSet<String>>,
     /// Nodes reporting a certificate inside `tls::RENEW_WITHIN`: when one was handed to them,
     /// and when that was last alerted.
     cert_renewals: Mutex<HashMap<String, (i64, i64)>>,
@@ -2171,6 +2284,7 @@ impl Controller {
             ca_pem: None,
             node_ca: None,
             own_names: vec![],
+            cleaning: Default::default(),
             cert_renewals: Default::default(),
             track: Track::default(),
         }
@@ -2797,7 +2911,7 @@ fn expire_previews(c: &Arc<Controller>) -> Result<()> {
 /// Consecutive failed health checks before a live instance counts as lost.
 const HEALTH_STRIKES: u32 = 3;
 
-/// Moves what runs toward what should (docs/fleet-hardening.md, "Convergence"):
+/// Moves what runs toward what should:
 /// Instances on a returning node are checked and taken back; live instances that stop
 /// answering are dropped. After a minute short of replicas, top up the live release.
 fn reconcile(c: &Arc<Controller>) -> Result<()> {
@@ -3091,7 +3205,23 @@ fn serve_request(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + 
     }
     head_read();
     let mut w = r.into_inner();
-    let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
+    // A body that isn't a JSON object is refused: read as `{}`, its fields (`force`, a
+    // spec's settings) would be dropped without a word.
+    let body: Value = match req.body.iter().all(u8::is_ascii_whitespace) {
+        true => json!({}),
+        false => match serde_json::from_slice::<Value>(&req.body) {
+            Ok(v) if v.is_object() => v,
+            Ok(_) => return respond(&mut w, 400, "application/json", br#"{"error":"the body must be a JSON object"}"#),
+            Err(e) => {
+                return respond(
+                    &mut w,
+                    400,
+                    "application/json",
+                    json!({"error": format!("the body isn't JSON: {e}")}).to_string().as_bytes(),
+                );
+            }
+        },
+    };
     // `/ns/NS/apps/...`; the same paths without the prefix are the `default` namespace.
     let (ns, seg) = match all.as_slice() {
         ["ns", ns, rest @ ..] if !rest.is_empty() => (ns.to_string(), rest.to_vec()),
@@ -3613,7 +3743,7 @@ fn serve_request(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + 
         }),
         (_, ["namespaces", ..]) => namespaces_route(c, &who, &req.method, &seg, &body),
         (_, ["jobs", ..]) | (_, ["schedules", ..]) => jobs_route(c, &who, &ns, &req.method, &seg, &body, &req.query),
-        ("POST", ["sandboxes"]) => create_sandbox(c, &who, &ns, &req, &mut w).map(|_| Value::Null),
+        ("POST", ["sandboxes"]) => create_sandbox(c, &who, &ns, &body, &mut w).map(|_| Value::Null),
         ("GET", ["sandboxes"]) => (|| {
             c.allow(&who, &ns, Role::Viewer)?;
             let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
@@ -3768,9 +3898,12 @@ fn create_body(b: &Value) -> Value {
     out
 }
 
-fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sandbox_api::Request, w: &mut impl Write) -> Result<()> {
+fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, b: &Value, w: &mut impl Write) -> Result<()> {
     let err = |w: &mut _, msg: String| respond(w, 400, "application/json", json!({"error": msg}).to_string().as_bytes());
-    let body = create_body(&serde_json::from_slice(&req.body).unwrap_or(json!({})));
+    let body = create_body(b);
+    if let Err(e) = spec_image(&body) {
+        return err(w, format!("{e:#}"));
+    }
     let (Some(url), Some(rev)) = (body["git"]["url"].as_str(), body["git"]["ref"].as_str()) else {
         return err(w, "remote sandboxes need git.url (and git.ref)".into());
     };
@@ -4967,24 +5100,18 @@ fn delete_instances_of(c: &Arc<Controller>, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Apps whose storage a [`finish_storage`] is removing right now: a retry leaves them be.
-static CLEANING: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
 /// The storage half of a destroy: bucket, keys and stored images, then the row. On failure
 /// the row stays `destroying` with the error in `destroy_error`, and `retry_destroys` tries
-/// again in a minute.
+/// again in a minute. One run per app at a time (`Controller::cleaning`); the error is
+/// recorded only once this run is over, so what `app status` shows is a finished attempt.
 fn finish_storage(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Value> {
-    {
-        let mut cleaning = CLEANING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cleaning.iter().any(|n| n == name) {
-            return Ok(json!({"destroyed": short_name(name), "storage": "being deleted"}));
-        }
-        cleaning.push(name.to_string());
+    if !c.cleaning.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string()) {
+        return Ok(json!({"destroyed": short_name(name), "storage": "being deleted"}));
     }
-    let r = (|| -> Result<Value> {
-        let storage = drop_bucket(c, name).and_then(|_| drop_release_store(c, name));
+    let storage = drop_bucket(c, name).and_then(|_| drop_release_store(c, name));
+    let r = || -> Result<Value> {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(e) = storage {
+        if let Err(e) = &storage {
             let e = format!("{e:#}");
             db.execute(
                 "update apps set destroying = ?2, destroy_error = ?3 where name = ?1 and generation = ?4",
@@ -4997,9 +5124,10 @@ fn finish_storage(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Va
         }
         remove_rows(&mut db, name, generation, &[])?;
         Ok(json!({"destroyed": short_name(name)}))
-    })();
-    CLEANING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|n| n != name);
-    r
+    };
+    // Out of the set before the outcome is visible: whoever sees it may retry at once.
+    c.cleaning.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(name);
+    r()
 }
 
 /// The app's rows, once nothing of it is left to remove, plus `leftover` for a later
@@ -6018,6 +6146,7 @@ fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, sche
         bail!("jobs need git.url (and git.ref)");
     }
     crate::sandbox_api::check_env(&job_env(spec))?;
+    spec_image(spec)?;
     let (cpus, gib) = job_resources(spec)?;
     let id = format!("j-{}", sandbox::new_id()?);
     let node = {
@@ -6257,6 +6386,7 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 bail!("jobs need git.url (and git.ref)");
             }
             crate::sandbox_api::check_env(&job_env(b))?;
+            spec_image(b)?;
             job_resources(b)?;
             let key = app_key(ns, name);
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -6365,7 +6495,7 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
     }
 }
 
-// Jobs, node registration, checkout files and restore (docs/fleet-hardening.md). Workers and
+// Jobs, node registration, checkout files and restore. Workers and
 // VMs are stubbed; controller SQL, HTTP and the job threads are real.
 #[cfg(test)]
 mod job_and_node_tests {
@@ -6401,6 +6531,9 @@ mod job_and_node_tests {
         created: AtomicUsize,
         removed: Mutex<Vec<String>>,
         work: PathBuf,
+        /// Each created sandbox's idle TTL, published ports and autoports switch.
+        ttls: Mutex<Vec<u64>>,
+        ports: Mutex<Vec<(Option<Vec<u16>>, bool)>>,
     }
 
     impl FakeHost {
@@ -6412,6 +6545,8 @@ mod job_and_node_tests {
                 created: AtomicUsize::new(0),
                 removed: Mutex::new(vec![]),
                 work: work.to_path_buf(),
+                ttls: Mutex::new(vec![]),
+                ports: Mutex::new(vec![]),
             })
         }
         fn step(&self, stage: &str) {
@@ -6431,8 +6566,10 @@ mod job_and_node_tests {
             std::fs::create_dir_all(&d)?;
             Ok(d)
         }
-        fn create(&self, _: &str, _: sandbox::CreateOptions) -> Result<String> {
+        fn create(&self, _: &str, o: sandbox::CreateOptions) -> Result<String> {
             self.created.fetch_add(1, Ordering::SeqCst);
+            self.ttls.lock().unwrap().push(o.ttl_secs);
+            self.ports.lock().unwrap().push((o.publish.clone(), o.no_autoports));
             self.step("create");
             Ok("fake-sb".into())
         }
@@ -6500,6 +6637,37 @@ mod job_and_node_tests {
     }
 
     #[test]
+    fn a_job_image_that_isnt_a_reference_never_reaches_docker() {
+        assert!(sandbox::check_image("ghcr.io/org/app@sha256:abc").is_ok() && sandbox::check_image("node:22-slim").is_ok());
+        for bad in ["--privileged", "-v/:/host", "", "a b", "img\n", "café"] {
+            assert!(sandbox::check_image(bad).is_err(), "{bad:?}");
+        }
+        let home = temp("job-image");
+        let paths = Paths { home: home.clone() };
+        let host = FakeHost::new("", &home.join("work"));
+        run_job_on(host.clone(), &paths, &json!({"id": "j-img", "git": {"url": "u"}, "cmd": ["x"], "image": "--privileged"})).unwrap();
+        let v = finished(&paths, "j-img");
+        assert!(v["error"].as_str().unwrap().contains("bad image"), "{v}");
+        assert_eq!(host.created.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A job's sandbox has no idle TTL, so the daemon never powers it off under a command
+    /// that runs for hours with nothing else touching the sandbox.
+    #[test]
+    fn a_job_sandbox_has_no_idle_ttl_and_opens_no_ports() {
+        let home = temp("job-ttl");
+        let paths = Paths { home: home.clone() };
+        let host = FakeHost::new("", &home.join("work"));
+        run_job_on(host.clone(), &paths, &json!({"id": "j-ttl", "git": {"url": "u"}, "cmd": ["x"], "ttl_secs": 60})).unwrap();
+        finished(&paths, "j-ttl");
+        assert_eq!(*host.ttls.lock().unwrap(), [0]);
+        // And its VM opens no ports on the node Mac (RT-03).
+        assert_eq!(*host.ports.lock().unwrap(), [(Some(vec![]), true)]);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
     fn a_job_env_without_a_value_never_reaches_the_node_sandbox() {
         let home = temp("job-env");
         let paths = Paths { home: home.clone() };
@@ -6543,6 +6711,83 @@ mod job_and_node_tests {
             std::fs::write(d.join(f), body).unwrap();
         }
         d
+    }
+
+    /// A sandbox `id` whose daemon (this process, holding its pid file) lists `ports`.
+    fn port_sandbox(home: &Path, id: &str, pid: u32, ports: Value) -> (PathBuf, std::fs::File) {
+        let d = fake_sandbox(home, id, id, &[]);
+        std::fs::create_dir_all(d.join("run")).unwrap();
+        let lock = crate::paths::lock(&d.join("run/daemon.pid")).unwrap();
+        std::fs::write(d.join("run/daemon.pid"), std::process::id().to_string()).unwrap();
+        std::fs::write(d.join("run/status.json"), json!({"pid": pid, "ports": ports}).to_string()).unwrap();
+        (d, lock)
+    }
+
+    #[test]
+    fn a_port_counts_as_the_instances_only_when_its_daemon_lists_it() {
+        let home = temp("holds-port");
+        let paths = Paths { home: home.clone() };
+        let me = std::process::id();
+        let entry = |extra: Value| {
+            let mut e = json!({"proto": "tcp", "address": "127.0.0.1", "port": 41001, "container": "app"});
+            e.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            json!([e])
+        };
+        let (_d, _l) = port_sandbox(&home, "sbgood", me, entry(json!({})));
+        assert!(holds_port(&paths, "sbgood", 41001));
+        assert!(!holds_port(&paths, "sbgood", 41002), "another port");
+        let (_d, _l) = port_sandbox(&home, "sberr", me, entry(json!({"error": "Address already in use"})));
+        assert!(!holds_port(&paths, "sberr", 41001), "listed with an error");
+        let (_d, _l) = port_sandbox(&home, "sbpid", me + 1, entry(json!({})));
+        assert!(!holds_port(&paths, "sbpid", 41001), "status from another daemon");
+        let (_d, l) = port_sandbox(&home, "sbdown", me, entry(json!({})));
+        drop(l);
+        assert!(!holds_port(&paths, "sbdown", 41001), "no daemon running");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_wake_fails_when_something_else_has_the_instances_port() {
+        let home = temp("wake-port");
+        let paths = Paths { home: home.clone() };
+        // A job's autoport, say, took the port while the instance slept.
+        let squatter = TcpListener::bind("127.0.0.1:0").unwrap();
+        let hp = squatter.local_addr().unwrap().port();
+        let (d, _l) = port_sandbox(&home, "sbwake", std::process::id(), json!([]));
+        std::fs::write(d.join("instance.json"), json!({"hp": hp, "ext": 0}).to_string()).unwrap();
+        std::fs::write(d.join(ASLEEP_MARKER), "").unwrap();
+        let e = wake_instance_with(&paths, "sbwake", Duration::from_millis(200), &|| Ok(())).unwrap_err().to_string();
+        assert!(e.contains("held by something else"), "{e}");
+        // Listed by the daemon, it wakes.
+        let status =
+            json!({"pid": std::process::id(), "ports": [{"proto": "tcp", "address": "127.0.0.1", "port": hp, "container": "app"}]});
+        std::fs::write(d.join("run/status.json"), status.to_string()).unwrap();
+        assert_eq!(wake_instance_with(&paths, "sbwake", Duration::from_millis(200), &|| Ok(())).unwrap()["woken"], "sbwake");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_sleeping_instances_relay_sends_nobody_to_its_port() {
+        let up = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = up.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for mut s in up.incoming().flatten() {
+                let _ = s.write_all(b"hi");
+            }
+        });
+        let home = temp("relay-asleep");
+        std::fs::write(home.join(ASLEEP_MARKER), "").unwrap();
+        let ext = start_relay("relay-asleep", &home, IpAddr::from([127, 0, 0, 1]), 0, port).unwrap();
+        let mut c = TcpStream::connect(("127.0.0.1", ext)).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut b = Vec::new();
+        assert!(matches!(c.read_to_end(&mut b), Ok(0)) || b.is_empty(), "closed, nothing relayed: {b:?}");
+        std::fs::remove_file(home.join(ASLEEP_MARKER)).unwrap();
+        let mut b = [0u8; 2];
+        TcpStream::connect(("127.0.0.1", ext)).unwrap().read_exact(&mut b).unwrap();
+        assert_eq!(&b, b"hi");
+        close_relay("relay-asleep");
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -7393,7 +7638,7 @@ fn github_call(method: &str, url: &str, body: Option<&str>) {
 /// The label that lets a pull request from a fork get a preview.
 const PREVIEW_LABEL: &str = "rekcod-preview";
 
-// ------------------------------------------------------------- storage (docs/rustfs.md)
+// ------------------------------------------------------------- storage
 
 const RELEASES: &str = "rekcod-releases";
 const CACHE: &str = "rekcod-cache";
@@ -8087,7 +8332,7 @@ pub struct ControllerOptions {
     pub http: bool,
     /// Extra names for the controller's certificate (a tailnet DNS name, say).
     pub tls_names: Vec<String>,
-    /// Advertise over Bonjour as `rekcod-<CA fingerprint>` (docs/lan-discovery.md).
+    /// Advertise over Bonjour as `rekcod-<CA fingerprint>`.
     pub bonjour: bool,
     /// SQLite file (default `~/.rekcod/controller/fleet.db`).
     pub db: Option<PathBuf>,
@@ -9380,7 +9625,7 @@ mod tests {
                 match err.map(|r| r.get::<Option<String>>(0)) {
                     None => return Ok(()),
                     Some(Some(e)) => return Err(e),
-                    Some(None) if t0.elapsed() > Duration::from_secs(10) => panic!("the destroy never finished"),
+                    Some(None) if t0.elapsed() > Duration::from_secs(120) => panic!("the destroy never finished"),
                     Some(None) => std::thread::sleep(Duration::from_millis(20)),
                 }
             }
@@ -9494,13 +9739,16 @@ mod tests {
         let route = |m: &str| apps_route(&c, &alice, "default", m, &["apps", "web"], &json!({"force": true}), &[]);
         let v = route("DELETE").unwrap();
         assert!(v["storage"].as_str().unwrap().contains("background"), "{v}");
+        // The error is recorded once the background attempt is over, so after this a retry
+        // isn't turned away as already running. The limit only stops a hung test.
         let t0 = Instant::now();
         let shown = loop {
             let v = route("GET").unwrap();
-            if !v["storage_error"].is_null() || t0.elapsed() > Duration::from_secs(10) {
+            if !v["storage_error"].is_null() {
                 break v;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            assert!(t0.elapsed() < Duration::from_secs(120), "the background cleanup never finished: {v}");
+            std::thread::sleep(Duration::from_millis(20));
         };
         assert!(shown["destroying"].is_i64() && shown["storage_error"].as_str().unwrap().contains("delete bucket app-web"), "{shown}");
         // The retry finishes it.
@@ -9580,6 +9828,21 @@ mod tests {
         let st: ReleaseStore = serde_json::from_value(release_store(&c, "web", &sha)).unwrap();
         assert!(st.cached && st.image_put.is_none() && st.toml_put.is_none() && st.cache_put.is_none());
         assert_eq!((st.image_sha256.as_deref(), st.toml_sha256.as_deref()), (Some("11"), Some("22")));
+    }
+
+    #[test]
+    fn cache_trees_match_by_content_not_time() {
+        let dir = std::env::temp_dir().join(format!("rekcod-dir-digest-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        for side in ["a", "b"] {
+            std::fs::create_dir_all(dir.join(side).join("blobs/sha256")).unwrap();
+            std::fs::write(dir.join(side).join("index.json"), b"{}").unwrap();
+            std::fs::write(dir.join(side).join("blobs/sha256/x"), b"layer").unwrap();
+        }
+        assert_eq!(dir_digest(&dir.join("a")).unwrap(), dir_digest(&dir.join("b")).unwrap());
+        std::fs::write(dir.join("b").join("blobs/sha256/y"), b"new layer").unwrap();
+        assert_ne!(dir_digest(&dir.join("a")).unwrap(), dir_digest(&dir.join("b")).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -9810,6 +10073,28 @@ mod tests {
     }
 
     #[test]
+    fn a_body_that_isnt_a_json_object_is_refused_not_read_as_empty() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        call(&url, "POST", "/namespaces", Some("admin-t"), &json!({"name": "team"})).unwrap();
+        let addr = url.trim_start_matches("http://");
+        let raw = |method: &str, path: &str, body: &str| {
+            let mut s = TcpStream::connect(addr).unwrap();
+            write!(s, "{method} {path} HTTP/1.1\r\nAuthorization: Bearer admin-t\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+            let mut reply = String::new();
+            let _ = s.read_to_string(&mut reply);
+            reply
+        };
+        for body in [r#"{"force": tru"#, "[1]", "\"x\""] {
+            let reply = raw("DELETE", "/namespaces/team", body);
+            assert!(reply.starts_with("HTTP/1.1 400"), "{body}: {reply}");
+        }
+        assert!(c.db().query_opt("select 1 from namespaces where name = 'team'", &[]).unwrap().is_some());
+        // An empty body is still an empty object.
+        assert!(raw("DELETE", "/namespaces/team", "").starts_with("HTTP/1.1 200"));
+    }
+
+    #[test]
     fn token_caps_stay_in_range_and_a_panicking_duty_runs_again() {
         let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
         add_token(&c, "admin-t", "admin", true, "member", false, None);
@@ -9879,7 +10164,14 @@ mod tests {
         let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
         add_token(&c, "alice-t", "alice", false, "member", false, None);
         let base = json!({"name": "nightly", "every_secs": 3600, "cmd": ["true"], "git": {"url": "https://example.invalid/r"}});
-        for (field, value) in [("cpus", json!(-1)), ("memory_gib", json!(10_000)), ("cmd", json!([])), ("env", json!(["HOME"]))] {
+        for (field, value) in [
+            ("cpus", json!(-1)),
+            ("memory_gib", json!(10_000)),
+            ("cmd", json!([])),
+            ("env", json!(["HOME"])),
+            ("image", json!("--privileged")),
+            ("image", json!(7)),
+        ] {
             let mut b = base.clone();
             b[field] = value.clone();
             let e = call(&url, "POST", "/jobs", Some("alice-t"), &b).unwrap_err().to_string();
@@ -9892,6 +10184,12 @@ mod tests {
         once["env"] = json!(["A=1", "GITHUB_TOKEN"]);
         let e = call(&url, "POST", "/jobs", Some("alice-t"), &once).unwrap_err().to_string();
         assert!(e.contains("(400)") && e.contains("GITHUB_TOKEN"), "{e}");
+        once["env"] = json!([]);
+        once["image"] = json!("-v/:/host");
+        assert!(call(&url, "POST", "/jobs", Some("alice-t"), &once).unwrap_err().to_string().contains("bad image"));
+        let create = json!({"git": {"url": "https://example.invalid/r", "ref": "main"}, "image": "--privileged"});
+        let e = call(&url, "POST", "/sandboxes", Some("alice-t"), &create).unwrap_err().to_string();
+        assert!(e.contains("bad image"), "{e}");
         assert_eq!(c.db.lock().unwrap().query_one("select count(*) from jobs", &[]).unwrap().get::<i64>(0), 0);
         call(&url, "POST", "/jobs", Some("alice-t"), &base).unwrap();
     }
@@ -10578,7 +10876,9 @@ mod tests {
                 let _ = s.write_all(b"hi");
             }
         });
-        let ext = start_relay("relay-test", IpAddr::from([127, 0, 0, 1]), 0, port).unwrap();
+        let home = std::env::temp_dir().join(format!("rekcod-relay-{}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        let ext = start_relay("relay-test", &home, IpAddr::from([127, 0, 0, 1]), 0, port).unwrap();
         let mut b = [0u8; 2];
         TcpStream::connect(("127.0.0.1", ext)).unwrap().read_exact(&mut b).unwrap();
         assert_eq!(&b, b"hi");

@@ -32,8 +32,8 @@ export async function POST(req: Request) {
   let r: { code: number; stdout: string; stderr: string; terminal?: boolean }
   if (FIXTURE) r = { code: 0, stdout: `dry run: rekcod ${argv.join(" ")}`, stderr: "" }
   else if (a.interactive && !STREAMED.has(a.kind)) {
-    inTerminal({ ...a, argv })
-    r = { code: 0, stdout: "opened in Terminal", stderr: "" , terminal: true }
+    const why = inTerminal({ ...a, argv })
+    r = why ? { code: 1, stdout: "", stderr: `not opening Terminal: ${why}` } : { code: 0, stdout: "opened in Terminal", stderr: "", terminal: true }
   } else r = await run(argv, { cwd: a.dir, timeout: 600_000 })
   const entry = record({ ...base, code: r.code, ms: Date.now() - t0, stdout: r.stdout, stderr: r.stderr, terminal: r.terminal })
   nudge()

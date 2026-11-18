@@ -67,7 +67,8 @@ pub struct Options {
     pub allow: Option<String>,
     /// `IP:PORT,...` the sandbox may reach although it's on the Mac or LAN.
     pub reach: Option<String>,
-    /// Power off after this many seconds without an exec (`run/last-used`).
+    /// Power off after this many seconds without an exec (`run/last-used`) and with no
+    /// connection open on the docker socket.
     pub idle_ttl: Option<u64>,
     /// `e2fsck -fy` the data disk at boot (`rekcod start --repair`).
     pub repair: bool,
@@ -255,7 +256,8 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         let sock = paths.socket();
         let _ = std::fs::remove_file(&sock);
         let listener = crate::paths::with_umask(0o077, || UnixListener::bind(&sock)).with_context(|| format!("bind {}", sock.display()))?;
-        tokio::spawn(docker_proxy(vm.clone(), listener));
+        // Only a VM with an idle TTL (a sandbox) counts its connections.
+        tokio::spawn(docker_proxy(vm.clone(), listener, opts.idle_ttl.map(|_| paths.home.join("run/last-used"))));
         if fresh {
             tokio::spawn(forget_fresh_disk(vm.clone(), paths.data_fresh()));
         }
@@ -372,8 +374,11 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             }
             _ = tick.tick() => {
                 if let Some(ttl) = opts.idle_ttl
-                    && let Ok(used) = std::fs::metadata(paths.home.join("run/last-used")).and_then(|m| m.modified())
-                    && used.elapsed().is_ok_and(|e| e.as_secs() > ttl)
+                    && idle(
+                        std::fs::metadata(paths.home.join("run/last-used")).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()),
+                        ttl,
+                        DOCKER_OPEN.load(std::sync::atomic::Ordering::SeqCst),
+                    )
                 {
                     log!("idle for {ttl}s, stopping");
                     break;
@@ -808,7 +813,8 @@ impl DnsPolicy {
             false
         };
         if refuse {
-            let line = format!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain query)"));
+            // The name is the guest's: escaped, cut short, and rate-limited.
+            let line = format!("rekcod-egress: refused dns {}", dns::printable(name.as_deref().unwrap_or("(not one plain query)")));
             let lines = self.limit.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lines(line, Instant::now());
             for l in lines {
                 (self.log)(l);
@@ -817,8 +823,9 @@ impl DnsPolicy {
         }
         let answer = resolve(query).await?;
         if let Some(f) = &self.filter {
+            let raw = name.as_deref().map(|n| rekcod_proto::raw_ports(&f.allow, n)).unwrap_or_default();
             for (ip, ttl) in dns::answer_a(&answer) {
-                f.resolved.record(ip, ttl);
+                f.resolved.record_ports(ip, ttl, &raw);
             }
         }
         Some(answer)
@@ -836,16 +843,31 @@ async fn dns_bridge(vm: Vm, policy: Arc<DnsPolicy>) {
     }
 }
 
-/// Queries answered at once, and answers waiting for the guest to read them. A guest that
-/// sends without reading fills both and then isn't read either, so its answers can't pile
-/// up on the Mac.
-const DNS_IN_FLIGHT: usize = 256;
-
 async fn dns_session<S>(stream: S, policy: &Arc<DnsPolicy>) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
+    let policy = policy.clone();
+    dns_serve(stream, move |query: Vec<u8>| {
+        let policy = policy.clone();
+        async move { policy.answer(&query).await }
+    })
+    .await
+}
+
+/// Queries answered at once; more wait, so a flood can't spawn tasks without limit.
+const DNS_IN_FLIGHT: usize = 256;
+
+/// Length-prefixed DNS queries in, `answer`'s replies out, until the stream ends.
+async fn dns_serve<S, F, Fut>(stream: S, answer: F) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
+{
     let (mut rd, mut wr) = tokio::io::split(stream);
+    // Bounded, and a query's permit is held until its answer is queued: a guest that stops
+    // reading answers stops having its queries read.
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(DNS_IN_FLIGHT);
     let in_flight = Arc::new(tokio::sync::Semaphore::new(DNS_IN_FLIGHT));
     let writer = tokio::spawn(async move {
@@ -862,12 +884,12 @@ where
             let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
-            let policy = policy.clone();
             let permit = in_flight.clone().acquire_owned().await?;
+            let answering = answer(query);
             tokio::spawn(async move {
                 // Held until the answer is queued.
                 let _permit = permit;
-                if let Some(frame) = policy.answer(&query).await.as_deref().and_then(frame) {
+                if let Some(frame) = answering.await.as_deref().and_then(frame) {
                     let _ = tx.send(frame).await;
                 }
             });
@@ -904,23 +926,18 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
         servers = dns::nameservers(&resolv, dns::if_index);
     }
     for server in servers {
-        if let Some(answer) = ask_resolver(query, server, Duration::from_secs(2)).await {
-            return Some(answer);
+        if let Some(buf) = dns::ask_udp(query, server, Duration::from_secs(2)).await {
+            // Truncated (TC): the full answer only comes over TCP.
+            if buf.len() > 2
+                && buf[2] & 0x02 != 0
+                && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
+            {
+                return Some(full);
+            }
+            return Some(buf);
         }
     }
     None
-}
-
-/// One resolver's answer to `query` ([`dns::ask_udp`]); a truncated one is asked again over TCP.
-async fn ask_resolver(query: &[u8], server: SocketAddr, wait: Duration) -> Option<Vec<u8>> {
-    let answer = dns::ask_udp(query, server, wait).await?;
-    // Truncated (TC): the full answer only comes over TCP.
-    if answer[2] & 0x02 != 0
-        && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
-    {
-        return Some(full);
-    }
-    Some(answer)
 }
 
 async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
@@ -936,7 +953,37 @@ async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
     Ok(answer)
 }
 
-async fn docker_proxy(vm: Vm, listener: UnixListener) {
+/// Connections open on the docker socket. A `docker exec`, attach or shell holds one for as
+/// long as it runs, so a sandbox isn't idle while one is open, however long ago it started.
+static DOCKER_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a sandbox has been idle past its TTL: nothing connected to its docker socket and
+/// `run/last-used` older than `ttl` seconds.
+fn idle(last_used_age: Option<Duration>, ttl: u64, open: usize) -> bool {
+    open == 0 && last_used_age.is_some_and(|a| a.as_secs() > ttl)
+}
+
+/// Counts a docker connection in [`DOCKER_OPEN`] while it lives; closing it is use, so the
+/// TTL then starts from that moment.
+struct DockerOpen(PathBuf);
+
+impl DockerOpen {
+    fn new(used: PathBuf) -> DockerOpen {
+        DOCKER_OPEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DockerOpen(used)
+    }
+}
+
+impl Drop for DockerOpen {
+    fn drop(&mut self) {
+        if let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&self.0) {
+            let _ = f.set_modified(SystemTime::now());
+        }
+        DOCKER_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn docker_proxy(vm: Vm, listener: UnixListener, used: Option<PathBuf>) {
     loop {
         let client = match listener.accept().await {
             Ok((c, _)) => c,
@@ -945,8 +992,9 @@ async fn docker_proxy(vm: Vm, listener: UnixListener) {
                 continue;
             }
         };
-        let vm = vm.clone();
+        let (vm, open) = (vm.clone(), used.clone().map(DockerOpen::new));
         tokio::spawn(async move {
+            let _open = open;
             match vm.connect(DOCKER_PORT).await {
                 Ok(guest) => {
                     if let Err(e) = crate::proxy::pipe(client, guest).await
@@ -1312,6 +1360,7 @@ async fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
     }
     let mut changed = false;
     let mut closing = Vec::new();
+    let dashboard = crate::dashboard::serving_port(&status.paths.home);
     // Ports our listeners hold now, including ones closed below.
     let ours: BTreeSet<u16> = {
         let mut active = status.forwards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1348,7 +1397,7 @@ async fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
                 continue;
             }
             changed = true;
-            let fwd = match listen(binding, !ours.contains(&binding.port)) {
+            let fwd = match listen(binding, !ours.contains(&binding.port), dashboard) {
                 Ok(listener) => {
                     log!("port {}:{}/{:?} -> {container}", binding.addr, binding.port, binding.proto);
                     let task = match listener {
@@ -1384,9 +1433,14 @@ enum Listener {
 }
 
 /// `probe`: refuse if something already answers on the port. Off when one of our own
-/// listeners has (or just had) the port, since it would answer the probe itself.
-fn listen(b: Binding, probe: bool) -> std::io::Result<Listener> {
+/// listeners has (or just had) the port, since it would answer the probe itself. `dashboard`:
+/// the dashboard's port, refused on any address (it listens on 127.0.0.1 only, so a probe of
+/// `[::1]` finds nothing there).
+fn listen(b: Binding, probe: bool, dashboard: Option<u16>) -> std::io::Result<Listener> {
     use socket2::{Domain, Socket, Type};
+    if dashboard == Some(b.port) {
+        return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "the rekcod dashboard's port"));
+    }
     let addr = SocketAddr::new(b.addr, b.port);
     let kind = if b.proto == Proto::Udp { Type::DGRAM } else { Type::STREAM };
     let socket = Socket::new(Domain::for_address(addr), kind, None)?;
@@ -1402,13 +1456,14 @@ fn listen(b: Binding, probe: bool) -> std::io::Result<Listener> {
     // SO_REUSEADDR (needed to rebind right after a container restarts, past TIME_WAIT) also
     // lets macOS bind 127.0.0.1:P while another app holds *:P, and loopback traffic would
     // then come to us. So first check whether anything answers there.
-    let probe_first = probe;
-    let probe = if addr.ip().is_unspecified() {
-        SocketAddr::new(if addr.is_ipv6() { std::net::Ipv6Addr::LOCALHOST.into() } else { std::net::Ipv4Addr::LOCALHOST.into() }, b.port)
-    } else {
-        addr
+    // `[::]` is dual-stack, so it would take 127.0.0.1's traffic too (the dashboard's, say).
+    let v4 = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, b.port));
+    let probes = match (addr.ip().is_unspecified(), addr.is_ipv6()) {
+        (true, true) => vec![SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, b.port)), v4],
+        (true, false) => vec![v4],
+        (false, _) => vec![addr],
     };
-    if probe_first && std::net::TcpStream::connect_timeout(&probe, Duration::from_millis(100)).is_ok() {
+    if probe && probes.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_millis(100)).is_ok()) {
         return Err(std::io::Error::from(std::io::ErrorKind::AddrInUse));
     }
     socket.set_reuse_address(true)?;
@@ -1671,6 +1726,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_open_docker_connection_keeps_a_sandbox_up() {
+        let hour = Some(Duration::from_secs(3600));
+        assert!(idle(hour, 60, 0));
+        assert!(!idle(hour, 60, 1), "a long exec still running");
+        assert!(!idle(Some(Duration::from_secs(10)), 60, 0));
+        assert!(!idle(None, 60, 0));
+        let used = std::env::temp_dir().join(format!("rekcod-dopen-{}", std::process::id()));
+        let _ = std::fs::remove_file(&used);
+        let before = DOCKER_OPEN.load(std::sync::atomic::Ordering::SeqCst);
+        let open = DockerOpen::new(used.clone());
+        assert!(DOCKER_OPEN.load(std::sync::atomic::Ordering::SeqCst) > before);
+        drop(open);
+        // Closing counts as use.
+        assert!(std::fs::metadata(&used).unwrap().modified().unwrap().elapsed().unwrap() < Duration::from_secs(5));
+        let _ = std::fs::remove_file(&used);
+    }
+
+    #[test]
     fn stats_carry_elastic_held_only_with_elastic_memory() {
         assert_eq!(with_elastic_held(r#"{"disk_used":1}"#.into(), Some(5)), r#"{"disk_used":1,"elastic_held":5}"#);
         assert_eq!(with_elastic_held(r#"{"disk_used":1}"#.into(), None), r#"{"disk_used":1}"#);
@@ -1803,6 +1876,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn forwards_leave_the_dashboards_port_alone() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let any = Binding { proto: Proto::Tcp, addr: std::net::Ipv6Addr::UNSPECIFIED.into(), port };
+        assert_eq!(listen(any, true, None).err().map(|e| e.kind()), Some(std::io::ErrorKind::AddrInUse));
+        // The dashboard holds 127.0.0.1 only; [::1] at its port is refused too.
+        let v6 = Binding { proto: Proto::Tcp, addr: std::net::Ipv6Addr::LOCALHOST.into(), port };
+        assert_eq!(listen(v6, true, Some(port)).err().map(|e| e.kind()), Some(std::io::ErrorKind::AddrInUse));
+        drop(held);
+        assert!(listen(v6, true, None).is_ok(), "any other [::1] port is fine");
+    }
+
+    #[tokio::test]
     async fn a_renamed_container_keeps_its_listener() {
         let open = || Forward { container: "web".into(), task: Some(tokio::spawn(async {})), error: None };
         let failed = Forward { container: "web".into(), task: None, error: Some("in use".into()) };
@@ -1895,31 +1981,6 @@ mod tests {
         };
         assert!(tokio::time::timeout(Duration::from_secs(3), flood).await.is_err(), "the bridge kept reading");
         assert!(logged.load(std::sync::atomic::Ordering::Relaxed) <= 20, "{logged:?} lines");
-    }
-
-    #[tokio::test]
-    async fn a_resolver_answer_comes_from_the_resolver_and_answers_the_query() {
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let query = dns_query(0x1234, "npmjs.org", 1);
-        let q = query.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            let (n, client) = server.recv_from(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], &q[..]);
-            // Someone else races the resolver, then the resolver sends a stale answer first.
-            let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let mut fake = q.clone();
-            fake[2] |= 0x80;
-            forger.send_to(&fake, client).await.unwrap();
-            let mut stale = fake.clone();
-            stale[1] ^= 1;
-            server.send_to(&stale, client).await.unwrap();
-            fake[3] = 3; // NXDOMAIN, from the real resolver this time
-            server.send_to(&fake, client).await.unwrap();
-        });
-        let answer = ask_resolver(&query, addr, Duration::from_secs(5)).await.unwrap();
-        assert_eq!((answer[1], answer[3]), (0x34, 3));
     }
 
     #[tokio::test]

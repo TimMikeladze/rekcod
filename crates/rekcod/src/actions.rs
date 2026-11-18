@@ -1,4 +1,4 @@
-//! What the menu bar shows and can do (docs/frontends.md).
+//! What the menu bar shows and can do (README, "Manage it from the terminal, menu bar or dashboard").
 //!
 //! The CLI is the implementation: every [`Action`] is a `rekcod` command line
 //! (or opening a URL). The menu bar renders the lists returned by the
@@ -194,6 +194,38 @@ impl Kind {
     pub fn from_name(name: &str) -> Option<Kind> {
         Kind::ALL.into_iter().find(|k| format!("{k:?}") == name)
     }
+
+    /// Kinds this binary ever runs in Terminal. A host's `rekcod state` can't make another
+    /// kind open one here (`state::check_remote`).
+    pub fn may_be_interactive(self) -> bool {
+        matches!(
+            self,
+            Kind::VmRepair
+                | Kind::Shell
+                | Kind::SocketInstall
+                | Kind::Doctor
+                | Kind::Upgrade
+                | Kind::UpgradeRollback
+                | Kind::Uninstall
+                | Kind::StorageEnv
+                | Kind::StorageUp
+                | Kind::ContainerLogs
+                | Kind::ContainerShell
+                | Kind::ImageHistory
+                | Kind::VolumeBrowse
+                | Kind::SandboxShell
+                | Kind::SandboxDiff
+                | Kind::AppLogs
+                | Kind::AppWebhook
+                | Kind::JobLogs
+                | Kind::HostForward
+                | Kind::HostRestart
+                | Kind::HostUninstall
+                | Kind::EdgeBan
+                | Kind::ControllerTokens
+                | Kind::ControllerAudit
+        )
+    }
 }
 
 /// What a value typed into an action's input must look like.
@@ -265,11 +297,12 @@ impl Input {
 }
 
 /// Why `v` isn't a valid `kind` value, or `None` when it is. The dashboard checks the
-/// same rules (lib/inputs.ts) before anything runs.
+/// same rules (lib/inputs.ts) before anything runs; dashboard/fixtures/input-vectors.json holds
+/// both to the same answers.
 pub fn invalid(kind: InputKind, v: &str) -> Option<String> {
     let max = if kind == InputKind::Env { 4096 } else { 255 };
     if v.is_empty() || v.len() > max {
-        return Some(format!("must be 1 to {max} characters"));
+        return Some(format!("must be 1 to {max} bytes"));
     }
     if v.starts_with('-') || v.chars().any(|c| c.is_control()) {
         return Some("can't start with - or contain control characters".into());
@@ -279,7 +312,8 @@ pub fn invalid(kind: InputKind, v: &str) -> Option<String> {
             && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
             && s.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
     };
-    let port = |s: &str| s.parse::<u16>().is_ok_and(|p| p > 0);
+    // `parse` alone would take "+80".
+    let port = |s: &str| (1..=5).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit()) && s.parse::<u16>().is_ok_and(|p| p > 0);
     let ok = match kind {
         InputKind::Image => {
             v.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
@@ -419,6 +453,20 @@ impl Action {
         }
     }
 
+    /// The script Terminal.app runs for an interactive action: `/bin/sh` (zsh would expand a
+    /// leading `=`), deleting itself first. Terminal is handed only the script's path, never this
+    /// text: typed into a line editor, a ^U or ^C inside quotes would start a new command line.
+    /// `None` when the command or its directory holds a control character.
+    pub fn terminal_script(&self) -> Option<String> {
+        let line = self.command_line();
+        let dir = self.dir.as_ref().map(|d| d.display().to_string());
+        if has_control(&line) || dir.as_deref().is_some_and(has_control) {
+            return None;
+        }
+        let cd = dir.map(|d| format!("cd {} || exit\n", shell_quote(&d))).unwrap_or_default();
+        Some(format!("#!/bin/sh\nrm -f -- \"$0\"\n{cd}exec {line}\n"))
+    }
+
     /// A non-interactive command, ready to spawn with captured output.
     pub fn command(&self) -> Command {
         let mut cmd = match &self.run {
@@ -439,6 +487,11 @@ impl Action {
         cmd.stdin(Stdio::null());
         cmd
     }
+}
+
+/// C0, DEL or C1: bytes a terminal acts on.
+pub fn has_control(s: &str) -> bool {
+    s.chars().any(char::is_control)
 }
 
 pub fn shell_quote(s: &str) -> String {
@@ -583,7 +636,10 @@ pub struct Snapshot {
 #[derive(Debug, Clone)]
 pub struct Engine {
     pub name: String,
-    pub state: Result<Value, String>,
+    /// `None` until the first read finishes.
+    pub state: Option<Result<Value, String>>,
+    /// Seconds since that read.
+    pub age: u64,
 }
 
 /// Everything the menu bar shows, loaded in one go.
@@ -1343,6 +1399,10 @@ pub fn network_actions(n: &Network) -> Vec<Action> {
 const CLONE: &str =
     r#"[ -z "$(ls -A /to)" ] || { echo "that volume already has files; clone into a new name" >&2; exit 1; }; cp -a /v/. /to/"#;
 
+/// `VolumeExport`'s archive of volume `$1`, in the helper container: a name with the time, and
+/// `-2`, `-3`... rather than overwriting a file of the same name.
+const EXPORT: &str = r#"f="/out/$1-$(date +%Y%m%d-%H%M%S)"; n=1; g="$f"; while [ -e "$g.tar.gz" ]; do n=$((n+1)); g="$f-$n"; done; tar czf "$g.tar.gz" -C /v . && echo "${g#/out/}.tar.gz""#;
+
 /// Where `VolumeExport` writes: `~/Downloads` (shared with the VM at the same path).
 fn downloads() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Downloads")
@@ -1352,7 +1412,6 @@ pub fn volume_actions(v: &Volume) -> Vec<Action> {
     let n = v.name.as_str();
     let helper = crate::cli::HELPER_IMAGE;
     let ro = format!("{n}:/v:ro");
-    let tgz = format!("{n}.tar.gz");
     let out_dir = downloads();
     let mut out = vec![
         // `ls -ld` of up to 2000 paths, six levels deep.
@@ -1365,24 +1424,11 @@ pub fn volume_actions(v: &Volume) -> Vec<Action> {
         // Into a new (empty) volume only: copying over one that has files would mix the two.
         Action::rekcod(Kind::VolumeClone, "Clone", &["run", "--rm", "-v", &ro, "-v", "{target}:/to", helper, "sh", "-c", CLONE])
             .input(Input::new("target", "New volume", InputKind::Name, &format!("{n}-copy"))),
+        // A new file each time, named NAME-YYYYMMDD-HHMMSS.tar.gz.
         Action::rekcod(
             Kind::VolumeExport,
-            format!("Export to ~/Downloads/{tgz}"),
-            &[
-                "run",
-                "--rm",
-                "-v",
-                &ro,
-                "-v",
-                &format!("{}:/out", out_dir.display()),
-                helper,
-                "tar",
-                "czf",
-                &format!("/out/{tgz}"),
-                "-C",
-                "/v",
-                ".",
-            ],
+            "Export to ~/Downloads",
+            &["run", "--rm", "-v", &ro, "-v", &format!("{}:/out", out_dir.display()), helper, "sh", "-c", EXPORT, "sh", n],
         ),
     ];
     if v.containers.is_empty() {
@@ -1888,6 +1934,39 @@ pub mod tests {
         assert_eq!(shell_quote("KEY=value"), "KEY=value");
     }
 
+    /// `may_be_interactive` is exactly the kinds some list builds with `.interactive()`.
+    #[test]
+    fn interactive_kinds_are_listed() {
+        let all = reachable_kinds();
+        for k in Kind::ALL {
+            assert_eq!(all.iter().any(|a| a.kind == k && a.interactive), k.may_be_interactive(), "{k:?}");
+        }
+    }
+
+    #[test]
+    fn terminal_gets_a_script_without_control_characters() {
+        let mut a = Action::rekcod(Kind::ContainerLogs, "Logs", &["logs", "it's", "=x"]).interactive();
+        a.dir = Some("/Users/me/my app".into());
+        let s = a.terminal_script().unwrap();
+        assert!(s.starts_with("#!/bin/sh\nrm -f -- \"$0\"\ncd '/Users/me/my app' || exit\nexec "), "{s}");
+        // A leading `=` is quoted too (HO-21: zsh expands it; harmless under sh).
+        assert!(s.trim_end().ends_with(r" logs 'it'\''s' '=x'"), "{s:?}");
+        for bad in ["\u{15}touch x\n#", "\u{3}", "\u{7f}", "\u{9b}"] {
+            let a = Action::rekcod(Kind::ContainerLogs, "Logs", &["logs", bad]).interactive();
+            assert_eq!(a.terminal_script(), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn exports_never_overwrite() {
+        let v = &sample_volumes()[0];
+        let export = volume_actions(v).into_iter().find(|a| a.kind == Kind::VolumeExport).unwrap();
+        let Run::Rekcod(argv) = &export.run else { panic!() };
+        assert!(!argv.iter().any(|a| a.ends_with(".tar.gz")), "no fixed file name: {argv:?}");
+        // The name is $1, not part of the script.
+        assert_eq!(argv[argv.len() - 4..], ["-c", EXPORT, "sh", v.name.as_str()]);
+    }
+
     #[test]
     fn prunes_say_what_they_free_and_spare_snapshots() {
         let d = disk_actions(true, &sample_images(), &sample_volumes(), Some(&Disk { build_cache_free: 7 << 20, ..Default::default() }));
@@ -1942,6 +2021,22 @@ pub mod tests {
         let clone = volume_actions(&sample_volumes()[0]).into_iter().find(|a| a.kind == Kind::VolumeClone).unwrap();
         let filled = fill(&argv(&clone), &clone.inputs, &values(&[("target", &["pg2"])])).unwrap();
         assert!(filled.contains(&"pg2:/to".to_string()), "{filled:?}");
+        // Into an empty volume only; `cp -a` over one with files would mix the two.
+        assert!(
+            filled.last().is_some_and(|s| s.starts_with(r#"[ -z "$(ls -A /to)" ] || {"#) && s.ends_with("cp -a /v/. /to/")),
+            "{filled:?}"
+        );
+    }
+
+    /// The cases the dashboard's `invalid` (lib/inputs.ts) is held to as well.
+    #[test]
+    fn input_values_match_the_dashboards() {
+        let rows: Vec<(String, String, bool)> =
+            serde_json::from_str(include_str!("../../../dashboard/fixtures/input-vectors.json")).unwrap();
+        assert!(rows.len() > 20);
+        for (k, v, valid) in rows {
+            assert_eq!(invalid(InputKind::from_name(&k).unwrap(), &v).is_none(), valid, "{k} {v:?}");
+        }
     }
 
     #[test]

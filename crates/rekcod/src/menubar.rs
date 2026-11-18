@@ -1,6 +1,6 @@
-//! `rekcod menubar`: a menu bar item with the same actions as the CLI
-//! (docs/frontends.md). The title follows the VM every 2 s; the menu is
-//! built from `actions::Model` each time it opens, and every item runs an
+//! `rekcod menubar`: a menu bar item with the same actions as the CLI (README, "Manage it
+//! from the terminal, menu bar or dashboard"). The title follows the VM every 2 s; the menu
+//! is built from `actions::Model` each time it opens, and every item runs an
 //! `actions::Action` (a `rekcod` command).
 
 use std::cell::{Cell, OnceCell, RefCell};
@@ -14,13 +14,13 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadMarker, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSImage, NSMenu, NSMenuDelegate,
-    NSMenuItem, NSStatusBar, NSStatusItem, NSTextField, NSVariableStatusItemLength, NSView,
+    NSAlert, NSAlertFirstButtonReturn, NSApplication, NSApplicationActivationPolicy, NSBorderType, NSCellImagePosition, NSImage, NSMenu,
+    NSMenuDelegate, NSMenuItem, NSScrollView, NSStatusBar, NSStatusItem, NSTextField, NSTextView, NSVariableStatusItemLength, NSView,
 };
 use objc2_foundation::{NSData, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer};
 use serde_json::Value;
 
-use crate::actions::{self, Action, Engine, InputKind, Model, Run};
+use crate::actions::{self, Action, Engine, Model, Run};
 use crate::paths::Paths;
 
 const LABEL: &str = "dev.rekcod.menubar";
@@ -69,9 +69,8 @@ pub struct Ivars {
 #[derive(Default)]
 pub struct Models {
     latest: std::sync::Mutex<Option<(std::time::Instant, Arc<Model>)>>,
-    /// Hosts' engines, read over SSH on their own thread so a slow host never holds the menu:
-    /// once at start, then each time the menu opens (`fresh`).
-    engines: std::sync::Mutex<Vec<Engine>>,
+    /// Hosts' engines, read over SSH once at start, then each time the menu opens (`fresh`).
+    engines: Arc<Engines>,
     engines_poke: std::sync::Mutex<bool>,
     engines_poked: std::sync::Condvar,
     loaded: std::sync::Condvar,
@@ -84,13 +83,10 @@ impl Models {
     fn run(self: Arc<Self>, paths: Paths) {
         let me = self.clone();
         std::thread::spawn(move || {
+            let read: Arc<ReadEngine> = Arc::new(|name: &str| crate::host::engine_state(name).map_err(|e| format!("{e:#}")));
             loop {
                 let (hosts, _) = crate::host::list();
-                let engines = hosts
-                    .iter()
-                    .map(|h| Engine { name: h.name.clone(), state: crate::host::engine_state(&h.name).map_err(|e| format!("{e:#}")) })
-                    .collect();
-                *me.engines.lock().unwrap() = engines;
+                me.engines.refresh(hosts.into_iter().map(|h| h.name).collect(), &read);
                 let poked = me.engines_poke.lock().unwrap();
                 let mut poked = me.engines_poked.wait_while(poked, |p| !*p).unwrap();
                 *poked = false;
@@ -99,7 +95,7 @@ impl Models {
         std::thread::spawn(move || {
             loop {
                 let mut m = Model::load(&paths);
-                m.engines = self.engines.lock().unwrap().clone();
+                m.engines = self.engines.snapshot();
                 let m = Arc::new(m);
                 *self.latest.lock().unwrap() = Some((std::time::Instant::now(), m));
                 self.loaded.notify_all();
@@ -120,6 +116,52 @@ impl Models {
         let latest = self.latest.lock().unwrap();
         let (latest, _) = self.loaded.wait_timeout_while(latest, wait, |l| l.as_ref().is_none_or(|(t, _)| *t < asked)).unwrap();
         latest.as_ref().map(|(_, m)| m.clone())
+    }
+}
+
+type ReadEngine = dyn Fn(&str) -> Result<Value, String> + Send + Sync;
+
+/// What the menu shows of each host's engine. Each host is read on a thread of its own, one
+/// read at a time, so a host that stalls holds only its own submenu, which says how old it is.
+#[derive(Default)]
+pub struct Engines {
+    slots: std::sync::Mutex<std::collections::BTreeMap<String, EngineSlot>>,
+}
+
+#[derive(Default)]
+struct EngineSlot {
+    state: Option<Result<Value, String>>,
+    at: Option<std::time::Instant>,
+    reading: bool,
+}
+
+impl Engines {
+    /// Forgets hosts that aren't in `hosts` and starts a read of each one that isn't being read.
+    fn refresh(self: &Arc<Self>, hosts: Vec<String>, read: &Arc<ReadEngine>) {
+        let mut slots = self.slots.lock().unwrap();
+        slots.retain(|name, _| hosts.contains(name));
+        for name in hosts {
+            let slot = slots.entry(name.clone()).or_default();
+            if slot.reading {
+                continue;
+            }
+            slot.reading = true;
+            let (me, read) = (self.clone(), read.clone());
+            std::thread::spawn(move || {
+                let state = read(&name);
+                if let Some(slot) = me.slots.lock().unwrap().get_mut(&name) {
+                    *slot = EngineSlot { state: Some(state), at: Some(std::time::Instant::now()), reading: false };
+                }
+            });
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Engine> {
+        let slots = self.slots.lock().unwrap();
+        slots
+            .iter()
+            .map(|(name, s)| Engine { name: name.clone(), state: s.state.clone(), age: s.at.map_or(0, |t| t.elapsed().as_secs()) })
+            .collect()
     }
 }
 
@@ -400,20 +442,31 @@ pub fn entries(m: &Model) -> Vec<Entry> {
 /// A host's engine from its `rekcod host state` JSON: the same sections as this Mac's, each
 /// action already rewritten to run there.
 pub fn engine_entries(e: &Engine) -> Vec<Entry> {
+    // Past a minute the read is older than any menu open would give, so say so.
+    let old = match e.age {
+        a if a < 60 => String::new(),
+        a if a < 7200 => format!(" (read {}m ago)", a / 60),
+        a => format!(" (read {}h ago)", a / 3600),
+    };
     let v = match &e.state {
-        Ok(v) => v,
-        Err(err) => return vec![Entry::Label(format!("Can't read {}: {err}", e.name))],
+        None => return vec![Entry::Label(format!("Reading {}…", e.name))],
+        Some(Ok(v)) => v,
+        Some(Err(err)) => return vec![Entry::Label(format!("Can't read {}: {err}{old}", e.name))],
     };
     let acts = |v: &Value| -> Vec<Entry> {
         v.as_array().into_iter().flatten().filter_map(crate::state::action_from_json).map(Entry::Action).collect()
     };
     let running = v["running"] == true;
-    let mut out =
-        vec![Entry::Label(if running { format!("rekcod running on {}", e.name) } else { format!("rekcod is stopped on {}", e.name) })];
+    let mut out = vec![Entry::Label(if running {
+        format!("rekcod running on {}{old}", e.name)
+    } else {
+        format!("rekcod is stopped on {}{old}", e.name)
+    })];
     out.extend(acts(&v["vm_actions"]));
     if !running {
         return out;
     }
+    out.extend(acts(&v["storage_actions"]));
     out.push(Entry::Separator);
     let s = |x: &Value, k: &str| x[k].as_str().unwrap_or("?").to_string();
     let section = |key: &str, title: &str, label: &dyn Fn(&Value) -> String| -> Option<Entry> {
@@ -435,6 +488,30 @@ pub fn engine_entries(e: &Engine) -> Vec<Entry> {
     }));
     out.extend(section("volumes", "Volumes", &|x| s(x, "name")));
     out.extend(section("networks", "Networks", &|n| format!("{}  ({})", s(n, "name"), s(n, "driver"))));
+    let projects: Vec<Entry> = v["projects"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| {
+            let mut items = acts(&p["actions"]);
+            let snaps = p["snapshots"].as_array().map(Vec::as_slice).unwrap_or_default();
+            if !snaps.is_empty() {
+                items.push(Entry::Separator);
+            }
+            for sn in snaps {
+                items.push(Entry::Submenu(format!("{}  ({})", s(sn, "name"), actions::age(sn["created"].as_u64())), acts(&sn["actions"])));
+            }
+            Entry::Submenu(s(p, "name"), items)
+        })
+        .collect();
+    if !projects.is_empty() {
+        out.push(Entry::Submenu("Projects & snapshots".into(), projects));
+    }
+    out.extend(section("sandboxes", "Agent sandboxes", &|x| {
+        let dot = if x["running"] == true { "●" } else { "○" };
+        let dir = x["project"].as_str().and_then(|p| p.rsplit('/').next()).unwrap_or_default();
+        format!("{dot} {}  ({dir})", x["name"].as_str().or(x["id"].as_str()).unwrap_or("?"))
+    }));
     let new = acts(&v["engine_actions"]);
     if !new.is_empty() {
         out.push(Entry::Submenu("New".into(), new));
@@ -446,9 +523,9 @@ pub fn engine_entries(e: &Engine) -> Vec<Entry> {
     out
 }
 
-/// One field's text as values: split at commas for repeatable inputs. An env value may hold
-/// commas, so a piece that isn't `KEY=...` joins the one before it.
-pub fn split_values(kind: InputKind, multiple: bool, text: &str) -> Vec<String> {
+/// One field's text as values: one per line for repeatable inputs, as the dashboard's text
+/// area takes them. Commas aren't separators: an env value may hold `,NAME=...`.
+pub fn split_values(multiple: bool, text: &str) -> Vec<String> {
     let text = text.trim();
     if text.is_empty() {
         return vec![];
@@ -456,19 +533,17 @@ pub fn split_values(kind: InputKind, multiple: bool, text: &str) -> Vec<String> 
     if !multiple {
         return vec![text.to_string()];
     }
-    let mut out: Vec<String> = Vec::new();
-    for piece in text.split(',') {
-        let starts_new = kind != InputKind::Env || actions::invalid(InputKind::Env, piece.trim()).is_none();
-        match out.last_mut() {
-            Some(last) if !starts_new => {
-                last.push(',');
-                last.push_str(piece);
-            }
-            _ => out.push(piece.trim().to_string()),
-        }
+    text.lines().map(str::trim).filter(|l| !l.is_empty()).map(String::from).collect()
+}
+
+/// The question asked before an action with inputs runs: its own, if any, then the filled
+/// command, which the input alert couldn't show.
+pub fn filled_question(action: &Action, argv: &[String]) -> String {
+    let line = argv.iter().map(|a| actions::shell_quote(a)).collect::<Vec<_>>().join(" ");
+    match &action.confirm {
+        Some(q) => format!("{q}\n\nrekcod {line}"),
+        None => format!("rekcod {line}"),
     }
-    out.retain(|v| !v.is_empty());
-    out
 }
 
 impl Target {
@@ -555,6 +630,7 @@ impl Target {
         let mut action = action.clone();
         if !action.inputs.is_empty() {
             let Some(argv) = self.ask_inputs(&action) else { return };
+            action.confirm = Some(filled_question(&action, &argv));
             action.run = Run::Rekcod(argv);
             action.inputs.clear();
         }
@@ -565,7 +641,7 @@ impl Target {
             return;
         }
         if action.interactive {
-            in_terminal(&action.command_line());
+            in_terminal(&self.ivars().paths, action);
             return;
         }
         // Runs in the background; the next menu open shows the result.
@@ -610,12 +686,19 @@ impl Target {
         }
     }
 
-    /// One alert with a field per input; asks again (keeping what was typed) until the values
-    /// pass `actions::fill` or it's cancelled. The filled argv, or `None`.
+    /// One alert with a field per input (a text box, one value per line, for repeatable ones);
+    /// asks again, keeping what was typed, until the values pass `actions::fill` or it's
+    /// cancelled. The filled argv, or `None`.
     fn ask_inputs(&self, action: &Action) -> Option<Vec<String>> {
+        enum Field {
+            Line(Retained<NSTextField>),
+            Lines(Retained<NSTextView>),
+        }
         let mtm = self.mtm();
         let Run::Rekcod(argv) = &action.run else { return None };
-        let (w, row) = (340.0, 48.0);
+        let (w, label_h, line_h, lines_h) = (340.0, 22.0, 26.0, 66.0);
+        let height = |i: &actions::Input| label_h + if i.multiple { lines_h } else { line_h };
+        let total: f64 = action.inputs.iter().map(height).sum();
         let mut typed: Vec<String> = vec![String::new(); action.inputs.len()];
         let mut problem: Option<String> = None;
         loop {
@@ -628,35 +711,60 @@ impl Target {
             alert.setInformativeText(&NSString::from_str(&hint));
             alert.addButtonWithTitle(&NSString::from_str(&action.label));
             alert.addButtonWithTitle(&NSString::from_str("Cancel"));
-            let n = action.inputs.len() as f64;
-            let view = NSView::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, row * n)));
+            let view = NSView::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, total)));
             let mut fields = Vec::new();
+            let mut top = total;
             for (k, i) in action.inputs.iter().enumerate() {
-                let y = (n - 1.0 - k as f64) * row;
                 let mut text = i.label.clone();
                 if i.optional {
                     text.push_str(" (optional)");
                 }
                 if i.multiple {
-                    text.push_str(", comma-separated");
+                    text.push_str(&format!(", one per line, e.g. {}", i.placeholder));
                 }
+                top -= label_h;
                 let label = NSTextField::labelWithString(&NSString::from_str(&text), mtm);
-                label.setFrame(NSRect::new(NSPoint::new(0.0, y + 26.0), NSSize::new(w, 18.0)));
-                let field = NSTextField::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, y + 2.0), NSSize::new(w, 22.0)));
-                field.setPlaceholderString(Some(&NSString::from_str(&i.placeholder)));
-                field.setStringValue(&NSString::from_str(&typed[k]));
+                label.setFrame(NSRect::new(NSPoint::new(0.0, top + 2.0), NSSize::new(w, 18.0)));
                 view.addSubview(&label);
-                view.addSubview(&field);
-                fields.push(field);
+                if i.multiple {
+                    top -= lines_h;
+                    let frame = NSRect::new(NSPoint::new(0.0, top + 4.0), NSSize::new(w, lines_h - 6.0));
+                    let scroll = NSScrollView::initWithFrame(mtm.alloc(), frame);
+                    scroll.setHasVerticalScroller(true);
+                    scroll.setBorderType(NSBorderType::BezelBorder);
+                    let tv = NSTextView::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, 0.0), frame.size));
+                    tv.setRichText(false);
+                    tv.setString(&NSString::from_str(&typed[k]));
+                    scroll.setDocumentView(Some(&tv));
+                    view.addSubview(&scroll);
+                    fields.push(Field::Lines(tv));
+                } else {
+                    top -= line_h;
+                    let field = NSTextField::initWithFrame(mtm.alloc(), NSRect::new(NSPoint::new(0.0, top + 2.0), NSSize::new(w, 22.0)));
+                    field.setPlaceholderString(Some(&NSString::from_str(&i.placeholder)));
+                    field.setStringValue(&NSString::from_str(&typed[k]));
+                    view.addSubview(&field);
+                    fields.push(Field::Line(field));
+                }
             }
             alert.setAccessoryView(Some(&view));
-            alert.window().setInitialFirstResponder(fields.first().map(|f| &**f as &NSView));
+            let first: Option<&NSView> = fields.first().map(|f| match f {
+                Field::Line(t) => &**t as &NSView,
+                Field::Lines(t) => &**t as &NSView,
+            });
+            alert.window().setInitialFirstResponder(first);
             NSApplication::sharedApplication(mtm).activate();
             if alert.runModal() != NSAlertFirstButtonReturn {
                 return None;
             }
-            typed = fields.iter().map(|f| f.stringValue().to_string()).collect();
-            let values = action.inputs.iter().zip(&typed).map(|(i, t)| (i.key.clone(), split_values(i.kind, i.multiple, t))).collect();
+            typed = fields
+                .iter()
+                .map(|f| match f {
+                    Field::Line(t) => t.stringValue().to_string(),
+                    Field::Lines(t) => t.string().to_string(),
+                })
+                .collect();
+            let values = action.inputs.iter().zip(&typed).map(|(i, t)| (i.key.clone(), split_values(i.multiple, t))).collect();
             match actions::fill(argv, &action.inputs, &values) {
                 Ok(filled) => return Some(filled),
                 Err(e) => problem = Some(e),
@@ -682,13 +790,52 @@ fn open(target: &str) {
     }
 }
 
-/// Opens Terminal.app running `command`.
-fn in_terminal(command: &str) {
-    let escaped = command.replace('\\', "\\\\").replace('"', "\\\"");
-    let script = format!("tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell");
-    if let Ok(mut child) = Command::new("/usr/bin/osascript").args(["-e", &script]).spawn() {
-        std::thread::spawn(move || child.wait());
+/// Opens Terminal.app running `action` from a script file (`Action::terminal_script`).
+fn in_terminal(paths: &Paths, action: &Action) {
+    let opened = action
+        .terminal_script()
+        .context("the command has control characters")
+        .and_then(|script| write_terminal_script(&paths.home.join("run/terminal"), &script))
+        .and_then(|file| terminal_applescript(&file).context("the script's path has control characters"));
+    match opened {
+        Ok(script) => {
+            if let Ok(mut child) = Command::new("/usr/bin/osascript").args(["-e", &script]).spawn() {
+                std::thread::spawn(move || child.wait());
+            }
+        }
+        Err(e) => eprintln!("rekcod menubar: not opening Terminal for {}: {e:#}", action.label),
     }
+}
+
+/// `script` as a new 0700 file in `dir` (0700 too). The script deletes itself when it runs;
+/// ones older than a day are from Terminal windows that never ran them.
+pub fn write_terminal_script(dir: &Path, script: &str) -> Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    let day = std::time::Duration::from_secs(86_400);
+    for e in std::fs::read_dir(dir)?.flatten() {
+        if e.metadata().and_then(|m| m.modified()).is_ok_and(|t| t.elapsed().is_ok_and(|age| age > day)) {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos();
+    let file = dir.join(format!("{}-{nanos}.sh", std::process::id()));
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o700).open(&file)?;
+    f.write_all(script.as_bytes())?;
+    Ok(file)
+}
+
+/// The AppleScript that opens a Terminal window running the script at `file`, or `None` when
+/// its path has a control character.
+pub fn terminal_applescript(file: &Path) -> Option<String> {
+    let line = actions::shell_quote(&file.display().to_string());
+    if actions::has_control(&line) {
+        return None;
+    }
+    let escaped = line.replace('\\', "\\\\").replace('"', "\\\"");
+    Some(format!("tell application \"Terminal\"\nactivate\ndo script \"{escaped}\"\nend tell"))
 }
 
 pub fn run(paths: Paths) -> Result<()> {
@@ -908,7 +1055,7 @@ mod tests {
             "networks": [{"name": "bridge", "driver": "bridge", "actions": []}],
         });
         crate::host::rewrite(&mut state, "mini");
-        let e = entries(&Model { engines: vec![Engine { name: "mini".into(), state: Ok(state) }], ..Model::default() });
+        let e = entries(&Model { engines: vec![Engine { name: "mini".into(), state: Some(Ok(state)), age: 0 }], ..Model::default() });
         let Some(Entry::Submenu(title, items)) = e.iter().find(|x| matches!(x, Entry::Submenu(t, _) if t.starts_with("Engine:"))) else {
             panic!("no engine submenu in {e:?}")
         };
@@ -917,16 +1064,134 @@ mod tests {
         let Entry::Action(stop) = &items[1] else { panic!("{:?}", items[1]) };
         assert_eq!(stop.run, Run::Rekcod(["host", "exec", "mini", "--", "stop"].map(String::from).into()));
         assert!(items.contains(&Entry::Submenu("Networks (1)".into(), vec![Entry::Label("bridge  (bridge)".into())])));
-        let down = engine_entries(&Engine { name: "mini".into(), state: Err("ssh: connect timed out".into()) });
+        let down = engine_entries(&Engine { name: "mini".into(), state: Some(Err("ssh: connect timed out".into())), age: 0 });
         assert_eq!(down, vec![Entry::Label("Can't read mini: ssh: connect timed out".into())]);
+        let old = engine_entries(&Engine { name: "mini".into(), state: Some(Err("no answer in 20 s".into())), age: 600 });
+        assert_eq!(old, vec![Entry::Label("Can't read mini: no answer in 20 s (read 10m ago)".into())]);
+        let first = engine_entries(&Engine { name: "mini".into(), state: None, age: 0 });
+        assert_eq!(first, vec![Entry::Label("Reading mini…".into())]);
+    }
+
+    /// A host's engine offers what its `rekcod host state` holds: every action kind in it is in
+    /// the submenu.
+    #[test]
+    fn engine_submenu_offers_every_action_in_a_hosts_state() {
+        use crate::actions::tests::*;
+        let (containers, ports, projects) = sample();
+        let full = Model {
+            running: true,
+            containers: containers.into_iter().chain([sample_storage()]).collect(),
+            ports,
+            projects,
+            sandboxes: vec![sample_sandbox()],
+            images: sample_images(),
+            volumes: sample_volumes(),
+            networks: sample_networks(),
+            ..Model::default()
+        };
+        let mut want = std::collections::BTreeSet::new();
+        let mut seen = Vec::new();
+        for m in [full, Model { socket_installed: false, ..Model::default() }] {
+            let mut v = crate::state::model_json(&m);
+            crate::state::check_remote(&mut v, "mini");
+            crate::host::rewrite(&mut v, "mini");
+            fn walk(v: &Value, out: &mut std::collections::BTreeSet<String>) {
+                match v {
+                    Value::Object(o) if o.contains_key("argv") && o.contains_key("kind") => {
+                        out.insert(o["kind"].as_str().unwrap().to_string());
+                    }
+                    Value::Object(o) => o.values().for_each(|x| walk(x, out)),
+                    Value::Array(a) => a.iter().for_each(|x| walk(x, out)),
+                    _ => {}
+                }
+            }
+            walk(&v, &mut want);
+            let e = Engine { name: "mini".into(), state: Some(Ok(v)), age: 0 };
+            fn kinds(e: &[Entry], out: &mut Vec<String>) {
+                for e in e {
+                    match e {
+                        Entry::Action(a) => out.push(format!("{:?}", a.kind)),
+                        Entry::Submenu(_, c) => kinds(c, out),
+                        _ => {}
+                    }
+                }
+            }
+            kinds(&engine_entries(&e), &mut seen);
+        }
+        assert!(want.len() > 40, "{want:?}");
+        for k in &want {
+            assert!(seen.contains(k), "the Engine submenu lacks {k}");
+        }
     }
 
     #[test]
-    fn typed_values_split_at_commas() {
-        assert_eq!(split_values(InputKind::Publish, true, " 80:80, 443:443 "), ["80:80", "443:443"]);
-        assert_eq!(split_values(InputKind::Env, true, "A=1,B=x,y,C=2"), ["A=1", "B=x,y", "C=2"]);
-        assert_eq!(split_values(InputKind::Name, false, "a,b"), ["a,b"]);
-        assert!(split_values(InputKind::Mount, true, "  ").is_empty());
+    fn a_stalled_host_holds_only_its_own_engine() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let wait = std::sync::Mutex::new(wait);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let n = reads.clone();
+        let read: Arc<ReadEngine> = Arc::new(move |name: &str| {
+            n.fetch_add(1, Ordering::SeqCst);
+            if name == "stuck" {
+                wait.lock().unwrap().recv().unwrap();
+            }
+            Ok(serde_json::json!({"running": true}))
+        });
+        let engines = Arc::new(Engines::default());
+        engines.refresh(vec!["ok".into(), "stuck".into()], &read);
+        let got = |name: &str| engines.snapshot().into_iter().find(|e| e.name == name).and_then(|e| e.state);
+        let t0 = std::time::Instant::now();
+        while got("ok").is_none() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "ok was never read");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(got("stuck").is_none());
+        // A second menu open reads ok again but doesn't stack another read on stuck.
+        engines.refresh(vec!["ok".into(), "stuck".into()], &read);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        release.send(()).unwrap();
+        while got("stuck").is_none() {
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5), "stuck never finished");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        engines.refresh(vec!["ok".into()], &read);
+        assert_eq!(engines.snapshot().len(), 1, "a removed host is forgotten");
+    }
+
+    #[test]
+    fn terminal_is_handed_a_script_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("rekcod-menubar-term-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = write_terminal_script(&dir.join("run/terminal"), "#!/bin/sh\nexit 0\n").unwrap();
+        assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(dir.join("run/terminal")).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "#!/bin/sh\nexit 0\n");
+        let script = terminal_applescript(Path::new("/Users/me/x y/\"a\".sh")).unwrap();
+        assert_eq!(script, "tell application \"Terminal\"\nactivate\ndo script \"'/Users/me/x y/\\\"a\\\".sh'\"\nend tell");
+        assert_eq!(terminal_applescript(Path::new("/tmp/\u{15}x.sh")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn typed_values_are_one_per_line() {
+        assert_eq!(split_values(true, " 80:80\n\n443:443 "), ["80:80", "443:443"]);
+        assert_eq!(
+            split_values(true, "DATABASE_URL=postgres://h/db?a=1,sslmode=require\nB=x,y"),
+            ["DATABASE_URL=postgres://h/db?a=1,sslmode=require", "B=x,y"]
+        );
+        assert_eq!(split_values(false, " a,b "), ["a,b"]);
+        assert!(split_values(true, "  ").is_empty());
+    }
+
+    #[test]
+    fn the_filled_command_is_shown_before_it_runs() {
+        let run = actions::engine_actions(true).into_iter().find(|a| a.kind == actions::Kind::ImageRun).unwrap();
+        let argv: Vec<String> = ["run", "-d", "-e", "A=x y", "nginx"].map(String::from).into();
+        assert_eq!(filled_question(&run, &argv), "rekcod run -d -e 'A=x y' nginx");
+        let confirm = actions::Action { confirm: Some("Push it?".into()), ..run };
+        assert_eq!(filled_question(&confirm, &argv), "Push it?\n\nrekcod run -d -e 'A=x y' nginx");
     }
 
     #[test]

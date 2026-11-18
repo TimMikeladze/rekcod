@@ -1,4 +1,4 @@
-//! TLS for the fleet's control plane (docs/fleet-hardening.md, "Transport").
+//! TLS for the fleet's control plane (README.md, "What the fleet trusts").
 //!
 //! The controller makes its own CA on first start (`controller/ca.pem`, `ca.key`) and a
 //! fresh server certificate from it at every start. Nodes get theirs from the controller
@@ -512,16 +512,19 @@ pub(crate) fn test_node_ca() -> Ca {
     ensure_node_ca(dir).unwrap()
 }
 
-/// Reads a request head. A test server must read all of it: closing with some unread resets
-/// the connection before the client reads the reply.
+/// Reads a request head and returns its first line and the stream to answer on. A test server
+/// must read all of it: closing with some unread resets the connection before the client reads
+/// the reply.
 #[cfg(test)]
-fn read_head(s: ServerStream) -> std::io::BufReader<ServerStream> {
+fn read_head(s: ServerStream) -> (String, std::io::BufReader<ServerStream>) {
     let mut r = std::io::BufReader::new(s);
+    let mut first = String::new();
+    let _ = std::io::BufRead::read_line(&mut r, &mut first);
     let mut line = String::new();
     while std::io::BufRead::read_line(&mut r, &mut line).is_ok_and(|n| n > 0) && line != "\r\n" {
         line.clear();
     }
-    r
+    (first, r)
 }
 
 /// Serves `cert` on a listener; each connection reads a request and gets `200 {}`.
@@ -531,7 +534,7 @@ pub(crate) fn test_https_server(l: std::net::TcpListener, cert: &str, key: &str)
     std::thread::spawn(move || {
         for tcp in l.incoming().flatten() {
             let Ok(s) = accept(Some(&server), tcp) else { continue };
-            let _ = read_head(s).get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            let _ = read_head(s).1.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
         }
     });
 }
@@ -556,10 +559,12 @@ mod tests {
         let ca_pem = ca.pem.clone();
         std::thread::spawn(move || {
             for tcp in l.incoming().flatten() {
-                let Ok(mut s) = accept(Some(&server), tcp) else { continue };
-                let mut req = [0u8; 4096];
-                let n = s.read(&mut req).unwrap_or(0);
-                let body = if String::from_utf8_lossy(&req[..n]).starts_with("GET /ca.pem") { ca_pem.clone() } else { "hello".into() };
+                let Ok(s) = accept(Some(&server), tcp) else { continue };
+                // `fetch_ca` writes its request in several TLS records; one read can return the
+                // first only, and closing with the rest unread resets the connection.
+                let (line, mut r) = read_head(s);
+                let s = r.get_mut();
+                let body = if line.starts_with("GET /ca.pem") { ca_pem.clone() } else { "hello".into() };
                 let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
                 let _ = s.flush();
             }
@@ -602,8 +607,11 @@ mod tests {
         std::thread::spawn(move || {
             for tcp in l.incoming().flatten() {
                 let Ok(s) = accept(Some(&server), tcp) else { continue };
-                let _ =
-                    write!(read_head(s).get_mut(), "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                let _ = write!(
+                    read_head(s).1.get_mut(),
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
             }
         });
         let err = fetch_ca(&format!("https://{addr}"), &real.fingerprint().unwrap()).unwrap_err();

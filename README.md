@@ -657,6 +657,11 @@ there yourself. It:
 
 The services get tokens through their environment, never their arguments.
 
+The services run as `rekcod controller serve`, `rekcod node serve`, `rekcod edge serve` and
+`rekcod storage serve`, each with `--install` to run as a launchd job. `rekcod node uninstall`,
+`rekcod controller uninstall`, `rekcod edge uninstall` and `rekcod storage uninstall` remove
+those jobs.
+
 ### Install a server from a pkg
 
 `scripts/package-server.sh` builds `out/server/rekcod-server-VERSION.pkg`. Copy it to the
@@ -757,7 +762,7 @@ naming the key and line, on the CLI and on the node.
 | `app.start` | start command when there is no Dockerfile |
 | `app.public` | `true` to serve it on the public listener too |
 | `resources.instances` | number of instances (default 1) |
-| `resources.spread` | `"strict"` puts at most one instance per node or zone; default `"soft"` |
+| `resources.spread` | `"strict"`: at most one instance per node and per zone (`node join --zone`); default `"soft"` spreads where it can |
 | `resources.cpus` | vCPUs per instance |
 | `resources.memory` | `"2GiB"` or `2` (GiB) per instance |
 | `resources.idle_stop` | stop the VMs after this long without a request (`"15m"`, `"1d"`) |
@@ -889,11 +894,6 @@ reconcile, its sandboxes are marked lost, and its unfinished jobs end as failed 
 "whether the job finished is unknown" in their log. `rotate-join` prints a new join token
 and writes it to `join-token`; the old one stops working. Nodes that already joined keep
 working, since they authenticate with their own secret.
-
-The services run as `rekcod controller serve`, `rekcod node serve`, `rekcod edge serve` and
-`rekcod storage serve`, each with `--install` to run as a launchd job. `rekcod node uninstall`,
-`rekcod controller uninstall`, `rekcod edge uninstall` and `rekcod storage uninstall` remove
-those jobs.
 
 ### Take a node out for maintenance
 
@@ -1818,9 +1818,9 @@ State lives under `~/.rekcod`:
 | `vm/root.img` | Linux guest filesystem and Docker binaries | Replaced when the guest version changes | Excluded |
 | `vm/data.img` | Local Docker images, containers, named volumes and snapshots | Kept across guest updates | Excluded |
 | `sb/<id>/` | A sandbox's workspace, reviewed copy and VM disks | Kept until the sandbox is removed | Excluded |
-| `logs/` | Logs of the daemon, guest and services | Rotated at 20 MB | Backed up |
-| `controller/fleet.db` | Fleet configuration, releases and encrypted secrets | Backed up separately from app data | Backed up |
-| `storage/data/` | Server RustFS objects, including app buckets and controller backups | Kept across app deployments | Backed up |
+| `logs/` | Logs of the daemon, guest and services | Rotated at 20 MB | Not excluded |
+| `controller/fleet.db` | Fleet configuration, releases and encrypted secrets | Backed up separately from app data | Not excluded |
+| `storage/data/` | Server RustFS objects, including app buckets and controller backups | Kept across app deployments | Not excluded |
 
 Separating the guest root from Docker data lets an upgrade replace the Linux system
 without replacing the local engine's images and volumes. Server app instances and

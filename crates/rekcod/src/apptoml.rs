@@ -52,6 +52,7 @@ struct Http {
     rate: Option<String>,
     burst: Option<u32>,
     max_body: Option<Scalar>,
+    timeout: Option<Scalar>,
 }
 
 /// A value an env var or a size can be written as.
@@ -125,6 +126,7 @@ pub fn parse(text: &str) -> Result<HashMap<String, String>> {
         put("http.rate", h.rate);
         put("http.burst", h.burst.map(|b| b.to_string()));
         put("http.max_body", h.max_body.map(|v| v.text()));
+        put("http.timeout", h.timeout.map(|v| v.text()));
     }
     Ok(out)
 }
@@ -184,5 +186,9 @@ WORKERS = 4
         let end = start + readme[start..].find("```").unwrap();
         let t = parse(&readme[start..end]).unwrap();
         assert_eq!((t["app.name"].as_str(), t["resources.memory"].as_str()), ("blog", "1"));
+        let start = readme.find("```toml\n[http]").expect("README has an [http] example") + "```toml\n".len();
+        let end = start + readme[start..].find("```").unwrap();
+        let t = parse(&readme[start..end]).unwrap();
+        assert_eq!((t["http.rate"].as_str(), t["http.timeout"].as_str()), ("10/s", "5m"));
     }
 }

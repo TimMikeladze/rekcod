@@ -368,7 +368,9 @@ The HTTP routes: `POST /sandboxes`, `GET /sandboxes`, `GET` and `DELETE /sandbox
 
 Request bodies are JSON objects. Flags take JSON booleans or `"true"`/`"false"`, numbers a
 JSON number or digits; anything else is a 400. An exec's output stops at 8 MiB per stream,
-the command is killed and the reply says `"truncated": true`. Reading a file over 8 MiB is
+the command is killed and the reply says `"truncated": true`. A macOS guest's command is killed
+after `timeout_secs` with exit 124. Over MCP, `read_file` returns `content_base64` for a file
+that isn't UTF-8, and `write_file` takes it. Reading a file over 8 MiB is
 refused; copy it out with `rekcod sandbox cp`. The API patch is cut at 32 MiB. `rekcod mcp`
 writes only JSON-RPC to stdout.
 

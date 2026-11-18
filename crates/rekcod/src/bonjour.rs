@@ -1,4 +1,4 @@
-//! A server on a LAN found by identity instead of address (docs/lan-discovery.md).
+//! A server on a LAN found by identity instead of address.
 //!
 //! The controller registers `rekcod-<fingerprint>` as `_rekcod._tcp`; a remote URL
 //! `https://rekcod-<fingerprint>.bonjour` is resolved through mDNSResponder on every call.

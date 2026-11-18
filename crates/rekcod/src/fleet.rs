@@ -1,4 +1,4 @@
-//! Self-hosted fleet and app hosting (docs/platform.md, tracks 2 and 3).
+//! Self-hosted fleet and app hosting (README.md, "Self-host apps on a Mac").
 //!
 //! - `rekcod controller serve`: the sandbox API for many Macs, plus apps. State in SQLite.
 //! - `rekcod node join|serve`: runs on each Mac; serves `sandbox_api` on its address with a
@@ -728,7 +728,7 @@ pub fn generated_dockerfile(dir: &Path, start: &str) -> Result<String> {
     Ok(format!("FROM {}\nWORKDIR /app\nCOPY . /app\n{install}CMD {}\n", plan.image, serde_json::to_string(&cmd)?))
 }
 
-/// Where a release's image is kept in RustFS (docs/rustfs.md): `<bucket>/<key>.tar.zst` is
+/// Where a release's image is kept in RustFS: `<bucket>/<key>.tar.zst` is
 /// `docker save | zstd`, `<key>.json` the commit's rekcod.toml. Sent by the controller.
 /// Where a node keeps and finds a release's image, as presigned URLs: nodes never see the
 /// RustFS root keys, so one node can't read other apps' buckets or the backups. A stored
@@ -1749,7 +1749,7 @@ const LEGACY_MIGRATIONS: &[&str] = &[
     "alter table apps add column idle_stop integer not null default 0",
     "alter table apps add column recycle integer not null default 0",
     "alter table apps add column last_request integer not null default 0",
-    // Namespaces (docs/namespaces.md). Rows from before them belong to `default`.
+    // Namespaces (README.md, "Give people access"). Rows from before them belong to `default`.
     "alter table apps add column ns text not null default 'default'",
     "alter table sandboxes add column ns text not null default 'default'",
     "alter table sandboxes add column cpus integer not null default 0",
@@ -1757,13 +1757,13 @@ const LEGACY_MIGRATIONS: &[&str] = &[
     "alter table jobs add column ns text not null default 'default'",
     "alter table schedules add column ns text not null default 'default'",
     "alter table audit add column ns text not null default 'default'",
-    // Per-app edge settings (docs/edge-http.md).
+    // Per-app edge settings (README.md, "Edge limits and client addresses").
     "alter table apps add column http text not null default '{}'",
-    // Per-app buckets (docs/rustfs.md); the secret is sealed like app secrets.
+    // Per-app buckets (README.md, "Run S3-compatible storage"); the secret is sealed like app secrets.
     "alter table apps add column bucket integer not null default 0",
     "alter table apps add column storage_key text",
     "alter table apps add column storage_secret text",
-    // Release detail (docs/dashboard.md): who deployed, when it finished, the deploy log.
+    // Release detail: who deployed, when it finished, the deploy log.
     "alter table releases add column who text not null default ''",
     "alter table releases add column finished integer",
     "alter table releases add column log text not null default ''",
@@ -1783,7 +1783,7 @@ const LEGACY_MIGRATIONS: &[&str] = &[
 /// Numbered migrations: entry i takes `PRAGMA user_version` from i + 1 to i + 2. A failure
 /// stops startup, rather than surfacing later as a missing column.
 const MIGRATIONS: &[&str] = &[
-    // Tokens stored as SHA-256 (docs/fleet-hardening.md); `hashed` marks converted rows.
+    // Tokens stored as SHA-256; `hashed` marks converted rows.
     "alter table tokens add column hashed integer not null default 0;
      alter table tokens add column expires integer;
      alter table tokens add column default_role text not null default 'member';
@@ -1808,7 +1808,7 @@ const MIGRATIONS: &[&str] = &[
      alter table nodes_new rename to nodes;",
     "alter table nodes add column zone text not null default '';
      alter table apps add column spread text not null default 'soft';",
-    // App lifecycle (docs/fleet-hardening.md, "Apps"). `generation` is new whenever a row is
+    // App lifecycle. `generation` is new whenever a row is
     // made or destroyed, so a deploy started for an earlier app of that name can't register
     // into it. `destroying` is when cleanup was last tried, null for a live app. `deploying`
     // counts admitted deploys still running; the quota holds their resources.
@@ -2815,7 +2815,7 @@ fn expire_previews(c: &Arc<Controller>) -> Result<()> {
 /// Consecutive failed health checks before a live instance counts as lost.
 const HEALTH_STRIKES: u32 = 3;
 
-/// Moves what runs toward what should (docs/fleet-hardening.md, "Convergence"):
+/// Moves what runs toward what should:
 /// Instances on a returning node are checked and taken back; live instances that stop
 /// answering are dropped. After a minute short of replicas, top up the live release.
 fn reconcile(c: &Arc<Controller>) -> Result<()> {
@@ -6378,7 +6378,7 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
     }
 }
 
-// Jobs, node registration, checkout files and restore (docs/fleet-hardening.md). Workers and
+// Jobs, node registration, checkout files and restore. Workers and
 // VMs are stubbed; controller SQL, HTTP and the job threads are real.
 #[cfg(test)]
 mod job_and_node_tests {
@@ -7406,7 +7406,7 @@ fn github_call(method: &str, url: &str, body: Option<&str>) {
 /// The label that lets a pull request from a fork get a preview.
 const PREVIEW_LABEL: &str = "rekcod-preview";
 
-// ------------------------------------------------------------- storage (docs/rustfs.md)
+// ------------------------------------------------------------- storage
 
 const RELEASES: &str = "rekcod-releases";
 const CACHE: &str = "rekcod-cache";
@@ -8100,7 +8100,7 @@ pub struct ControllerOptions {
     pub http: bool,
     /// Extra names for the controller's certificate (a tailnet DNS name, say).
     pub tls_names: Vec<String>,
-    /// Advertise over Bonjour as `rekcod-<CA fingerprint>` (docs/lan-discovery.md).
+    /// Advertise over Bonjour as `rekcod-<CA fingerprint>`.
     pub bonjour: bool,
     /// SQLite file (default `~/.rekcod/controller/fleet.db`).
     pub db: Option<PathBuf>,

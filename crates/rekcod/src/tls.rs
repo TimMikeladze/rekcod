@@ -1,4 +1,4 @@
-//! TLS for the fleet's control plane (docs/fleet-hardening.md, "Transport").
+//! TLS for the fleet's control plane (README.md, "What the fleet trusts").
 //!
 //! The controller makes its own CA on first start (`controller/ca.pem`, `ca.key`) and a
 //! fresh server certificate from it at every start. Nodes get theirs from the controller

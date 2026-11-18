@@ -115,6 +115,10 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let _ = std::fs::remove_file(paths.last_exit());
     raise_fd_limit();
     crate::lifecycle::trim_log_hourly(paths.daemon_log());
+    // Rotated only at boot otherwise; a VM up for months grows it. The dashboard started
+    // in the background has no rekcod process of its own to trim its log.
+    crate::lifecycle::trim_log_hourly(paths.console_log());
+    crate::lifecycle::trim_log_hourly(paths.home.join("logs/dashboard.log"));
     let guest = paths.guest_dir()?;
     let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
     let fresh = paths.data_fresh().exists();

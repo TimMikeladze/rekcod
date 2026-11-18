@@ -15,6 +15,8 @@ export async function GET(req: Request) {
   }
   const a = await offered(argv)
   if (!a || !STREAMED.has(a.kind)) return new Response("not a streamed action rekcod offers right now", { status: 400 })
+  // `offered` reads a full state first; a page that left meanwhile gets no process.
+  if (req.signal.aborted) return new Response(null, { status: 499 })
   if (FIXTURE) return new Response(`dry run: rekcod ${a.argv!.join(" ")}\n`)
   return cappedStream(req, () => spawnStream(a))
 }

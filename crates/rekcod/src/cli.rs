@@ -1161,7 +1161,19 @@ mod tests {
         let mut daemon = spawn("daemon", &home.home);
         let mut other_home = spawn("daemon", &t.join("elsewhere"));
         let mut menubar = spawn("menubar", &home.home);
-        std::thread::sleep(Duration::from_millis(300));
+        // Each child must have exec'd before its argv says anything; under a loaded test run
+        // that takes longer than any fixed sleep.
+        let t0 = Instant::now();
+        for c in [&daemon, &other_home, &menubar] {
+            while !Command::new("/bin/ps")
+                .args(["-o", "args=", "-p", &c.id().to_string()])
+                .output()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains("sleeper"))
+            {
+                assert!(t0.elapsed() < Duration::from_secs(20), "child {} never exec'd", c.id());
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
 
         let pid_of = |c: &std::process::Child, back: u64| {
             std::fs::write(home.pid_file(), c.id().to_string()).unwrap();

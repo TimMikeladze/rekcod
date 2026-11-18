@@ -251,7 +251,8 @@ async function switchEngine(name: string, refresh: () => void) {
     toast.error("Couldn't switch engines", { description: body.error })
     return
   }
-  toast.loading(`Reading ${name === "local" ? "this Mac's" : `${name}'s`} engine`, { id: "engine" })
+  // Dismissed when the new engine's state (or a failed read) arrives; a host read gives up within 40 s.
+  toast.loading(`Reading ${name === "local" ? "this Mac's" : `${name}'s`} engine`, { id: "engine", duration: 60_000 })
   refresh()
 }
 
@@ -278,10 +279,11 @@ function VmSwitcher({ state }: { state: S }) {
   const st = state.status
   const vm = state.vm_actions.filter((a) => a.kind !== "DashboardOpen")
   const name = state.engine ?? "rekcod"
-  // The switch's "Reading ..." toast stays until the new engine's state is here.
+  const { error } = useDash()
+  // The switch's "Reading ..." toast stays until the new engine's state, or a failure, is here.
   useEffect(() => {
     toast.dismiss("engine")
-  }, [state.engine, state.engine_error])
+  }, [state.engine, state.engine_error, error])
   return (
     <DropdownMenu>
       <DropdownMenuTrigger

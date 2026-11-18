@@ -310,6 +310,33 @@ impl Dir {
         dir.unlink(&name, libc::AT_REMOVEDIR)
     }
 
+    /// Removes the directory at `rel` if it's empty; false when something is still in it.
+    pub fn remove_dir_if_empty(&self, rel: &Path) -> Result<bool> {
+        let (dir, name) = self.parent(rel, false)?;
+        self.guard_entry(&dir, &name, rel)?;
+        let c = cstr(&name)?;
+        if unsafe { libc::unlinkat(dir.fd.as_raw_fd(), c.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            return match std::io::Error::last_os_error().raw_os_error() {
+                Some(libc::ENOTEMPTY | libc::EEXIST) => Ok(false),
+                Some(libc::ENOENT) => Ok(true),
+                _ => Err(last_err("remove directory", rel.as_os_str())),
+            };
+        }
+        Ok(true)
+    }
+
+    /// Makes `rel` a directory with permission bits `mode`, creating it (and its parents)
+    /// if needed. A symlink there or on the way is an error.
+    pub fn make_dir(&self, rel: &Path, mode: u32) -> Result<()> {
+        let (dir, name) = self.parent(rel, true)?;
+        self.guard_entry(&dir, &name, rel)?;
+        let d = dir.sub(&name, true).with_context(|| format!("in {}", rel.display()))?;
+        if unsafe { libc::fchmod(d.fd.as_raw_fd(), (mode & 0o777) as libc::mode_t) } != 0 {
+            return Err(last_err("chmod", rel.as_os_str()));
+        }
+        Ok(())
+    }
+
     /// Everything under the directory `rel`, as (path from the base, kind), parents before
     /// their children. Symlinks are listed, not followed.
     pub fn tree(&self, rel: &Path) -> Result<Vec<(PathBuf, char)>> {

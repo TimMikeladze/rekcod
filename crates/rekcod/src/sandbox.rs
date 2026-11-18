@@ -22,8 +22,10 @@ const DISK_GIB: u64 = 64;
 const DEFAULT_IMAGE: &str = "debian:trixie-slim";
 /// What `golden build` pulls when given no images.
 pub const GOLDEN_IMAGES: &[&str] = &["debian:trixie-slim", "alpine:3.24", "node:lts-slim", "python:3.14-slim"];
-/// Not compared by `diff` or written by `apply`: dirs that stay in the VM. Git's own state
-/// is left out too, under any spelling ([`is_git`]).
+/// Dependency directories that stay in the VM, not compared by `diff` or written by
+/// `apply`: at the project root, or anywhere the project has a directory of that name at
+/// the same path ([`skipped_dir`]). Git's own state is left out too, under any spelling
+/// ([`is_git`]).
 const SKIP: &[&str] = &["node_modules", ".venv", "target"];
 
 /// Whether the Mac's filesystem may take `name` for `.git`: compared without case, and
@@ -43,8 +45,18 @@ pub fn is_git(name: &std::ffi::OsStr) -> bool {
     folded == ".git"
 }
 
-fn skipped(name: &std::ffi::OsStr) -> bool {
-    is_git(name) || SKIP.iter().any(|s| name.as_bytes() == s.as_bytes())
+/// Whether the directory `rel` is a dependency directory left out: a [`SKIP`] name at the
+/// root, or one `project` has as a directory too. A new `src/target/` the sandbox made is
+/// compared like any other directory.
+fn skipped_dir(project: &Dir, rel: &Path) -> bool {
+    let Some(name) = rel.file_name() else { return false };
+    SKIP.iter().any(|s| name.as_bytes() == s.as_bytes())
+        && (rel.parent().is_none_or(|p| p.as_os_str().is_empty()) || project.state(rel).is_some_and(|s| s.kind() == 'd'))
+}
+
+/// Whether `rel` is left out of diff and apply: in `.git`, or under a skipped directory.
+fn left_out(project: &Dir, rel: &Path) -> bool {
+    rel.iter().any(is_git) || rel.ancestors().skip(1).filter(|a| !a.as_os_str().is_empty()).any(|a| skipped_dir(project, a))
 }
 
 /// Egress preset `dev`: package registries, image registries, source hosts, distro mirrors.
@@ -793,22 +805,24 @@ pub struct Change {
     pub path: String,
 }
 
-/// Directories (`d`), regular files (`f`) and symlinks (`l`) under `base`, without what
-/// [`skipped`] leaves out. FIFOs, sockets and devices are left out too: reading a FIFO the
+/// Directories (`d`), regular files (`f`) and symlinks (`l`) under `base`, and the
+/// directories [`skipped_dir`] leaves out (`s`, not entered), judged against `project`.
+/// `.git` isn't listed. FIFOs, sockets and devices are left out too: reading a FIFO the
 /// sandbox made would hang `diff`. Symlinked directories are listed, not entered.
-fn walk(base: &Path) -> Vec<(PathBuf, char)> {
-    fn into(base: &Path, rel: &Path, out: &mut Vec<(PathBuf, char)>) {
+fn walk(base: &Path, project: &Dir) -> Vec<(PathBuf, char)> {
+    fn into(base: &Path, project: &Dir, rel: &Path, out: &mut Vec<(PathBuf, char)>) {
         let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
         for e in rd.flatten() {
             let name = e.file_name();
-            if skipped(&name) {
+            if is_git(&name) {
                 continue;
             }
             let r = rel.join(&name);
             match e.file_type() {
+                Ok(t) if t.is_dir() && skipped_dir(project, &r) => out.push((r, 's')),
                 Ok(t) if t.is_dir() => {
                     out.push((r.clone(), 'd'));
-                    into(base, &r, out);
+                    into(base, project, &r, out);
                 }
                 Ok(t) if t.is_file() => out.push((r, 'f')),
                 Ok(t) if t.is_symlink() => out.push((r, 'l')),
@@ -817,13 +831,13 @@ fn walk(base: &Path) -> Vec<(PathBuf, char)> {
         }
     }
     let mut out = Vec::new();
-    into(base, Path::new(""), &mut out);
+    into(base, project, Path::new(""), &mut out);
     out
 }
 
-/// What [`walk`] finds that `diff` compares: files and symlinks.
-fn files(base: &Path) -> std::collections::BTreeSet<PathBuf> {
-    walk(base).into_iter().filter(|(_, k)| *k != 'd').map(|(p, _)| p).collect()
+/// What [`walk`] finds that `diff` compares, by path: directories, files and symlinks.
+fn entries(base: &Path, project: &Dir) -> std::collections::BTreeMap<PathBuf, char> {
+    walk(base, project).into_iter().filter(|(_, k)| *k != 's').collect()
 }
 
 fn open_nofollow(p: &Path) -> std::io::Result<std::fs::File> {
@@ -853,25 +867,45 @@ fn same(a: &Path, b: &Path) -> bool {
     }
     // The bits `apply` writes; it drops setuid, setgid and sticky.
     let mode = |m: &std::fs::Metadata| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777;
+    if ma.is_dir() && mb.is_dir() {
+        return mode(&ma) == mode(&mb);
+    }
     ma.len() == mb.len() && mode(&ma) == mode(&mb) && same_bytes(a, b)
 }
 
-/// What `apply` would do to `project` to make it match `ws`.
+/// What `apply` would do to `project` to make it match `ws`. Directories are changes of
+/// their own (made with their mode, removed once emptied, chmodded); a directory and a file
+/// swapped for each other show as the file's addition or deletion and the directory's
+/// contents.
 pub fn changes(project: &Path, ws: &Path) -> Vec<Change> {
-    let (a, b) = (files(project), files(ws));
+    let Ok(pd) = Dir::open(project) else { return vec![] };
+    let (a, b) = (entries(project, &pd), entries(ws, &pd));
     let mut out: Vec<Change> = Vec::new();
-    for p in b.iter() {
-        if !a.contains(p) {
-            out.push(Change { kind: 'A', path: p.to_string_lossy().into() });
-        } else if !same(&project.join(p), &ws.join(p)) {
-            out.push(Change { kind: 'M', path: p.to_string_lossy().into() });
+    let change = |kind, p: &PathBuf| Change { kind, path: p.to_string_lossy().into() };
+    for (p, k) in b.iter() {
+        match (a.get(p), *k) {
+            (None, _) => out.push(change('A', p)),
+            (Some('d'), 'd') if !same(&project.join(p), &ws.join(p)) => out.push(change('M', p)),
+            (Some('d'), 'd') => {}
+            // A file or link put where the project has a directory.
+            (Some('d'), _) => out.push(change('A', p)),
+            // A directory where the project has a file or link: the file goes.
+            (Some(_), 'd') => out.push(change('D', p)),
+            (Some(_), _) if !same(&project.join(p), &ws.join(p)) => out.push(change('M', p)),
+            (Some(_), _) => {}
         }
     }
-    for p in a.difference(&b) {
-        out.push(Change { kind: 'D', path: p.to_string_lossy().into() });
+    for (p, _) in a.iter().filter(|(p, _)| !b.contains_key(*p)) {
+        out.push(change('D', p));
     }
     out.sort_by(|x, y| x.path.cmp(&y.path));
     out
+}
+
+/// Directories in the workspace diff and apply leave alone, for the reviewer to know.
+pub fn not_compared(project: &Path, ws: &Path) -> Vec<String> {
+    let Ok(pd) = Dir::open(project) else { return vec![] };
+    walk(ws, &pd).into_iter().filter(|(_, k)| *k == 's').map(|(p, _)| p.to_string_lossy().into()).collect()
 }
 
 /// The project as the sandbox copied it: path to (kind, size, mtime ns, mode), directories
@@ -880,7 +914,7 @@ type Manifest = std::collections::BTreeMap<String, State>;
 
 fn manifest(project: &Path) -> Manifest {
     let Ok(dir) = Dir::open(project) else { return Manifest::new() };
-    walk(project).iter().filter_map(|(f, _)| Some((f.to_string_lossy().to_string(), dir.state(f)?))).collect()
+    entries(project, &dir).keys().filter_map(|f| Some((f.to_string_lossy().to_string(), dir.state(f)?))).collect()
 }
 
 /// Held across `diff`, `apply` and anything that replaces `ws/`, so what `apply --reviewed`
@@ -962,6 +996,8 @@ pub struct Review {
     pub changes: Vec<Change>,
     pub patch: String,
     pub review: String,
+    /// Dependency directories in the workspace that diff and apply leave alone.
+    pub not_compared: Vec<String>,
 }
 
 /// SHA-256 over the change list and, for each path written, its kind, mode and content (or
@@ -986,6 +1022,9 @@ fn review_id(src: &Path, ch: &[Change]) -> Result<String> {
         let st = from.state(rel).with_context(|| format!("{} is gone from the reviewed copy", c.path))?;
         field(&mut h, &[st.kind() as u8]);
         field(&mut h, &st.3.unwrap_or(0).to_be_bytes());
+        if st.kind() == 'd' {
+            continue;
+        }
         if st.kind() == 'l' {
             field(&mut h, from.read_link(rel)?.as_os_str().as_bytes());
         } else {
@@ -1019,6 +1058,7 @@ pub fn printable_name(name: &str) -> String {
 /// One side of a change: what's at the path, read without following any link.
 enum Side {
     None,
+    Dir(u32),
     /// Permission bits (as `apply` writes them) and content; None when over [`MAX_DIFF_FILE`].
     File(u32, u64, Option<Vec<u8>>),
     Link(PathBuf),
@@ -1027,13 +1067,13 @@ enum Side {
 fn side(dir: &Dir, rel: &Path) -> Result<Side> {
     use std::io::Read;
     let Some(st) = dir.state(rel) else { return Ok(Side::None) };
+    let mode = st.3.unwrap_or(0o644) & 0o777;
     match st.kind() {
         'l' => return Ok(Side::Link(dir.read_link(rel)?)),
+        'd' => return Ok(Side::Dir(mode)),
         'f' => {}
-        // A directory a file replaced: what was in it shows as deletions of its own.
         _ => return Ok(Side::None),
     }
-    let mode = st.3.unwrap_or(0o644) & 0o777;
     if st.1 > MAX_DIFF_FILE {
         return Ok(Side::File(mode, st.1, None));
     }
@@ -1053,11 +1093,18 @@ fn render(old: &Dir, new: &Dir, c: &Change) -> Result<String> {
     let a = if c.kind == 'A' { Side::None } else { side(old, rel)? };
     let b = if c.kind == 'D' { Side::None } else { side(new, rel)? };
     let name = printable_name(&c.path);
+    // Not something git shows; a line of its own between the files' diffs.
+    match (&a, &b) {
+        (_, Side::Dir(m)) if !matches!(a, Side::Dir(_)) => return Ok(format!("rekcod: new directory {name}, mode {m:04o}\n")),
+        (Side::Dir(_), Side::None) => return Ok(format!("rekcod: directory {name} removed once empty\n")),
+        (Side::Dir(x), Side::Dir(y)) => return Ok(format!("rekcod: directory {name} mode {x:04o} -> {y:04o}\n")),
+        _ => {}
+    }
     let (an, bn) = (format!("a/{name}"), format!("b/{name}"));
     let mode = |s: &Side| match s {
         Side::File(m, ..) => Some(format!("100{m:o}")),
         Side::Link(_) => Some("120000".to_string()),
-        Side::None => None,
+        Side::None | Side::Dir(_) => None,
     };
     let mut out = format!("diff --git {an} {bn}\n");
     match (mode(&a), mode(&b)) {
@@ -1070,7 +1117,7 @@ fn render(old: &Dir, new: &Dir, c: &Change) -> Result<String> {
         (if matches!(a, Side::None) { "/dev/null".into() } else { an }, if matches!(b, Side::None) { "/dev/null".into() } else { bn });
     let content = |s: Side| -> std::result::Result<Vec<u8>, u64> {
         match s {
-            Side::None => Ok(vec![]),
+            Side::None | Side::Dir(_) => Ok(vec![]),
             Side::Link(t) => Ok(t.into_os_string().into_vec()),
             Side::File(_, _, Some(b)) => Ok(b),
             Side::File(_, size, None) => Err(size),
@@ -1104,7 +1151,7 @@ fn render(old: &Dir, new: &Dir, c: &Change) -> Result<String> {
 /// Freezes the workspace into `<sandbox>/reviewed`, which `apply --reviewed <review>` writes
 /// back, and hands `sink` the unified diff of each change against the project. Any later
 /// diff replaces that copy, and the review ID with it.
-fn review(paths: &Paths, id: &str, sink: &mut dyn FnMut(&str)) -> Result<(Vec<Change>, String)> {
+fn review(paths: &Paths, id: &str, sink: &mut dyn FnMut(&str)) -> Result<(Vec<Change>, String, Vec<String>)> {
     let (s, _lock) = copy_sandbox(paths, id)?;
     let _ = std::fs::remove_file(s.paths.home.join("reviewed.id"));
     let ws = freeze(&s, "reviewed")?;
@@ -1115,14 +1162,14 @@ fn review(paths: &Paths, id: &str, sink: &mut dyn FnMut(&str)) -> Result<(Vec<Ch
     for c in &ch {
         sink(&render(&old, &new, c).with_context(|| format!("diff {}", printable_name(&c.path)))?);
     }
-    Ok((ch, review))
+    Ok((ch, review, not_compared(&s.meta.project, &ws)))
 }
 
 /// [`review`] collected for the API, up to [`MAX_PATCH`].
 pub fn patch(paths: &Paths, id: &str) -> Result<Review> {
     let mut patch = String::new();
     let mut cut = false;
-    let (changes, review) = review(paths, id, &mut |text| {
+    let (changes, review, not_compared) = review(paths, id, &mut |text| {
         if patch.len() + text.len() > MAX_PATCH {
             cut = true;
         } else if !cut {
@@ -1132,12 +1179,12 @@ pub fn patch(paths: &Paths, id: &str) -> Result<Review> {
     if cut {
         patch.push_str(&format!("rekcod: patch cut at {} MiB; `rekcod sandbox diff {id}` prints all of it\n", MAX_PATCH >> 20));
     }
-    Ok(Review { changes, patch, review })
+    Ok(Review { changes, patch, review, not_compared })
 }
 
 pub fn diff(paths: &Paths, id: &str, stat: bool) -> Result<()> {
     let mut out = std::io::stdout().lock();
-    let (ch, review) = review(paths, id, &mut |text| {
+    let (ch, review, skipped) = review(paths, id, &mut |text| {
         if !stat {
             let _ = out.write_all(printable(text).as_bytes());
         }
@@ -1148,6 +1195,10 @@ pub fn diff(paths: &Paths, id: &str, stat: bool) -> Result<()> {
         }
     }
     let _ = out.flush();
+    if !skipped.is_empty() {
+        let skipped: Vec<String> = skipped.iter().map(|p| printable_name(p)).collect();
+        eprintln!("rekcod: not compared (dependencies, kept in the sandbox): {}", skipped.join(", "));
+    }
     if !ch.is_empty() {
         eprintln!(
             "rekcod: `rekcod sandbox apply {id} --reviewed {review}` writes exactly this; without --reviewed it takes the workspace as it is then"
@@ -1209,12 +1260,12 @@ pub fn input(paths: &Paths, id: &str, action: &[String]) -> Result<()> {
 }
 
 /// Whether the Mac's state of a path (`now`) is still what the sandbox copied (`then`). A
-/// directory counts as unchanged whatever its size and mtime; what's in it is checked path
-/// by path. Manifests from before modes were recorded don't compare them.
+/// directory counts as unchanged whatever its size and mtime, if its mode is; what's in it
+/// is checked path by path. Manifests from before modes were recorded don't compare them.
 fn unchanged(now: Option<State>, then: Option<State>) -> bool {
     match (now, then) {
         (None, None) => true,
-        (Some(n), Some(t)) if n.kind() == 'd' && t.kind() == 'd' => true,
+        (Some(n), Some(t)) if n.kind() == 'd' && t.kind() == 'd' => t.3.is_none_or(|m| n.3 == Some(m)),
         (Some(n), Some(t)) => (n.0, n.1, n.2) == (t.0, t.1, t.2) && t.3.is_none_or(|m| n.3 == Some(m)),
         _ => false,
     }
@@ -1231,8 +1282,9 @@ fn was_dir(m: &Manifest, p: &str) -> bool {
 /// manifest (sandboxes made before there was one), anything whose inode changed after
 /// `since`: ctime, not mtime, so a file moved in with an old mtime (`mv`, `cp -p`, an
 /// unpacked archive) or a `chmod` counts.
-fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Change]) -> Vec<String> {
+fn conflicts(project: &Path, src: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Change]) -> Vec<String> {
     let dir = Dir::open(project).ok();
+    let from = Dir::open(src).ok();
     // A case-only or normalization-only rename: on the Mac the added name is the deleted one,
     // so it's judged by what the sandbox copied under the old name. Deletions go first.
     let deleted: std::collections::HashMap<(u64, u64), &str> = match &dir {
@@ -1245,12 +1297,15 @@ fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Chan
                 let now = d.state(Path::new(&c.path));
                 // A directory the workspace replaced with a file or link. What was in it
                 // shows up as deletions, each checked on its own.
-                let replaced = c.kind != 'D' && now.is_some_and(|s| s.kind() == 'd') && was_dir(m, &c.path);
+                let to_dir = from.as_ref().and_then(|f| f.state(Path::new(&c.path))).is_some_and(|s| s.kind() == 'd');
+                let replaced = c.kind != 'D' && !to_dir && now.is_some_and(|s| s.kind() == 'd') && was_dir(m, &c.path);
                 let was = match d.identity(Path::new(&c.path)).and_then(|i| deleted.get(&i)) {
                     Some(old) if c.kind == 'A' => *old,
                     _ => c.path.as_str(),
                 };
-                !replaced && !unchanged(now, m.get(was).copied())
+                // Older manifests list no directories, only what was in them.
+                let old_dir = now.is_some_and(|s| s.kind() == 'd') && !m.contains_key(was) && was_dir(m, was);
+                !replaced && !old_dir && !unchanged(now, m.get(was).copied())
             }
             _ => std::fs::symlink_metadata(project.join(&c.path))
                 .is_ok_and(|m| std::os::unix::fs::MetadataExt::ctime(&m) >= 0 && std::os::unix::fs::MetadataExt::ctime(&m) as u64 > since),
@@ -1316,9 +1371,9 @@ fn leaves(link: &Path, target: &Path, read_link: &dyn Fn(&Path) -> Option<PathBu
 fn check_links(dir: &Dir, from: &Dir, src: &Path, ch: &[Change]) -> Result<()> {
     let written: std::collections::HashSet<&Path> = ch.iter().filter(|c| c.kind != 'D').map(|c| Path::new(&c.path)).collect();
     // Afterwards, paths under skipped directories are the project's and the rest are `src`'s.
-    let after = |p: &Path| if p.iter().any(skipped) { dir.read_link(p).ok() } else { from.read_link(p).ok() };
+    let after = |p: &Path| if left_out(dir, p) { dir.read_link(p).ok() } else { from.read_link(p).ok() };
     let before = |p: &Path| dir.read_link(p).ok();
-    for (p, _) in walk(src).into_iter().filter(|(_, k)| *k == 'l') {
+    for (p, _) in walk(src, dir).into_iter().filter(|(_, k)| *k == 'l') {
         let target = from.read_link(&p)?;
         let Some(why) = leaves(&p, &target, &after) else { continue };
         let theirs = !written.contains(p.as_path()) && dir.read_link(&p).ok().as_ref() == Some(&target);
@@ -1333,12 +1388,12 @@ fn check_links(dir: &Dir, from: &Dir, src: &Path, ch: &[Change]) -> Result<()> {
 /// Directories in the project the workspace replaced with a file or symlink, each directory
 /// under them before its parent. Refuses one holding anything `apply` doesn't delete
 /// (a skipped directory such as `node_modules`, a FIFO).
-fn replaced_dirs(dir: &Dir, ch: &[Change]) -> Result<Vec<PathBuf>> {
+fn replaced_dirs(dir: &Dir, from: &Dir, ch: &[Change]) -> Result<Vec<PathBuf>> {
     let deleted: std::collections::HashSet<&Path> = ch.iter().filter(|c| c.kind == 'D').map(|c| Path::new(&c.path)).collect();
     let mut out = Vec::new();
     for c in ch.iter().filter(|c| c.kind != 'D') {
         let rel = Path::new(&c.path);
-        if dir.state(rel).is_none_or(|s| s.kind() != 'd') {
+        if dir.state(rel).is_none_or(|s| s.kind() != 'd') || from.state(rel).is_some_and(|s| s.kind() == 'd') {
             continue;
         }
         let mut tree = dir.tree(rel)?;
@@ -1365,7 +1420,7 @@ fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest:
         bail!("refusing {}: it's inside .git; nothing was applied", printable_name(&c.path));
     }
     check_links(dir, from, src, ch)?;
-    let replaced = replaced_dirs(dir, ch)?;
+    let replaced = replaced_dirs(dir, from, ch)?;
     let mut record = |rel: &Path| {
         // What's there now is ours; a later apply mustn't call it a conflict.
         if let Some(m) = manifest.as_mut() {
@@ -1376,7 +1431,8 @@ fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest:
             };
         }
     };
-    for c in ch.iter().filter(|c| c.kind == 'D') {
+    let is_dir = |d: &Dir, c: &&Change| d.state(Path::new(&c.path)).is_some_and(|s| s.kind() == 'd');
+    for c in ch.iter().filter(|c| c.kind == 'D' && !is_dir(dir, c)) {
         dir.remove(Path::new(&c.path))?;
         record(Path::new(&c.path));
     }
@@ -1384,7 +1440,18 @@ fn write_changes(dir: &Dir, from: &Dir, src: &Path, ch: &[Change], mut manifest:
         dir.remove_dir(d)?;
         record(d);
     }
-    for c in ch.iter().filter(|c| c.kind != 'D') {
+    // Deepest first. One still holding what diff leaves out (`node_modules`) stays.
+    for c in ch.iter().rev().filter(|c| c.kind == 'D' && is_dir(dir, c)) {
+        dir.remove_dir_if_empty(Path::new(&c.path))?;
+        record(Path::new(&c.path));
+    }
+    // Parents before their children, each with the workspace's mode.
+    for c in ch.iter().filter(|c| c.kind != 'D' && is_dir(from, c)) {
+        let rel = Path::new(&c.path);
+        dir.make_dir(rel, from.state(rel).and_then(|s| s.3).unwrap_or(0o755))?;
+        record(rel);
+    }
+    for c in ch.iter().filter(|c| c.kind != 'D' && !is_dir(from, c)) {
         let rel = Path::new(&c.path);
         match from.state(rel).map(|s| s.kind()) {
             Some('l') => dir.write_symlink(rel, &from.read_link(rel)?)?,
@@ -1428,7 +1495,7 @@ pub fn apply(paths: &Paths, id: &str, check: bool, reviewed: Option<&str>) -> Re
 /// `apply` of `ch` from the frozen copy `src`, with the review lock held.
 fn apply_from(mut s: Sandbox, src: &Path, ch: Vec<Change>, check: bool) -> Result<Vec<Change>> {
     let mut manifest = s.manifest();
-    let bad = conflicts(&s.meta.project, manifest.as_ref(), s.meta.created, &ch);
+    let bad = conflicts(&s.meta.project, src, manifest.as_ref(), s.meta.created, &ch);
     if !bad.is_empty() {
         let bad: Vec<String> = bad.iter().map(|p| printable_name(p)).collect();
         bail!("changed in {} since the sandbox copied it: {}", s.meta.project.display(), bad.join(", "));
@@ -1749,15 +1816,15 @@ mod tests {
         let got: Vec<(char, &str)> = ch.iter().map(|c| (c.kind, c.path.as_str())).collect();
         assert_eq!(got, vec![('D', "gone.txt"), ('M', "src/a.rs"), ('A', "src/b.rs")]);
         // No manifest: everything in p was just written, so it all counts as changed after an old copy.
-        assert_eq!(conflicts(&p, None, 0, &ch).len(), 2);
-        assert!(conflicts(&p, None, now() + 10, &ch).is_empty());
+        assert_eq!(conflicts(&p, &w, None, 0, &ch).len(), 2);
+        assert!(conflicts(&p, &w, None, now() + 10, &ch).is_empty());
         // With one, only paths whose state moved on conflict, whatever their mtime.
         let m = manifest(&p);
-        assert!(conflicts(&p, Some(&m), 0, &ch).is_empty());
+        assert!(conflicts(&p, &w, Some(&m), 0, &ch).is_empty());
         std::fs::write(p.join("src/a.rs"), "edited on the Mac").unwrap();
         // A file moved in with an old mtime still conflicts: it wasn't there when copied.
         std::fs::write(p.join("src/b.rs"), "moved in").unwrap();
-        let got = conflicts(&p, Some(&m), now() + 10, &ch);
+        let got = conflicts(&p, &w, Some(&m), now() + 10, &ch);
         assert_eq!(got, vec!["src/a.rs", "src/b.rs"]);
         // FIFOs are left out of the walk rather than read.
         let fifo = std::ffi::CString::new(w.join("pipe").as_os_str().as_bytes()).unwrap();
@@ -2066,6 +2133,45 @@ mod tests {
     }
 
     #[test]
+    fn directories_and_names_like_dependencies_are_changes() {
+        let (paths, project, m, ws) =
+            setup("dirs", &[("src/a.rs", "a"), ("old/gone", "g"), ("node_modules/x", "mac"), ("pkg/target/t", "t")]);
+        std::fs::create_dir_all(ws.join("src/target")).unwrap();
+        std::fs::write(ws.join("src/target/mod.rs"), "m").unwrap();
+        std::fs::write(ws.join("target"), "a file").unwrap();
+        std::fs::create_dir(ws.join("emptynew")).unwrap();
+        std::fs::create_dir(ws.join("private")).unwrap();
+        std::fs::write(ws.join("private/key"), "k").unwrap();
+        std::fs::set_permissions(ws.join("private"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir_all(ws.join("old")).unwrap();
+        // Dependency directories the project has too stay out, wherever they are.
+        std::fs::write(ws.join("node_modules/x"), "linux").unwrap();
+        std::fs::write(ws.join("pkg/target/t"), "linux").unwrap();
+        let r = patch(&paths, &m.id).unwrap();
+        assert_eq!(
+            paths_of(&r.changes),
+            vec![
+                ('A', "emptynew"),
+                ('D', "old"),
+                ('D', "old/gone"),
+                ('A', "private"),
+                ('A', "private/key"),
+                ('A', "src/target"),
+                ('A', "src/target/mod.rs"),
+                ('A', "target")
+            ]
+        );
+        assert_eq!(r.not_compared, vec!["node_modules".to_string(), "pkg/target".to_string()]);
+        assert!(r.patch.contains("rekcod: new directory private, mode 0700\n"), "{}", r.patch);
+        apply(&paths, &m.id, false, Some(&r.review)).unwrap();
+        assert!(project.join("emptynew").is_dir() && !project.join("old").exists());
+        assert_eq!(std::fs::metadata(project.join("private")).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::read_to_string(project.join("src/target/mod.rs")).unwrap(), "m");
+        assert_eq!(std::fs::read_to_string(project.join("node_modules/x")).unwrap(), "mac");
+        assert!(apply(&paths, &m.id, true, None).unwrap().is_empty());
+    }
+
+    #[test]
     fn mount_sandboxes_share_every_git_read_only() {
         let base = tmp("mount-git");
         let project = base.join("p");
@@ -2168,7 +2274,7 @@ mod tests {
         std::fs::remove_dir_all(ws.join("a")).unwrap();
         std::fs::write(ws.join("a"), "a file now").unwrap();
         let r = patch(&paths, &m.id).unwrap();
-        assert_eq!(paths_of(&r.changes), vec![('A', "a"), ('D', "a/child"), ('D', "a/sub/deep")]);
+        assert_eq!(paths_of(&r.changes), vec![('A', "a"), ('D', "a/child"), ('D', "a/sub"), ('D', "a/sub/deep")]);
         apply(&paths, &m.id, false, Some(&r.review)).unwrap();
         assert_eq!(std::fs::read_to_string(project.join("a")).unwrap(), "a file now");
         // And back: the file replaced by a directory.

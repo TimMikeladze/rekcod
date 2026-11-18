@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Release artifacts in out/release:
-#   rekcod-<version>-darwin-arm64.tar.gz   bin/rekcod, LICENSE, NOTICE, LICENSES/
+#   rekcod-<version>-darwin-arm64.tar.gz   bin/rekcod, LICENSE, NOTICE, LICENSES/,
+#                                          THIRD-PARTY-NOTICES.txt (crates, dashboard npm)
 #   rekcod-darwin-arm64.tar.gz             the same, for releases/latest/download
 #   rekcod-guest-<guest version>.tar.gz    Image, [initramfs], root.img, VERSION, the kernel
 #                                          config, the Alpine package list, license notices
+#                                          (THIRD-PARTY-NOTICES.txt: rekcod-agent's crates)
 #   SHA256SUMS
 # Needs out/guest (scripts/build.sh, or GUEST_DIR=... from CI) and runs on macOS.
 #
@@ -53,19 +55,24 @@ build() {
   cp -R LICENSES "$rel/stage/LICENSES"
 
   guest_tar="rekcod-guest-$gv.tar.gz"
+  mkdir -p "$rel/guest-notices"
+  python3 scripts/third-party-notices.py crates rekcod-agent aarch64-unknown-linux-musl >"$rel/guest-notices/THIRD-PARTY-NOTICES.txt"
   # COPYFILE_DISABLE: no macOS ._ metadata files in the archive.
   # config and packages.txt: the kernel's .config and the installed Alpine packages, which
   # NOTICE points to for the GPL parts' source.
   COPYFILE_DISABLE=1 tar -C "$guest" -czf "$rel/$guest_tar" $(cd "$guest" && ls Image initramfs root.img VERSION config packages.txt 2>/dev/null) \
-    -C "$PWD" LICENSE NOTICE LICENSES
+    -C "$PWD" LICENSE NOTICE LICENSES -C "$PWD/$rel/guest-notices" THIRD-PARTY-NOTICES.txt
+  rm -rf "$rel/guest-notices"
   sha=$(shasum -a 256 "$rel/$guest_tar" | cut -d' ' -f1)
 
   REKCOD_GUEST_VERSION=$gv REKCOD_GUEST_SHA256=$sha cargo build --locked --release -p rekcod
   cp target/release/rekcod "$rel/stage/bin/rekcod"
+  python3 scripts/third-party-notices.py crates rekcod aarch64-apple-darwin >"$rel/stage/THIRD-PARTY-NOTICES.txt"
   if [[ $with_dashboard == 1 ]]; then
     (cd dashboard && npm ci && npm run bundle)
     mkdir -p "$rel/stage/share/rekcod"
     cp -R dashboard/.next/standalone "$rel/stage/share/rekcod/dashboard"
+    python3 scripts/third-party-notices.py npm dashboard >>"$rel/stage/THIRD-PARTY-NOTICES.txt"
   fi
 }
 
@@ -73,7 +80,7 @@ sign() {
   [[ -f $rel/stage/bin/rekcod ]] || { echo "$0 sign: no $rel/stage/bin/rekcod; run $0 build first" >&2; exit 1; }
   guest_tar=$(cd "$rel" && ls rekcod-guest-*.tar.gz)
   signed_into "$rel/stage/bin/rekcod" "$rel/stage/bin/rekcod" "${CODESIGN_IDENTITY:--}"
-  parts=(bin LICENSE NOTICE LICENSES)
+  parts=(bin LICENSE NOTICE LICENSES THIRD-PARTY-NOTICES.txt)
   [[ ! -d $rel/stage/share ]] || parts+=(share)
   host_tar="rekcod-$version-darwin-arm64.tar.gz"
   COPYFILE_DISABLE=1 tar -C "$rel/stage" -czf "$rel/$host_tar" "${parts[@]}"

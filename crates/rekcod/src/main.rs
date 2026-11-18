@@ -569,6 +569,10 @@ struct ApiPolicyArgs {
     /// the internet, the Mac and the LAN.
     #[arg(long)]
     allow_macos: bool,
+    /// Let callers write a sandbox's changes into the project on the Mac (`apply`). Without
+    /// it they can diff and `apply` with `check` only; you apply with `rekcod sandbox apply`.
+    #[arg(long)]
+    allow_apply: bool,
 }
 
 impl ApiPolicyArgs {
@@ -589,6 +593,7 @@ impl ApiPolicyArgs {
             allow_hosts: self.allow_hosts,
             secrets: self.secrets,
             macos: self.allow_macos,
+            apply: self.allow_apply,
             node: false,
         })
     }

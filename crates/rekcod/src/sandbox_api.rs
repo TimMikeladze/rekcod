@@ -71,6 +71,9 @@ pub struct Policy {
     /// Allows macOS guests. Their network isn't filtered: they reach the internet, the Mac
     /// and the LAN.
     pub macos: bool,
+    /// Allows `apply` to write into the project on the Mac. Off, callers get `check` only
+    /// and a person applies from the CLI after reading the diff.
+    pub apply: bool,
     /// A fleet node, which only the controller calls (node secret). It takes git sources,
     /// serves [`NODE_ONLY`] and reaches only the sandboxes the fleet made, never the Mac
     /// owner's. Only [`Policy::node`] sets it.
@@ -99,7 +102,8 @@ enum Refusal {
 impl Policy {
     /// Fleet nodes: only the controller calls them (node secret), and it filters what users send.
     pub fn node() -> Policy {
-        Policy { roots: vec![], mount: false, allow_hosts: vec!["*".into()], secrets: vec![], macos: true, node: true }
+        // The controller never forwards apply.
+        Policy { roots: vec![], mount: false, allow_hosts: vec!["*".into()], secrets: vec![], macos: true, apply: false, node: true }
     }
 
     fn host_allowed(&self, h: &str) -> bool {
@@ -391,7 +395,15 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
         "apply" => {
             let id = target()?;
             let reviewed = text(args, "reviewed").context("reviewed takes the review ID a diff returned")?;
-            json!({"changes": sandbox::apply(paths, &id, flag(args, "check")?, reviewed)?})
+            let check = flag(args, "check")?;
+            if !check && !policy.apply {
+                return Err(anyhow::Error::new(Forbidden(
+                    "apply writes into the project on the Mac, which this server doesn't allow (only check); \
+                     apply with `rekcod sandbox apply`, or start the server with --allow-apply"
+                        .into(),
+                )));
+            }
+            json!({"changes": sandbox::apply(paths, &id, check, reviewed)?})
         }
         "stop" => {
             let id = target()?;
@@ -960,12 +972,15 @@ pub fn mcp_reply(paths: &Paths, policy: &Policy, msg: &Value) -> Option<Value> {
             "serverInfo": {"name": "rekcod", "version": env!("CARGO_PKG_VERSION")}
         })),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools": tools().into_iter().map(|(name, _, desc, destructive, props, req)| json!({
+        // Without --allow-apply, sandbox_apply isn't offered (a call with check still works).
+        "tools/list" => Ok(
+            json!({"tools": tools().into_iter().filter(|t| policy.apply || t.0 != "sandbox_apply").map(|(name, _, desc, destructive, props, req)| json!({
             "name": name,
             "description": desc,
             "inputSchema": {"type": "object", "properties": props, "required": req},
             "annotations": {"destructiveHint": destructive, "readOnlyHint": matches!(name, "sandbox_list" | "sandbox_read_file")}
-        })).collect::<Vec<_>>()})),
+        })).collect::<Vec<_>>()}),
+        ),
         "tools/call" => {
             let name = msg["params"]["name"].as_str().unwrap_or("");
             let args = msg["params"]["arguments"].clone();
@@ -1132,6 +1147,9 @@ mod tests {
         let init = mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 1, "method": "initialize"})).unwrap();
         assert_eq!(init["result"]["protocolVersion"], PROTOCOL);
         let list = mcp_reply(&paths, &Policy::default(), &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
+        assert!(!list["result"]["tools"].as_array().unwrap().iter().any(|t| t["name"] == "sandbox_apply"));
+        let pol = Policy { apply: true, ..Default::default() };
+        let list = mcp_reply(&paths, &pol, &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})).unwrap();
         let tools = list["result"]["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 12);
         let apply = tools.iter().find(|t| t["name"] == "sandbox_apply").unwrap();
@@ -1249,7 +1267,16 @@ mod tests {
         let pol = Policy { secrets: vec!["TOKEN".into()], ..pol };
         let (_, list) = mcp_call(&paths, &pol, "sandbox_list", json!({}));
         assert!(list.contains(&mine.id) && !list.contains(&sb.id), "{list}");
-        let (code, body) = http(&paths, &pol, "POST", &format!("/sandboxes/{}/apply", mine.id), "{}");
+        // Agents check; only a server started with --allow-apply lets them write the project.
+        let apply = format!("/sandboxes/{}/apply", mine.id);
+        let (code, body) = http(&paths, &pol, "POST", &apply, "{}");
+        assert!(code == 403 && body.contains("--allow-apply"), "{code} {body}");
+        let (err, text) = mcp_call(&paths, &pol, "sandbox_apply", json!({"id": mine.id}));
+        assert!(err && text.contains("--allow-apply"), "{text}");
+        assert_eq!(std::fs::read_to_string(a.join("f.txt")).unwrap(), "host");
+        assert_eq!(http(&paths, &pol, "POST", &apply, r#"{"check": true}"#).0, 200);
+        let pol = Policy { apply: true, ..pol };
+        let (code, body) = http(&paths, &pol, "POST", &apply, "{}");
         assert_eq!((code, body.as_str()), (200, r#"{"changes":[{"kind":"M","path":"f.txt"}]}"#));
         assert_eq!(std::fs::read_to_string(a.join("f.txt")).unwrap(), "sandbox");
 
@@ -1270,7 +1297,7 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("f"), "old").unwrap();
         let paths = Paths { home: base.join("home") };
-        let pol = Policy { roots: vec![base.clone()], ..Default::default() };
+        let pol = Policy { roots: vec![base.clone()], apply: true, ..Default::default() };
         let sb = fake(&paths, &project, |_| {});
         std::fs::write(paths.home.join("sb").join(&sb.id).join("ws/f"), "from-sandbox").unwrap();
         let apply = format!("/sandboxes/{}/apply", sb.id);

@@ -287,6 +287,29 @@ fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<Vec<u8>>) -
     Ok(r)
 }
 
+/// The bytes of the file `path` in the sandbox, up to [`MAX_OUTPUT`].
+fn read_file(paths: &Paths, id: &str, path: &str) -> Result<Vec<u8>> {
+    let r = exec_collect(paths, id, &json!({"cmd": ["cat", "--", path]}), None)?;
+    if r.truncated {
+        bail!("{path} is over {} MiB; copy it out with `rekcod sandbox cp`", MAX_OUTPUT >> 20);
+    }
+    if r.code != 0 {
+        bail!("{}", String::from_utf8_lossy(&r.err).trim());
+    }
+    Ok(r.out)
+}
+
+/// Writes `body` to `path` in the sandbox, making its directory; returns the bytes written.
+fn write_file(paths: &Paths, id: &str, path: &str, body: Vec<u8>) -> Result<usize> {
+    let n = body.len();
+    let a = json!({"cmd": ["sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "-", path]});
+    let r = exec_collect(paths, id, &a, Some(body))?;
+    if r.code != 0 {
+        bail!("{}", String::from_utf8_lossy(&r.err).trim());
+    }
+    Ok(n)
+}
+
 /// One API operation. `exec` here collects output; HTTP streams it separately. Every
 /// operation on an existing sandbox authorizes it first ([`Policy::target`]).
 pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Value> {
@@ -342,27 +365,20 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             }
             v
         }
-        "read_file" => {
-            let path = text(args, "path")?.context("missing path")?;
-            let a = json!({"cmd": ["cat", "--", path]});
-            let r = exec_collect(paths, &target()?, &a, None)?;
-            if r.truncated {
-                bail!("{path} is over {} MiB; copy it out with `rekcod sandbox cp`", MAX_OUTPUT >> 20);
-            }
-            if r.code != 0 {
-                bail!("{}", String::from_utf8_lossy(&r.err).trim());
-            }
-            json!({"content": String::from_utf8_lossy(&r.out)})
-        }
+        // JSON carries text: a file that isn't UTF-8 comes back as base64. HTTP sends bytes.
+        "read_file" => match String::from_utf8(read_file(paths, &target()?, text(args, "path")?.context("missing path")?)?) {
+            Ok(text) => json!({"content": text}),
+            Err(e) => json!({"content_base64": crate::daemon::base64(e.as_bytes())}),
+        },
         "write_file" => {
             let path = text(args, "path")?.context("missing path")?;
-            let a = json!({"cmd": ["sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "-", path]});
-            let body = text(args, "content")?.unwrap_or_default();
-            let r = exec_collect(paths, &target()?, &a, Some(body.as_bytes().to_vec()))?;
-            if r.code != 0 {
-                bail!("{}", String::from_utf8_lossy(&r.err).trim());
-            }
-            json!({"written": body.len()})
+            let body = match (text(args, "content")?, text(args, "content_base64")?) {
+                (Some(t), None) => t.as_bytes().to_vec(),
+                (None, Some(b)) => base64_decode(b)?,
+                (None, None) => vec![],
+                (Some(_), Some(_)) => bail!("pass content or content_base64, not both"),
+            };
+            json!({"written": write_file(paths, &target()?, path, body)?})
         }
         "fork" => {
             let meta = sandbox::fork(paths, &target()?, args["name"].as_str().map(String::from))?;
@@ -611,6 +627,8 @@ fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Resu
     }
     drop(tx);
     let mut timed_out = false;
+    // A character split across two reads is held back until the rest arrives.
+    let mut pending: std::collections::HashMap<&str, Vec<u8>> = Default::default();
     let sent = (|| -> Result<()> {
         write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")?;
         loop {
@@ -621,15 +639,26 @@ fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Resu
             };
             match got {
                 Ok((name, data)) => {
-                    writeln!(w, "{}", json!({ name: String::from_utf8_lossy(&data) }))?;
-                    w.flush()?;
+                    let buf = pending.entry(name).or_default();
+                    buf.extend_from_slice(&data);
+                    let rest = buf.split_off(buf.len() - incomplete_tail(buf));
+                    let text = String::from_utf8_lossy(&std::mem::replace(buf, rest)).into_owned();
+                    if !text.is_empty() {
+                        writeln!(w, "{}", json!({ name: text }))?;
+                        w.flush()?;
+                    }
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     timed_out = true;
                     let _ = child.kill();
                     return Ok(());
                 }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    for (name, rest) in pending.drain().filter(|(_, b)| !b.is_empty()) {
+                        writeln!(w, "{}", json!({ name: String::from_utf8_lossy(&rest) }))?;
+                    }
+                    return Ok(());
+                }
             }
         }
     })();
@@ -668,7 +697,7 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
     // Node-only routes don't exist on `sandbox serve`.
     let found = route(&req.method, &req.path, &req.query, body.as_ref().unwrap_or(&json!({})))
         .filter(|(name, _)| policy.node || !NODE_ONLY.contains(name));
-    let Some((name, mut args)) = found else {
+    let Some((name, args)) = found else {
         return respond(&mut w, 404, "application/json", br#"{"error":"no such endpoint"}"#);
     };
     // A body that doesn't parse is refused, not read as no arguments: `{"check": true,}`
@@ -676,9 +705,22 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
     if body.is_none() && name != "write_file" {
         return respond(&mut w, 400, "application/json", br#"{"error":"the body isn't a JSON object"}"#);
     }
-    if name == "write_file" {
-        args["content"] = json!(String::from_utf8_lossy(&req.body));
+    if name == "read_file" || name == "write_file" {
+        // Bytes both ways, not through `op`'s JSON.
+        let r = policy.target(paths, &args).and_then(|id| {
+            let path = text(&args, "path")?.context("missing path")?;
+            match name {
+                "read_file" => read_file(paths, &id, path),
+                _ => Ok(json!({"written": write_file(paths, &id, path, std::mem::take(&mut req.body))?}).to_string().into_bytes()),
+            }
+        });
+        let ctype = if name == "read_file" { "application/octet-stream" } else { "application/json" };
+        return match r {
+            Ok(body) => respond(&mut w, 200, ctype, &body),
+            Err(e) => respond(&mut w, error_code(&e), "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes()),
+        };
     }
+    let mut args = args;
     if name == "exec" {
         let r = policy.target(paths, &args).and_then(|id| {
             args["id"] = json!(id);
@@ -691,10 +733,9 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
     }
     match op(paths, policy, name, &args) {
         Ok(v) if name == "screenshot" => {
-            let png = base64_decode(v["png_base64"].as_str().unwrap_or(""));
+            let png = base64_decode(v["png_base64"].as_str().unwrap_or(""))?;
             respond(&mut w, 200, "image/png", &png)
         }
-        Ok(v) if name == "read_file" => respond(&mut w, 200, "application/octet-stream", v["content"].as_str().unwrap_or("").as_bytes()),
         Ok(v) => respond(&mut w, if name == "create" { 201 } else { 200 }, "application/json", v.to_string().as_bytes()),
         Err(e) => respond(&mut w, error_code(&e), "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes()),
     }
@@ -766,16 +807,19 @@ pub(crate) fn spawn_limited<T: Send + 'static>(f: impl FnOnce() -> T + Send + 's
     });
 }
 
-fn base64_decode(s: &str) -> Vec<u8> {
-    let mut out = Vec::new();
+/// Standard base64 with padding; anything else is an error, not bytes.
+fn base64_decode(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim_end_matches('=');
+    let mut out = Vec::with_capacity(s.len() * 3 / 4);
     let (mut acc, mut bits) = (0u32, 0);
-    for c in s.bytes().filter(|c| *c != b'=') {
+    for c in s.bytes() {
         let v = match c {
             b'A'..=b'Z' => c - b'A',
             b'a'..=b'z' => c - b'a' + 26,
             b'0'..=b'9' => c - b'0' + 52,
             b'+' => 62,
-            _ => 63,
+            b'/' => 63,
+            _ => bail!("content_base64 isn't base64"),
         } as u32;
         acc = acc << 6 | v;
         bits += 6;
@@ -784,7 +828,28 @@ fn base64_decode(s: &str) -> Vec<u8> {
             out.push((acc >> bits) as u8);
         }
     }
-    out
+    if bits >= 6 {
+        bail!("content_base64 isn't base64");
+    }
+    Ok(out)
+}
+
+/// How many bytes at the end of `b` start a UTF-8 character that isn't complete yet.
+fn incomplete_tail(b: &[u8]) -> usize {
+    for back in 1..=b.len().min(3) {
+        let c = b[b.len() - back];
+        if c & 0xc0 == 0x80 {
+            continue;
+        }
+        let need = match c {
+            0xc0..=0xdf => 2,
+            0xe0..=0xef => 3,
+            0xf0..=0xf7 => 4,
+            _ => 1,
+        };
+        return if need > back { back } else { 0 };
+    }
+    0
 }
 
 // -------------------------------------------------------------------- MCP
@@ -830,7 +895,7 @@ fn tools() -> Vec<Tool> {
         (
             "sandbox_read_file",
             "read_file",
-            "Read a file in the sandbox.",
+            "Read a file in the sandbox (up to 8 MiB). Returns content, or content_base64 when the file isn't UTF-8.",
             false,
             json!({"id": id, "path": {"type": "string"}}),
             vec!["id", "path"],
@@ -838,10 +903,10 @@ fn tools() -> Vec<Tool> {
         (
             "sandbox_write_file",
             "write_file",
-            "Write a file in the sandbox.",
+            "Write a file in the sandbox, making its directory. Pass content as text or content_base64 for bytes.",
             false,
-            json!({"id": id, "path": {"type": "string"}, "content": {"type": "string"}}),
-            vec!["id", "path", "content"],
+            json!({"id": id, "path": {"type": "string"}, "content": {"type": "string"}, "content_base64": {"type": "string"}}),
+            vec!["id", "path"],
         ),
         (
             "sandbox_fork",
@@ -1032,6 +1097,20 @@ mod tests {
         let r = collect(&mut sh("sleep 30"), None, MAX_OUTPUT, Some(std::time::Duration::from_secs(1))).unwrap();
         assert_eq!(r.code, 124);
         assert!(t0.elapsed() < std::time::Duration::from_secs(10));
+    }
+
+    #[test]
+    fn bytes_survive_base64_and_split_reads() {
+        let all: Vec<u8> = (0..=255).collect();
+        assert_eq!(base64_decode(&crate::daemon::base64(&all)).unwrap(), all);
+        assert_eq!(base64_decode("aGk=").unwrap(), b"hi");
+        assert!(base64_decode("a$==").is_err() && base64_decode("a").is_err());
+        let e = "\u{e9}\u{20ac}\u{1f600}".as_bytes();
+        assert_eq!(incomplete_tail(&e[..1]), 1);
+        assert_eq!(incomplete_tail(&e[..2]), 0);
+        assert_eq!(incomplete_tail(&e[..4]), 2);
+        assert_eq!(incomplete_tail(&e[..7]), 2);
+        assert_eq!(incomplete_tail(b"ok\xff"), 0);
     }
 
     #[test]

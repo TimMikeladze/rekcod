@@ -67,7 +67,7 @@ impl RunAs {
     }
 }
 
-/// A KeepAlive job: `exe args...` started in `cwd`, with `env`, logging to `log`.
+/// A KeepAlive job: `exe args...` with `env`, logging to `log`.
 /// `crash_only`: launchd restarts it only after a non-zero exit, so a deliberate stop
 /// sticks. `run_as` makes it a daemon for that user.
 #[derive(Debug, Clone, Default)]
@@ -78,7 +78,6 @@ pub struct Job {
     pub log: PathBuf,
     /// `REKCOD_HOME` (other homes only) and the variables in [`CARRIED`] that were set.
     pub env: Vec<(String, String)>,
-    pub cwd: Option<PathBuf>,
     pub crash_only: bool,
     pub run_as: Option<RunAs>,
 }
@@ -106,13 +105,6 @@ pub fn plist_with(job: &Job) -> String {
         .as_ref()
         .map(|r| format!("  <key>UserName</key><string>{}</string>\n  <key>GroupName</key><string>staff</string>\n", xml_escape(&r.user)))
         .unwrap_or_default();
-    // launchd starts jobs in `/`: a relative --db or --data means what it did where
-    // `--install` ran.
-    let cwd = job
-        .cwd
-        .as_ref()
-        .map(|d| format!("  <key>WorkingDirectory</key><string>{}</string>\n", xml_escape(&d.display().to_string())))
-        .unwrap_or_default();
     let log = xml_escape(&job.log.display().to_string());
     let keep_alive = if job.crash_only { "<dict><key>SuccessfulExit</key><false/></dict>" } else { "<true/>" };
     format!(
@@ -124,7 +116,7 @@ pub fn plist_with(job: &Job) -> String {
   <key>ProgramArguments</key>
   <array>
 {argv}  </array>
-{user}{env}{cwd}  <key>RunAtLoad</key><true/>
+{user}{env}  <key>RunAtLoad</key><true/>
   <key>KeepAlive</key>{keep_alive}
   <key>ThrottleInterval</key><integer>5</integer>
   <key>StandardOutPath</key><string>{log}</string>
@@ -328,8 +320,32 @@ fn wants_daemon(name: &str) -> bool {
     is_daemon(name) || std::env::var("REKCOD_LAUNCHD").is_ok_and(|v| v == "system")
 }
 
-/// The job `--install` writes for `name`: this binary by its stable path, run where the
-/// command ran, with the environment that changes what it does.
+/// Flags whose value is a path. launchd starts jobs in `/`, so a relative one is made
+/// absolute against where `--install` ran (not by a WorkingDirectory: that directory may
+/// be gone by the next boot, the pkg's scripts directory always is).
+const PATH_FLAGS: &[&str] = &["--db", "--data", "--backup-dir", "--storage-credentials"];
+
+fn absolute_paths(args: &[String], cwd: &Path) -> Vec<String> {
+    let abs = |v: &str| if Path::new(v).is_absolute() { v.to_string() } else { cwd.join(v).display().to_string() };
+    let mut out = Vec::with_capacity(args.len());
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if PATH_FLAGS.contains(&a.as_str()) {
+            out.push(a.clone());
+            if let Some(v) = it.next() {
+                out.push(abs(v));
+            }
+        } else if let Some((flag, v)) = a.split_once('=').filter(|(f, _)| PATH_FLAGS.contains(f)) {
+            out.push(format!("{flag}={}", abs(v)));
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
+/// The job `--install` writes for `name`: this binary by its stable path, its path
+/// arguments absolute, with the environment that changes what it does.
 fn job_for(paths: &Paths, name: &str, args: &[String], crash_only: bool) -> Result<Job> {
     let log = paths.home.join("logs").join(format!("{name}.log"));
     let mut env = Vec::new();
@@ -344,10 +360,9 @@ fn job_for(paths: &Paths, name: &str, args: &[String], crash_only: bool) -> Resu
     Ok(Job {
         name: name.into(),
         exe: stable_exe()?,
-        args: args.to_vec(),
+        args: absolute_paths(args, &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))),
         log,
         env,
-        cwd: std::env::current_dir().ok(),
         crash_only,
         run_as: None,
     })
@@ -493,7 +508,6 @@ fn agent_job(name: &str, path: &Path) -> Result<Job> {
         args: args.to_vec(),
         log: v["StandardOutPath"].as_str().unwrap_or_default().into(),
         env,
-        cwd: v["WorkingDirectory"].as_str().map(PathBuf::from),
         crash_only: v["KeepAlive"].is_object(),
         run_as: None,
     })
@@ -544,12 +558,10 @@ mod tests {
     fn plist_keeps_alive_and_logs() {
         let mut j = job("edge", "/opt/r&d/rekcod", &["edge", "serve", "--data", "./rustfs"]);
         j.env = vec![("REKCOD_HOME".into(), "/h".into()), ("REKCOD_INSECURE".into(), "1".into())];
-        j.cwd = Some("/Users/me/srv".into());
         let p = plist_with(&j);
         assert!(p.contains("<string>/opt/r&amp;d/rekcod</string>\n    <string>edge</string>\n    <string>serve</string>"), "{p}");
         assert!(p.contains("<key>KeepAlive</key><true/>") && p.contains("<string>dev.rekcod.edge</string>"));
         assert!(p.contains("<key>REKCOD_HOME</key><string>/h</string><key>REKCOD_INSECURE</key><string>1</string>"));
-        assert!(p.contains("<key>WorkingDirectory</key><string>/Users/me/srv</string>"));
         // plutil is the authority on whether launchd can read it.
         let f = std::env::temp_dir().join(format!("rekcod-plist-{}.plist", std::process::id()));
         std::fs::write(&f, &p).unwrap();
@@ -558,13 +570,38 @@ mod tests {
         let back = agent_job("edge", &f).unwrap();
         std::fs::remove_file(&f).unwrap();
         assert!(ok, "plutil rejected:\n{p}");
-        assert_eq!((back.exe, back.args, back.cwd, back.log), (j.exe, j.args, j.cwd, j.log));
+        assert_eq!((back.exe, back.args, back.log), (j.exe, j.args, j.log));
         let mut env = back.env;
         env.sort();
         assert_eq!(env, j.env);
         let mut vm = job("vm", "/r", &["start"]);
         vm.crash_only = true;
         assert!(plist_with(&vm).contains("<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>"));
+    }
+
+    /// A relative --db or --data in the job means what it meant where --install ran.
+    #[test]
+    fn relative_paths_become_absolute() {
+        let a: Vec<String> =
+            ["controller", "serve", "--db", "fleet.db", "--backup-dir=../b", "--storage-credentials", "/abs/c.json", "--domain", "x"]
+                .map(String::from)
+                .into();
+        assert_eq!(
+            absolute_paths(&a, Path::new("/srv")),
+            [
+                "controller",
+                "serve",
+                "--db",
+                "/srv/fleet.db",
+                "--backup-dir=/srv/../b",
+                "--storage-credentials",
+                "/abs/c.json",
+                "--domain",
+                "x"
+            ]
+        );
+        let s: Vec<String> = ["storage", "serve", "--data", "./rustfs"].map(String::from).into();
+        assert_eq!(absolute_paths(&s, Path::new("/h"))[3], "/h/./rustfs");
     }
 
     #[test]

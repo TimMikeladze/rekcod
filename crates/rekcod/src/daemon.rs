@@ -972,7 +972,11 @@ async fn docker_proxy(vm: Vm, listener: UnixListener) {
         tokio::spawn(async move {
             match vm.connect(DOCKER_PORT).await {
                 Ok(guest) => {
-                    let _ = crate::proxy::pipe(client, guest).await;
+                    if let Err(e) = crate::proxy::pipe(client, guest).await
+                        && e.downcast_ref::<crate::proxy::ClientGone>().is_none()
+                    {
+                        log!("docker proxy: {e:#}");
+                    }
                 }
                 Err(e) => log!("docker proxy: {e:#}"),
             }

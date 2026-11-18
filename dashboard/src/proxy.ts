@@ -1,13 +1,16 @@
 import { NextResponse, type NextRequest } from "next/server"
 import { TOKEN_KEY } from "@/lib/api"
-import { authorized, expireLegacyCookies, LOCAL_HOST, sameSecret, serverToken } from "@/lib/auth"
+import { authorized, expireLegacyCookies, LOCAL_HOST, loopbackUrl, sameSecret, serverToken } from "@/lib/auth"
 
 // Every API route needs `Authorization: Bearer <token>` (lib/auth.ts); `/auth?token=` puts the
 // token where the page's `api()` finds it. Pages are public: they're shells that fetch
 // everything they show from the API.
 export function proxy(req: NextRequest) {
   const host = req.headers.get("host") ?? ""
-  if (!LOCAL_HOST.test(host)) return new Response("dashboard answers on localhost only", { status: 403 })
+  const moved = loopbackUrl(host, req.nextUrl.pathname + req.nextUrl.search)
+  // Next turns a Location on another loopback name into a relative one, so this is a page.
+  if (moved) return page(200, movedPage(moved), [])
+  if (!LOCAL_HOST.test(host)) return new Response("dashboard answers on 127.0.0.1 only", { status: 403 })
   const expire = expireLegacyCookies(req.headers.get("cookie"))
   const { pathname, searchParams } = req.nextUrl
   if (pathname === "/auth") {
@@ -28,6 +31,14 @@ const AUTH_PAGE = `<!doctype html><html lang="en"><head><meta charset="utf-8"><t
 <noscript>The dashboard needs JavaScript.</noscript>
 <script>try{localStorage.setItem(${JSON.stringify(TOKEN_KEY)},new URLSearchParams(location.search).get("token"));location.replace("/")}catch(e){document.body.textContent="This browser didn't let the dashboard keep its sign-in in localStorage: "+e}</script>
 </body></html>`
+
+const attr = (s: string) => s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+
+function movedPage(url: string) {
+  const u = attr(new URL(url).href)
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="0;url=${u}"><title>rekcod</title></head>
+<body><p>The dashboard is at <a href="${u}">127.0.0.1</a>, not localhost.</p></body></html>`
+}
 
 function signIn(why: string, expire: string[]) {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in · rekcod</title>

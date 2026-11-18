@@ -8,7 +8,7 @@ import { authorized, LOCAL_HOST } from "./auth"
 // pages can't read this origin's localStorage, so these back up the token rather than replace it.
 export function refuse(req: Request, mutating: boolean): Response | null {
   const host = req.headers.get("host") ?? ""
-  if (!LOCAL_HOST.test(host)) return new Response("dashboard answers on localhost only", { status: 403 })
+  if (!LOCAL_HOST.test(host)) return new Response("dashboard answers on 127.0.0.1 only", { status: 403 })
   if (!authorized(req)) return new Response("not signed in; open the dashboard with `rekcod dashboard`", { status: 401 })
   const site = req.headers.get("sec-fetch-site")
   if (site && site !== "same-origin" && site !== "none") return new Response("cross-site request", { status: 403 })

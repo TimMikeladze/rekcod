@@ -1106,13 +1106,14 @@ fn listen(b: Binding, probe: bool) -> std::io::Result<Listener> {
     // SO_REUSEADDR (needed to rebind right after a container restarts, past TIME_WAIT) also
     // lets macOS bind 127.0.0.1:P while another app holds *:P, and loopback traffic would
     // then come to us. So first check whether anything answers there.
-    let probe_first = probe;
-    let probe = if addr.ip().is_unspecified() {
-        SocketAddr::new(if addr.is_ipv6() { std::net::Ipv6Addr::LOCALHOST.into() } else { std::net::Ipv4Addr::LOCALHOST.into() }, b.port)
-    } else {
-        addr
+    // `[::]` is dual-stack, so it would take 127.0.0.1's traffic too (the dashboard's, say).
+    let v4 = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, b.port));
+    let probes = match (addr.ip().is_unspecified(), addr.is_ipv6()) {
+        (true, true) => vec![SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, b.port)), v4],
+        (true, false) => vec![v4],
+        (false, _) => vec![addr],
     };
-    if probe_first && std::net::TcpStream::connect_timeout(&probe, Duration::from_millis(100)).is_ok() {
+    if probe && probes.iter().any(|p| std::net::TcpStream::connect_timeout(p, Duration::from_millis(100)).is_ok()) {
         return Err(std::io::Error::from(std::io::ErrorKind::AddrInUse));
     }
     socket.set_reuse_address(true)?;
@@ -1484,6 +1485,14 @@ mod tests {
         UdpSocket::bind(addr).await.expect("the port is free right away");
         let closed = tokio::time::timeout(Duration::from_secs(5), guest.read(&mut buf)).await;
         assert!(matches!(closed, Ok(Ok(0))), "the flow ended with it: {closed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_forward_leaves_a_port_127_0_0_1_answers_on() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = held.local_addr().unwrap().port();
+        let any = Binding { proto: Proto::Tcp, addr: std::net::Ipv6Addr::UNSPECIFIED.into(), port };
+        assert_eq!(listen(any, true).err().map(|e| e.kind()), Some(std::io::ErrorKind::AddrInUse));
     }
 
     #[test]

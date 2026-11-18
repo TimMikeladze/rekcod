@@ -1,4 +1,4 @@
-//! `rekcod dashboard`: runs the web dashboard's standalone build (docs/dashboard.md) on
+//! `rekcod dashboard`: runs the web dashboard's standalone build (README, "Dashboard") on
 //! 127.0.0.1 and opens it. A dashboard that's already running is just opened.
 //!
 //! Each launch gets a new token. It goes to the server in `REKCOD_DASHBOARD_TOKEN` and to
@@ -6,6 +6,9 @@
 //! the page sends it as a bearer header. Not a cookie: cookies reach every localhost port.
 //! Containers reach the Mac's 127.0.0.1 through `host.docker.internal`, so loopback alone
 //! doesn't keep them out.
+//!
+//! Every URL is `127.0.0.1`, never `localhost`: macOS resolves `localhost` to `::1` first, and
+//! anyone can listen on `[::1]` at the dashboard's port and be sent the token.
 
 use std::io::{IsTerminal, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -70,6 +73,12 @@ fn answers(port: u16) -> bool {
     TcpStream::connect_timeout(&SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(300)).is_ok()
 }
 
+/// Nothing holds `port` on 127.0.0.1 or on `[::1]`, so `localhost:PORT` typed by hand reaches
+/// the dashboard too (it redirects to 127.0.0.1).
+fn port_free(port: u16) -> bool {
+    TcpListener::bind(("127.0.0.1", port)).is_ok() && TcpListener::bind(("::1", port)).is_ok()
+}
+
 /// 32 random bytes as hex.
 fn new_token() -> Result<String> {
     let mut b = [0u8; 32];
@@ -78,7 +87,7 @@ fn new_token() -> Result<String> {
 }
 
 fn auth_url(port: u16, token: &str) -> String {
-    format!("http://localhost:{port}/auth?token={token}")
+    format!("http://127.0.0.1:{port}/auth?token={token}")
 }
 
 /// The pid, port and token `record` wrote. A file without a token was written for a build
@@ -96,7 +105,7 @@ fn running(paths: &Paths) -> Option<String> {
 }
 
 fn free_port() -> Result<u16> {
-    (FIRST_PORT..FIRST_PORT + 200).find(|p| TcpListener::bind(("127.0.0.1", *p)).is_ok()).context("no free port from 4500 to 4699")
+    (FIRST_PORT..FIRST_PORT + 200).find(|p| port_free(*p)).context("no free port from 4500 to 4699")
 }
 
 fn command(paths: &Paths, port: u16, token: &str) -> Result<Command> {
@@ -149,7 +158,7 @@ pub fn run(paths: &Paths, foreground: bool, open_it: bool) -> Result<()> {
         if std::io::stderr().is_terminal() {
             eprintln!("rekcod dashboard: {url}");
         } else {
-            eprintln!("rekcod dashboard: http://localhost:{port} (`rekcod dashboard` opens it signed in)");
+            eprintln!("rekcod dashboard: http://127.0.0.1:{port} (`rekcod dashboard` opens it signed in)");
         }
         let status = child.wait()?;
         let _ = std::fs::remove_file(run_file(paths));
@@ -216,7 +225,18 @@ mod tests {
         record(&paths, 42, 4501, "ab12").unwrap();
         assert_eq!(std::fs::metadata(&f).unwrap().permissions().mode() & 0o777, 0o600);
         assert_eq!(recorded(&paths), Some((42, 4501, "ab12".to_string())));
-        assert_eq!(auth_url(4501, "ab12"), "http://localhost:4501/auth?token=ab12");
+        assert_eq!(auth_url(4501, "ab12"), "http://127.0.0.1:4501/auth?token=ab12");
         std::fs::remove_dir_all(&paths.home).unwrap();
+    }
+
+    #[test]
+    fn a_port_held_on_ipv6_loopback_isnt_free() {
+        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        drop(v4);
+        let v6 = TcpListener::bind(("::1", port)).unwrap();
+        assert!(!port_free(port));
+        drop(v6);
+        assert!(port_free(port));
     }
 }

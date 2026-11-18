@@ -353,6 +353,11 @@ Environment and secret changes redeploy the live release. Secrets are encrypted 
 the controller database. `scale` changes the number of instances, subject to available
 node capacity. `rollback` deploys the previous good release.
 
+Keys set with `app env set` stay across deploys. `app deploy` merges the `[env]` table
+of `rekcod.toml` over the app's env, so a key in both takes the value from the file;
+`rekcod app env unset blog KEY` removes one. `[resources]` values the file leaves out
+keep the app's current ones.
+
 To make `mini` the default for fleet commands:
 
 ```sh

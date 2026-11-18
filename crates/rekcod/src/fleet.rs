@@ -4571,11 +4571,13 @@ fn upsert_app<'a>(c: &'a Controller, ns: &str, who: &Caller, b: &Value, preview_
     if spread.is_some_and(|s| !matches!(s, "soft" | "strict")) {
         bail!("spread must be soft or strict");
     }
-    let cpus = spec_count(b, "cpus", 1, MAX_CPUS)?;
-    let mem = spec_count(b, "memory_gib", 1, MAX_MEMORY_GIB)?;
+    // Left out keeps an existing app's resources (1 CPU and 1 GiB for a new app).
+    let cpus = b.get("cpus").filter(|v| !v.is_null()).map(|_| spec_count(b, "cpus", 1, MAX_CPUS)).transpose()?;
+    let mem = b.get("memory_gib").filter(|v| !v.is_null()).map(|_| spec_count(b, "memory_gib", 1, MAX_MEMORY_GIB)).transpose()?;
     let health = b["health"].as_str().unwrap_or("/");
     let start = b["start"].as_str();
-    let env = b.get("env").filter(|e| e.is_object()).map(|e| e.to_string());
+    // Merged over the stored env below: keys set with `app env set` survive a deploy.
+    let env = b.get("env").and_then(Value::as_object).map(env_strings);
     // None keeps an existing app's visibility; new apps are private.
     let public = b["public"].as_bool();
     let idle_stop = spec_secs(b, "idle_stop_secs")?;
@@ -4595,13 +4597,16 @@ fn upsert_app<'a>(c: &'a Controller, ns: &str, who: &Caller, b: &Value, preview_
     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let tx = db.0.transaction()?;
     use rusqlite::OptionalExtension;
-    let row: Option<(String, String, Option<String>, bool, i64, i64)> = tx
-        .query_row("select owner, ns, preview_of, destroying is not null, generation, instances from apps where name = ?1", [&name], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
-        })
+    type Stored = (String, String, Option<String>, bool, i64, i64, i64, i64, String);
+    let row: Option<Stored> = tx
+        .query_row(
+            "select owner, ns, preview_of, destroying is not null, generation, instances, cpus, memory_gib, env from apps where name = ?1",
+            [&name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
+        )
         .optional()?;
     let generation = match &row {
-        Some((owner, row_ns, row_preview, destroying, generation, _)) => {
+        Some((owner, row_ns, row_preview, destroying, generation, ..)) => {
             if *destroying {
                 bail!("{short} is being destroyed; deploy it again once that has finished");
             }
@@ -4630,6 +4635,13 @@ fn upsert_app<'a>(c: &'a Controller, ns: &str, who: &Caller, b: &Value, preview_
         }
     };
     let instances = instances.or(row.as_ref().map(|r| r.5)).unwrap_or(1).max(1);
+    let cpus = cpus.or(row.as_ref().map(|r| r.6)).unwrap_or(1);
+    let mem = mem.or(row.as_ref().map(|r| r.7)).unwrap_or(1);
+    let env = env.map(|new| {
+        let mut merged: serde_json::Map<String, Value> = row.as_ref().and_then(|r| serde_json::from_str(&r.8).ok()).unwrap_or_default();
+        merged.extend(new);
+        Value::Object(merged).to_string()
+    });
     Controller::quota_on(&tx, ns, &name, instances.saturating_mul(cpus), instances.saturating_mul(mem), 0)?;
     if row.is_some() {
         tx.execute(
@@ -4661,6 +4673,11 @@ fn upsert_app<'a>(c: &'a Controller, ns: &str, who: &Caller, b: &Value, preview_
     tx.execute("update apps set deploying = deploying + 1 where name = ?1", [&name])?;
     tx.commit()?;
     Ok(Admitted { c, key: name, generation, short })
+}
+
+/// Env values as strings, which is what reaches the container: `4` becomes `"4"`.
+fn env_strings(m: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    m.iter().map(|(k, v)| (k.clone(), json!(v.as_str().map(String::from).unwrap_or_else(|| v.to_string())))).collect()
 }
 
 fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[&str], b: &Value, q: &[(String, String)]) -> Result<Value> {
@@ -4750,23 +4767,29 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
         ("POST", ["apps", name, "env"]) | ("POST", ["apps", name, "secrets"]) => {
             let app = load(name, Role::Member)?;
             let secrets = seg[2] == "secrets";
-            let mut map = if secrets { app.secrets.clone() } else { app.env.clone() };
-            for (k, v) in b["set"].as_object().into_iter().flatten() {
-                map[k] = v.clone();
-            }
-            for k in b["unset"].as_array().into_iter().flatten().filter_map(|k| k.as_str()) {
-                map.as_object_mut().map(|m| m.remove(k));
-            }
+            let col = if secrets { "secrets" } else { "env" };
+            let mut set = env_strings(&b["set"].as_object().cloned().unwrap_or_default());
             if secrets {
-                for v in map.as_object_mut().into_iter().flat_map(|m| m.values_mut()) {
-                    let plain = v.as_str().map(String::from).unwrap_or_else(|| v.to_string());
-                    *v = json!(c.seal(ns, &plain)?);
+                for v in set.values_mut() {
+                    *v = json!(c.seal(ns, v.as_str().unwrap_or(""))?);
                 }
             }
-            let col = if secrets { "secrets" } else { "env" };
-            c.db.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .execute(&format!("update apps set {col} = ?2 where name = ?1"), &[&app.name, &map.to_string()])?;
+            // Read, merge and write in one transaction: two edits at once both stick.
+            {
+                let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                let tx = db.0.transaction()?;
+                let stored: String = tx.query_row(&format!("select {col} from apps where name = ?1"), [&app.name], |r| r.get(0))?;
+                let mut map: serde_json::Map<String, Value> = serde_json::from_str(&stored).unwrap_or_default();
+                map.extend(set);
+                for k in b["unset"].as_array().into_iter().flatten().filter_map(|k| k.as_str()) {
+                    map.remove(k);
+                }
+                tx.execute(
+                    &format!("update apps set {col} = ?2 where name = ?1"),
+                    rusqlite::params![app.name, Value::Object(map).to_string()],
+                )?;
+                tx.commit()?;
+            }
             let Some(commit) = live_commit(c, &app.name)? else { return Ok(json!({"updated": col})) };
             deploy(c, &load(name, Role::Member)?, Some(commit), &who.name)
         }
@@ -7921,6 +7944,33 @@ mod tests {
         let tail = v["log"].as_str().unwrap();
         assert!(tail.ends_with("last line\n") && tail.len() == JOB_LOG_BYTES, "{}", tail.len());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_deploy_keeps_env_set_by_hand_and_resources_it_leaves_out() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let who = Caller::system("t");
+        let deploy_body = |env: Value| json!({"name": "web", "git": {"url": "u"}, "env": env});
+        let mut first = deploy_body(json!({"A": "1"}));
+        first["cpus"] = json!(2);
+        first["memory_gib"] = json!(4);
+        drop(upsert_app(&c, "default", &who, &first, None).unwrap());
+        // Two edits at once, one with a number from an API client.
+        let edit = |set: Value| {
+            let c = c.clone();
+            std::thread::spawn(move || {
+                apps_route(&c, &Caller::system("t"), "default", "POST", &["apps", "web", "env"], &json!({"set": set}), &[])
+            })
+        };
+        let (x, y) = (edit(json!({"LOG_LEVEL": "debug"})), edit(json!({"WORKERS": 4})));
+        x.join().unwrap().unwrap();
+        y.join().unwrap().unwrap();
+        // The next deploy sends rekcod.toml's [env] and no resources.
+        drop(upsert_app(&c, "default", &who, &deploy_body(json!({"A": "2"})), None).unwrap());
+        let r = c.db.lock().unwrap().query_one("select env, cpus, memory_gib from apps", &[]).unwrap();
+        let env: Value = serde_json::from_str(&r.get::<String>(0)).unwrap();
+        assert_eq!(env, json!({"A": "2", "LOG_LEVEL": "debug", "WORKERS": "4"}));
+        assert_eq!((r.get::<i64>(1), r.get::<i64>(2)), (2, 4));
     }
 
     #[test]

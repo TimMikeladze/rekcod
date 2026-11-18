@@ -538,6 +538,8 @@ pub struct FleetNode {
     pub id: String,
     pub state: String,
     pub last_seen: Option<u64>,
+    /// Drained by an admin; stays so while the node is `lost`.
+    pub drained: bool,
 }
 
 /// A client IP the edges saw in the last 10 minutes.
@@ -709,6 +711,7 @@ fn remote_data(paths: &Paths) -> RemoteData {
                         id: n["id"].as_str().unwrap_or_default().into(),
                         state: n["state"].as_str().unwrap_or_default().into(),
                         last_seen: n["last_seen"].as_u64(),
+                        drained: n["drained"].as_bool().unwrap_or(false),
                     })
                     .collect(),
             )
@@ -1502,7 +1505,7 @@ pub fn job_actions(j: &RemoteJob) -> Vec<Action> {
 /// Admin token only: drain a node, or put a drained one back.
 pub fn node_actions(n: &FleetNode) -> Vec<Action> {
     let id = n.id.as_str();
-    if n.state == "drain" {
+    if n.drained || n.state == "drain" {
         vec![Action::rekcod(Kind::NodeUndrain, "Undrain (place sandboxes again)", &["node", "undrain", id])]
     } else {
         vec![
@@ -1695,8 +1698,8 @@ pub mod tests {
 
     pub fn sample_nodes() -> Vec<FleetNode> {
         vec![
-            FleetNode { id: "n-1".into(), state: "ready".into(), last_seen: Some(0) },
-            FleetNode { id: "n-2".into(), state: "drain".into(), last_seen: Some(0) },
+            FleetNode { id: "n-1".into(), state: "ready".into(), last_seen: Some(0), drained: false },
+            FleetNode { id: "n-2".into(), state: "drain".into(), last_seen: Some(0), drained: true },
         ]
     }
 
@@ -1782,6 +1785,12 @@ pub mod tests {
         all.extend(controller_actions(true));
         all.extend(remote_actions(&sample_remotes()));
         all
+    }
+
+    #[test]
+    fn a_drained_node_that_went_lost_is_still_undrained() {
+        let n = FleetNode { id: "n-3".into(), state: "lost".into(), last_seen: Some(0), drained: true };
+        assert_eq!(node_actions(&n).iter().map(|a| a.kind).collect::<Vec<_>>(), [Kind::NodeUndrain]);
     }
 
     #[test]

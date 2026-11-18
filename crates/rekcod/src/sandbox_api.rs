@@ -601,6 +601,9 @@ pub fn serve(paths: Paths, policy: Policy, listen: Option<String>) -> Result<()>
 /// Connections served at once by the threaded HTTP servers (sandbox API, node, controller).
 const MAX_CONNECTIONS: usize = 256;
 static CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Unix time of the last connection refused for that; the controller doesn't mark nodes lost
+/// right after, since their heartbeats may have been refused too.
+pub(crate) static LAST_REFUSED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// Runs `f` on its own thread unless [`MAX_CONNECTIONS`] are already being served; then the
 /// connection (owned by `f`) is dropped, which closes it.
@@ -608,6 +611,8 @@ pub(crate) fn spawn_limited<T: Send + 'static>(f: impl FnOnce() -> T + Send + 's
     use std::sync::atomic::Ordering;
     if CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
         CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        LAST_REFUSED.store(t, Ordering::SeqCst);
         eprintln!("rekcod: {MAX_CONNECTIONS} connections open; refusing another");
         return;
     }

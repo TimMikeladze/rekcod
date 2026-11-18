@@ -1216,7 +1216,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             let (disk_total, disk_free) = (disk.map(|d| d.0), disk.map(|d| d.1));
             let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs,
                               "cpus": crate::cli::sysctl_u64("hw.ncpu"), "load": load_average(),
-                              "disk_total_gib": disk_total, "disk_free_gib": disk_free});
+                              "disk_total_gib": disk_total, "disk_free_gib": disk_free, "now": now()});
             match call_within(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body, QUICK) {
                 Ok(v) => {
                     let mut ips: Vec<IpAddr> =
@@ -1406,7 +1406,14 @@ const MIGRATIONS: &[&str] = &[
     "update jobs set state = 'failed', log = coalesce(log, '') || 'rekcod: lost before an upgrade' || char(10)
        where state = 'lost' and finished is not null;
      create table if not exists leftover_storage (bucket text, storage_key text, app text not null, since integer not null);",
+    // A drain is kept apart from liveness: `state` is only pending, ready or lost, so a
+    // drained node that misses heartbeats comes back drained.
+    "alter table nodes add column drained integer not null default 0;
+     update nodes set drained = 1, state = 'ready' where state = 'drain';",
 ];
+
+/// A node's state as shown: `drain` for a drained node that answers.
+const NODE_STATE: &str = "case when drained and state = 'ready' then 'drain' else state end";
 
 pub struct Db(rusqlite::Connection);
 
@@ -1519,6 +1526,47 @@ struct Controller {
     node_ca: Option<crate::tls::Ca>,
     /// Names in the controller's own certificate, never issued to a node.
     own_names: Vec<String>,
+    track: Track,
+}
+
+/// In-memory bookkeeping for the watchdog and launches.
+#[derive(Default)]
+struct Track {
+    /// Wall-clock time of the last lost-nodes pass, and the time before which no node is
+    /// marked lost (the controller itself was away).
+    lost_pass: Mutex<(i64, i64)>,
+    /// Open node calls, per node, that may create a fleet sandbox the controller hasn't
+    /// recorded yet. The orphan check leaves that node alone meanwhile.
+    launching: Mutex<HashMap<String, usize>>,
+    /// Apps whose recycle failed and was alerted; cleared when one succeeds.
+    recycle_failed: Mutex<std::collections::HashSet<String>>,
+}
+
+/// A sandbox on a node that stopped answering: only a delete works on it.
+#[derive(Debug)]
+struct LostSandbox(String);
+
+impl std::fmt::Display for LostSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for LostSandbox {}
+
+/// Counts a node call in [`Track::launching`] until dropped.
+struct Launching<'a>(&'a Controller, String);
+
+impl Drop for Launching<'_> {
+    fn drop(&mut self) {
+        let mut m = self.0.track.launching.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(n) = m.get_mut(&self.1) {
+            *n -= 1;
+            if *n == 0 {
+                m.remove(&self.1);
+            }
+        }
+    }
 }
 
 struct Caller {
@@ -1620,7 +1668,13 @@ impl Controller {
             ca_pem: None,
             node_ca: None,
             own_names: vec![],
+            track: Track::default(),
         }
+    }
+
+    fn launching(&self, node: &str) -> Launching<'_> {
+        *self.track.launching.lock().unwrap_or_else(std::sync::PoisonError::into_inner).entry(node.to_string()).or_default() += 1;
+        Launching(self, node.to_string())
     }
 
     /// Posts `{"text": msg}` to `--alert-webhook` (Slack and Discord both take that shape),
@@ -1703,7 +1757,7 @@ impl Controller {
     /// only gets its pool; other namespaces never get pooled nodes.
     fn place(&self, mib: i64, macos: bool, ns: &str) -> Result<Vec<(String, String, String)>> {
         let rows = self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
-            "select id, url, secret from nodes where state = 'ready' and last_seen > ?1 and mem_free >= ?2
+            "select id, url, secret from nodes where state = 'ready' and not drained and last_seen > ?1 and mem_free >= ?2
              and (not ?3 or macos_free > 0)
              and case when exists(select 1 from node_pools where ns = ?4) then id in (select node from node_pools where ns = ?4)
                       else id not in (select node from node_pools) end
@@ -1745,7 +1799,7 @@ impl Controller {
             bail!(sandbox::NoSandbox(id.into()));
         }
         if state == "lost" {
-            bail!("sandbox {id} is on node {node}, which stopped answering");
+            bail!(LostSandbox(format!("sandbox {id} is on node {node}, which stopped answering")));
         }
         self.node(&node)
     }
@@ -1757,22 +1811,23 @@ impl Controller {
     /// CPUs, GiB and sandbox/job count in use or held in `ns`, leaving out app `skip_app`. Apps
     /// count while they have a live release (sleeping ones too, so a wake never hits the quota)
     /// or an admitted deploy still running, and not once their destroy has begun. They're
-    /// charged at least one instance, CPU and GiB, which is what a deploy starts.
+    /// charged at least one instance, CPU and GiB, which is what a deploy starts. A `lost`
+    /// sandbox still has its VM until its node returns or it's deleted.
     fn usage_on(db: &rusqlite::Connection, ns: &str, skip_app: &str) -> Result<(i64, i64, i64)> {
         const APPS: &str = "from apps where ns = ?1 and name <> ?2 and destroying is null and (live_release is not null or deploying > 0)";
         let sql = format!(
             "select
                coalesce((select sum(max(instances, 1) * max(cpus, 1)) {APPS}), 0)
-             + coalesce((select sum(cpus) from sandboxes s where ns = ?1 and state = 'running'
+             + coalesce((select sum(cpus) from sandboxes s where ns = ?1 and state in ('running', 'lost')
                            and not exists(select 1 from instances i where i.sandbox = s.id)), 0)
              + coalesce((select sum(coalesce(json_extract(spec, '$.cpus'), 2)) from jobs where ns = ?1
                            and state in {JOB_ACTIVE_SQL}), 0),
                coalesce((select sum(max(instances, 1) * max(memory_gib, 1)) {APPS}), 0)
-             + coalesce((select sum(memory_gib) from sandboxes s where ns = ?1 and state = 'running'
+             + coalesce((select sum(memory_gib) from sandboxes s where ns = ?1 and state in ('running', 'lost')
                            and not exists(select 1 from instances i where i.sandbox = s.id)), 0)
              + coalesce((select sum(coalesce(json_extract(spec, '$.memory_gib'), 2)) from jobs where ns = ?1
                            and state in {JOB_ACTIVE_SQL}), 0),
-               (select count(*) from sandboxes s where ns = ?1 and state = 'running'
+               (select count(*) from sandboxes s where ns = ?1 and state in ('running', 'lost')
                   and not exists(select 1 from instances i where i.sandbox = s.id))
              + (select count(*) from jobs where ns = ?1 and state in {JOB_ACTIVE_SQL})"
         );
@@ -1901,7 +1956,7 @@ fn metrics(c: &Controller) -> Result<String> {
         }
         Ok(())
     };
-    gauge("rekcod_nodes", "Nodes by state.", "select state, count(*) from nodes group by state", "state")?;
+    gauge("rekcod_nodes", "Nodes by state.", &format!("select {NODE_STATE}, count(*) from nodes group by 1"), "state")?;
     gauge(
         "rekcod_instances",
         "App instances by state.",
@@ -1959,16 +2014,46 @@ fn watchdog(c: Arc<Controller>) {
     every("reconcile", Duration::from_secs(10), Duration::from_secs(30), reconcile);
 }
 
+/// The lost-nodes pass runs every 5 s; a longer gap means the controller itself was away.
+const LOST_PASS_GAP: i64 = 15;
+
 fn mark_lost_nodes(c: &Arc<Controller>) -> Result<()> {
-    let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let lost =
-        db.query("update nodes set state = 'lost' where state in ('ready', 'drain') and last_seen < ?1 returning id", &[&(now() - 15)])?;
-    for r in &lost {
-        let id: String = r.get(0);
-        db.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", &[&id])?;
-        db.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping')", &[&id])?;
-        // Not over: the worker may still run them. `poll_jobs` keeps asking.
-        db.execute("update jobs set state = 'lost' where node = ?1 and state = 'running'", &[&id])?;
+    let t = now();
+    {
+        // The Mac slept, the process was stopped, or the clock stepped: every last_seen looks
+        // stale although no node failed. Give them three beats, as after a restart. Wall
+        // clock, since an Instant doesn't advance while a Mac sleeps.
+        let mut pass = c.track.lost_pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pass.0 != 0 && (t - pass.0 > LOST_PASS_GAP || t < pass.0) {
+            eprintln!("rekcod: no lost-nodes pass for {}s; waiting 20s for heartbeats", t - pass.0);
+            pass.1 = t + 20;
+        }
+        pass.0 = t;
+        if t < pass.1 {
+            return Ok(());
+        }
+    }
+    // Connections were refused: heartbeats may have been among them.
+    if t - crate::sandbox_api::LAST_REFUSED.load(std::sync::atomic::Ordering::SeqCst) < 15 {
+        return Ok(());
+    }
+    let lost: Vec<String> = {
+        let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tx = db.0.transaction()?;
+        let lost: Vec<String> = tx
+            .prepare("update nodes set state = 'lost' where state = 'ready' and last_seen < ?1 returning id")?
+            .query_map([t - 15], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in &lost {
+            tx.execute("update sandboxes set state = 'lost' where node = ?1 and state = 'running'", [id])?;
+            tx.execute("update instances set state = 'lost' where node = ?1 and state in ('live', 'sleeping')", [id])?;
+            // Not over: the worker may still run them. `poll_jobs` keeps asking.
+            tx.execute("update jobs set state = 'lost' where node = ?1 and state = 'running'", [id])?;
+        }
+        tx.commit()?;
+        lost
+    };
+    for id in lost {
         eprintln!("rekcod: node {id} lost (no heartbeat for 15s)");
         c.alert(&format!("node {id} lost"));
     }
@@ -2053,7 +2138,7 @@ const HEALTH_STRIKES: u32 = 3;
 fn reconcile(c: &Arc<Controller>) -> Result<()> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select i.sandbox, i.endpoint, a.health, i.state from instances i join apps a on a.name = i.app join nodes n on n.id = i.node
-         where n.state in ('ready', 'drain') and i.state in ('live', 'lost')",
+         where n.state = 'ready' and i.state in ('live', 'lost')",
         &[],
     )?;
     let checks: Vec<_> = rows
@@ -2108,7 +2193,7 @@ fn reconcile(c: &Arc<Controller>) -> Result<()> {
     let apps = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select a.name, a.instances,
            (select count(*) from instances i join nodes n on n.id = i.node where i.app = a.name and i.state = 'live'
-             and n.state = 'ready' and n.last_seen > ?1),
+             and n.state = 'ready' and not n.drained and n.last_seen > ?1),
            (select count(*) from instances i where i.app = a.name and i.state = 'sleeping'),
            r.commit_sha
          from apps a join releases r on r.app = a.name and r.n = a.live_release where a.destroying is null",
@@ -2393,13 +2478,18 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                 // gone, are deleted on the node, once they're older than any deploy in flight.
                 let mut delete: Vec<String> = Vec::new();
                 if let Some(have) = body["sandboxes"].as_array() {
+                    // Ages on the node's clock, which `created` is on; older nodes don't send it.
+                    let node_now = body["now"].as_i64().unwrap_or_else(now);
                     // Nodes from before this send bare ids; their sandboxes are never orphans.
                     let old_enough: Vec<&str> = have
                         .iter()
-                        .filter(|v| v["created"].as_i64().is_some_and(|t| t < now() - 600))
+                        .filter(|v| v["created"].as_i64().is_some_and(|t| t < node_now - 600))
                         .filter_map(|v| v["id"].as_str())
                         .collect();
                     let have: Vec<&str> = have.iter().filter_map(|v| v.as_str().or(v["id"].as_str())).collect();
+                    // A launch or create on this node that hasn't been recorded yet: its VM is
+                    // in the list but not in the database, and may build for longer than 600 s.
+                    let launching = c.track.launching.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_key(*id);
                     let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     for r in db.query("select sandbox from instances where node = ?1 and state in ('live', 'sleeping')", &[id])? {
                         let sb: String = r.get(0);
@@ -2407,9 +2497,21 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                             db.execute("update instances set state = 'lost' where sandbox = ?1", &[&sb])?;
                         }
                     }
+                    // User sandboxes marked lost while the node was silent: back to running if
+                    // it still has them, gone if it doesn't. Instances are restored by reconcile.
+                    let lost = db.query(
+                        "select id from sandboxes s where node = ?1 and state = 'lost'
+                           and not exists(select 1 from instances i where i.sandbox = s.id)",
+                        &[id],
+                    )?;
+                    for r in lost {
+                        let sb: String = r.get(0);
+                        let state = if have.contains(&sb.as_str()) { "running" } else { "removed" };
+                        db.execute("update sandboxes set state = ?2 where id = ?1 and state = 'lost'", &[&sb, &state])?;
+                    }
                     for sb in old_enough {
                         let known = db.query_opt("select 1 from sandboxes where id = ?1 and state in ('running', 'lost')", &[&sb])?;
-                        if known.is_none() && c.started.elapsed() > Duration::from_secs(600) {
+                        if known.is_none() && !launching && c.started.elapsed() > Duration::from_secs(600) {
                             delete.push(sb.to_string());
                         }
                     }
@@ -2454,10 +2556,10 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         ("GET", ["nodes"]) => admin_only().and_then(|_| {
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let rows = db.query(
-                "select id, url, mem_total, mem_free, last_seen, state, cpus, load, disk_total, disk_free,
+                &format!("select id, url, mem_total, mem_free, last_seen, {NODE_STATE}, cpus, load, disk_total, disk_free,
                    (select count(*) from instances i where i.node = n.id and i.state in ('live', 'starting', 'sleeping', 'draining')),
-                   (select count(*) from jobs j where j.node = n.id and j.state = 'running'), zone
-                 from nodes n order by id",
+                   (select count(*) from jobs j where j.node = n.id and j.state = 'running'), zone, drained
+                 from nodes n order by id"),
                 &[],
             )?;
             let pools = db.query("select node, ns from node_pools order by ns", &[])?;
@@ -2472,7 +2574,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                             "cpus": r.get::<Option<i64>>(6), "load": r.get::<Option<i64>>(7).map(|l| l as f64 / 100.0),
                             "disk_total_gib": r.get::<Option<i64>>(8), "disk_free_gib": r.get::<Option<i64>>(9),
                             "instances": r.get::<i64>(10), "jobs_running": r.get::<i64>(11),
-                            "zone": r.get::<String>(12),
+                            "zone": r.get::<String>(12), "drained": r.get::<bool>(13),
                         })
                     })
                     .collect::<Vec<_>>()
@@ -2525,7 +2627,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             let n =
                 c.db.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .execute("update nodes set state = 'ready' where id = ?1 and state = 'drain'", &[id])?;
+                    .execute("update nodes set drained = 0 where id = ?1 and drained", &[id])?;
             if n == 0 {
                 bail!("node {id} isn't drained");
             }
@@ -2720,6 +2822,14 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             let need = if m == "GET" { Role::Viewer } else { Role::Member };
             let node_path = format!("/{}", seg.join("/"));
             match c.sandbox_node(&ns, id, &who, need) {
+                // Forgotten here now; the VM is deleted when its node reports it again.
+                Err(e) if delete && e.is::<LostSandbox>() => (|| {
+                    c.db.lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .execute("update sandboxes set state = 'removed' where id = ?1 and state = 'lost'", &[id])?;
+                    c.audit(&ns, &who.name, "DELETE ", id, true);
+                    Ok(json!({"removed": true, "id": id, "note": "its node stopped answering; the VM is deleted when it's back"}))
+                })(),
                 Err(e) => Err(e),
                 Ok((url, sec, _)) if fork => (|| {
                     let (cpus, gib): (i64, i64) = {
@@ -2732,13 +2842,14 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                     let ql = c.quota_lock(&ns);
                     let _quota = ql.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                     c.check_quota(&ns, "", cpus, gib, 1)?;
-                    let mut v = call(&url, "POST", &node_path, Some(&sec), &body)?;
-                    let child = v["id"].as_str().context("node returned no id")?.to_string();
                     let node: String =
                         c.db.lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .query_one("select node from sandboxes where id = ?1", &[id])?
                             .get(0);
+                    let _launching = c.launching(&node);
+                    let mut v = call(&url, "POST", &node_path, Some(&sec), &body)?;
+                    let child = v["id"].as_str().context("node returned no id")?.to_string();
                     c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).execute(
                         "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
                         &[&child, &node, &who.name, &now(), &ns, &cpus, &gib],
@@ -2814,6 +2925,7 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
         let what = if macos { format!("a free macOS slot and {mib} MiB") } else { format!("{mib} MiB free") };
         return err(w, format!("no node has {what}"));
     };
+    let launching = c.launching(&node);
     let mut v = match call(&url, "POST", "/sandboxes", Some(&sec), &body) {
         Ok(v) => v,
         Err(e) => return err(w, format!("node {node}: {e:#}")),
@@ -2823,6 +2935,7 @@ fn create_sandbox(c: &Arc<Controller>, who: &Caller, ns: &str, req: &crate::sand
         "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, ?2, ?3, 'running', ?4, ?5, ?6, ?7)",
         &[&id, &node, &who.name, &now(), &ns, &cpus, &gib],
     )?;
+    drop(launching);
     c.audit(ns, &who.name, "create", &id, true);
     v["node"] = json!(node);
     v["ns"] = json!(ns);
@@ -3172,7 +3285,7 @@ impl Controller {
             "select n.id, n.url, n.secret, n.zone, n.mem_free,
                (select count(*) from instances i where i.node = n.id and i.app = ?1 and i.release = ?2
                  and i.state in ('live', 'starting', 'sleeping'))
-             from nodes n where n.state = 'ready' and n.last_seen > ?3
+             from nodes n where n.state = 'ready' and not n.drained and n.last_seen > ?3
                and case when exists(select 1 from node_pools where ns = ?4)
                  then n.id in (select node from node_pools where ns = ?4)
                  else n.id not in (select node from node_pools) end",
@@ -3376,6 +3489,7 @@ fn launch_instances(
             bail!("{} was destroyed during this deploy", app.short);
         }
         let mut handles = Vec::new();
+        let mut launching = Vec::new();
         // Build and store once before launching the other replicas in parallel.
         let batch = if spec["store"]["cached"] == json!(false) { 1 } else { count - result.started.len() };
         for _ in 0..batch {
@@ -3383,6 +3497,7 @@ fn launch_instances(
             let n = &placement.nodes[i];
             log.push(format!("placing instance on {}", n.id));
             let (url, secret, spec) = (n.url.clone(), n.secret.clone(), spec.clone());
+            launching.push(c.launching(&n.id));
             handles.push((i, std::thread::spawn(move || call(&url, "POST", "/instances", Some(&secret), &spec))));
         }
         if handles.is_empty() {
@@ -3413,6 +3528,8 @@ fn launch_instances(
                 }
             }
         }
+        // Every reply is recorded (or its sandbox deleted): the orphan check may look again.
+        drop(launching);
         let t0 = Instant::now();
         while !pending.is_empty() && t0.elapsed() < Duration::from_secs(30) {
             pending.retain(|(_, instance)| {
@@ -3483,7 +3600,7 @@ fn top_up_locked(c: &Arc<Controller>, app: &App) -> Result<usize> {
         let Some(r) = db.query_opt(
             "select r.n, r.commit_sha,
                (select count(*) from instances i join nodes n on n.id = i.node where i.app = a.name and i.release = r.n
-                 and i.state = 'live' and n.state = 'ready' and n.last_seen > ?2),
+                 and i.state = 'live' and n.state = 'ready' and not n.drained and n.last_seen > ?2),
                (select count(*) from instances i where i.app = a.name and i.state = 'sleeping')
              from apps a join releases r on r.app = a.name and r.n = a.live_release
              where a.name = ?1 and a.generation = ?3 and a.destroying is null",
@@ -3562,7 +3679,7 @@ fn retire_drained(c: &Arc<Controller>, app: &App, release: i32) -> Result<()> {
         let rows = db.query(
             "update instances set state = 'draining' where sandbox in
                (select i.sandbox from instances i join nodes n on n.id = i.node where i.app = ?1 and i.release = ?2
-                 and i.state = 'live' and n.state = 'drain' order by i.sandbox limit ?3) returning node, sandbox",
+                 and i.state = 'live' and n.drained order by i.sandbox limit ?3) returning node, sandbox",
             &[&app.name, &release, &surplus],
         )?;
         rows.into_iter().map(|r| (r.get::<String>(0), r.get::<String>(1))).collect::<Vec<_>>()
@@ -3582,9 +3699,11 @@ fn retire_drained(c: &Arc<Controller>, app: &App, release: i32) -> Result<()> {
 fn drain_node(c: &Arc<Controller>, id: &str) -> Result<Value> {
     {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if db.execute("update nodes set state = 'drain' where id = ?1", &[&id])? == 0 {
-            bail!("no node {id}");
+        let Some(r) = db.query_opt("select state from nodes where id = ?1", &[&id])? else { bail!("no node {id}") };
+        if r.get::<String>(0) == "pending" {
+            bail!("node {id} is waiting for approval; `rekcod node rm {id}` if it shouldn't join");
         }
+        db.execute("update nodes set drained = 1 where id = ?1", &[&id])?;
     }
     // A deploy can have selected this Mac before the drain, but not registered its VM yet.
     // Stop placement first, then wait for those app operations before inspecting instances.
@@ -3674,7 +3793,12 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
         log.push("failed; the previous release keeps serving".into());
         finish("failed", &log);
         c.audit(&app.ns, who, "deploy", &format!("{} r{n}", app.short), false);
-        c.alert(&format!("{} r{n} failed to deploy; the previous release keeps serving", app.short));
+        // A recycle that keeps failing is alerted once, until one succeeds.
+        let first =
+            who != "recycle" || c.track.recycle_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(app.name.clone());
+        if first {
+            c.alert(&format!("{} r{n} failed to deploy; the previous release keeps serving", app.short));
+        }
         bail!("release {n} failed, the previous release keeps serving:\n{}", errors.join("\n"));
     }
     // The switch is one transaction: if any of it fails, the previous release keeps its
@@ -3752,6 +3876,7 @@ fn deploy_locked(c: &Arc<Controller>, app: &App, commit: Option<String>, who: &s
             .execute("update apps set health = ?2 where name = ?1", &[&app.name, &health])?;
     }
     c.audit(&app.ns, who, "deploy", &format!("{} r{n}", app.short), true);
+    c.track.recycle_failed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(&app.name);
     Ok(json!({"app": app.short, "ns": app.ns, "release": n, "commit": commit, "url": format!("http://{}.{}", app.name, c.domain),
               "instances": started.iter().map(|(n, s, e)| json!({"node": n, "sandbox": s, "endpoint": e})).collect::<Vec<_>>()}))
 }
@@ -3906,7 +4031,7 @@ fn wake(c: &Arc<Controller>, app: &App) -> Result<Vec<String>> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .execute("update apps set last_request = ?2 where name = ?1", &[&app.name, &now()]);
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
-        "select i.node, i.sandbox, i.endpoint, i.release = a.live_release from instances i join apps a on a.name = i.app
+        "select i.node, i.sandbox, i.endpoint, coalesce(i.release = a.live_release, 1) from instances i join apps a on a.name = i.app
          where i.app = ?1 and i.state = 'sleeping'",
         &[&app.name],
     )?;
@@ -3992,30 +4117,50 @@ fn sleep_idle(c: &Arc<Controller>) -> Result<()> {
         drop(_g);
         // Holds the app's lock until the VMs are down: a wake that comes in meanwhile waits,
         // instead of finding a VM that's still shutting down.
+        let c2 = c.clone();
         std::thread::spawn(move || {
             let _g = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             // After the edge's next route refresh (2 s), so requests in flight finish.
             std::thread::sleep(Duration::from_secs(3));
-            for (sb, node) in targets {
-                let r = node.and_then(|(url, sec, _)| call(&url, "POST", &format!("/sandboxes/{sb}/stop"), Some(&sec), &json!({})));
-                if let Err(e) = r {
-                    eprintln!("rekcod: stop {sb}: {e:#}");
-                }
-            }
+            stop_sleeping(&c2, targets);
         });
         c.audit("-", "watchdog", "sleep", &name, true);
     }
     Ok(())
 }
 
+type NodeTarget = Result<(String, String, String)>;
+
+/// Stops the VMs of instances put to sleep. The caller holds the app's lock.
+fn stop_sleeping(c: &Controller, targets: Vec<(String, NodeTarget)>) {
+    for (sb, node) in targets {
+        // A wake that got the lock between sleep_idle's hold and this one made it live again.
+        let asleep =
+            c.db.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .query_opt("select 1 from instances where sandbox = ?1 and state = 'sleeping'", &[&sb])
+                .is_ok_and(|r| r.is_some());
+        if !asleep {
+            continue;
+        }
+        let r = node.and_then(|(url, sec, _)| call(&url, "POST", &format!("/sandboxes/{sb}/stop"), Some(&sec), &json!({})));
+        if let Err(e) = r {
+            eprintln!("rekcod: stop {sb}: {e:#}");
+        }
+    }
+}
+
 /// Redeploys the live commit of apps whose live release is older than `recycle`, so
-/// fresh VMs replace ones holding memory macOS can't get back.
+/// fresh VMs replace ones holding memory macOS can't get back. After a failed recycle the
+/// next try waits `recycle` or an hour, whichever is shorter.
 fn recycle_due(c: &Arc<Controller>) -> Result<()> {
     let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
         "select a.name, r.commit_sha from apps a join releases r on r.app = a.name and r.n = a.live_release
          where a.recycle > 0 and a.destroying is null and r.created < ?1 - a.recycle
            and exists(select 1 from instances i where i.app = a.name and i.state = 'live')
-           and not exists(select 1 from releases b where b.app = a.name and b.state = 'building')",
+           and not exists(select 1 from releases b where b.app = a.name and b.state = 'building')
+           and not exists(select 1 from releases f where f.app = a.name and f.who = 'recycle' and f.state = 'failed'
+             and f.n > a.live_release and f.created > ?1 - min(a.recycle, 3600))",
         &[&now()],
     )?;
     for r in rows {
@@ -7047,7 +7192,7 @@ mod tests {
             )
             .unwrap();
         }
-        db.0.execute_batch(MIGRATIONS.last().unwrap()).unwrap();
+        db.0.execute_batch(MIGRATIONS.iter().find(|m| m.contains("lost before an upgrade")).unwrap()).unwrap();
         let mut state = |id: &str| db.query_one("select state from jobs where id = ?1", &[&id]).unwrap().get::<String>(0);
         assert_eq!((state("j-old"), state("j-new")), ("failed".into(), "lost".into()));
     }
@@ -7276,8 +7421,8 @@ mod tests {
         });
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let state: String = c.db.lock().unwrap().query_one("select state from nodes where id = 'drainme'", &[]).unwrap().get(0);
-            if state == "drain" {
+            let drained: bool = c.db.lock().unwrap().query_one("select drained from nodes where id = 'drainme'", &[]).unwrap().get(0);
+            if drained {
                 break;
             }
             assert!(Instant::now() < deadline);
@@ -7422,6 +7567,162 @@ mod tests {
         assert_eq!(state, "live");
     }
 
+    /// A heartbeat from node `id` (secret `s`) listing `sandboxes`, each made at `created`.
+    fn heartbeat(url: &str, id: &str, sandboxes: &[&str], created: i64) -> Value {
+        let sbs: Vec<Value> = sandboxes.iter().map(|s| json!({"id": s, "created": created})).collect();
+        call(url, "POST", &format!("/nodes/{id}/heartbeat"), Some("s"), &json!({"sandboxes": sbs, "now": now()})).unwrap()
+    }
+
+    fn node_state(c: &Controller, id: &str) -> (String, bool) {
+        let r = c.db.lock().unwrap().query_one("select state, drained from nodes where id = ?1", &[&id]).unwrap();
+        (r.get(0), r.get(1))
+    }
+
+    fn sandbox_state(c: &Controller, id: &str) -> String {
+        c.db.lock().unwrap().query_one("select state from sandboxes where id = ?1", &[&id]).unwrap().get(0)
+    }
+
+    /// A node that answers 200 to everything and records each request line.
+    fn recording_node(c: &Controller, id: &str) -> Arc<Mutex<Vec<String>>> {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        c.db.lock()
+            .unwrap()
+            .execute(
+                "insert into nodes (id, url, secret, mem_free, mem_total, last_seen) values (?1, ?2, 's', 0, 8192, ?3)",
+                &[&id, &url, &now()],
+            )
+            .unwrap();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let s2 = seen.clone();
+        std::thread::spawn(move || {
+            for s in l.incoming().flatten() {
+                let mut r = BufReader::new(s);
+                let req = crate::sandbox_api::read_request(&mut r).unwrap();
+                s2.lock().unwrap().push(format!("{} {}", req.method, req.path));
+                let _ = respond(r.get_mut(), 200, "application/json", b"{}");
+            }
+        });
+        seen
+    }
+
+    #[test]
+    fn a_drained_node_that_misses_heartbeats_comes_back_drained() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        instance_node(&c, "n1", 8192, false);
+        drain_node(&c, "n1").unwrap();
+        // The Mac reboots for its maintenance and is silent for 20 s.
+        c.db.lock().unwrap().execute("update nodes set last_seen = ?1", &[&(now() - 20)]).unwrap();
+        mark_lost_nodes(&c).unwrap();
+        assert_eq!(node_state(&c, "n1"), ("lost".into(), true));
+        heartbeat(&url, "n1", &[], now());
+        assert_eq!(node_state(&c, "n1"), ("ready".into(), true));
+        assert!(c.place(1024, false, "default").unwrap().is_empty(), "a drained node takes no work");
+        let nodes = call(&url, "GET", "/nodes", Some("admin-t"), &Value::Null).unwrap();
+        assert_eq!((nodes[0]["state"].as_str(), nodes[0]["drained"].as_bool()), (Some("drain"), Some(true)));
+        call(&url, "POST", "/nodes/n1/undrain", Some("admin-t"), &json!({})).unwrap();
+        assert_eq!(c.place(1024, false, "default").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn user_sandboxes_on_a_returning_node_run_again_or_go() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "alice-t", "alice", false, "member", false, None);
+        instance_node(&c, "n1", 8192, false);
+        {
+            let mut db = c.db.lock().unwrap();
+            for sb in ["sb1", "sb2", "sb3"] {
+                db.execute(
+                    "insert into sandboxes (id, node, owner, state, created, ns, cpus, memory_gib) values (?1, 'n1', 'alice', 'running', 0, 'default', 2, 2)",
+                    &[&sb],
+                )
+                .unwrap();
+            }
+            db.execute("update nodes set last_seen = ?1", &[&(now() - 20)]).unwrap();
+        }
+        mark_lost_nodes(&c).unwrap();
+        assert_eq!(sandbox_state(&c, "sb1"), "lost");
+        assert_eq!(c.usage("default", "").unwrap(), (6, 6, 3), "lost sandboxes keep their share until resolved");
+        // Deleting one while its node is away forgets it; the node deletes the VM once back.
+        call(&url, "DELETE", "/sandboxes/sb3", Some("alice-t"), &Value::Null).unwrap();
+        assert_eq!(sandbox_state(&c, "sb3"), "removed");
+        let reply = heartbeat(&url, "n1", &["sb1"], now());
+        assert_eq!((sandbox_state(&c, "sb1"), sandbox_state(&c, "sb2")), ("running".into(), "removed".into()));
+        assert_eq!(c.usage("default", "").unwrap(), (2, 2, 1));
+        assert_eq!(reply["delete"], json!([]));
+    }
+
+    #[test]
+    fn orphans_are_left_alone_while_a_launch_to_their_node_is_open() {
+        let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        ctl.started = Instant::now() - Duration::from_secs(700);
+        let (url, c) = serve_test(ctl);
+        instance_node(&c, "n1", 8192, false);
+        // A build still running after 11 minutes: the node lists its VM, the controller has no row yet.
+        let launch = c.launching("n1");
+        assert_eq!(heartbeat(&url, "n1", &["building"], now() - 660)["delete"], json!([]));
+        drop(launch);
+        assert_eq!(heartbeat(&url, "n1", &["building"], now() - 660)["delete"], json!(["building"]));
+    }
+
+    #[test]
+    fn a_controller_that_was_away_waits_for_heartbeats_before_marking_nodes_lost() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        instance_node(&c, "n1", 8192, false);
+        c.db.lock().unwrap().execute("update nodes set last_seen = ?1", &[&(now() - 60)]).unwrap();
+        // The previous pass was a minute ago: the Mac slept.
+        *c.track.lost_pass.lock().unwrap() = (now() - 60, 0);
+        mark_lost_nodes(&c).unwrap();
+        assert_eq!(node_state(&c, "n1").0, "ready");
+        // The grace is over and the node still hasn't answered.
+        c.track.lost_pass.lock().unwrap().1 = 0;
+        mark_lost_nodes(&c).unwrap();
+        assert_eq!(node_state(&c, "n1").0, "lost");
+    }
+
+    #[test]
+    fn a_failing_recycle_backs_off() {
+        let c = Arc::new(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        // No memory left for the second copy a rolling recycle needs.
+        let ep = instance_node(&c, "n1", 0, false);
+        recovery_app(&c, 1);
+        {
+            let mut db = c.db.lock().unwrap();
+            db.execute("update apps set recycle = 3600", &[]).unwrap();
+            db.execute("insert into instances values ('web', 7, 'r7', 'n1', ?1, 'live')", &[&ep]).unwrap();
+        }
+        let releases = || c.db.lock().unwrap().query_one("select count(*) from releases", &[]).unwrap().get::<i64>(0);
+        for _ in 0..4 {
+            recycle_due(&c).unwrap();
+            std::thread::sleep(Duration::from_millis(300));
+            wait_until(|| c.db.lock().unwrap().query_opt("select 1 from releases where state = 'building'", &[]).unwrap().is_none());
+        }
+        assert_eq!(releases(), 2, "one failed recycle, then a wait");
+        assert!(c.track.recycle_failed.lock().unwrap().contains("web"));
+    }
+
+    fn wait_until(mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn a_wake_between_sleep_and_stop_keeps_the_vm_running() {
+        let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+        let seen = recording_node(&c, "n1");
+        // sleep_idle marked it sleeping and let go of the lock; a wake made it live again.
+        c.db.lock().unwrap().execute("insert into instances values ('web', 7, 'sb', 'n1', 'ep', 'live')", &[]).unwrap();
+        stop_sleeping(&c, vec![("sb".into(), c.node("n1"))]);
+        assert!(seen.lock().unwrap().is_empty());
+        c.db.lock().unwrap().execute("update instances set state = 'sleeping'", &[]).unwrap();
+        stop_sleeping(&c, vec![("sb".into(), c.node("n1"))]);
+        assert_eq!(*seen.lock().unwrap(), ["POST /sandboxes/sb/stop"]);
+    }
+
     #[test]
     fn assignment_spreads_reserves_memory_and_honours_zones() {
         let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
@@ -7460,7 +7761,7 @@ mod tests {
             for (id, state, seen) in [
                 ("survivor", "ready", now()),
                 ("empty", "ready", now()),
-                ("drained", "drain", now()),
+                ("drained", "ready", now()),
                 ("stale", "ready", 0),
                 ("pending", "pending", now()),
                 ("pooled", "ready", now()),
@@ -7472,6 +7773,7 @@ mod tests {
                 )
                 .unwrap();
             }
+            db.execute("update nodes set drained = 1 where id = 'drained'", &[]).unwrap();
             db.execute("insert into node_pools values ('pooled', 'team')", &[]).unwrap();
             db.execute("insert into instances values ('web', 7, 'keep', 'survivor', 'ep', 'live')", &[]).unwrap();
         }

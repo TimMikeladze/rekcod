@@ -1254,7 +1254,7 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     for err in status.watch.set_roots(binds) {
         log!("{err}");
     }
-    apply_forwards(vm, status, true);
+    apply_forwards(vm, status, true).await;
     Ok(())
 }
 
@@ -1285,14 +1285,33 @@ async fn autoports(vm: Vm, status: Arc<Status>) {
             changed
         };
         if changed {
-            apply_forwards(&vm, &status, false);
+            apply_forwards(&vm, &status, false).await;
         }
     }
 }
 
 /// Opens and closes Mac listeners to match published + auto-detected ports.
 /// `retry_failed`: try again on ports that couldn't be bound before.
-fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
+/// What to do with a forward already in place, given the container that wants its binding now.
+#[derive(Debug, PartialEq)]
+enum Next {
+    Keep,
+    /// Same binding, another container name (`docker rename`, a swap seen in one step): the
+    /// tunnel goes by protocol and port, so the listener stays and only the name changes.
+    Rename(String),
+    Close,
+}
+
+fn next(fwd: &Forward, wanted: Option<&String>, retry_failed: bool) -> Next {
+    match wanted {
+        Some(name) if fwd.task.is_some() && *name == fwd.container => Next::Keep,
+        Some(name) if fwd.task.is_some() => Next::Rename(name.clone()),
+        Some(name) if *name == fwd.container && !retry_failed => Next::Keep,
+        _ => Next::Close,
+    }
+}
+
+async fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
     let mut want = status.listening.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     want.extend(status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
     let (want, refused) = status.scope.apply(want);
@@ -1304,21 +1323,38 @@ fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
         *last = refused;
     }
     let mut changed = false;
-    {
+    let mut closing = Vec::new();
+    // Ports our listeners hold now, including ones closed below.
+    let ours: BTreeSet<u16> = {
         let mut active = status.forwards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        // Ports our listeners hold now, including ones closed below (abort is asynchronous).
-        let ours: BTreeSet<u16> = active.iter().filter(|(_, f)| f.task.is_some()).map(|(b, _)| b.port).collect();
-        active.retain(|binding, fwd| {
-            let keep = want.get(binding) == Some(&fwd.container) && (fwd.task.is_some() || !retry_failed);
-            if !keep {
+        let ours = active.iter().filter(|(_, f)| f.task.is_some()).map(|(b, _)| b.port).collect();
+        active.retain(|binding, fwd| match next(fwd, want.get(binding), retry_failed) {
+            Next::Keep => true,
+            Next::Rename(name) => {
+                log!("port {}:{}/{:?} -> {name} (was {})", binding.addr, binding.port, binding.proto, fwd.container);
+                fwd.container = name;
+                changed = true;
+                true
+            }
+            Next::Close => {
                 if let Some(task) = fwd.task.take() {
                     task.abort();
+                    closing.push(task);
                     log!("port {}:{}/{:?} closed", binding.addr, binding.port, binding.proto);
                 }
                 changed = true;
+                false
             }
-            keep
         });
+        ours
+    };
+    // Abort is asynchronous: the socket is free once the task has ended, and a listener for
+    // another address on the same port binds only then.
+    for task in closing {
+        let _ = tokio::time::timeout(Duration::from_secs(1), task).await;
+    }
+    {
+        let mut active = status.forwards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for (binding, container) in want {
             if active.contains_key(&binding) {
                 continue;
@@ -1763,6 +1799,19 @@ mod tests {
         UdpSocket::bind(addr).await.expect("the port is free right away");
         let closed = tokio::time::timeout(Duration::from_secs(5), guest.read(&mut buf)).await;
         assert!(matches!(closed, Ok(Ok(0))), "the flow ended with it: {closed:?}");
+    }
+
+    #[tokio::test]
+    async fn a_renamed_container_keeps_its_listener() {
+        let open = || Forward { container: "web".into(), task: Some(tokio::spawn(async {})), error: None };
+        let failed = Forward { container: "web".into(), task: None, error: Some("in use".into()) };
+        let (web, api) = ("web".to_string(), "api".to_string());
+        assert_eq!(next(&open(), Some(&web), true), Next::Keep);
+        assert_eq!(next(&open(), Some(&api), true), Next::Rename("api".into()), "docker rename");
+        assert_eq!(next(&open(), None, true), Next::Close);
+        assert_eq!(next(&failed, Some(&web), false), Next::Keep, "not retried between docker events");
+        assert_eq!(next(&failed, Some(&web), true), Next::Close, "retried on the next event");
+        assert_eq!(next(&failed, Some(&api), false), Next::Close);
     }
 
     #[test]

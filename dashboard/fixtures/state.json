@@ -3215,7 +3215,7 @@
         },
         {
           "kind": "VolumeExport",
-          "label": "Export to ~/Downloads/redis-data.tar.gz",
+          "label": "Export to ~/Downloads",
           "argv": [
             "run",
             "--rm",
@@ -3224,12 +3224,11 @@
             "-v",
             "/Users/me/Downloads:/out",
             "alpine:3.24",
-            "tar",
-            "czf",
-            "/out/redis-data.tar.gz",
-            "-C",
-            "/v",
-            "."
+            "sh",
+            "-c",
+            "f=\"/out/$1-$(date +%Y%m%d-%H%M%S)\"; n=1; g=\"$f\"; while [ -e \"$g.tar.gz\" ]; do n=$((n+1)); g=\"$f-$n\"; done; tar czf \"$g.tar.gz\" -C /v . && echo \"${g#/out/}.tar.gz\"",
+            "sh",
+            "redis-data"
           ],
           "interactive": false,
           "confirm": null
@@ -3293,7 +3292,7 @@
         },
         {
           "kind": "VolumeExport",
-          "label": "Export to ~/Downloads/shop_pg.tar.gz",
+          "label": "Export to ~/Downloads",
           "argv": [
             "run",
             "--rm",
@@ -3302,12 +3301,11 @@
             "-v",
             "/Users/me/Downloads:/out",
             "alpine:3.24",
-            "tar",
-            "czf",
-            "/out/shop_pg.tar.gz",
-            "-C",
-            "/v",
-            "."
+            "sh",
+            "-c",
+            "f=\"/out/$1-$(date +%Y%m%d-%H%M%S)\"; n=1; g=\"$f\"; while [ -e \"$g.tar.gz\" ]; do n=$((n+1)); g=\"$f-$n\"; done; tar czf \"$g.tar.gz\" -C /v . && echo \"${g#/out/}.tar.gz\"",
+            "sh",
+            "shop_pg"
           ],
           "interactive": false,
           "confirm": null
@@ -3369,7 +3367,7 @@
         },
         {
           "kind": "VolumeExport",
-          "label": "Export to ~/Downloads/rekcod-snap.shop.before-migrate.shop_pg.tar.gz",
+          "label": "Export to ~/Downloads",
           "argv": [
             "run",
             "--rm",
@@ -3378,12 +3376,11 @@
             "-v",
             "/Users/me/Downloads:/out",
             "alpine:3.24",
-            "tar",
-            "czf",
-            "/out/rekcod-snap.shop.before-migrate.shop_pg.tar.gz",
-            "-C",
-            "/v",
-            "."
+            "sh",
+            "-c",
+            "f=\"/out/$1-$(date +%Y%m%d-%H%M%S)\"; n=1; g=\"$f\"; while [ -e \"$g.tar.gz\" ]; do n=$((n+1)); g=\"$f-$n\"; done; tar czf \"$g.tar.gz\" -C /v . && echo \"${g#/out/}.tar.gz\"",
+            "sh",
+            "rekcod-snap.shop.before-migrate.shop_pg"
           ],
           "interactive": false,
           "confirm": null
@@ -3456,7 +3453,7 @@
         },
         {
           "kind": "VolumeExport",
-          "label": "Export to ~/Downloads/rekcod-snap.shop.seeded.shop_pg.tar.gz",
+          "label": "Export to ~/Downloads",
           "argv": [
             "run",
             "--rm",
@@ -3465,12 +3462,11 @@
             "-v",
             "/Users/me/Downloads:/out",
             "alpine:3.24",
-            "tar",
-            "czf",
-            "/out/rekcod-snap.shop.seeded.shop_pg.tar.gz",
-            "-C",
-            "/v",
-            "."
+            "sh",
+            "-c",
+            "f=\"/out/$1-$(date +%Y%m%d-%H%M%S)\"; n=1; g=\"$f\"; while [ -e \"$g.tar.gz\" ]; do n=$((n+1)); g=\"$f-$n\"; done; tar czf \"$g.tar.gz\" -C /v . && echo \"${g#/out/}.tar.gz\"",
+            "sh",
+            "rekcod-snap.shop.seeded.shop_pg"
           ],
           "interactive": false,
           "confirm": null
@@ -3543,7 +3539,7 @@
         },
         {
           "kind": "VolumeExport",
-          "label": "Export to ~/Downloads/3f9c2a1b7d.tar.gz",
+          "label": "Export to ~/Downloads",
           "argv": [
             "run",
             "--rm",
@@ -3552,12 +3548,11 @@
             "-v",
             "/Users/me/Downloads:/out",
             "alpine:3.24",
-            "tar",
-            "czf",
-            "/out/3f9c2a1b7d.tar.gz",
-            "-C",
-            "/v",
-            "."
+            "sh",
+            "-c",
+            "f=\"/out/$1-$(date +%Y%m%d-%H%M%S)\"; n=1; g=\"$f\"; while [ -e \"$g.tar.gz\" ]; do n=$((n+1)); g=\"$f-$n\"; done; tar czf \"$g.tar.gz\" -C /v . && echo \"${g#/out/}.tar.gz\"",
+            "sh",
+            "3f9c2a1b7d"
           ],
           "interactive": false,
           "confirm": null

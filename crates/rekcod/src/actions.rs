@@ -1368,6 +1368,10 @@ pub fn network_actions(n: &Network) -> Vec<Action> {
 const CLONE: &str =
     r#"[ -z "$(ls -A /to)" ] || { echo "that volume already has files; clone into a new name" >&2; exit 1; }; cp -a /v/. /to/"#;
 
+/// `VolumeExport`'s archive of volume `$1`, in the helper container: a name with the time, and
+/// `-2`, `-3`... rather than overwriting a file of the same name.
+const EXPORT: &str = r#"f="/out/$1-$(date +%Y%m%d-%H%M%S)"; n=1; g="$f"; while [ -e "$g.tar.gz" ]; do n=$((n+1)); g="$f-$n"; done; tar czf "$g.tar.gz" -C /v . && echo "${g#/out/}.tar.gz""#;
+
 /// Where `VolumeExport` writes: `~/Downloads` (shared with the VM at the same path).
 fn downloads() -> PathBuf {
     PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Downloads")
@@ -1377,7 +1381,6 @@ pub fn volume_actions(v: &Volume) -> Vec<Action> {
     let n = v.name.as_str();
     let helper = crate::cli::HELPER_IMAGE;
     let ro = format!("{n}:/v:ro");
-    let tgz = format!("{n}.tar.gz");
     let out_dir = downloads();
     let mut out = vec![
         // `ls -ld` of up to 2000 paths, six levels deep.
@@ -1390,24 +1393,11 @@ pub fn volume_actions(v: &Volume) -> Vec<Action> {
         // Into a new (empty) volume only: copying over one that has files would mix the two.
         Action::rekcod(Kind::VolumeClone, "Clone", &["run", "--rm", "-v", &ro, "-v", "{target}:/to", helper, "sh", "-c", CLONE])
             .input(Input::new("target", "New volume", InputKind::Name, &format!("{n}-copy"))),
+        // A new file each time, named NAME-YYYYMMDD-HHMMSS.tar.gz.
         Action::rekcod(
             Kind::VolumeExport,
-            format!("Export to ~/Downloads/{tgz}"),
-            &[
-                "run",
-                "--rm",
-                "-v",
-                &ro,
-                "-v",
-                &format!("{}:/out", out_dir.display()),
-                helper,
-                "tar",
-                "czf",
-                &format!("/out/{tgz}"),
-                "-C",
-                "/v",
-                ".",
-            ],
+            "Export to ~/Downloads",
+            &["run", "--rm", "-v", &ro, "-v", &format!("{}:/out", out_dir.display()), helper, "sh", "-c", EXPORT, "sh", n],
         ),
     ];
     if v.containers.is_empty() {
@@ -1902,6 +1892,16 @@ pub mod tests {
             let a = Action::rekcod(Kind::ContainerLogs, "Logs", &["logs", bad]).interactive();
             assert_eq!(a.terminal_script(), None, "{bad:?}");
         }
+    }
+
+    #[test]
+    fn exports_never_overwrite() {
+        let v = &sample_volumes()[0];
+        let export = volume_actions(v).into_iter().find(|a| a.kind == Kind::VolumeExport).unwrap();
+        let Run::Rekcod(argv) = &export.run else { panic!() };
+        assert!(!argv.iter().any(|a| a.ends_with(".tar.gz")), "no fixed file name: {argv:?}");
+        // The name is $1, not part of the script.
+        assert_eq!(argv[argv.len() - 4..], ["-c", EXPORT, "sh", v.name.as_str()]);
     }
 
     #[test]

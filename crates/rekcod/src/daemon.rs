@@ -678,7 +678,27 @@ async fn dns_bridge(vm: Vm, filter: Option<Arc<DnsFilter>>) {
 }
 
 async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
-    let (mut rd, mut wr) = tokio::io::split(vm.connect(DNS_PORT).await?);
+    let filter = filter.clone();
+    dns_serve(vm.connect(DNS_PORT).await?, move |query: Vec<u8>| {
+        let filter = filter.clone();
+        async move {
+            match &filter {
+                Some(f) => f.answer(&query).await,
+                None => resolve(&query).await,
+            }
+        }
+    })
+    .await
+}
+
+/// Length-prefixed DNS queries in, `answer`'s replies out, until the stream ends.
+async fn dns_serve<S, F, Fut>(stream: S, answer: F) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
+{
+    let (mut rd, mut wr) = tokio::io::split(stream);
     // Bounded: a guest that stops reading answers stops having its queries read.
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1024);
     // Queries resolving at once; more wait, so a flood can't spawn tasks without limit.
@@ -697,15 +717,11 @@ async fn dns_session(vm: &Vm, filter: &Option<Arc<DnsFilter>>) -> Result<()> {
             let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
-            let filter = filter.clone();
             let permit = in_flight.clone().acquire_owned().await?;
+            let answering = answer(query);
             tokio::spawn(async move {
                 let _permit = permit;
-                let answer = match &filter {
-                    Some(f) => f.answer(&query).await,
-                    None => resolve(&query).await,
-                };
-                if let Some(frame) = answer.as_deref().and_then(frame) {
+                if let Some(frame) = answering.await.as_deref().and_then(frame) {
                     let _ = tx.send(frame).await;
                 }
             });
@@ -1356,6 +1372,31 @@ fn meta_reply(req: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_guest_that_never_reads_answers_stops_being_read() {
+        let (ours, mut guest) = tokio::io::duplex(64 << 10);
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = answered.clone();
+        tokio::spawn(dns_serve(ours, move |q: Vec<u8>| {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { dns::refused(&q) }
+        }));
+        let q = [&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x04evil\x03com\x00\x00\x01\x00\x01"].concat();
+        let framed = frame(&q).unwrap();
+        tokio::spawn(async move {
+            for _ in 0..100_000 {
+                if guest.write_all(&framed).await.is_err() {
+                    return;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let settled = answered.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(answered.load(std::sync::atomic::Ordering::SeqCst), settled, "still reading");
+        assert!(settled < 10_000, "{settled} queries read");
+    }
 
     #[test]
     fn stats_carry_elastic_held_only_with_elastic_memory() {

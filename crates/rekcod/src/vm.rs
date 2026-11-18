@@ -200,9 +200,12 @@ impl Vm {
     }
 
     /// Opens a vsock connection to `port` in the guest. See [`Conn`] for why
-    /// it is always drained.
+    /// it is always drained. Gives up after 10 s: a stuck VM queue never answers.
     pub async fn connect(&self, port: u32) -> Result<Conn> {
-        Ok(Conn::new(self.connect_raw(port).await?))
+        let raw = tokio::time::timeout(std::time::Duration::from_secs(10), self.connect_raw(port))
+            .await
+            .map_err(|_| anyhow!("vsock connect to port {port} timed out"))??;
+        Ok(Conn::new(raw))
     }
 
     async fn connect_raw(&self, port: u32) -> Result<UnixStream> {

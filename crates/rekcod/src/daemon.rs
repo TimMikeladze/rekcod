@@ -425,7 +425,7 @@ async fn shutdown(vm: &Vm) {
 async fn forget_fresh_disk(vm: Vm, marker: PathBuf) {
     loop {
         if let Ok(c) = vm.connect(DOCKER_PORT).await
-            && http::get(c, "/_ping").await.is_ok_and(|b| b == b"OK")
+            && tokio::time::timeout(Duration::from_secs(5), http::get(c, "/_ping")).await.is_ok_and(|b| b.is_ok_and(|b| b == b"OK"))
         {
             let _ = std::fs::remove_file(&marker);
             return;
@@ -481,12 +481,37 @@ async fn control(vm: &Vm, cmd: Control) -> Result<String> {
 }
 
 async fn control_within(vm: &Vm, cmd: Control, timeout: Duration) -> Result<String> {
-    let stream = vm.connect(CONTROL_PORT).await?;
+    ask(vm.connect(CONTROL_PORT).await?, &cmd, timeout).await
+}
+
+/// Sends `cmd` on a fresh control connection and reads the one-line reply.
+async fn ask<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(stream: S, cmd: &Control, timeout: Duration) -> Result<String> {
     let mut stream = BufReader::new(stream);
     stream.get_mut().write_all(cmd.encode().as_bytes()).await?;
     let mut reply = String::new();
-    tokio::time::timeout(timeout, stream.read_line(&mut reply)).await??;
+    tokio::time::timeout(timeout, read_line_max(&mut stream, &mut reply)).await??;
     Ok(reply.trim_end().to_string())
+}
+
+/// Longest reply line read from the guest agent.
+const REPLY_MAX: u64 = 64 << 10;
+
+/// `read_line`, but a line that hasn't ended within [`REPLY_MAX`] is an error: a sandbox's
+/// guest decides what it sends, and would otherwise grow the daemon's memory at will.
+async fn read_line_max<R: tokio::io::AsyncBufRead + Unpin>(r: &mut R, line: &mut String) -> Result<usize> {
+    let mut buf = Vec::new();
+    let n = (&mut *r).take(REPLY_MAX).read_until(b'\n', &mut buf).await?;
+    if n as u64 == REPLY_MAX && buf.last() != Some(&b'\n') {
+        bail!("guest reply over {} KiB without a line end", REPLY_MAX >> 10);
+    }
+    line.push_str(std::str::from_utf8(&buf).context("guest reply is not UTF-8")?);
+    Ok(n)
+}
+
+/// Returns once the client has closed its end (anything it sends is ignored).
+async fn closed<R: tokio::io::AsyncRead + Unpin>(r: &mut R) {
+    let mut buf = [0u8; 256];
+    while matches!(r.read(&mut buf).await, Ok(n) if n > 0) {}
 }
 
 /// `~/.rekcod/run/control.sock`: one command line in, the agent's reply out.
@@ -507,16 +532,23 @@ async fn control_server(vm: Vm, listener: UnixListener) {
             if conn.read_line(&mut line).await.is_err() {
                 return;
             }
-            let reply = match Control::parse(&line) {
-                Some(Control::Stats) => {
-                    let reply =
-                        control_within(&vm, Control::Stats, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"));
-                    with_elastic_held(reply, vm.elastic_held())
+            let relay = async {
+                match Control::parse(&line) {
+                    Some(Control::Stats) => {
+                        let reply =
+                            control_within(&vm, Control::Stats, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"));
+                        with_elastic_held(reply, vm.elastic_held())
+                    }
+                    Some(cmd @ (Control::Trim | Control::BenchMeta(_))) => {
+                        control_within(&vm, cmd, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"))
+                    }
+                    _ => format!("error: unsupported command {:?}", line.trim_end()),
                 }
-                Some(cmd @ (Control::Trim | Control::BenchMeta(_))) => {
-                    control_within(&vm, cmd, Duration::from_secs(600)).await.unwrap_or_else(|e| format!("error: {e:#}"))
-                }
-                _ => format!("error: unsupported command {:?}", line.trim_end()),
+            };
+            // A client that gave up (the CLI waits 5 s for stats) takes the guest side with it.
+            let reply = tokio::select! {
+                reply = relay => reply,
+                () = closed(&mut conn) => return,
             };
             let _ = conn.get_mut().write_all(format!("{reply}\n").as_bytes()).await;
         });
@@ -658,7 +690,7 @@ async fn notify_guest(vm: &Vm, conn: &NotifyConn, changed: &[String]) -> Result<
             let mut reply = String::new();
             for _ in changed {
                 reply.clear();
-                if stream.read_line(&mut reply).await? == 0 {
+                if read_line_max(stream, &mut reply).await? == 0 {
                     bail!("control connection closed");
                 }
             }
@@ -1062,6 +1094,9 @@ impl Status {
 }
 
 const EVENTS_PATH: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D";
+/// How long one Docker API round trip in the guest may take before the port forwarder
+/// gives up on it and starts over.
+const GUEST_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 async fn port_forwarder(vm: Vm, status: Arc<Status>, autoports_on: bool) {
     if autoports_on {
@@ -1077,7 +1112,8 @@ async fn port_forwarder(vm: Vm, status: Arc<Status>, autoports_on: bool) {
 
 async fn watch_events(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     reconcile(vm, status).await?;
-    let mut events = http::Lines::open(vm.connect(DOCKER_PORT).await?, EVENTS_PATH).await?;
+    let open = async { http::Lines::open(vm.connect(DOCKER_PORT).await?, EVENTS_PATH).await };
+    let mut events = tokio::time::timeout(GUEST_API_TIMEOUT, open).await.context("the guest's /events did not answer")??;
     while let Some(line) = events.next().await? {
         let Ok(ev) = serde_json::from_slice::<serde_json::Value>(&line) else { continue };
         let action = ev["Action"].as_str().unwrap_or_default();
@@ -1093,7 +1129,8 @@ async fn watch_events(vm: &Vm, status: &Arc<Status>) -> Result<()> {
 
 async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     // all=1: created containers too, so a bind source is warmed before `start`.
-    let body = http::get(vm.connect(DOCKER_PORT).await?, "/containers/json?all=1").await?;
+    let list = async { http::get(vm.connect(DOCKER_PORT).await?, "/containers/json?all=1").await };
+    let body = tokio::time::timeout(GUEST_API_TIMEOUT, list).await.context("the guest's /containers/json did not answer")??;
     *status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ports::desired(&body)?;
     *status.autoport.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ports::autoport_containers(&body)?;
     let binds = status.watch_scope.filter(watch::bind_sources(&body)?);
@@ -1664,6 +1701,26 @@ mod tests {
         assert_eq!(WatchScope::Within(app.clone()).filter(binds.clone()), [app.clone(), app.join("src")].into());
         assert!(WatchScope::Nothing.filter(binds).is_empty(), "a copy-mode sandbox watches nothing");
         std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[tokio::test]
+    async fn guest_replies_have_a_size_limit() {
+        let (ours, mut guest) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let junk = vec![b'x'; 1 << 16];
+            for _ in 0..16 {
+                if guest.write_all(&junk).await.is_err() {
+                    return;
+                }
+            }
+            let _ = guest.write_all(b"\n").await;
+        });
+        let err = ask(ours, &Control::Ping, Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.to_string().contains("over 64 KiB"), "{err}");
+
+        let (ours, mut guest) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move { guest.write_all(b"pong fs-notify\n").await });
+        assert_eq!(ask(ours, &Control::Ping, Duration::from_secs(5)).await.unwrap(), "pong fs-notify");
     }
 
     #[test]

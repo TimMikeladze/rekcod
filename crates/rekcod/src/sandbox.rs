@@ -659,6 +659,20 @@ pub fn cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
     Ok(())
 }
 
+/// A fork's workspace and the manifest that goes with it: the child's apply must judge the
+/// Mac's files against what the parent copied, not guess from times.
+fn clone_workspace(parent: &Sandbox, child: &Path) -> Result<()> {
+    if parent.meta.mode != "copy" {
+        return Ok(());
+    }
+    clonefile(&parent.ws(), &child.join("ws"))?;
+    let manifest = parent.paths.home.join("manifest.json");
+    if manifest.exists() {
+        clonefile(&manifest, &child.join("manifest.json"))?;
+    }
+    Ok(())
+}
+
 /// A new sandbox from `id`'s data disk and workspace. Running processes don't carry over.
 pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
     let parent = find(paths, id)?;
@@ -687,7 +701,7 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
         for f in ["disk.img", "aux.img", "hw.bin", "config.json"] {
             clonefile(&parent.paths.home.join(f), &child_paths.home.join(f))?;
         }
-        clonefile(&parent.ws(), &child_paths.home.join("ws"))?;
+        clone_workspace(&parent, &child_paths.home)?;
         crate::macos::reidentify(&child_paths.home)?;
         let child = Sandbox { meta: Meta { id: new.clone(), name, ..parent.meta.clone() }, paths: child_paths };
         if let Err(e) = child.save().and_then(|_| child.boot(paths)) {
@@ -703,8 +717,7 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
         let _ = parent.docker()?.args(["exec", WS, "sync"]).status();
         let _ = parent.docker()?.args(["pause", WS]).stdout(Stdio::null()).status();
     }
-    let cloned = clonefile(&parent.paths.data_disk(), &child_paths.data_disk())
-        .and_then(|_| if parent.meta.mode == "copy" { clonefile(&parent.ws(), &child_paths.home.join("ws")) } else { Ok(()) });
+    let cloned = clonefile(&parent.paths.data_disk(), &child_paths.data_disk()).and_then(|_| clone_workspace(&parent, &child_paths.home));
     if running {
         let _ = parent.docker()?.args(["unpause", WS]).stdout(Stdio::null()).status();
     }
@@ -1136,7 +1149,9 @@ fn was_dir(m: &Manifest, p: &str) -> bool {
 }
 
 /// Changed paths whose state on the Mac differs from when the sandbox copied them. Without a
-/// manifest (sandboxes made before there was one), anything modified after `since`.
+/// manifest (sandboxes made before there was one), anything whose inode changed after
+/// `since`: ctime, not mtime, so a file moved in with an old mtime (`mv`, `cp -p`, an
+/// unpacked archive) or a `chmod` counts.
 fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Change]) -> Vec<String> {
     let dir = Dir::open(project).ok();
     ch.iter()
@@ -1149,8 +1164,7 @@ fn conflicts(project: &Path, manifest: Option<&Manifest>, since: u64, ch: &[Chan
                 !replaced && !unchanged(now, m.get(&c.path).copied())
             }
             _ => std::fs::symlink_metadata(project.join(&c.path))
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) > since),
+                .is_ok_and(|m| std::os::unix::fs::MetadataExt::ctime(&m) >= 0 && std::os::unix::fs::MetadataExt::ctime(&m) as u64 > since),
         })
         .map(|c| c.path.clone())
         .collect()
@@ -1765,6 +1779,31 @@ mod tests {
         );
         assert!(p.contains("Binary files /dev/null and b/bin differ"), "{p}");
         assert!(!p.contains("same"), "{p}");
+    }
+
+    #[test]
+    fn a_fork_judges_the_mac_by_its_parents_manifest() {
+        let (paths, project, parent, _) = setup("fork", &[("keep.txt", "k"), ("script.sh", "s")]);
+        let child = Paths::at(root(&paths).join("forkchld")).unwrap();
+        clone_workspace(&find(&paths, &parent.id).unwrap(), &child.home).unwrap();
+        let c = Sandbox { meta: Meta { id: "forkchld".into(), created: now() - 2, ..parent.clone() }, paths: child };
+        c.save().unwrap();
+        assert!(c.manifest().is_some());
+        // The Mac chmods a file and moves one in with an old mtime; the fork changed neither
+        // and deletes nothing.
+        let ws = c.ws();
+        std::fs::write(ws.join("keep.txt"), "k2").unwrap();
+        std::fs::set_permissions(project.join("keep.txt"), std::fs::Permissions::from_mode(0o600)).unwrap();
+        let e = apply(&paths, "forkchld", true, None).unwrap_err().to_string();
+        assert!(e.ends_with("since the sandbox copied it: keep.txt"), "{e}");
+        // Without a manifest (an older sandbox), the inode change still counts.
+        std::fs::remove_file(c.paths.home.join("manifest.json")).unwrap();
+        std::fs::write(project.join("hostnew.txt"), "h").unwrap();
+        let old = std::fs::File::options().write(true).open(project.join("hostnew.txt")).unwrap();
+        old.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(1_577_836_800)).unwrap();
+        let e = apply(&paths, "forkchld", true, None).unwrap_err().to_string();
+        assert!(e.contains("hostnew.txt") && e.contains("keep.txt"), "{e}");
+        assert!(project.join("hostnew.txt").exists());
     }
 
     #[test]

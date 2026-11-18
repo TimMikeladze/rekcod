@@ -905,12 +905,20 @@ enum EdgeCmd {
         #[arg(long)]
         public_listen: Option<String>,
         /// The public listener's clients send a PROXY v2 header (a TCP load balancer in front).
-        #[arg(long, requires = "public_listen")]
+        #[arg(long, requires_all = ["public_listen", "proxy_protocol_from"])]
         proxy_protocol: bool,
-        /// Peers (IP or CIDR) whose CF-Connecting-IP / X-Forwarded-For name the client, such
-        /// as cloudflared. Repeat it; giving any replaces the loopback default.
+        /// The load balancer's address (IP or CIDR) for --proxy-protocol; connections from
+        /// anywhere else are closed. Repeat it for more than one.
+        #[arg(long = "proxy-protocol-from", value_name = "NET", requires = "proxy_protocol")]
+        proxy_protocol_from: Vec<String>,
+        /// Peers (IP or CIDR) whose X-Forwarded-For names the client, such as cloudflared.
+        /// Repeat it; giving any replaces the loopback default.
         #[arg(long = "trusted-proxy", value_name = "NET", default_values = ["127.0.0.0/8", "::1"])]
         trusted_proxies: Vec<String>,
+        /// A header the trusted proxy overwrites with the client's address, read instead of
+        /// X-Forwarded-For: `cf-connecting-ip` behind cloudflared.
+        #[arg(long, value_name = "HEADER")]
+        client_ip_header: Option<String>,
         /// Requests per client IP across all apps (N/s, N/m or N/h).
         #[arg(long, default_value = "50/s")]
         rate: String,
@@ -1453,10 +1461,27 @@ fn main() {
             remote_call(&paths, &remote, "POST", "/join-token", &serde_json::json!({}))
         }
         Cmd::Edge(EdgeCmd::Serve { install: true, .. }) => service::install(&paths, "edge", &service::args_without_install()),
-        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, proxy_protocol, trusted_proxies, rate, burst, access_log, remote, .. }) => {
+        Cmd::Edge(EdgeCmd::Serve {
+            listen,
+            public_listen,
+            proxy_protocol,
+            proxy_protocol_from,
+            trusted_proxies,
+            client_ip_header,
+            rate,
+            burst,
+            access_log,
+            remote,
+            ..
+        }) => {
             let rate = edge::limit::parse_rate(&rate)?;
-            let trusted_proxies = trusted_proxies.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<_>>()?;
-            let settings = edge::Settings { rate, burst, access_log, trusted_proxies };
+            let nets = |v: &[String]| v.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<Vec<_>>>();
+            let (trusted_proxies, proxy_protocol_from) = (nets(&trusted_proxies)?, nets(&proxy_protocol_from)?);
+            let client_ip_header = client_ip_header
+                .map(|h| hyper::header::HeaderName::from_bytes(h.trim().to_ascii_lowercase().as_bytes()))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("--client-ip-header: {e}"))?;
+            let settings = edge::Settings { rate, burst, access_log, trusted_proxies, client_ip_header, proxy_protocol_from };
             let o = edge::Options { listen, public_listen, proxy_protocol, settings };
             edge::serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), o)
         }

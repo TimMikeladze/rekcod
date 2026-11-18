@@ -60,15 +60,28 @@ pub struct Settings {
     pub burst: u32,
     /// One line per request on stderr.
     pub access_log: bool,
-    /// Peers whose `CF-Connecting-IP` / `X-Forwarded-For` name the client: the tunnel.
+    /// Peers whose `X-Forwarded-For` (or `client_ip_header`) names the client: the tunnel.
     pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// A header a trusted proxy overwrites with the client's address, read instead of
+    /// `X-Forwarded-For` (`cf-connecting-ip` behind cloudflared).
+    pub client_ip_header: Option<HeaderName>,
+    /// Peers allowed to send a PROXY v2 header on a `proxy_protocol` listener; anyone else
+    /// is disconnected.
+    pub proxy_protocol_from: Vec<ipnet::IpNet>,
 }
 
 impl Default for Settings {
     /// What `edge serve` starts with: cloudflared on this Mac connects from loopback.
     fn default() -> Settings {
         let trusted_proxies = ["127.0.0.0/8", "::1"].iter().map(|n| ban::parse_net(n).unwrap()).collect();
-        Settings { rate: Duration::from_millis(20), burst: 100, access_log: false, trusted_proxies }
+        Settings {
+            rate: Duration::from_millis(20),
+            burst: 100,
+            access_log: false,
+            trusted_proxies,
+            client_ip_header: None,
+            proxy_protocol_from: vec![],
+        }
     }
 }
 
@@ -92,6 +105,8 @@ pub struct Edge {
     id_prefix: String,
     access_log: bool,
     trusted_proxies: Vec<ipnet::IpNet>,
+    client_ip_header: Option<HeaderName>,
+    proxy_protocol_from: Vec<ipnet::IpNet>,
     stats: stats::Stats,
     /// Where the last good route table is kept, so a restart while the controller is down
     /// still routes (`~/.rekcod/edge-routes.json`).
@@ -120,6 +135,8 @@ impl Edge {
             id_prefix,
             access_log: s.access_log,
             trusted_proxies: s.trusted_proxies,
+            client_ip_header: s.client_ip_header,
+            proxy_protocol_from: s.proxy_protocol_from,
             stats: Default::default(),
             cache: None,
             waking: Default::default(),
@@ -316,11 +333,16 @@ pub async fn run(l: TcpListener, edge: Arc<Edge>, opts: Listener) {
 
 async fn conn(mut s: TcpStream, peer: SocketAddr, edge: Arc<Edge>, opts: Listener) -> Result<()> {
     let _ = s.set_nodelay(true);
-    let mut peer = peer.ip();
-    if opts.proxy_protocol
-        && let Some(ip) = tokio::time::timeout(HEADER_TIMEOUT, client_ip::read_proxy_v2(&mut s)).await??
-    {
-        peer = ip;
+    // A dual-stack `[::]` listener sees IPv4 clients as `::ffff:a.b.c.d`.
+    let mut peer = peer.ip().to_canonical();
+    if opts.proxy_protocol {
+        // Whoever may send the header picks the client address, so only the balancer may.
+        if !edge.proxy_protocol_from.iter().any(|n| n.contains(&peer)) {
+            return Ok(());
+        }
+        if let Some(ip) = tokio::time::timeout(HEADER_TIMEOUT, client_ip::read_proxy_v2(&mut s)).await?? {
+            peer = ip;
+        }
     }
     // Before any parsing: a banned client gets a closed connection and nothing else. Not
     // for the tunnel, which carries everyone; its clients are checked per request.
@@ -400,30 +422,46 @@ fn strip_hop(h: &mut HeaderMap, upgrade: bool) {
 
 /// Turns the client's request into the one an instance gets: HTTP/1.1, origin-form path,
 /// a Host header, and the forwarding headers.
-fn prepare(edge: &Edge, p: &mut Parts, client: IpAddr, peer: IpAddr, upgrade: bool) {
+fn prepare(edge: &Edge, p: &mut Parts, client: IpAddr, peer: IpAddr, upgrade: bool, routed: &str) {
     let trusted = edge.trusts(peer);
     let host = p.headers.get(header::HOST).cloned().or_else(|| p.uri.authority().and_then(|a| HeaderValue::from_str(a.as_str()).ok()));
     strip_hop(&mut p.headers, upgrade);
+    // Client-address and origin headers an app may believe. Whatever a client or a tunnel
+    // passed through is dropped; X-Real-IP and X-Forwarded-Host are set from what the edge
+    // decided below.
+    for n in ["forwarded", "x-real-ip", "true-client-ip", "x-client-ip", "x-forwarded-host", "x-forwarded-port", "x-forwarded-server"] {
+        p.headers.remove(n);
+    }
     if let Some(h) = host {
         p.headers.insert(header::HOST, h);
     }
     p.uri = p.uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/").parse().unwrap_or_default();
     p.version = hyper::Version::HTTP_11;
     let xff = HeaderName::from_static("x-forwarded-for");
-    let chain = match p.headers.get(&xff).and_then(|v| v.to_str().ok()) {
-        Some(prior) if trusted => format!("{prior}, {peer}"),
-        _ => client.to_string(),
-    };
+    // Every line, in order: a proxy that appends a line of its own keeps it.
+    let prior: Vec<&str> = p.headers.get_all(&xff).iter().filter_map(|v| v.to_str().ok()).collect();
+    let chain = if trusted && !prior.is_empty() { format!("{}, {peer}", prior.join(", ")) } else { client.to_string() };
     if let Ok(v) = HeaderValue::from_str(&chain) {
         p.headers.insert(xff, v);
+    }
+    if let Ok(v) = HeaderValue::from_str(&client.to_string()) {
+        p.headers.insert(HeaderName::from_static("x-real-ip"), v);
+    }
+    if let Ok(v) = HeaderValue::from_str(routed) {
+        p.headers.insert(HeaderName::from_static("x-forwarded-host"), v);
     }
     let proto = HeaderName::from_static("x-forwarded-proto");
     if !trusted || !p.headers.contains_key(&proto) {
         p.headers.insert(proto, HeaderValue::from_static("http"));
     }
-    if !trusted {
-        // An app that trusts this header would trust whatever the client wrote.
-        p.headers.remove("cf-connecting-ip");
+    // An app that trusts this header would trust whatever the client wrote. Only a trusted
+    // peer that the edge was told overwrites it (cloudflared) passes it on.
+    let cf = HeaderName::from_static("cf-connecting-ip");
+    if !trusted || edge.client_ip_header.as_ref() != Some(&cf) {
+        p.headers.remove(&cf);
+    }
+    if let Some(n) = edge.client_ip_header.as_ref().filter(|_| !trusted) {
+        p.headers.remove(n);
     }
     let id = HeaderName::from_static("x-request-id");
     if !p.headers.contains_key(&id)
@@ -434,7 +472,11 @@ fn prepare(edge: &Edge, p: &mut Parts, client: IpAddr, peer: IpAddr, upgrade: bo
 }
 
 async fn handle(edge: Arc<Edge>, req: Request<Incoming>, peer: IpAddr, opts: Listener) -> Response<Body> {
-    let client = if edge.trusts(peer) { client_ip::forwarded(req.headers(), &edge.trusted_proxies).unwrap_or(peer) } else { peer };
+    let client = if edge.trusts(peer) {
+        client_ip::forwarded(req.headers(), &edge.trusted_proxies, edge.client_ip_header.as_ref()).unwrap_or(peer)
+    } else {
+        peer
+    };
     let host = req_host(&req);
     let t = Instant::now();
     let log = edge.access_log.then(|| (req.method().clone(), req.uri().path().to_string()));
@@ -487,7 +529,7 @@ async fn forward(edge: &Edge, mut req: Request<Incoming>, host: &str, client: Ip
     let upgrade = is_upgrade(req.headers());
     let client_upgrade = upgrade.then(|| hyper::upgrade::on(&mut req));
     let (mut parts, body) = req.into_parts();
-    prepare(edge, &mut parts, client, peer, upgrade);
+    prepare(edge, &mut parts, client, peer, upgrade, host);
     // A chunked body can't be checked up front: it's cut off at the limit and the client gets a 413.
     let mut req = Some((parts, Limited::new(body, max_body as usize).boxed_unsync()));
 
@@ -758,6 +800,105 @@ mod tests {
         assert_eq!(get(&mut s, "a.test", spoof).await.0, 403);
         assert!(!edge.bans.is_banned("127.0.0.1".parse().unwrap()));
         assert_eq!(get(&mut dial(&tunnel).await, "a.test", "X-Forwarded-For: 203.0.113.11\r\n").await.0, 200);
+    }
+
+    /// An instance that answers with the request head it received, lowercased.
+    async fn echo_head() -> String {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (s, _) = l.accept().await.unwrap();
+                tokio::spawn(async move {
+                    let mut r = BufReader::new(s);
+                    loop {
+                        let mut head = String::new();
+                        loop {
+                            let mut line = String::new();
+                            if r.read_line(&mut line).await.unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line == "\r\n" {
+                                break;
+                            }
+                            head.push_str(&line.to_ascii_lowercase());
+                        }
+                        let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{head}", head.len());
+                        r.get_mut().write_all(resp.as_bytes()).await.unwrap();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn client_address_headers_come_from_the_edge() {
+        let a = echo_head().await;
+        let spoof = "X-Real-IP: 10.0.0.1\r\nForwarded: for=10.0.0.1\r\nX-Forwarded-Host: admin.internal\r\n\
+                     X-Forwarded-Port: 443\r\nTrue-Client-IP: 10.0.0.1\r\nCF-Connecting-IP: 10.0.0.1\r\n";
+        for settings in [direct(), fast()] {
+            let edge = Edge::new(None, settings);
+            edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+            let addr = edge_on(&edge, Listener::default()).await;
+            let (code, head) = get(&mut dial(&addr).await, "a.test:8080", spoof).await;
+            assert_eq!(code, 200);
+            assert!(!head.contains("10.0.0.1") && !head.contains("admin.internal") && !head.contains("forwarded:"), "{head}");
+            assert!(!head.contains("x-forwarded-port") && !head.contains("cf-connecting-ip"), "{head}");
+            assert!(head.contains("x-real-ip: 127.0.0.1\r\n") && head.contains("x-forwarded-host: a.test\r\n"), "{head}");
+        }
+        // Behind a proxy that appends its own X-Forwarded-For line, the client's line can't
+        // choose the address, and the app gets both lines in order.
+        let edge = Edge::new(None, fast());
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let addr = edge_on(&edge, Listener::default()).await;
+        let two = "X-Forwarded-For: 6.6.6.6\r\nX-Forwarded-For: 203.0.113.50\r\n";
+        let head = get(&mut dial(&addr).await, "a.test", two).await.1;
+        assert!(head.contains("x-forwarded-for: 6.6.6.6, 203.0.113.50, 127.0.0.1\r\n"), "{head}");
+        assert!(head.contains("x-real-ip: 203.0.113.50\r\n"), "{head}");
+    }
+
+    #[tokio::test]
+    async fn a_dual_stack_listener_applies_ipv4_bans() {
+        let a = instance("a").await;
+        let edge = Edge::new(None, direct());
+        edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], false));
+        let l = TcpListener::bind("[::]:0").await.unwrap();
+        let addr = format!("127.0.0.1:{}", l.local_addr().unwrap().port());
+        tokio::spawn(run(l, edge.clone(), Listener::default()));
+        assert_eq!(get(&mut dial(&addr).await, "a.test", "").await.1, "a|127.0.0.1");
+        edge.bans.set_remote(vec![ban::parse_net("127.0.0.1").unwrap()]);
+        let mut s = dial(&addr).await;
+        s.get_mut().write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\n\r\n").await.unwrap();
+        let mut buf = Vec::new();
+        assert_eq!(s.read_to_end(&mut buf).await.unwrap_or(0), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_only_from_the_balancer() {
+        let a = instance("a").await;
+        let header = |ip: [u8; 4]| {
+            let mut h = b"\r\n\r\n\0\r\nQUIT\n\x21\x11\x00\x0c".to_vec();
+            h.extend(ip);
+            h.extend([127, 0, 0, 1, 0x1f, 0x90, 0, 80]);
+            h
+        };
+        let opts = Listener { public_only: true, proxy_protocol: true };
+        for (from, served) in [("127.0.0.1", true), ("192.0.2.0/24", false)] {
+            let edge = Edge::new(None, Settings { proxy_protocol_from: vec![ban::parse_net(from).unwrap()], ..direct() });
+            edge.table.write().unwrap_or_else(std::sync::PoisonError::into_inner).insert("a.test".into(), route(&[&a], true));
+            let addr = edge_on(&edge, opts).await;
+            let mut s = dial(&addr).await;
+            s.get_mut().write_all(&header([198, 51, 100, 7])).await.unwrap();
+            s.get_mut().write_all(b"GET / HTTP/1.1\r\nHost: a.test\r\nConnection: close\r\n\r\n").await.unwrap();
+            let mut buf = Vec::new();
+            let _ = s.read_to_end(&mut buf).await;
+            let body = String::from_utf8_lossy(&buf);
+            assert_eq!(body.ends_with("a|198.51.100.7"), served, "{from}: {body}");
+            if !served {
+                assert!(buf.is_empty(), "{body}");
+            }
+        }
     }
 
     #[tokio::test]

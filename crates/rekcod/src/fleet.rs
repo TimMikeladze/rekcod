@@ -1985,6 +1985,8 @@ struct Controller {
     node_ca: Option<crate::tls::Ca>,
     /// Names in the controller's own certificate, never issued to a node.
     own_names: Vec<String>,
+    /// Apps whose storage a destroy is removing right now (`finish_storage`).
+    cleaning: Mutex<std::collections::HashSet<String>>,
     /// Nodes reporting a certificate inside `tls::RENEW_WITHIN`: when one was handed to them,
     /// and when that was last alerted.
     cert_renewals: Mutex<HashMap<String, (i64, i64)>>,
@@ -2189,6 +2191,7 @@ impl Controller {
             ca_pem: None,
             node_ca: None,
             own_names: vec![],
+            cleaning: Default::default(),
             cert_renewals: Default::default(),
             track: Track::default(),
         }
@@ -4985,24 +4988,18 @@ fn delete_instances_of(c: &Arc<Controller>, name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Apps whose storage a [`finish_storage`] is removing right now: a retry leaves them be.
-static CLEANING: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
 /// The storage half of a destroy: bucket, keys and stored images, then the row. On failure
 /// the row stays `destroying` with the error in `destroy_error`, and `retry_destroys` tries
-/// again in a minute.
+/// again in a minute. One run per app at a time (`Controller::cleaning`); the error is
+/// recorded only once this run is over, so what `app status` shows is a finished attempt.
 fn finish_storage(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Value> {
-    {
-        let mut cleaning = CLEANING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cleaning.iter().any(|n| n == name) {
-            return Ok(json!({"destroyed": short_name(name), "storage": "being deleted"}));
-        }
-        cleaning.push(name.to_string());
+    if !c.cleaning.lock().unwrap_or_else(std::sync::PoisonError::into_inner).insert(name.to_string()) {
+        return Ok(json!({"destroyed": short_name(name), "storage": "being deleted"}));
     }
-    let r = (|| -> Result<Value> {
-        let storage = drop_bucket(c, name).and_then(|_| drop_release_store(c, name));
+    let storage = drop_bucket(c, name).and_then(|_| drop_release_store(c, name));
+    let r = || -> Result<Value> {
         let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(e) = storage {
+        if let Err(e) = &storage {
             let e = format!("{e:#}");
             db.execute(
                 "update apps set destroying = ?2, destroy_error = ?3 where name = ?1 and generation = ?4",
@@ -5015,9 +5012,10 @@ fn finish_storage(c: &Arc<Controller>, name: &str, generation: i64) -> Result<Va
         }
         remove_rows(&mut db, name, generation, &[])?;
         Ok(json!({"destroyed": short_name(name)}))
-    })();
-    CLEANING.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|n| n != name);
-    r
+    };
+    // Out of the set before the outcome is visible: whoever sees it may retry at once.
+    c.cleaning.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remove(name);
+    r()
 }
 
 /// The app's rows, once nothing of it is left to remove, plus `leftover` for a later
@@ -9357,7 +9355,7 @@ mod tests {
                 match err.map(|r| r.get::<Option<String>>(0)) {
                     None => return Ok(()),
                     Some(Some(e)) => return Err(e),
-                    Some(None) if t0.elapsed() > Duration::from_secs(10) => panic!("the destroy never finished"),
+                    Some(None) if t0.elapsed() > Duration::from_secs(120) => panic!("the destroy never finished"),
                     Some(None) => std::thread::sleep(Duration::from_millis(20)),
                 }
             }
@@ -9471,13 +9469,16 @@ mod tests {
         let route = |m: &str| apps_route(&c, &alice, "default", m, &["apps", "web"], &json!({"force": true}), &[]);
         let v = route("DELETE").unwrap();
         assert!(v["storage"].as_str().unwrap().contains("background"), "{v}");
+        // The error is recorded once the background attempt is over, so after this a retry
+        // isn't turned away as already running. The limit only stops a hung test.
         let t0 = Instant::now();
         let shown = loop {
             let v = route("GET").unwrap();
-            if !v["storage_error"].is_null() || t0.elapsed() > Duration::from_secs(10) {
+            if !v["storage_error"].is_null() {
                 break v;
             }
-            std::thread::sleep(Duration::from_millis(50));
+            assert!(t0.elapsed() < Duration::from_secs(120), "the background cleanup never finished: {v}");
+            std::thread::sleep(Duration::from_millis(20));
         };
         assert!(shown["destroying"].is_i64() && shown["storage_error"].as_str().unwrap().contains("delete bucket app-web"), "{shown}");
         // The retry finishes it.

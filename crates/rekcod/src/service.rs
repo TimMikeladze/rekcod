@@ -190,6 +190,28 @@ pub fn installed(name: &str) -> bool {
     plist_path(name).is_ok_and(|p| p.exists()) || is_daemon(name)
 }
 
+/// Fleet services in the order `upgrade` restarts them. The controller goes first: it
+/// accepts nodes and edges one minor version behind it, never ahead.
+pub const FLEET_SERVICES: &[&str] = &["controller", "node", "edge", "storage"];
+
+/// The installed job's command line (the binary first), read back from its plist.
+pub fn job_args(name: &str) -> Option<Vec<String>> {
+    let path = if is_daemon(name) { daemon_path(name) } else { plist_path(name).ok().filter(|p| p.exists())? };
+    agent_job(&path).ok().map(|(argv, _)| argv)
+}
+
+/// Stops the job and starts it again from its plist (`launchctl kickstart -k`), so it
+/// runs whatever binary is at its path now.
+pub fn restart(name: &str) -> Result<()> {
+    let target = format!("{}/{}", domain_of(name), label(name));
+    let out =
+        if is_daemon(name) { root(&["/bin/launchctl", "kickstart", "-k", &target])? } else { launchctl(&["kickstart", "-k", &target])? };
+    if !out.status.success() {
+        bail!("launchctl kickstart -k {target}: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(())
+}
+
 /// Starts the job now if it isn't running (no-op otherwise).
 pub fn kickstart(name: &str) {
     let target = format!("{}/{}", domain_of(name), label(name));

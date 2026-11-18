@@ -382,6 +382,24 @@ your DNS. Marking an app public alone does not create the tunnel.
 Private apps are excluded from that public listener and remain accessible through
 the private edge on the configured tailnet or LAN.
 
+### Take a node out for maintenance
+
+```sh
+rekcod node drain NODE_ID --remote mini
+rekcod node undrain NODE_ID --remote mini
+```
+
+`drain` stops placing work on the node and moves its app instances to other nodes as
+capacity allows; instances without anywhere to go keep serving where they are. The
+node stays drained through reboots and missed heartbeats until `undrain`.
+
+A node that misses heartbeats for 15 s is `lost`: its app instances leave the routes
+and are replaced on other nodes after a minute, and its jobs and user sandboxes are
+held. When it heartbeats again, sandboxes it still has run again and ones it no longer
+has are removed; deleting a sandbox while its node is away removes the VM once the
+node is back. A controller that was itself away (the Mac slept, the process was
+stopped) waits 20 s for heartbeats before it marks any node lost.
+
 ### Back up the controller
 
 Server setup configures RustFS for release images, build caches and hourly controller
@@ -391,6 +409,9 @@ database backups. You can also create and list backups yourself:
 rekcod controller backup --remote mini
 rekcod controller backups --remote mini
 ```
+
+`rekcod controller restore` puts a backup in place of `fleet.db`. It refuses while a
+controller runs on that database; stop the controller service first.
 
 These backups are stored on the server's RustFS disk. Copy them off the server for
 recovery from disk loss. Back up the server's `~/.rekcod/controller/secret-key` separately: it is
@@ -484,6 +505,22 @@ rekcod doctor --bundle
 
 `upgrade` verifies the release checksum and replaces the installed binary and any
 bundled dashboard. A running VM keeps using its current daemon until restarted.
+
+On a server, `upgrade` then restarts the controller, node, edge and storage services
+that run that binary, in that order, and waits for the controller to listen again
+before the rest. A controller accepts heartbeats and route fetches from nodes and edges
+one minor version behind it, so with several Macs, upgrade the controller's Mac first.
+CLIs must be on the controller's minor version; an older one gets "this controller
+runs rekcod X, you have Y".
+
+Before a new rekcod migrates `fleet.db`, it copies it to
+`fleet.db.before-schema-N`. An older rekcod refuses a database a newer one migrated.
+To go back a release, stop the controller, put that copy back as `fleet.db`, and
+install the older version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TimMikeladze/rekcod/main/scripts/install.sh | REKCOD_VERSION=0.3.0 bash
+```
 `doctor --bundle` writes a diagnostic archive under `~/.rekcod` with configuration,
 status and logs, excluding tokens and keys.
 

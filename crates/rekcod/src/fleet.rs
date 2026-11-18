@@ -2541,9 +2541,17 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         let pem = c.ca_pem.clone().unwrap_or_default();
         return respond(r.get_mut(), if pem.is_empty() { 404 } else { 200 }, "application/x-pem-file", pem.as_bytes());
     }
-    // A CLI or node from another release would speak another API: say so plainly.
+    // A CLI or node from another release would speak another API: say so plainly. Nodes and
+    // edges one minor version behind keep heartbeating and reading routes, so a server can
+    // be upgraded one service at a time.
+    let from_service = matches!(
+        (req.method.as_str(), req.path.trim_matches('/').split('/').collect::<Vec<_>>().as_slice()),
+        ("POST", ["nodes", "register"] | ["nodes", _, "heartbeat"] | ["routes", "activity"] | ["bans"] | ["ns", _, "apps", _, "wake"])
+            | ("GET", ["routes"] | ["bans"] | ["metrics"])
+    );
+    let fits = if from_service { crate::lifecycle::compatible_peer } else { crate::lifecycle::compatible };
     if let Some(v) = req.header("x-rekcod-version").map(String::from)
-        && !crate::lifecycle::compatible(&v, env!("CARGO_PKG_VERSION"))
+        && !fits(&v, env!("CARGO_PKG_VERSION"))
     {
         let msg =
             format!("this controller runs rekcod {}, you have {v}; upgrade the older one (`rekcod upgrade`)", env!("CARGO_PKG_VERSION"));
@@ -8159,6 +8167,31 @@ mod tests {
         assert_eq!(db.query_one("select count(*) from sandboxes", &[]).unwrap().get::<i64>(0), 2);
         let r = db.query_one("select count(*), min(n), sum(state = 'live') from releases", &[]).unwrap();
         assert_eq!((r.get::<i64>(0), r.get::<i64>(1), r.get::<i64>(2)), (51, 7, 1));
+    }
+
+    #[test]
+    fn nodes_one_minor_version_behind_still_heartbeat_and_clis_dont() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        instance_node(&c, "n1", 8192, false);
+        let (major, minor, _) = crate::lifecycle::parse_version(env!("CARGO_PKG_VERSION"));
+        let older = format!("{major}.{}.0", minor.saturating_sub(1));
+        let raw = |method: &str, path: &str, token: &str| {
+            let mut s = TcpStream::connect(authority(&url).unwrap()).unwrap();
+            write!(
+                s,
+                "{method} {path} HTTP/1.1\r\nHost: x\r\nX-Rekcod-Version: {older}\r\nAuthorization: Bearer {token}\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+            )
+            .unwrap();
+            let mut out = String::new();
+            s.read_to_string(&mut out).unwrap();
+            out
+        };
+        let hb = raw("POST", "/nodes/n1/heartbeat", "s");
+        assert!(hb.starts_with("HTTP/1.1 200"), "{hb}");
+        assert!(raw("GET", "/routes", "admin-t").starts_with("HTTP/1.1 200"));
+        let cli = raw("GET", "/apps", "admin-t");
+        assert!(cli.starts_with("HTTP/1.1 400") && cli.contains("this controller runs"), "{cli}");
     }
 
     #[test]

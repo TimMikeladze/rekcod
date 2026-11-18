@@ -192,7 +192,8 @@ enum Cmd {
     },
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp(ApiPolicyArgs),
-    /// Install the latest release over this binary (the VM keeps running the old one until restarted).
+    /// Install the latest release over this binary and restart the fleet services that run it
+    /// (the VM keeps running the old one until restarted).
     Upgrade {
         /// Only say whether a newer release exists; exit 1 if one does.
         #[arg(long)]

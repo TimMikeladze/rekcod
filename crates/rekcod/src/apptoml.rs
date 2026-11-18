@@ -178,17 +178,78 @@ WORKERS = 4
         assert!(parse("").unwrap().is_empty());
     }
 
-    /// The README's example deploys as written.
+    /// Every ```toml block in the README, together one rekcod.toml, deploys as written.
     #[test]
-    fn readme_example() {
+    fn readme_examples() {
         let readme = include_str!("../../../README.md");
-        let start = readme.find("```toml\n[app]").expect("README has a rekcod.toml example") + "```toml\n".len();
-        let end = start + readme[start..].find("```").unwrap();
-        let t = parse(&readme[start..end]).unwrap();
-        assert_eq!((t["app.name"].as_str(), t["resources.memory"].as_str()), ("blog", "1"));
-        let start = readme.find("```toml\n[http]").expect("README has an [http] example") + "```toml\n".len();
-        let end = start + readme[start..].find("```").unwrap();
-        let t = parse(&readme[start..end]).unwrap();
-        assert_eq!((t["http.rate"].as_str(), t["http.timeout"].as_str()), ("10/s", "5m"));
+        let blocks: Vec<&str> = readme.split("```toml\n").skip(1).map(|b| &b[..b.find("```").unwrap()]).collect();
+        assert!(blocks.len() >= 3, "{blocks:?}");
+        let t = parse(&blocks.concat()).unwrap();
+        for (k, v) in [
+            ("app.name", "blog"),
+            ("resources.memory", "1"),
+            ("env.NODE_ENV", "production"),
+            ("http.rate", "10/s"),
+            ("http.timeout", "5m"),
+            ("storage.bucket", "true"),
+        ] {
+            assert_eq!(t.get(k).map(String::as_str), Some(v), "{k}");
+        }
+    }
+
+    /// Every key the deploy code reads (main.rs `run_app` and `http_settings`, fleet.rs's
+    /// build) is one the parser accepts.
+    #[test]
+    fn every_key_the_deploy_reads_is_accepted() {
+        let t = parse(
+            r#"[app]
+name = "a"
+port = 3000
+health = "/"
+start = "node s.js"
+public = true
+[resources]
+instances = 2
+spread = "strict"
+cpus = 2
+memory = "2GiB"
+idle_stop = "15m"
+recycle = "1d"
+[env]
+A = "1"
+[storage]
+bucket = true
+[http]
+rate = "10/s"
+burst = 20
+max_body = "20MB"
+timeout = "5m"
+"#,
+        )
+        .unwrap();
+        let mut keys: Vec<&str> = t.keys().map(String::as_str).collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "app.health",
+                "app.name",
+                "app.port",
+                "app.public",
+                "app.start",
+                "env.A",
+                "http.burst",
+                "http.max_body",
+                "http.rate",
+                "http.timeout",
+                "resources.cpus",
+                "resources.idle_stop",
+                "resources.instances",
+                "resources.memory",
+                "resources.recycle",
+                "resources.spread",
+                "storage.bucket",
+            ]
+        );
     }
 }

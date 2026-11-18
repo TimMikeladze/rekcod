@@ -138,7 +138,9 @@ pub fn serve(paths: &Paths, listen: &str, data: Option<&Path>) -> Result<()> {
     let file = credentials_file(paths);
     let mut creds = match read_credentials(&file) {
         Ok(c) => c,
-        Err(_) => S3 { endpoint: String::new(), access_key: format!("rekcod-{}", random_key(8)?), secret_key: random_key(40)? },
+        Err(_) => {
+            S3 { endpoint: String::new(), access_key: format!("rekcod-{}", random_key(8)?), secret_key: random_key(40)?, region: None }
+        }
     };
     creds.endpoint = format!("http://{addr}");
     write_private(&file, &serde_json::to_vec_pretty(&creds)?)?;
@@ -205,6 +207,7 @@ pub fn up(paths: &Paths) -> Result<()> {
             endpoint: String::new(),
             access_key: format!("rekcod-{}", random_key(8)?),
             secret_key: random_key(40)?,
+            region: None,
         });
         // A stopped one keeps its port and data; a port taken since then means a new one.
         let _ = docker(paths, &["rm", "-f", LOCAL_CONTAINER]);
@@ -271,7 +274,7 @@ pub fn snap_target(paths: &Paths) -> Result<(S3, String)> {
         (var("S3_ENDPOINT"), var("AWS_ACCESS_KEY_ID"), var("AWS_SECRET_ACCESS_KEY"))
     {
         let bucket = var("S3_BUCKET").context("S3_ENDPOINT is set but S3_BUCKET isn't")?;
-        return Ok((S3 { endpoint, access_key, secret_key }, bucket));
+        return Ok((S3 { endpoint, access_key, secret_key, region: var("AWS_REGION") }, bucket));
     }
     let s = local(paths)?;
     s.create_bucket("rekcod-snaps")?;

@@ -4486,10 +4486,8 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
                 return Ok(json!({"destroyed": name, "ns": ns}));
             }
             let app = load(name, Role::Member)?;
-            if !b["force"].as_bool().unwrap_or(false)
-                && let Some(n) = bucket_objects(c, &app.name)?.filter(|n| *n > 0)
-            {
-                bail!("{name}'s bucket {} has {n} object(s); destroy --force deletes them too", app_bucket(&app.name));
+            if !b["force"].as_bool().unwrap_or(false) && bucket_has_objects(c, &app.name)? == Some(true) {
+                bail!("{name}'s bucket {} isn't empty; destroy --force deletes its objects too", app_bucket(&app.name));
             }
             c.audit(ns, &who.name, "destroy", name, true);
             destroy_app(c, &app.name)?;
@@ -5520,7 +5518,7 @@ impl Controller {
                 else {
                     return Ok(None);
                 };
-                crate::s3::S3 { endpoint, access_key, secret_key: self.open_sealed("default", &sealed)? }
+                crate::s3::S3 { endpoint, access_key, secret_key: self.open_sealed("default", &sealed)?, region: None }
             }
         };
         // RustFS may come up after the controller at boot; deploys retry this.
@@ -5642,8 +5640,9 @@ fn app_storage(c: &Controller, app: &App) -> Result<Value> {
     }))
 }
 
-/// How many objects the app's bucket holds; None when it has no bucket of its own.
-fn bucket_objects(c: &Controller, app: &str) -> Result<Option<usize>> {
+/// Whether the app's bucket holds anything (one key is enough to say); None when it has no
+/// bucket of its own.
+fn bucket_has_objects(c: &Controller, app: &str) -> Result<Option<bool>> {
     let on: bool =
         c.db.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -5655,9 +5654,9 @@ fn bucket_objects(c: &Controller, app: &str) -> Result<Option<usize>> {
     }
     let bucket = app_bucket(app);
     if !s.bucket_exists(&bucket)? {
-        return Ok(Some(0));
+        return Ok(Some(false));
     }
-    Ok(Some(s.list(&bucket, "")?.len()))
+    Ok(Some(!s.is_empty(&bucket, "")?))
 }
 
 /// Revokes the app's user and policy, then deletes its bucket (objects too). Any failure is
@@ -6489,7 +6488,7 @@ mod tests {
                 let _ = respond(r.get_mut(), code, "application/xml", body.as_bytes());
             }
         });
-        (crate::s3::S3 { endpoint, access_key: "root".into(), secret_key: "root".into() }, seen)
+        (crate::s3::S3 { endpoint, access_key: "root".into(), secret_key: "root".into(), region: None }, seen)
     }
 
     fn storage_controller(fail: Arc<Mutex<Vec<(&'static str, u16)>>>) -> (Arc<Controller>, Arc<Mutex<Vec<String>>>) {
@@ -6526,7 +6525,7 @@ mod tests {
         let legacy = load_app_key(&c, &digest).unwrap().unwrap();
         assert!(bucket_env(&c, &legacy).unwrap_err().to_string().contains("belongs to another app"));
         assert!(app_s3(&c, &legacy).is_err());
-        assert_eq!(bucket_objects(&c, &digest).unwrap(), None);
+        assert_eq!(bucket_has_objects(&c, &digest).unwrap(), None);
         let owner = load_app_key(&c, &long).unwrap().unwrap();
         let env = bucket_env(&c, &owner).unwrap();
         assert!(env.contains(&("S3_BUCKET", bucket.clone())));

@@ -1308,8 +1308,20 @@ fn main() {
         libc::sigemptyset(&mut none);
         libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
     }
-    if !matches!(command, Cmd::Daemon { .. }) {
-        // Behave like other CLIs when piped into `head` (the daemon keeps Rust's SIGPIPE-ignore).
+    // Servers keep Rust's SIGPIPE-ignore: a peer or a child that closes its end is an error
+    // to handle, not a reason for the daemon, `mcp` or an API server to die.
+    let serves = matches!(
+        command,
+        Cmd::Daemon { .. }
+            | Cmd::Mcp(_)
+            | Cmd::Sandbox { cmd: SandboxCmd::Serve { .. }, .. }
+            | Cmd::Node(NodeCmd::Serve { .. } | NodeCmd::Join { .. })
+            | Cmd::Controller(ControllerCmd::Serve { .. })
+            | Cmd::Storage(StorageCmd::Serve { .. })
+            | Cmd::Edge(EdgeCmd::Serve { .. })
+    );
+    if !serves {
+        // Behave like other CLIs when piped into `head`.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
     let result = paths::Paths::new().and_then(|paths| match command {
@@ -1946,7 +1958,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         SandboxCmd::Log { id, follow, json, net } => sandbox::log(paths, &id, follow, json, net),
         SandboxCmd::Ls { json } => sandbox::print_list(paths, json),
         SandboxCmd::Stop { id } => sandbox::stop(paths, &id),
-        SandboxCmd::Rm { ids, all } => sandbox::rm(paths, &ids, all),
+        SandboxCmd::Rm { ids, all } => sandbox::rm_each(paths, &ids, all, &mut |id| println!("{id}")),
         SandboxCmd::Serve { listen, policy } => sandbox_api::serve(paths.clone(), policy.policy()?, listen),
         SandboxCmd::Golden(Golden::Build { name, images }) => sandbox::golden_build(paths, &name, &images),
         SandboxCmd::Golden(Golden::Ls) => sandbox::golden_list(paths),

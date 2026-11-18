@@ -694,7 +694,7 @@ pub fn fork(paths: &Paths, id: &str, name: Option<String>) -> Result<Meta> {
         if running {
             // No pause for macOS guests: flush, then clone what's on disk.
             let ip = parent.guest(paths)?;
-            let _ = crate::macos::exec_command(paths, &ip, Some("/"), &[], &["sync".into()], false)?.status();
+            let _ = crate::macos::exec_command(paths, &ip, Some("/"), &[], &["sync".into()], false)?.stdin(Stdio::null()).status();
             let _lock = review_lock(&parent.paths.home)?;
             crate::macos::pull_ws(paths, &ip, &parent.ws())?;
         }
@@ -1099,16 +1099,24 @@ pub fn docker_cmd(paths: &Paths, id: &str) -> Result<(Command, Meta)> {
 
 /// The command that runs `cmd` in the sandbox: `docker exec` for Linux, ssh for macOS.
 pub fn exec_cmd(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Result<Command> {
+    exec_command(paths, id, o, cmd).map(|(c, _)| c)
+}
+
+/// [`exec_cmd`], and the seconds after which the caller must kill it. `docker exec` runs
+/// `timeout_secs` in the container; ssh to a macOS guest can't, so there the caller does.
+pub fn exec_command(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Result<(Command, Option<u64>)> {
     let s = find(paths, id)?;
     if s.macos() {
         let ip = s.guest(paths)?;
-        return crate::macos::exec_command(paths, &ip, o.workdir.as_deref(), &o.env, cmd, false);
+        let mut c = crate::macos::exec_command(paths, &ip, o.workdir.as_deref(), &o.env, cmd, false)?;
+        c.stdin(Stdio::null());
+        return Ok((c, o.timeout_secs));
     }
     s.boot(paths)?;
     s.touch();
     let mut c = s.docker()?;
-    c.args(exec_args(&s.meta, o, cmd));
-    Ok(c)
+    c.args(exec_args(&s.meta, o, cmd)).stdin(Stdio::null());
+    Ok((c, None))
 }
 
 pub fn screenshot(paths: &Paths, id: &str, out: &Path) -> Result<()> {
@@ -1474,12 +1482,18 @@ fn remove(s: &Sandbox) -> Result<()> {
     r.with_context(|| format!("remove {}", s.paths.home.display()))
 }
 
+/// Removes the sandboxes without printing: on `rekcod mcp` stdout carries JSON-RPC.
 pub fn rm(paths: &Paths, ids: &[String], every: bool) -> Result<()> {
+    rm_each(paths, ids, every, &mut |_| {})
+}
+
+/// [`rm`], calling `removed` with each ID as it goes.
+pub fn rm_each(paths: &Paths, ids: &[String], every: bool, removed: &mut dyn FnMut(&str)) -> Result<()> {
     let targets: Vec<Sandbox> = if every { all(paths) } else { ids.iter().map(|i| find(paths, i)).collect::<Result<_>>()? };
     for s in targets {
         s.warn_git();
         remove(&s)?;
-        println!("{}", s.meta.id);
+        removed(&s.meta.id);
     }
     Ok(())
 }

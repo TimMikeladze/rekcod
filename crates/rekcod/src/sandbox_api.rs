@@ -192,28 +192,98 @@ fn exec_opts(args: &Value) -> Result<ExecOptions> {
     Ok(ExecOptions { workdir: text(args, "workdir")?.map(String::from), env, timeout_secs: num(args, "timeout_secs")?, tty: false })
 }
 
-/// Runs a command to completion: (exit, stdout, stderr).
-fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<&[u8]>) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-    let cmd = strs(&args["cmd"]);
-    if cmd.is_empty() {
-        bail!("missing cmd");
-    }
-    let mut c = sandbox::exec_cmd(paths, id, &exec_opts(args)?, &cmd)?;
-    let t0 = Instant::now();
+/// Most output kept per stream of a collected exec, and the largest file `read_file`
+/// returns. Past it the command is killed: an endless printer can't grow the server.
+const MAX_OUTPUT: usize = 8 << 20;
+
+/// What a collected command left.
+pub(crate) struct Collected {
+    pub code: i32,
+    pub out: Vec<u8>,
+    pub err: Vec<u8>,
+    /// A stream passed the cap and the command was killed.
+    pub truncated: bool,
+}
+
+/// Runs `c` to completion. `stdin` is fed from a thread, and the child closing its end
+/// (EPIPE) ends the feed, not this process. At most `cap` bytes of each stream are kept;
+/// past that, or after `deadline`, the child is killed (exit 124 for the deadline, as
+/// `timeout` does). The child is always waited for.
+pub(crate) fn collect(
+    c: &mut std::process::Command,
+    stdin: Option<Vec<u8>>,
+    cap: usize,
+    deadline: Option<std::time::Duration>,
+) -> Result<Collected> {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
     let mut child = c
         .stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("run docker")?;
-    if let Some(data) = stdin {
-        let mut w = child.stdin.take().context("stdin")?;
-        w.write_all(data)?;
+    let feed = match (stdin, child.stdin.take()) {
+        (Some(data), Some(mut w)) => Some(std::thread::spawn(move || match w.write_all(&data) {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+            r => r,
+        })),
+        _ => None,
+    };
+    let over = Arc::new(AtomicBool::new(false));
+    let read = |mut pipe: Box<dyn Read + Send>| {
+        let over = over.clone();
+        std::thread::spawn(move || {
+            let (mut kept, mut buf) = (Vec::new(), vec![0u8; 1 << 16]);
+            while let Ok(n) = pipe.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                let room = cap - kept.len();
+                kept.extend_from_slice(&buf[..n.min(room)]);
+                if n > room {
+                    over.store(true, Ordering::SeqCst);
+                }
+            }
+            kept
+        })
+    };
+    let out = read(Box::new(child.stdout.take().context("stdout")?));
+    let err = read(Box::new(child.stderr.take().context("stderr")?));
+    let t0 = Instant::now();
+    let mut nap = std::time::Duration::from_millis(1);
+    let (status, timed_out) = loop {
+        if let Some(st) = child.try_wait()? {
+            break (st, false);
+        }
+        let late = deadline.is_some_and(|d| t0.elapsed() >= d);
+        if late || over.load(Ordering::SeqCst) {
+            let _ = child.kill();
+            break (child.wait()?, late);
+        }
+        std::thread::sleep(nap);
+        nap = (nap * 2).min(std::time::Duration::from_millis(50));
+    };
+    let (out, err) = (out.join().unwrap_or_default(), err.join().unwrap_or_default());
+    if let Some(f) = feed {
+        f.join().map_err(|_| anyhow!("stdin writer panicked"))?.context("write stdin")?;
     }
-    let out = child.wait_with_output()?;
-    let code = out.status.code().unwrap_or(1);
-    sandbox::record(paths, id, &cmd, code, t0.elapsed().as_millis());
-    Ok((code, out.stdout, out.stderr))
+    use std::os::unix::process::ExitStatusExt;
+    let code = if timed_out { 124 } else { status.code().unwrap_or_else(|| 128 + status.signal().unwrap_or(0)) };
+    Ok(Collected { code, out, err, truncated: over.load(Ordering::SeqCst) })
+}
+
+/// Runs `args["cmd"]` in the sandbox to completion.
+fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<Vec<u8>>) -> Result<Collected> {
+    let cmd = strs(&args["cmd"]);
+    if cmd.is_empty() {
+        bail!("missing cmd");
+    }
+    let (mut c, deadline) = sandbox::exec_command(paths, id, &exec_opts(args)?, &cmd)?;
+    let t0 = Instant::now();
+    let r = collect(&mut c, stdin, MAX_OUTPUT, deadline.map(std::time::Duration::from_secs))?;
+    sandbox::record(paths, id, &cmd, r.code, t0.elapsed().as_millis());
+    Ok(r)
 }
 
 /// One API operation. `exec` here collects output; HTTP streams it separately. Every
@@ -264,24 +334,32 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
         }
         "get" => serde_json::to_value(sandbox::get(paths, &target()?)?)?,
         "exec" => {
-            let (exit, out, err) = exec_collect(paths, &target()?, args, None)?;
-            json!({"exit": exit, "stdout": String::from_utf8_lossy(&out), "stderr": String::from_utf8_lossy(&err)})
+            let r = exec_collect(paths, &target()?, args, None)?;
+            let mut v = json!({"exit": r.code, "stdout": String::from_utf8_lossy(&r.out), "stderr": String::from_utf8_lossy(&r.err)});
+            if r.truncated {
+                v["truncated"] = json!(true);
+            }
+            v
         }
         "read_file" => {
-            let a = json!({"cmd": ["cat", "--", args["path"].as_str().context("missing path")?]});
-            let (exit, out, err) = exec_collect(paths, &target()?, &a, None)?;
-            if exit != 0 {
-                bail!("{}", String::from_utf8_lossy(&err).trim());
+            let path = text(args, "path")?.context("missing path")?;
+            let a = json!({"cmd": ["cat", "--", path]});
+            let r = exec_collect(paths, &target()?, &a, None)?;
+            if r.truncated {
+                bail!("{path} is over {} MiB; copy it out with `rekcod sandbox cp`", MAX_OUTPUT >> 20);
             }
-            json!({"content": String::from_utf8_lossy(&out)})
+            if r.code != 0 {
+                bail!("{}", String::from_utf8_lossy(&r.err).trim());
+            }
+            json!({"content": String::from_utf8_lossy(&r.out)})
         }
         "write_file" => {
-            let path = args["path"].as_str().context("missing path")?;
+            let path = text(args, "path")?.context("missing path")?;
             let a = json!({"cmd": ["sh", "-c", "mkdir -p \"$(dirname \"$1\")\" && cat > \"$1\"", "-", path]});
-            let body = args["content"].as_str().unwrap_or_default();
-            let (exit, _, err) = exec_collect(paths, &target()?, &a, Some(body.as_bytes()))?;
-            if exit != 0 {
-                bail!("{}", String::from_utf8_lossy(&err).trim());
+            let body = text(args, "content")?.unwrap_or_default();
+            let r = exec_collect(paths, &target()?, &a, Some(body.as_bytes().to_vec()))?;
+            if r.code != 0 {
+                bail!("{}", String::from_utf8_lossy(&r.err).trim());
             }
             json!({"written": body.len()})
         }
@@ -502,40 +580,64 @@ pub fn route(method: &str, path: &str, query: &[(String, String)], body: &Value)
     Some((op, args))
 }
 
-/// `exec` over HTTP: NDJSON events as the command prints, then `{"exit": n}`.
+/// `exec` over HTTP: NDJSON events as the command prints, then `{"exit": n}`. A client that
+/// goes away gets the command killed; a macOS guest's command is killed after
+/// `timeout_secs` (exit 124). The child is always waited for.
 fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Result<()> {
     let id = id_of(args)?;
     let cmd = strs(&args["cmd"]);
     if cmd.is_empty() {
         bail!("missing cmd");
     }
-    let mut c = sandbox::exec_cmd(paths, &id, &exec_opts(args)?, &cmd)?;
+    let (mut c, deadline) = sandbox::exec_command(paths, &id, &exec_opts(args)?, &cmd)?;
     let t0 = Instant::now();
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
-    write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")?;
     let (tx, rx) = std::sync::mpsc::channel::<(&'static str, Vec<u8>)>();
-    let mut readers = Vec::new();
     for (name, mut pipe) in [
         ("stdout", Box::new(child.stdout.take().context("stdout")?) as Box<dyn Read + Send>),
         ("stderr", Box::new(child.stderr.take().context("stderr")?)),
     ] {
         let tx = tx.clone();
-        readers.push(std::thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             while let Ok(n) = pipe.read(&mut buf) {
                 if n == 0 || tx.send((name, buf[..n].to_vec())).is_err() {
                     break;
                 }
             }
-        }));
+        });
     }
     drop(tx);
-    for (name, data) in rx {
-        writeln!(w, "{}", json!({ name: String::from_utf8_lossy(&data) }))?;
-        w.flush()?;
+    let mut timed_out = false;
+    let sent = (|| -> Result<()> {
+        write!(w, "HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nConnection: close\r\n\r\n")?;
+        loop {
+            let wait = deadline.map(|d| std::time::Duration::from_secs(d).saturating_sub(t0.elapsed()));
+            let got = match wait {
+                Some(left) => rx.recv_timeout(left),
+                None => rx.recv().map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected),
+            };
+            match got {
+                Ok((name, data)) => {
+                    writeln!(w, "{}", json!({ name: String::from_utf8_lossy(&data) }))?;
+                    w.flush()?;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    timed_out = true;
+                    let _ = child.kill();
+                    return Ok(());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+        }
+    })();
+    if sent.is_err() {
+        let _ = child.kill();
     }
-    let code = child.wait()?.code().unwrap_or(1);
+    let status = child.wait()?;
+    let code = if timed_out { 124 } else { status.code().unwrap_or(1) };
     sandbox::record(paths, &id, &cmd, code, t0.elapsed().as_millis());
+    sent?;
     writeln!(w, "{}", json!({"exit": code}))?;
     Ok(())
 }
@@ -821,11 +923,28 @@ pub fn mcp_reply(paths: &Paths, policy: &Policy, msg: &Value) -> Option<Value> {
     })
 }
 
-/// `rekcod mcp`: newline-delimited JSON-RPC on stdin/stdout.
+/// A private, close-on-exec copy of `fd`.
+fn private_dup(fd: i32) -> Result<std::fs::File> {
+    use std::os::fd::FromRawFd;
+    let d = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
+    if d < 0 {
+        bail!("dup fd {fd}: {}", std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(d) })
+}
+
+/// `rekcod mcp`: newline-delimited JSON-RPC on stdin/stdout. Requests are read from and
+/// replies written to private copies of fds 0 and 1, which then point at /dev/null and
+/// stderr: nothing else in this process (a `println!`) or its children (ssh, docker)
+/// can read a queued request or write a line into the stream.
 pub fn mcp(paths: Paths, policy: Policy) -> Result<()> {
-    let stdin = std::io::stdin();
-    let mut out = std::io::stdout();
-    for line in stdin.lock().lines() {
+    use std::os::fd::AsRawFd;
+    let (input, mut out) = (private_dup(0)?, private_dup(1)?);
+    let null = std::fs::OpenOptions::new().read(true).write(true).open("/dev/null")?;
+    if unsafe { libc::dup2(null.as_raw_fd(), 0) } < 0 || unsafe { libc::dup2(2, 1) } < 0 {
+        bail!("redirect stdio: {}", std::io::Error::last_os_error());
+    }
+    for line in BufReader::new(input).lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -890,6 +1009,27 @@ mod tests {
         assert!(exec_opts(&json!({"env": ["AWS_SECRET_ACCESS_KEY"]})).is_err());
         assert!(exec_opts(&json!({"env": ["A=1"]})).is_ok());
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn collected_commands_are_bounded() {
+        let sh = |script: &str| {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", script]);
+            c
+        };
+        // A child that exits without reading its stdin: the feed ends, the exit code comes back.
+        let r = collect(&mut sh("echo no >&2; exit 3"), Some(vec![b'x'; 4 << 20]), MAX_OUTPUT, None).unwrap();
+        assert_eq!((r.code, r.err.as_slice(), r.truncated), (3, &b"no\n"[..], false));
+        let r = collect(&mut sh("cat"), Some(b"round trip".to_vec()), MAX_OUTPUT, None).unwrap();
+        assert_eq!((r.code, r.out.as_slice()), (0, &b"round trip"[..]));
+        // An endless printer is cut at the cap and killed.
+        let r = collect(&mut sh("yes"), None, 1 << 20, None).unwrap();
+        assert!(r.truncated && r.out.len() == 1 << 20 && r.code != 0, "{}", r.code);
+        let t0 = Instant::now();
+        let r = collect(&mut sh("sleep 30"), None, MAX_OUTPUT, Some(std::time::Duration::from_secs(1))).unwrap();
+        assert_eq!(r.code, 124);
+        assert!(t0.elapsed() < std::time::Duration::from_secs(10));
     }
 
     #[test]

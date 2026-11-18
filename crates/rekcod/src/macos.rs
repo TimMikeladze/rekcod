@@ -490,7 +490,7 @@ pub fn pull_ws(paths: &Paths, ip: &str, ws: &Path) -> Result<()> {
         }
     }
     std::fs::create_dir_all(&fresh)?;
-    let mut ssh = ssh_base(paths, ip)?.arg("tar -C ~/ws --exclude ./.git -cf - .").stdout(Stdio::piped()).spawn()?;
+    let mut ssh = ssh_base(paths, ip)?.arg("tar -C ~/ws --exclude ./.git -cf - .").stdin(Stdio::null()).stdout(Stdio::piped()).spawn()?;
     let out = ssh.stdout.take().context("ssh stdout")?;
     let ok = Command::new("tar").arg("-C").arg(&fresh).args(["-xf", "-"]).stdin(out).status()?.success();
     if !ssh.wait()?.success() || !ok {
@@ -582,7 +582,11 @@ pub fn input_script(action: &[String]) -> Result<String> {
 
 pub fn input(paths: &Paths, ip: &str, action: &[String]) -> Result<()> {
     let script = input_script(action)?;
-    let ok = ssh_base(paths, ip)?.arg(format!("osascript -l JavaScript -e {}", crate::actions::shell_quote(&script))).status()?.success();
+    let ok = ssh_base(paths, ip)?
+        .arg(format!("osascript -l JavaScript -e {}", crate::actions::shell_quote(&script)))
+        .stdin(Stdio::null())
+        .status()?
+        .success();
     if !ok {
         bail!("input failed; the guest needs Accessibility allowed for sshd-keygen-wrapper");
     }

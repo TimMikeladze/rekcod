@@ -520,10 +520,25 @@ fn check_capacity(paths: &Paths, gib: u64) -> Result<()> {
     Ok(())
 }
 
+/// A container image reference as `docker run` takes it: `[a-zA-Z0-9][a-zA-Z0-9._/:@-]*`.
+/// Anything else, `--env-file=/path` above all, would be read as an option of the docker
+/// CLI on the Mac.
+pub fn check_image(image: &str) -> Result<()> {
+    let ok = image.len() <= 255
+        && image.bytes().next().is_some_and(|b| b.is_ascii_alphanumeric())
+        && image.bytes().all(|b| b.is_ascii_alphanumeric() || b"._/:@-".contains(&b));
+    if !ok {
+        bail!("bad image {:?}: use a reference like debian:trixie-slim or ghcr.io/org/app@sha256:...", printable_name(image));
+    }
+    Ok(())
+}
+
 pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     check_name("golden disk", &o.golden)?;
-    if let Some(img) = o.image.as_deref().filter(|_| o.os.as_deref() == Some("macos")) {
-        check_name("macOS image", img)?;
+    match o.image.as_deref() {
+        Some(img) if o.os.as_deref() == Some("macos") => check_name("macOS image", img)?,
+        Some(img) => check_image(img)?,
+        None => {}
     }
     let project = o.dir.clone().map_or_else(std::env::current_dir, Ok)?.canonicalize()?;
     if !["/Users", "/Volumes", "/private"].iter().any(|r| project.starts_with(r)) {
@@ -2294,6 +2309,21 @@ mod tests {
         std::fs::set_permissions(project.join("locked"), std::fs::Permissions::from_mode(0o755)).unwrap();
         let left: Vec<_> = std::fs::read_dir(root(&paths)).unwrap().map(|e| e.unwrap().path()).filter(|p| p.is_dir()).collect();
         assert!(e.is_err() && left.is_empty(), "{:?} {left:?}", e.err());
+    }
+
+    #[test]
+    fn images_are_references_not_options() {
+        for ok in ["debian:trixie-slim", "ghcr.io/astral-sh/uv:python3.14-bookworm-slim", "node@sha256:abc123", "localhost:5000/x"] {
+            assert!(check_image(ok).is_ok(), "{ok}");
+        }
+        for bad in ["--privileged", "--env-file=/etc/passwd", "-v", "", "a b", "x;y", "a\nb"] {
+            assert!(check_image(bad).is_err(), "{bad}");
+        }
+        let base = tmp("image");
+        let paths = Paths { home: base.join("home") };
+        let o = CreateOptions { dir: Some(base.clone()), image: Some("--privileged".into()), ..Default::default() };
+        assert!(create(&paths, o).unwrap_err().to_string().contains("bad image"));
+        assert!(!root(&paths).exists());
     }
 
     #[test]

@@ -135,7 +135,8 @@ enum Cmd {
         /// Do not change the active docker context.
         #[arg(long)]
         no_switch: bool,
-        /// Power off immediately, without letting dockerd stop containers. For a hung VM.
+        /// Power off immediately, without letting dockerd stop containers. For a hung VM;
+        /// a daemon still there after 45 s gets SIGKILL.
         #[arg(long)]
         force: bool,
     },
@@ -1281,9 +1282,10 @@ enum ServerCmd {
 
 #[derive(Subcommand)]
 enum Socket {
-    /// Point /var/run/docker.sock at ~/.rekcod/default.sock (sudo, once); start/stop then switch it.
+    /// Point /var/run/docker.sock at ~/.rekcod/default.sock (sudo, once), and again at every
+    /// boot (a root LaunchDaemon); start/stop then switch it.
     Install,
-    /// Put /var/run/docker.sock back to what it was before `install` (sudo).
+    /// Put /var/run/docker.sock back to what it was before `install` and remove the LaunchDaemon (sudo).
     Uninstall,
 }
 

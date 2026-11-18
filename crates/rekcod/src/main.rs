@@ -19,6 +19,8 @@ mod route;
 #[cfg(target_os = "macos")]
 mod actions;
 #[cfg(target_os = "macos")]
+mod apptoml;
+#[cfg(target_os = "macos")]
 mod bonjour;
 #[cfg(target_os = "macos")]
 mod cli;
@@ -1797,7 +1799,7 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
     match c {
         AppCmd::Deploy { name, port, instances, git, git_ref, public, private, idle_stop, recycle } => {
             let dir = std::env::current_dir()?;
-            let t = fleet::parse_toml(&std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default());
+            let local_head = git_ref.is_none();
             let (origin, head) = match (&git, &git_ref) {
                 (Some(g), Some(r)) => (g.clone(), r.clone()),
                 _ => {
@@ -1805,6 +1807,7 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                     (git.unwrap_or(o), git_ref.unwrap_or(h))
                 }
             };
+            let t = apptoml::parse(&fleet::deployed_toml(&dir, local_head.then_some(head.as_str()))?)?;
             let dir_name = dir.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
             let num = |k: &str| t.get(k).and_then(|v| v.parse::<i64>().ok());
             let dur = |k: &str| t.get(k).map(|v| duration_secs(v).map_err(|e| anyhow::anyhow!("rekcod.toml {k}: {e}"))).transpose();

@@ -288,7 +288,7 @@ pub fn check_plain_http(authority: &str, what: &str) -> Result<()> {
 /// The git remote URL and HEAD commit of `dir`, for remote creates and deploys.
 pub fn git_origin(dir: &Path) -> Result<(String, String)> {
     let run = |args: &[&str]| -> Result<String> {
-        let o = Command::new("git").arg("-C").arg(dir).args(args).output()?;
+        let o = git_here().arg("-C").arg(dir).args(args).output()?;
         if !o.status.success() {
             bail!("git {}: {}", args.join(" "), String::from_utf8_lossy(&o.stderr).trim());
         }
@@ -326,8 +326,22 @@ pub fn check_git_source(url: &str, rev: &str) -> Result<()> {
 
 /// `git` with only network transports allowed (plus `file` under [`ALLOW_LOCAL_GIT`]),
 /// no prompts and no ext:: helpers.
-fn git_cmd() -> Command {
+/// Variables that point git at a repository other than `-C`'s: a git hook (the pre-commit
+/// one running these tests, say) sets them, and `git init` there rewrites that repo.
+const GIT_REPO_VARS: &[&str] =
+    &["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES"];
+
+/// `git` for the repository at `-C DIR`, whatever the environment says.
+fn git_here() -> Command {
     let mut c = Command::new("git");
+    for v in GIT_REPO_VARS {
+        c.env_remove(v);
+    }
+    c
+}
+
+fn git_cmd() -> Command {
+    let mut c = git_here();
     let protocols = if std::env::var_os(ALLOW_LOCAL_GIT).is_some() { "https:ssh:http:file" } else { "https:ssh:http" };
     c.env("GIT_ALLOW_PROTOCOL", protocols).env("GIT_TERMINAL_PROMPT", "0").stdin(Stdio::null());
     // A remote that stops sending would hold the deploy until the controller's timeout.
@@ -451,27 +465,25 @@ fn start_relay(ip: IpAddr, ext: u16, port: u16) -> Result<u16> {
     Ok(bound)
 }
 
-/// `rekcod.toml`: `[app]`, `[resources]` and `[env]` with `key = value` lines.
-pub fn parse_toml(text: &str) -> HashMap<String, String> {
-    let mut out = HashMap::new();
-    let mut section = String::new();
-    for line in text.lines() {
-        let line = line.split(" #").next().unwrap_or("").trim();
-        if line.starts_with('#') || line.is_empty() {
-            continue;
-        }
-        if let Some(s) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
-            section = s.trim().to_string();
-        } else if let Some((k, v)) = line.split_once('=') {
-            out.insert(format!("{section}.{}", k.trim()), v.trim().trim_matches('"').to_string());
-        }
-    }
-    out
-}
-
 /// A checkout's `rekcod.toml`, read on the Mac without following links.
 fn checkout_toml(dir: &Path) -> Result<HashMap<String, String>> {
-    Ok(parse_toml(&crate::xrun::read_project_file(dir, "rekcod.toml")?.unwrap_or_default()))
+    crate::apptoml::parse(&crate::xrun::read_project_file(dir, "rekcod.toml")?.unwrap_or_default())
+}
+
+/// The `rekcod.toml` `app deploy` sends: the one in `commit` (what the node builds), or
+/// with none (`--ref` given) the working tree's. An edited, uncommitted one is named.
+pub fn deployed_toml(dir: &Path, commit: Option<&str>) -> Result<String> {
+    let disk = std::fs::read_to_string(dir.join("rekcod.toml")).unwrap_or_default();
+    let Some(commit) = commit else { return Ok(disk) };
+    let o = git_here().arg("-C").arg(dir).args(["show", &format!("{commit}:rekcod.toml")]).stderr(Stdio::null()).output()?;
+    let committed = if o.status.success() { String::from_utf8(o.stdout).context("rekcod.toml isn't UTF-8")? } else { String::new() };
+    if committed != disk {
+        eprintln!(
+            "rekcod: rekcod.toml differs from the one in {}; deploying the committed one (commit and push to change it)",
+            &commit[..commit.len().min(12)]
+        );
+    }
+    Ok(committed)
 }
 
 /// Writes a generated Dockerfile into a checkout that has nothing named `Dockerfile`. A
@@ -6423,9 +6435,38 @@ mod tests {
         assert!(crate::daemon::reach_arg("1.2.3.4:5 rekcod.sandbox=0").is_err());
     }
 
+    /// `app deploy` sends the rekcod.toml of the commit the node builds, not an edited one.
+    #[test]
+    fn deploy_reads_the_committed_toml() {
+        let dir = std::env::temp_dir().join(format!("rekcod-toml-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let ok = git_here()
+                .arg("-C")
+                .arg(&dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("rekcod.toml"), "[app]\nport = 3000\n").unwrap();
+        git(&["add", "rekcod.toml"]);
+        git(&["commit", "-q", "-m", "x"]);
+        std::fs::write(dir.join("rekcod.toml"), "[app]\nport = 9999\n").unwrap();
+        assert_eq!(deployed_toml(&dir, Some("HEAD")).unwrap(), "[app]\nport = 3000\n");
+        assert_eq!(deployed_toml(&dir, None).unwrap(), "[app]\nport = 9999\n", "--ref: the working tree's");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn toml_and_dockerfile() {
-        let t = parse_toml("[app]\nname = \"dash\"\nport = 3000 # comment\nstart = \"python3 app.py\"\n[env]\nA = \"1\"\n");
+        let t =
+            crate::apptoml::parse("[app]\nname = \"dash\"\nport = 3000 # comment\nstart = \"python3 app.py\"\n[env]\nA = \"1\"\n").unwrap();
         assert_eq!(t["app.name"], "dash");
         assert_eq!(t["app.port"], "3000");
         assert_eq!(t["env.A"], "1");

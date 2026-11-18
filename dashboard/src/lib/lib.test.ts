@@ -10,7 +10,9 @@ import { compileSearch, layout, lineLevel, windowOf } from "@/components/log-she
 import { entries, entryId, remember, search } from "@/components/palette"
 import { errorRate } from "@/components/tabs/apps"
 import { parseSort, sortRows } from "@/hooks/use-sort"
+import { destructive } from "./kinds"
 import { share } from "./share"
+import fixtureState from "../../fixtures/state.json"
 import type { State } from "./types"
 
 const stop = { kind: "ContainerStop", label: "Stop", argv: ["stop", "web"], interactive: false, confirm: null }
@@ -192,6 +194,24 @@ describe("log viewer", () => {
     expect((compileSearch("4\\d\\d", true) as RegExp).test("GET / 404")).toBe(true)
     expect(compileSearch("(", true)).toHaveProperty("error")
     expect(compileSearch("", true)).toBeNull()
+  })
+})
+
+describe("destructive", () => {
+  it("is every action that asks first, and only those", () => {
+    const all: { kind: string; confirm?: string | null }[] = []
+    const walk = (v: unknown) => {
+      if (Array.isArray(v)) v.forEach(walk)
+      else if (v && typeof v === "object") {
+        const o = v as Record<string, unknown>
+        if (typeof o.kind === "string" && "label" in o) all.push(o as { kind: string; confirm?: string | null })
+        else Object.values(o).forEach(walk)
+      }
+    }
+    walk(fixtureState)
+    const red = new Set(all.filter(destructive).map((a) => a.kind))
+    for (const k of ["ImagePush", "SnapRestore", "SandboxApply", "AppPublic", "AppRollback", "NodeDrain", "ContainerRemove", "VolumeRemove"]) expect(red, k).toContain(k)
+    for (const k of ["ContainerStop", "ImagePull", "VolumeExport", "SnapSave"]) expect(red, k).not.toContain(k)
   })
 })
 

@@ -18,13 +18,16 @@ export default defineConfig({
   use: { baseURL: `http://127.0.0.1:${PORT}`, trace: "retain-on-failure" },
   projects: [
     { name: "setup", testMatch: /auth\.setup\.ts/ },
-    { name: "desktop", use: { ...devices["Desktop Chrome"], storageState: AUTH_STATE }, grepInvert: /@phone/, dependencies: ["setup"] },
+    { name: "desktop", use: { ...devices["Desktop Chrome"], storageState: AUTH_STATE }, grepInvert: /@phone/, testIgnore: /engines\.spec\.ts/, dependencies: ["setup"] },
     {
       name: "phone",
       use: { ...devices["Desktop Chrome"], viewport: { width: 390, height: 844 }, storageState: AUTH_STATE },
       grep: /@phone/,
+      testIgnore: /engines\.spec\.ts/,
       dependencies: ["setup"],
     },
+    // Switches the server's engine, which every page shares: after the others, never beside them.
+    { name: "engines", use: { ...devices["Desktop Chrome"], storageState: AUTH_STATE }, testMatch: /engines\.spec\.ts/, dependencies: ["desktop", "phone"] },
   ],
   webServer: {
     // The same standalone bundle and entry `rekcod dashboard` runs. /api/state answers 401

@@ -11,14 +11,24 @@ async function noSeriousA11yIssues(page: Page) {
   expect(bad.map((v) => `${v.id}: ${v.nodes.map((n) => n.target.join(" ")).slice(0, 3).join(", ")}`)).toEqual([])
 }
 
+// What the Content-Security-Policy (next.config.ts) blocked; the dashboard's own scripts,
+// styles, fonts and fetches must all pass it.
+let blocked: string[] = []
+
 test.beforeEach(async ({ page }) => {
+  blocked = []
   page.on("pageerror", (e) => {
     throw e
   })
   // A server/client markup mismatch only logs; make it fail the test.
   page.on("console", (m) => {
     if (m.type() === "error" && /hydrat/i.test(m.text())) throw new Error(m.text())
+    if (/Content Security Policy/i.test(m.text())) blocked.push(m.text())
   })
+})
+
+test.afterEach(() => {
+  expect(blocked).toEqual([])
 })
 
 for (const tab of TABS) {

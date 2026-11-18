@@ -1,11 +1,21 @@
-// The per-launch token (docs/dashboard.md). `rekcod dashboard` and `npm run dev` put it in
+// The per-launch token (crates/rekcod/src/dashboard.rs). `rekcod dashboard` and `npm run dev` put it in
 // REKCOD_DASHBOARD_TOKEN; `/auth?token=` stores it in the page's localStorage, and every API
 // request sends it as `Authorization: Bearer`. Never a cookie: cookies ignore ports, so every
 // other server on localhost would receive it. No "server-only" here: proxy.ts imports this too.
 import { createHash, timingSafeEqual } from "node:crypto"
 
 export const TOKEN_ENV = "REKCOD_DASHBOARD_TOKEN"
-export const LOCAL_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/
+// 127.0.0.1 only. macOS resolves `localhost` to ::1 first, and any local account or container
+// forward can listen on [::1] at this port: a `localhost` URL would send it the token, and its
+// pages would share this origin's localStorage. proxy.ts sends `localhost` to 127.0.0.1.
+export const LOCAL_HOST = /^127\.0\.0\.1(:\d+)?$/
+const LOCALHOST = /^localhost(:\d+)?$/
+
+/** `http://127.0.0.1:PORT/path?query` for a request that came in as `localhost:PORT`, else null. */
+export function loopbackUrl(host: string, pathAndQuery: string): string | null {
+  const m = LOCALHOST.exec(host)
+  return m ? `http://127.0.0.1${m[1] ?? ""}${pathAndQuery}` : null
+}
 
 /** The server's token, or null when it has none (or one too short to count). Every request is then refused. */
 export function serverToken(): string | null {

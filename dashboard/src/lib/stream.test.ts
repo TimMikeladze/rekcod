@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events"
 import { PassThrough } from "node:stream"
-import type { ChildProcess } from "node:child_process"
+import { spawn, type ChildProcess } from "node:child_process"
 import { describe, expect, it, vi } from "vitest"
 import { eventStream, HIGH_WATER as SSE_HIGH_WATER, MAX_PENDING } from "./server/sse"
 import { cappedStream, HIGH_WATER, MAX_STREAMS, openStreams, textStream } from "./server/stream"
@@ -126,6 +126,25 @@ describe("event stream backpressure", () => {
     expect(teardown).toHaveBeenCalledTimes(1)
   })
 
+  it("tells a page that lost stats samples to reload them, once it has caught up", async () => {
+    let send!: (event: string, data: unknown) => void
+    const ac = new AbortController()
+    const body = eventStream(ac.signal, (s) => {
+      send = s
+      return () => {}
+    })
+    for (let i = 0; i < 10; i++) send("stats", { i, big })
+    const got: string[] = []
+    const reading = readEvents(body, (event) => {
+      got.push(event)
+    })
+    await vi.waitFor(() => expect(got).toContain("resync"))
+    ac.abort()
+    await reading
+    expect(got.at(-1)).toBe("resync")
+    expect(got.filter((e) => e === "resync")).toHaveLength(1)
+  })
+
   it("drops a page that falls more than MAX_PENDING frames behind", async () => {
     let send!: (event: string, data: unknown) => void
     const teardown = vi.fn()
@@ -162,5 +181,28 @@ describe("readEvents", () => {
       ["x", "one\ntwo"],
       ["message", "é"],
     ])
+  })
+})
+
+describe("log stream children", () => {
+  const node = (code: string) => () => spawn(process.execPath, ["-e", code], { stdio: ["ignore", "pipe", "pipe"] })
+
+  it("are killed and free their slot when the client left before the stream started", async () => {
+    const ac = new AbortController()
+    ac.abort()
+    let child!: ChildProcess
+    const res = cappedStream(new Request("http://127.0.0.1:4500/api/logs", { signal: ac.signal }), () => (child = node("setInterval(() => {}, 1000)")()))
+    expect(await res.text()).toBe("")
+    await vi.waitFor(() => expect(openStreams()).toBe(0))
+    expect(child.signalCode ?? child.exitCode).not.toBeNull()
+  })
+
+  it("free their slot when a child exited with unread output and the client cancels", async () => {
+    let child!: ChildProcess
+    const res = cappedStream(req(), () => (child = node("process.stdout.write('x'.repeat(180 * 1024))")()))
+    await vi.waitFor(() => expect(child.exitCode).toBe(0))
+    expect(openStreams()).toBe(1)
+    await res.body!.cancel()
+    await vi.waitFor(() => expect(openStreams()).toBe(0))
   })
 })

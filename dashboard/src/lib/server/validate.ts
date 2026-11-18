@@ -55,10 +55,18 @@ export function sandboxStatArgv(s: State, id: string | null): Argv {
   return { argv: ["sandbox", "diff", "--stat", id] }
 }
 
-/** The tmp file is the server's; the page only picks a running macOS sandbox. */
+/** The TCP ports `/api/probe` asks: real port numbers only, each once. */
+export function probePorts(s: State): number[] {
+  return [...new Set(s.ports.filter((p) => !p.udp && !p.error && Number.isInteger(p.port) && p.port >= 1 && p.port <= 65535).map((p) => p.port))]
+}
+
+/** The tmp file is the server's; the page only picks a running macOS sandbox on this Mac. */
 export function screenshotArgv(s: State, id: string | null, file: string): Argv {
+  if (s.engine) return no("screenshots aren't available for another Mac's engine")
+  // Ids are lowercase letters and digits (`sandbox::new_id`), never an option.
+  if (!id || !/^[a-z0-9]{1,64}$/.test(id)) return no("no such sandbox")
   const sb = s.sandboxes.find((x) => x.id === id)
-  if (!sb || !id) return no("no such sandbox")
+  if (!sb) return no("no such sandbox")
   if (!sb.macos || !sb.running) return no("screenshots are for running macOS sandboxes")
   return { argv: ["sandbox", "screenshot", id, file] }
 }

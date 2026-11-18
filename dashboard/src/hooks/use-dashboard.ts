@@ -85,6 +85,14 @@ export function useDashboard(): DashData {
     let retry: ReturnType<typeof setTimeout> | undefined
     let poll: ReturnType<typeof setInterval> | null = null
     let stopped = false
+    // Stats samples and activity entries the stream couldn't deliver (lib/server/sse.ts).
+    const resync = () => {
+      loadStats(windowRef.current)
+      api("/api/activity")
+        .then((r) => r.json())
+        .then((l: ActivityEntry[]) => Array.isArray(l) && setActivity(l))
+        .catch(() => {})
+    }
     const startPolling = () => {
       poll ??= setInterval(() => document.visibilityState === "visible" && refresh(), POLL_MS)
     }
@@ -96,6 +104,7 @@ export function useDashboard(): DashData {
       const d = JSON.parse(data)
       if (event === "state") gotState(d as State)
       else if (event === "fail") setError((d as { error: string }).error)
+      else if (event === "resync") loadStats(windowRef.current)
       else if (event === "stats") {
         const s = d as { latest: Stat[]; sample: Sample[]; colors: Record<string, string> }
         setStats((old) => sameStats(old, s.latest))
@@ -119,6 +128,8 @@ export function useDashboard(): DashData {
         if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`)
         setLive(true)
         stopPolling()
+        // What came while it was down, or what the first load missed if the server was starting.
+        resync()
         await readEvents(r.body, onEvent)
       } catch {}
       if (stopped) return

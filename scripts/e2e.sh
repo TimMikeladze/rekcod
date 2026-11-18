@@ -70,6 +70,38 @@ kill $srv 2>/dev/null
 tmpf=$(mktemp /tmp/rekcod-e2e.XXXX); echo mac-tmp >"$tmpf"
 check "Mac /tmp bind mount" sh -c "test \"\$(docker run --rm -v $tmpf:/f alpine:3.24 cat /f)\" = mac-tmp"
 rm -f "$tmpf"
+# Read-only opens on a Mac bind mount are deferred until the host is needed. A
+# copy_file_range from one that was never read must still copy the right file, and a file
+# deleted on the Mac between open and the first read must fail the read, not send fh 0.
+mkdir -p "$work/lazy" && head -c 300000 /dev/urandom >"$work/lazy/src" && echo gone >"$work/lazy/gone"
+check "copy_file_range from a file not yet read" docker run --rm -v "$work/lazy:/w" python:3.13-alpine python3 -c '
+import os
+src = os.open("/w/src", os.O_RDONLY)
+dst = os.open("/w/dst", os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
+n = 0
+while (c := os.copy_file_range(src, dst, 1 << 20)) > 0:
+    n += c
+assert open("/w/src", "rb").read() == open("/w/dst", "rb").read(), n
+'
+check "cmp on the Mac" cmp -s "$work/lazy/src" "$work/lazy/dst"
+docker run -d --name rekcod-e2e-lazy -l "$run_label" -v "$work/lazy:/w" python:3.13-alpine python3 -c '
+import errno, os, time
+fd = os.open("/w/gone", os.O_RDONLY)
+open("/w/opened", "w").close()
+for _ in range(100):
+    if os.path.exists("/w/deleted"):
+        break
+    time.sleep(0.1)
+try:
+    print("read", os.read(fd, 100))
+except OSError as e:
+    print("error", errno.errorcode.get(e.errno, e.errno))
+' >/dev/null
+until_ok 100 0.1 test -e "$work/lazy/opened"
+rm -f "$work/lazy/gone" && touch "$work/lazy/deleted"
+until_ok 100 0.1 sh -c '! docker inspect -f "{{.State.Running}}" rekcod-e2e-lazy | grep -q true'
+check "a read after the Mac deleted the file fails (not EBADF)" sh -c 'docker logs rekcod-e2e-lazy 2>&1 | grep -E "^error E" | grep -vq EBADF'
+docker rm -f rekcod-e2e-lazy >/dev/null 2>&1
 check "rekcod compact" "$R" compact
 
 echo "docker passthrough (docs/cli-passthrough.md)"

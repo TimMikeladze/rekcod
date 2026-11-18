@@ -728,14 +728,16 @@ const LOCAL_KEYS: &[&str] =
     &["hosts", "remotes", "namespaces", "bans", "controller_actions", "apps", "jobs", "nodes", "remote", "schedules", "routes", "backups"];
 
 /// `ssh`, or `REKCOD_SSH` (scripts/e2e-engines.sh points it at a stand-in that runs the
-/// command here), with the options `add` uses.
-fn engine_ssh(dest: &str, extra: &[&str]) -> Command {
+/// command here), with the options `add` uses. `shared`: over the multiplexed connection.
+fn engine_ssh(dest: &str, extra: &[&str], shared: bool) -> Command {
     let mut cmd = Command::new(std::env::var_os("REKCOD_SSH").unwrap_or_else(|| "ssh".into()));
-    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"])
-        .args(ALIVE)
-        .args(mux_opts())
-        .args(extra)
-        .args(ssh_dest(dest));
+    cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"]).args(ALIVE);
+    if shared {
+        cmd.args(mux_opts());
+    } else {
+        cmd.args(["-o", "ControlPath=none"]);
+    }
+    cmd.args(extra).args(ssh_dest(dest));
     cmd
 }
 
@@ -843,7 +845,7 @@ pub(crate) fn output_within(mut cmd: Command, deadline: Duration) -> Result<std:
 /// `rekcod host state NAME`: `rekcod state --local` on that Mac, rewritten to run from here.
 pub fn engine_state(name: &str) -> Result<serde_json::Value> {
     let dest = dest_of(name)?;
-    let mut cmd = engine_ssh(&dest, &[]);
+    let mut cmd = engine_ssh(&dest, &[], true);
     cmd.arg(remote_rekcod(None, &["state".into(), "--local".into()], false)).stdin(Stdio::null());
     let out = output_within(cmd, STATE_DEADLINE).with_context(|| name.to_string())?;
     if !out.status.success() {
@@ -872,7 +874,9 @@ pub fn exec(name: &str, dir: Option<&str>, args: &[String]) -> Result<std::conve
     use std::os::unix::process::CommandExt;
     let dest = dest_of(name)?;
     let tty = wants_tty(unsafe { libc::isatty(0) } == 1, unsafe { libc::isatty(1) } == 1);
-    let mut cmd = engine_ssh(&dest, if tty { &["-t"] } else { &[] });
+    // Without a pty the session's sshd has to go away for the remote command to be
+    // stopped (ORPHAN_WATCH); a shared connection's sshd stays, so this one gets its own.
+    let mut cmd = engine_ssh(&dest, if tty { &["-t"] } else { &[] }, tty);
     cmd.arg(remote_rekcod(dir, args, !tty));
     Err(cmd.exec()).context("exec ssh")
 }

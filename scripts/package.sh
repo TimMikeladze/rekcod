@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Release artifacts in out/release (docs/phase3.md):
+# Release artifacts in out/release:
 #   rekcod-<version>-darwin-arm64.tar.gz   bin/rekcod, LICENSE, NOTICE, LICENSES/
 #   rekcod-darwin-arm64.tar.gz             the same, for releases/latest/download
 #   rekcod-guest-<guest version>.tar.gz    Image, [initramfs], root.img, VERSION, license notices
@@ -10,8 +10,8 @@
 # where `rekcod dashboard` finds it. Off by default: it needs Node on the user's Mac.
 #
 # CODESIGN_IDENTITY signs the released binary with that identity, hardened runtime and a
-# secure timestamp (release.yml sets it to the Developer ID when the secrets exist,
-# docs/releasing.md). Default "-": ad-hoc.
+# secure timestamp (release.yml sets it to the Developer ID when the secrets exist).
+# Default "-": ad-hoc.
 set -euo pipefail
 with_dashboard=0
 [[ ${1:-} == --with-dashboard ]] && with_dashboard=1

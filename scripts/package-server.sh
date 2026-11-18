@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # out/server/rekcod-server-<version>.pkg: double-click on a Mac to make it a one-machine
-# fleet (docs/server-pkg.md). Runs scripts/package.sh first, so it needs out/guest.
+# fleet. Runs scripts/package.sh first, so it needs out/guest.
 #
 # SERVER_DOMAIN=apps.example.com   apps are served at <app>.<domain> (default apps.localhost)
 # INSTALLER_IDENTITY="Developer ID Installer: ..."   sign the pkg; unsigned otherwise

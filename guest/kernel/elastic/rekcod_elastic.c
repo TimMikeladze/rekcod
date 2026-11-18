@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 // Copyright (c) 2026 TimMikeladze
 /*
- * rekcod elastic memory (docs/elastic-memory.md): a swap device on a virtio shared
- * memory region that the host backs with its own memory. Chunks the guest stops using
+ * rekcod elastic memory (host side: crates/rekcod/src/elastic.rs): a swap device on a
+ * virtio shared memory region that the host backs with its own memory. Chunks the guest stops using
  * are handed back to the host (RELEASE), which returns them to macOS; a chunk is taken
  * back (REUSE) before anything is written to it again.
  *

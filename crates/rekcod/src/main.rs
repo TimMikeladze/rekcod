@@ -135,7 +135,8 @@ enum Cmd {
         /// Do not change the active docker context.
         #[arg(long)]
         no_switch: bool,
-        /// Power off immediately, without letting dockerd stop containers. For a hung VM.
+        /// Power off immediately, without letting dockerd stop containers. For a hung VM;
+        /// a daemon still there after 45 s gets SIGKILL.
         #[arg(long)]
         force: bool,
     },
@@ -163,7 +164,7 @@ enum Cmd {
         /// Don't forward listening ports automatically.
         #[arg(long)]
         no_autoports: bool,
-        /// Run in a separate VM that sees only this directory (docs/sandbox.md).
+        /// Run in a separate VM that sees only this directory, read-write.
         #[arg(long)]
         sandbox: bool,
         /// No network at all.
@@ -179,7 +180,7 @@ enum Cmd {
         #[arg(required = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Throwaway VMs for AI agents: a full dockerd that sees a copy of one project (docs/agent-sandboxes.md).
+    /// Throwaway VMs for AI agents: a full dockerd that sees a copy of one project.
     Sandbox {
         /// Run on a fleet controller (`rekcod remote add`); no NAME means the default remote.
         #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]
@@ -192,7 +193,8 @@ enum Cmd {
     },
     /// MCP server on stdio exposing the sandbox commands to agents.
     Mcp(ApiPolicyArgs),
-    /// Install the latest release over this binary (the VM keeps running the old one until restarted).
+    /// Install the latest release over this binary and restart the fleet services that run it
+    /// (the VM keeps running the old one until restarted).
     Upgrade {
         /// Only say whether a newer release exists; exit 1 if one does.
         #[arg(long)]
@@ -342,6 +344,11 @@ enum Cmd {
         repair: bool,
         #[arg(long)]
         network_user: bool,
+        /// Sandbox VM: the only Mac ports it may listen on, comma-separated (empty: none).
+        #[arg(long)]
+        publish: Option<String>,
+        #[arg(long)]
+        no_autoports: bool,
     },
 }
 
@@ -388,11 +395,11 @@ enum Snap {
 fn quota_value(s: &str) -> Result<i64, String> {
     match s {
         "unlimited" => Ok(-1),
-        _ => s.parse::<u32>().map(i64::from).map_err(|_| format!("{s}: a number or `unlimited`")),
+        _ => s.parse::<i64>().ok().filter(|n| (0..=100_000).contains(n)).ok_or_else(|| format!("{s}: 0 to 100000 or `unlimited`")),
     }
 }
 
-/// `30m`, `2h`, `90s`, `0` (never).
+/// `30m`, `2h`, `90s`, `30d`, `0` (never).
 fn duration_secs(s: &str) -> Result<u64, String> {
     let (n, unit) = s.split_at(s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len()));
     let n: u64 = n.parse().map_err(|_| format!("bad duration {s}"))?;
@@ -400,7 +407,8 @@ fn duration_secs(s: &str) -> Result<u64, String> {
         "" | "s" => Ok(n),
         "m" => Ok(n * 60),
         "h" => Ok(n * 3600),
-        _ => Err(format!("bad duration {s} (use s, m or h)")),
+        "d" => Ok(n * 86400),
+        _ => Err(format!("bad duration {s} (use s, m, h or d)")),
     }
 }
 
@@ -487,9 +495,10 @@ enum SandboxCmd {
         /// Only print what would change; exit 1 if anything would.
         #[arg(long)]
         check: bool,
-        /// Write the copy the last `diff` showed, not the workspace as it is now.
-        #[arg(long)]
-        reviewed: bool,
+        /// Write the copy the `diff` that printed REVIEW showed, not the workspace as it is
+        /// now. Refused once a later diff (yours or an agent's) has replaced that copy.
+        #[arg(long, value_name = "REVIEW")]
+        reviewed: Option<String>,
     },
     /// Save a macOS sandbox's screen as PNG.
     Screenshot {
@@ -535,6 +544,12 @@ enum SandboxCmd {
         #[arg(long, conflicts_with = "ids")]
         all: bool,
     },
+    /// Delete stopped sandboxes not used for a while, and what failed creates left behind.
+    Prune {
+        /// Last used longer ago than this.
+        #[arg(long, default_value = "168h", value_parser = duration_secs)]
+        older_than: u64,
+    },
     /// Serve the sandbox API on ~/.rekcod/run/sandbox.sock.
     Serve {
         /// Also listen on 127.0.0.1:PORT, with a bearer token.
@@ -568,6 +583,10 @@ struct ApiPolicyArgs {
     /// the internet, the Mac and the LAN.
     #[arg(long)]
     allow_macos: bool,
+    /// Let callers write a sandbox's changes into the project on the Mac (`apply`). Without
+    /// it they can diff and `apply` with `check` only; you apply with `rekcod sandbox apply`.
+    #[arg(long)]
+    allow_apply: bool,
 }
 
 impl ApiPolicyArgs {
@@ -588,6 +607,7 @@ impl ApiPolicyArgs {
             allow_hosts: self.allow_hosts,
             secrets: self.secrets,
             macos: self.allow_macos,
+            apply: self.allow_apply,
             node: false,
         })
     }
@@ -636,8 +656,13 @@ enum RemoteCmd {
     Add {
         name: String,
         url: String,
-        #[arg(long)]
-        token: String,
+        /// The controller token. Anyone on this Mac can read it from the process list while
+        /// this runs; REKCOD_TOKEN or --token-file keep it off argv.
+        #[arg(long, env = "REKCOD_TOKEN", hide_env_values = true)]
+        token: Option<String>,
+        /// Read the token from this file (`-` for stdin) instead.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<std::path::PathBuf>,
         /// Namespace this remote's commands use (default: default).
         #[arg(long)]
         ns: Option<String>,
@@ -660,7 +685,12 @@ enum NodeCmd {
     /// Register with a controller and start serving (saves ~/.rekcod/node.json).
     Join {
         controller: String,
-        join_token: String,
+        /// The controller's join token; REKCOD_JOIN_TOKEN or --token-file keep it off argv.
+        #[arg(env = "REKCOD_JOIN_TOKEN", hide_env_values = true)]
+        join_token: Option<String>,
+        /// Read the join token from this file (`-` for stdin) instead.
+        #[arg(long, value_name = "PATH")]
+        token_file: Option<std::path::PathBuf>,
         /// Address the node API listens on.
         #[arg(long, default_value = "127.0.0.1:7701")]
         listen: String,
@@ -839,13 +869,16 @@ enum ControllerCmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
-    /// Replace fleet.db with a backup (the latest unless KEY); stop the controller first.
+    /// Replace fleet.db with a backup (the latest in RustFS unless KEY, or --from FILE); stop the controller first.
     Restore {
         key: Option<String>,
         #[arg(long)]
         db: Option<std::path::PathBuf>,
         #[arg(long)]
         storage_credentials: Option<std::path::PathBuf>,
+        /// A backup file (from --backup-dir, or copied off the server) instead of RustFS.
+        #[arg(long, conflicts_with_all = ["key", "storage_credentials"])]
+        from: Option<std::path::PathBuf>,
     },
     /// Change an existing token's cap (admin token); applies to every token with that name.
     Limit {
@@ -879,6 +912,24 @@ enum ControllerCmd {
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         remote: Option<String>,
     },
+    /// Every token: name, role, cap, expiry and namespaces, never the token itself (admin token).
+    Tokens {
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
+    /// Who did what, newest first: admins see everything, a namespace's owners see it with --ns.
+    Audit {
+        #[arg(long)]
+        ns: Option<String>,
+        /// Only this far back (`30m`, `12h`, `7d`).
+        #[arg(long, value_parser = duration_secs)]
+        since: Option<u64>,
+        /// At most this many rows (up to 1000).
+        #[arg(long, default_value = "100")]
+        limit: u32,
+        #[arg(long, num_args = 0..=1, default_missing_value = "")]
+        remote: Option<String>,
+    },
     /// Delete every token with this name (admin token).
     Revoke {
         name: String,
@@ -905,12 +956,20 @@ enum EdgeCmd {
         #[arg(long)]
         public_listen: Option<String>,
         /// The public listener's clients send a PROXY v2 header (a TCP load balancer in front).
-        #[arg(long, requires = "public_listen")]
+        #[arg(long, requires_all = ["public_listen", "proxy_protocol_from"])]
         proxy_protocol: bool,
-        /// Peers (IP or CIDR) whose CF-Connecting-IP / X-Forwarded-For name the client, such
-        /// as cloudflared. Repeat it; giving any replaces the loopback default.
+        /// The load balancer's address (IP or CIDR) for --proxy-protocol; connections from
+        /// anywhere else are closed. Repeat it for more than one.
+        #[arg(long = "proxy-protocol-from", value_name = "NET", requires = "proxy_protocol")]
+        proxy_protocol_from: Vec<String>,
+        /// Peers (IP or CIDR) whose X-Forwarded-For names the client, such as cloudflared.
+        /// Repeat it; giving any replaces the loopback default.
         #[arg(long = "trusted-proxy", value_name = "NET", default_values = ["127.0.0.0/8", "::1"])]
         trusted_proxies: Vec<String>,
+        /// A header the trusted proxy overwrites with the client's address, read instead of
+        /// X-Forwarded-For: `cf-connecting-ip` behind cloudflared.
+        #[arg(long, value_name = "HEADER")]
+        client_ip_header: Option<String>,
         /// Requests per client IP across all apps (N/s, N/m or N/h).
         #[arg(long, default_value = "50/s")]
         rate: String,
@@ -986,6 +1045,13 @@ enum AppCmd {
     Recycle {
         name: String,
     },
+    /// The app's GitHub webhook: the payload URL and secret for the repository's settings
+    /// (pull request events deploy previews). Made the first time; `--rotate` makes a new secret.
+    Webhook {
+        name: String,
+        #[arg(long)]
+        rotate: bool,
+    },
     /// Serve an app on the edge's public listener.
     Public {
         name: String,
@@ -1050,7 +1116,7 @@ enum AppStorageCmd {
         #[arg(long, default_value = "1h", value_parser = duration_secs)]
         expires: u64,
     },
-    /// New secret key for the app; redeploys the live release with it.
+    /// New key for the app's bucket; redeploys the live release with it, then revokes the old key.
     Rotate,
 }
 
@@ -1098,7 +1164,7 @@ enum JobCmd {
         /// Kill it after this long (exit 124).
         #[arg(long, value_parser = duration_secs)]
         timeout: Option<u64>,
-        /// Run it on this schedule instead of once (needs --name).
+        /// Run it on this schedule instead of once (needs --name; at least 1m).
         #[arg(long, value_parser = duration_secs)]
         every: Option<u64>,
         #[arg(long)]
@@ -1193,6 +1259,10 @@ enum HostCmd {
         /// Only the server; no docker context.
         #[arg(long, requires = "server")]
         no_docker: bool,
+        /// Also copy the controller's hourly backups to this directory on the server (another
+        /// disk, a synced folder); an absolute path there.
+        #[arg(long, requires = "server")]
+        backup_dir: Option<String>,
     },
     /// Hosts (docker contexts rekcod-*); * marks the one in use.
     Ls {
@@ -1247,6 +1317,7 @@ enum ServerCmd {
         #[arg(long, requires = "edge_only")]
         remote: Option<String>,
         /// Existing controller's join token, required when this Mac has not joined yet.
+        /// REKCOD_JOIN_TOKEN keeps it off argv.
         #[arg(long, requires = "edge_only")]
         join_token: Option<String>,
         /// Listen here instead of the Tailscale IP.
@@ -1259,6 +1330,10 @@ enum ServerCmd {
         /// Skip `sudo pmset`.
         #[arg(long)]
         no_power: bool,
+        /// Also copy the hourly controller backups here (another disk, a synced folder): the
+        /// copy that survives losing the server's disk.
+        #[arg(long, conflicts_with = "edge_only")]
+        backup_dir: Option<std::path::PathBuf>,
     },
     /// Remove the controller, node, edge, RustFS and VM jobs (data stays).
     Uninstall,
@@ -1276,9 +1351,10 @@ enum ServerCmd {
 
 #[derive(Subcommand)]
 enum Socket {
-    /// Point /var/run/docker.sock at ~/.rekcod/default.sock (sudo, once); start/stop then switch it.
+    /// Point /var/run/docker.sock at ~/.rekcod/default.sock (sudo, once), and again at every
+    /// boot (a root LaunchDaemon); start/stop then switch it.
     Install,
-    /// Put /var/run/docker.sock back to what it was before `install` (sudo).
+    /// Put /var/run/docker.sock back to what it was before `install` and remove the LaunchDaemon (sudo).
     Uninstall,
 }
 
@@ -1307,8 +1383,20 @@ fn main() {
         libc::sigemptyset(&mut none);
         libc::pthread_sigmask(libc::SIG_SETMASK, &none, std::ptr::null_mut());
     }
-    if !matches!(command, Cmd::Daemon { .. }) {
-        // Behave like other CLIs when piped into `head` (the daemon keeps Rust's SIGPIPE-ignore).
+    // Servers keep Rust's SIGPIPE-ignore: a peer or a child that closes its end is an error
+    // to handle, not a reason for the daemon, `mcp` or an API server to die.
+    let serves = matches!(
+        command,
+        Cmd::Daemon { .. }
+            | Cmd::Mcp(_)
+            | Cmd::Sandbox { cmd: SandboxCmd::Serve { .. }, .. }
+            | Cmd::Node(NodeCmd::Serve { .. } | NodeCmd::Join { .. })
+            | Cmd::Controller(ControllerCmd::Serve { .. })
+            | Cmd::Storage(StorageCmd::Serve { .. })
+            | Cmd::Edge(EdgeCmd::Serve { .. })
+    );
+    if !serves {
+        // Behave like other CLIs when piped into `head`.
         unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     }
     let result = paths::Paths::new().and_then(|paths| match command {
@@ -1345,8 +1433,9 @@ fn main() {
         Cmd::Macos(MacosCmd::Ls) => macos::list(&paths),
         Cmd::Macos(MacosCmd::Rm { name }) => macos::remove(&paths, &name),
         Cmd::Macos(MacosCmd::Run { home, idle_ttl }) => macos::run(home, idle_ttl),
-        Cmd::Remote(RemoteCmd::Add { name, url, token, ns, ca_fingerprint }) => {
-            fleet::remote_add(&paths, &name, &url, &token, ns.as_deref(), ca_fingerprint.as_deref())
+        Cmd::Remote(RemoteCmd::Add { name, url, token, token_file, ns, ca_fingerprint }) => {
+            fleet::token_arg(token, token_file.as_deref(), "--token (or REKCOD_TOKEN)")
+                .and_then(|token| fleet::remote_add(&paths, &name, &url, &token, ns.as_deref(), ca_fingerprint.as_deref()))
         }
         Cmd::Remote(RemoteCmd::Ls) => {
             fleet::remote_list(&paths);
@@ -1354,18 +1443,22 @@ fn main() {
         }
         Cmd::Remote(RemoteCmd::Rm { name }) => fleet::remote_rm(&paths, &name),
         Cmd::Remote(RemoteCmd::Use { name }) => fleet::remote_use(&paths, &name),
-        Cmd::Node(NodeCmd::Join { controller, join_token, listen, advertise, install, ca_fingerprint, zone }) => fleet::node_join(
-            &paths,
-            &controller,
-            &join_token,
-            fleet::NodeJoinOptions {
-                listen: &listen,
-                advertise: advertise.as_deref(),
-                install,
-                ca_fingerprint: ca_fingerprint.as_deref(),
-                zone: zone.as_deref(),
-            },
-        ),
+        Cmd::Node(NodeCmd::Join { controller, join_token, token_file, listen, advertise, install, ca_fingerprint, zone }) => {
+            fleet::token_arg(join_token, token_file.as_deref(), "JOIN_TOKEN (or REKCOD_JOIN_TOKEN)").and_then(|join_token| {
+                fleet::node_join(
+                    &paths,
+                    &controller,
+                    &join_token,
+                    fleet::NodeJoinOptions {
+                        listen: &listen,
+                        advertise: advertise.as_deref(),
+                        install,
+                        ca_fingerprint: ca_fingerprint.as_deref(),
+                        zone: zone.as_deref(),
+                    },
+                )
+            })
+        }
         Cmd::Node(NodeCmd::Serve { install: true }) => service::install(&paths, "node", &["node".into(), "serve".into()]),
         Cmd::Node(NodeCmd::Serve { install: false }) => fleet::node_serve(&paths),
         Cmd::Node(NodeCmd::Uninstall) => service::uninstall("node"),
@@ -1420,8 +1513,8 @@ fn main() {
         ),
         Cmd::Controller(ControllerCmd::Backup { remote }) => remote_call(&paths, &remote, "POST", "/backups", &serde_json::json!({})),
         Cmd::Controller(ControllerCmd::Backups { remote }) => remote_call(&paths, &remote, "GET", "/backups", &serde_json::Value::Null),
-        Cmd::Controller(ControllerCmd::Restore { key, db, storage_credentials }) => {
-            fleet::controller_restore(&paths, db, key.as_deref(), storage_credentials)
+        Cmd::Controller(ControllerCmd::Restore { key, db, storage_credentials, from }) => {
+            fleet::controller_restore(&paths, db, key.as_deref(), storage_credentials, from)
         }
         Cmd::Storage(StorageCmd::Serve { install: true, .. }) => service::install(&paths, "storage", &service::args_without_install()),
         Cmd::Storage(StorageCmd::Serve { listen, data, .. }) => storage::serve(&paths, &listen, data.as_deref()),
@@ -1429,9 +1522,13 @@ fn main() {
         Cmd::Storage(StorageCmd::Up) => storage::up(&paths),
         Cmd::Storage(StorageCmd::Down) => storage::down(&paths),
         Cmd::Storage(StorageCmd::Env) => storage::env(&paths),
-        Cmd::Controller(ControllerCmd::Limit { name, max_sandboxes, remote }) => {
-            remote_call(&paths, &remote, "POST", &format!("/tokens/{name}"), &serde_json::json!({"max_sandboxes": max_sandboxes}))
-        }
+        Cmd::Controller(ControllerCmd::Limit { name, max_sandboxes, remote }) => remote_call(
+            &paths,
+            &remote,
+            "POST",
+            &format!("/tokens/{}", fleet::percent_encode(&name)),
+            &serde_json::json!({"max_sandboxes": max_sandboxes}),
+        ),
         Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, ns, role, edge, expires, remote }) => remote_call(
             &paths,
             &remote,
@@ -1441,7 +1538,20 @@ fn main() {
                                 "edge": edge, "expires_secs": expires}),
         ),
         Cmd::Controller(ControllerCmd::Revoke { name, remote }) => {
-            remote_call(&paths, &remote, "DELETE", &format!("/tokens/{name}"), &serde_json::json!({}))
+            // The name in the body: it reaches names from before they were checked, too.
+            remote_call(&paths, &remote, "DELETE", "/tokens", &serde_json::json!({"name": name}))
+        }
+        Cmd::Controller(ControllerCmd::Tokens { remote }) => remote_call(&paths, &remote, "GET", "/tokens", &serde_json::Value::Null),
+        Cmd::Controller(ControllerCmd::Audit { ns, since, limit, remote }) => {
+            let mut q = vec![format!("limit={limit}")];
+            if let Some(n) = ns {
+                q.push(format!("ns={}", fleet::percent_encode(&n)));
+            }
+            if let Some(s) = since {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_secs();
+                q.push(format!("since={}", now.saturating_sub(s)));
+            }
+            remote_call(&paths, &remote, "GET", &format!("/audit?{}", q.join("&")), &serde_json::Value::Null)
         }
         Cmd::Controller(ControllerCmd::Ca) => {
             let pem = std::fs::read_to_string(paths.home.join("controller/ca.pem"))
@@ -1453,10 +1563,28 @@ fn main() {
             remote_call(&paths, &remote, "POST", "/join-token", &serde_json::json!({}))
         }
         Cmd::Edge(EdgeCmd::Serve { install: true, .. }) => service::install(&paths, "edge", &service::args_without_install()),
-        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, proxy_protocol, trusted_proxies, rate, burst, access_log, remote, .. }) => {
+        Cmd::Edge(EdgeCmd::Serve {
+            listen,
+            public_listen,
+            proxy_protocol,
+            proxy_protocol_from,
+            trusted_proxies,
+            client_ip_header,
+            rate,
+            burst,
+            access_log,
+            remote,
+            ..
+        }) => {
             let rate = edge::limit::parse_rate(&rate)?;
-            let trusted_proxies = trusted_proxies.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<_>>()?;
-            let settings = edge::Settings { rate, burst, access_log, trusted_proxies };
+            let nets = |v: &[String]| v.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<Vec<_>>>();
+            let (trusted_proxies, proxy_protocol_from) = (nets(&trusted_proxies)?, nets(&proxy_protocol_from)?);
+            let client_ip_header = client_ip_header
+                .map(|h| hyper::header::HeaderName::from_bytes(h.trim().to_ascii_lowercase().as_bytes()))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("--client-ip-header: {e}"))?;
+            let settings =
+                edge::Settings { rate, burst, access_log, trusted_proxies, client_ip_header, proxy_protocol_from, ..Default::default() };
             let o = edge::Options { listen, public_listen, proxy_protocol, settings };
             edge::serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), o)
         }
@@ -1492,12 +1620,15 @@ fn main() {
         Cmd::Shell => cli::shell(&paths),
         Cmd::Compact => cli::compact(&paths),
         Cmd::Host(HostCmd::Add { name, dest, no_use, server: false, .. }) => host::add(&paths, &name, &dest, !no_use),
-        Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, lan, no_power, no_docker, .. }) => {
-            let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker };
+        Cmd::Host(HostCmd::Add { name, dest, no_use, domain, addr, lan, no_power, no_docker, backup_dir, .. }) => {
+            let f = host::Fleet { domain: domain.unwrap_or_default(), addr, lan, no_power, docker: !no_docker, backup_dir };
             host::add_server(&paths, &name, &dest, !no_use, &f)
         }
-        Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token }) => {
+        Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token, backup_dir }) => {
             if edge_only {
+                // Read here, not as the flag's clap `env`: an exported variable would make a
+                // plain setup fail `requires = "edge_only"`.
+                let join_token = join_token.or_else(|| std::env::var("REKCOD_JOIN_TOKEN").ok().filter(|t| !t.is_empty()));
                 server::setup_edge(
                     &paths,
                     remote.as_deref().context("--edge-only requires --remote")?,
@@ -1507,7 +1638,14 @@ fn main() {
                     no_power,
                 )
             } else {
-                server::setup(&paths, domain.as_deref().context("server setup requires --domain")?, addr.as_deref(), lan, no_power)
+                server::setup(
+                    &paths,
+                    domain.as_deref().context("server setup requires --domain")?,
+                    addr.as_deref(),
+                    lan,
+                    no_power,
+                    backup_dir.as_deref(),
+                )
             }
         }
         Cmd::Server(ServerCmd::Uninstall) => server::uninstall(),
@@ -1543,9 +1681,35 @@ fn main() {
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib, base_memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user } => daemon::run(
+        Cmd::Daemon {
+            cpus,
+            memory_mib,
+            base_memory_mib,
+            project,
+            workspace,
+            allow,
+            reach,
+            idle_ttl,
+            repair,
+            network_user,
+            publish,
+            no_autoports,
+        } => daemon::run(
             paths,
-            daemon::Options { cpus, memory_mib, base_memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user },
+            daemon::Options {
+                cpus,
+                memory_mib,
+                base_memory_mib,
+                project,
+                workspace,
+                allow,
+                reach,
+                idle_ttl,
+                repair,
+                network_user,
+                publish,
+                no_autoports,
+            },
         ),
     });
     if let Err(e) = result {
@@ -1580,9 +1744,13 @@ fn run_ns(paths: &paths::Paths, remote: &Option<String>, c: NsCmd) -> anyhow::Re
         NsCmd::Member(NsMember::Add { ns, who, role }) => {
             remote_call(paths, remote, "POST", &format!("/namespaces/{ns}/members"), &json!({"who": who, "role": role}))
         }
-        NsCmd::Member(NsMember::Rm { ns, who }) => {
-            remote_call(paths, remote, "DELETE", &format!("/namespaces/{ns}/members/{who}"), &serde_json::Value::Null)
-        }
+        NsCmd::Member(NsMember::Rm { ns, who }) => remote_call(
+            paths,
+            remote,
+            "DELETE",
+            &format!("/namespaces/{ns}/members/{}", fleet::percent_encode(&who)),
+            &serde_json::Value::Null,
+        ),
         NsCmd::Use { name } => fleet::remote_use_ns(paths, remote.as_deref().filter(|r| !r.is_empty()), &name),
         NsCmd::Rm { name, force } => remote_call(paths, remote, "DELETE", &format!("/namespaces/{name}"), &json!({"force": force})),
     }
@@ -1593,8 +1761,8 @@ fn run_ns(paths: &paths::Paths, remote: &Option<String>, c: NsCmd) -> anyhow::Re
 /// `[http]` from rekcod.toml; null (keep the app's current settings) when there's none.
 #[cfg(target_os = "macos")]
 fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Result<serde_json::Value> {
-    let (rate, burst, max_body) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"));
-    if rate.is_none() && burst.is_none() && max_body.is_none() {
+    let (rate, burst, max_body, timeout) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"), t.get("http.timeout"));
+    if rate.is_none() && burst.is_none() && max_body.is_none() && timeout.is_none() {
         return Ok(serde_json::Value::Null);
     }
     if let Some(r) = rate {
@@ -1602,7 +1770,15 @@ fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Resul
     }
     let burst = burst.map(|b| b.parse::<u32>().map_err(|_| anyhow::anyhow!("rekcod.toml http.burst: {b} isn't a number"))).transpose()?;
     let max_body = max_body.map(|m| edge::limit::parse_size(m)).transpose()?;
-    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body}))
+    let timeout = timeout
+        .map(|t| {
+            duration_secs(t)
+                .ok()
+                .filter(|t| (1..=3600).contains(t))
+                .ok_or_else(|| anyhow::anyhow!("rekcod.toml http.timeout: {t} isn't between 1s and 1h"))
+        })
+        .transpose()?;
+    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body, "timeout": timeout}))
 }
 
 fn remote_call(paths: &paths::Paths, remote: &Option<String>, method: &str, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
@@ -1778,8 +1954,9 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
                 // Neither given keeps the app's current count (1 for a new app).
                 "instances": instances.or(num("resources.instances")),
                 "spread": t.get("resources.spread"),
-                "cpus": num("resources.cpus").unwrap_or(1),
-                "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()).unwrap_or(1),
+                // Left out keeps the app's resources. `[env]` is merged over the env it has.
+                "cpus": num("resources.cpus"),
+                "memory_gib": t.get("resources.memory").and_then(|m| m.trim_end_matches("GiB").parse::<i64>().ok()),
                 "health": t.get("app.health").cloned(),
                 "start": t.get("app.start"),
                 "env": env,
@@ -1796,6 +1973,14 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
         AppCmd::Ls => remote_call(paths, remote, "GET", "/apps", &serde_json::Value::Null),
         AppCmd::Wake { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/wake"), &json!({})),
         AppCmd::Recycle { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/recycle"), &json!({})),
+        AppCmd::Webhook { name, rotate } => {
+            let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
+            let method = if rotate { "POST" } else { "GET" };
+            let mut v = fleet::call(&r.url, method, &r.scoped(format!("/apps/{name}/webhook")), Some(&r.token), &json!({}))?;
+            v["payload_url"] = json!(format!("{}{}", r.url.trim_end_matches('/'), v["path"].as_str().unwrap_or("")));
+            println!("{}", serde_json::to_string_pretty(&v)?);
+            Ok(())
+        }
         AppCmd::Public { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/visibility"), &json!({"public": true})),
         AppCmd::Private { name } => remote_call(paths, remote, "POST", &format!("/apps/{name}/visibility"), &json!({"public": false})),
         AppCmd::Status { name } => remote_call(paths, remote, "GET", &format!("/apps/{name}"), &serde_json::Value::Null),
@@ -1856,11 +2041,20 @@ fn run_app(paths: &paths::Paths, remote: &Option<String>, c: AppCmd) -> anyhow::
         }
         AppCmd::Storage { name, cmd: Some(AppStorageCmd::Ls) } => {
             let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
-            let v = fleet::call(&r.url, "GET", &r.scoped(format!("/apps/{name}/storage")), Some(&r.token), &serde_json::Value::Null)?;
-            for o in v["list"].as_array().into_iter().flatten() {
-                println!("{:>12}  {}  {}", o["size"], o["modified"].as_str().unwrap_or(""), o["key"].as_str().unwrap_or(""));
+            // The controller answers a page at a time.
+            let mut after: Option<String> = None;
+            loop {
+                let q = after.as_deref().map(|a| format!("?after={}", fleet::percent_encode(a))).unwrap_or_default();
+                let v =
+                    fleet::call(&r.url, "GET", &r.scoped(format!("/apps/{name}/storage{q}")), Some(&r.token), &serde_json::Value::Null)?;
+                for o in v["list"].as_array().into_iter().flatten() {
+                    println!("{:>12}  {}  {}", o["size"], o["modified"].as_str().unwrap_or(""), o["key"].as_str().unwrap_or(""));
+                }
+                match v["next"].as_str() {
+                    Some(n) => after = Some(n.to_string()),
+                    None => return Ok(()),
+                }
             }
-            Ok(())
         }
         AppCmd::Storage { name, cmd: Some(AppStorageCmd::Url { key, expires }) } => {
             let r = fleet::remote(paths, remote.as_deref().filter(|r| !r.is_empty()))?;
@@ -1909,10 +2103,11 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         }
         SandboxCmd::Exec { id, workdir, env, timeout, cmd } => {
             let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
-            let code = sandbox::exec(paths, &id, sandbox::ExecOptions { workdir, env, timeout_secs: timeout, tty }, &cmd)?;
+            let code =
+                sandbox::exec(paths, &id, sandbox::ExecOptions { workdir, env, timeout_secs: timeout, tty, clean_env: false }, &cmd)?;
             std::process::exit(code)
         }
-        SandboxCmd::Shell { id } => sandbox::shell(paths, &id),
+        SandboxCmd::Shell { id } => std::process::exit(sandbox::shell(paths, &id)?),
         SandboxCmd::Cp { src, dst } => sandbox::cp(paths, &src, &dst),
         SandboxCmd::Fork { id, name, json } => {
             let m = sandbox::fork(paths, &id, name)?;
@@ -1925,7 +2120,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         }
         SandboxCmd::Diff { id, stat } => sandbox::diff(paths, &id, stat),
         SandboxCmd::Apply { id, check, reviewed } => {
-            let ch = sandbox::apply(paths, &id, check, reviewed)?;
+            let ch = sandbox::apply(paths, &id, check, reviewed.as_deref())?;
             sandbox::print_changes(&ch);
             if check && !ch.is_empty() {
                 std::process::exit(1);
@@ -1945,7 +2140,8 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         SandboxCmd::Log { id, follow, json, net } => sandbox::log(paths, &id, follow, json, net),
         SandboxCmd::Ls { json } => sandbox::print_list(paths, json),
         SandboxCmd::Stop { id } => sandbox::stop(paths, &id),
-        SandboxCmd::Rm { ids, all } => sandbox::rm(paths, &ids, all),
+        SandboxCmd::Rm { ids, all } => sandbox::rm_each(paths, &ids, all, &mut |id| println!("{id}")),
+        SandboxCmd::Prune { older_than } => sandbox::prune(paths, older_than, &mut |id| println!("{id}")),
         SandboxCmd::Serve { listen, policy } => sandbox_api::serve(paths.clone(), policy.policy()?, listen),
         SandboxCmd::Golden(Golden::Build { name, images }) => sandbox::golden_build(paths, &name, &images),
         SandboxCmd::Golden(Golden::Ls) => sandbox::golden_list(paths),
@@ -1982,7 +2178,8 @@ mod tests {
     fn quota_values() {
         assert_eq!(super::quota_value("unlimited"), Ok(-1));
         assert_eq!(super::quota_value("8"), Ok(8));
-        assert!(super::quota_value("-1").is_err() && super::quota_value("lots").is_err());
+        assert_eq!((super::duration_secs("30d"), super::duration_secs("90s")), (Ok(30 * 86400), Ok(90)));
+        assert!(super::quota_value("-1").is_err() && super::quota_value("lots").is_err() && super::quota_value("100001").is_err());
     }
 
     #[test]
@@ -1992,6 +2189,40 @@ mod tests {
         // The node's 64 KiB window moved past the start of what was shown.
         assert_eq!(super::new_output("xxhello\n", "hello\nworld\n"), "world\n");
         assert_eq!(super::new_output("gone", "fresh\n"), "fresh\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn http_timeout_from_rekcod_toml() {
+        let t = |v: &str| std::collections::HashMap::from([("http.timeout".to_string(), v.to_string())]);
+        assert_eq!(http_settings(&t("5m")).unwrap()["timeout"], 300);
+        assert_eq!(http_settings(&t("90")).unwrap()["timeout"], 90);
+        assert!(http_settings(&t("0")).is_err());
+        assert!(http_settings(&t("2h")).is_err());
+    }
+
+    #[test]
+    fn tokens_can_stay_off_argv() {
+        use clap::{CommandFactory, Parser};
+        let env_of = |path: &[&str], arg: &str| {
+            let mut c = Args::command();
+            for p in path {
+                c = c.find_subcommand(p).unwrap().clone();
+            }
+            let a = c.get_arguments().find(|a| a.get_id() == arg).unwrap().clone();
+            (a.get_env().map(|e| e.to_string_lossy().to_string()), a.is_hide_env_values_set())
+        };
+        assert_eq!(env_of(&["remote", "add"], "token"), (Some("REKCOD_TOKEN".into()), true));
+        assert_eq!(env_of(&["node", "join"], "join_token"), (Some("REKCOD_JOIN_TOKEN".into()), true));
+        assert!(Args::try_parse_from(["rekcod", "remote", "add", "x", "https://h:7700", "--token-file", "-"]).is_ok());
+        assert!(Args::try_parse_from(["rekcod", "node", "join", "https://h:7700", "--token-file", "/t"]).is_ok());
+        assert!(Args::try_parse_from(["rekcod", "node", "join", "https://h:7700", "jt", "--listen", "127.0.0.1:1"]).is_ok());
+        let f = std::env::temp_dir().join(format!("rekcod-token-{}", std::process::id()));
+        std::fs::write(&f, "from-file\n").unwrap();
+        assert_eq!(fleet::token_arg(Some("from-env".into()), Some(&f), "x").unwrap(), "from-file");
+        assert_eq!(fleet::token_arg(Some(" argv ".into()), None, "x").unwrap(), "argv");
+        assert!(fleet::token_arg(None, None, "--token").unwrap_err().to_string().contains("--token"));
+        let _ = std::fs::remove_file(&f);
     }
 
     #[test]

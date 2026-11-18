@@ -7,10 +7,21 @@
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Largest response [`get`] reads; a large `/containers/json` is a few MiB. The other end
+/// may be a sandbox's guest, which decides how much it sends.
+const BODY_MAX: u64 = 64 << 20;
+/// Longest header block, and longest event line, read from a stream.
+const HEAD_MAX: usize = 64 << 10;
+const LINE_MAX: usize = 1 << 20;
+
+/// GET `path`; the body of a 200 answer. Callers put a deadline on it.
 pub async fn get<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, path: &str) -> Result<Vec<u8>> {
     send_get(&mut stream, path).await?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    (&mut stream).take(BODY_MAX + 1).read_to_end(&mut buf).await?;
+    if buf.len() as u64 > BODY_MAX {
+        bail!("GET {path}: response over {} MiB", BODY_MAX >> 20);
+    }
     let (status, body_at) = parse_head(&buf)?.context("incomplete HTTP response")?;
     if status != 200 {
         bail!("GET {path}: HTTP {status}: {}", String::from_utf8_lossy(&buf[body_at..]).trim());
@@ -41,6 +52,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Lines<S> {
                     return Ok(Lines { stream, buf });
                 }
                 Some((status, _)) => bail!("GET {path}: HTTP {status}"),
+                None if buf.len() > HEAD_MAX => bail!("GET {path}: header over {} KiB", HEAD_MAX >> 10),
                 None => {}
             }
         }
@@ -54,6 +66,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Lines<S> {
                 let mut line: Vec<u8> = self.buf.drain(..=nl).collect();
                 line.pop();
                 return Ok(Some(line));
+            }
+            if self.buf.len() > LINE_MAX {
+                bail!("a line over {} MiB", LINE_MAX >> 20);
             }
             let n = self.stream.read(&mut chunk).await?;
             if n == 0 {
@@ -95,6 +110,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn replies_have_a_size_limit() {
+        let (mut server, client) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let mut req = [0u8; 256];
+            let _ = server.read(&mut req).await;
+            server.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.unwrap();
+            let junk = vec![b'x'; 1 << 20];
+            while server.write_all(&junk).await.is_ok() {}
+        });
+        let err = get(client, "/containers/json").await.unwrap_err();
+        assert!(err.to_string().contains("over 64 MiB"), "{err}");
+
+        let (mut server, client) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            let mut req = [0u8; 256];
+            let _ = server.read(&mut req).await;
+            server.write_all(b"HTTP/1.0 200 OK\r\n\r\n{}\n").await.unwrap();
+            let junk = vec![b'x'; 1 << 16];
+            while server.write_all(&junk).await.is_ok() {}
+        });
+        let mut events = Lines::open(client, "/events").await.unwrap();
+        assert_eq!(events.next().await.unwrap(), Some(b"{}".to_vec()));
+        assert!(events.next().await.is_err(), "a line that never ends");
+    }
+
+    #[tokio::test]
     async fn streams_lines_split_across_reads() {
         let (mut server, client) = tokio::io::duplex(64);
         tokio::spawn(async move {
@@ -110,5 +151,28 @@ mod tests {
             lines.push(line);
         }
         assert_eq!(lines, vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]);
+    }
+
+    /// A server that answers 200 and then sends `n` bytes of `fill`.
+    fn endless(fill: u8, n: usize) -> tokio::io::DuplexStream {
+        let (mut server, client) = tokio::io::duplex(64 << 10);
+        tokio::spawn(async move {
+            let mut req = [0u8; 256];
+            let _ = server.read(&mut req).await;
+            server.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.unwrap();
+            let chunk = vec![fill; 64 << 10];
+            let mut left = n;
+            while left > 0 && server.write_all(&chunk[..left.min(chunk.len())]).await.is_ok() {
+                left = left.saturating_sub(chunk.len());
+            }
+        });
+        client
+    }
+
+    #[tokio::test]
+    async fn a_guest_cant_send_without_end() {
+        let mut lines = Lines::open(endless(b'x', 2 << 20), "/events").await.unwrap();
+        assert!(lines.next().await.is_err());
+        assert!(get(endless(b'x', BODY_MAX as usize + (1 << 20)), "/containers/json").await.is_err());
     }
 }

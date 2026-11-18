@@ -38,8 +38,17 @@ pub fn autoport_containers(containers_json: &[u8]) -> serde_json::Result<Vec<(St
         .into_iter()
         .filter(|c| c.state.as_deref() == Some("running"))
         .filter(|c| c.labels.as_ref().is_some_and(|l| l.contains_key(AUTOPORTS_LABEL)))
-        .map(|c| (c.id, c.names.first().map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default()))
+        .map(|c| (c.id.clone(), c.name()))
         .collect())
+}
+
+impl Container {
+    /// The container's name, safe to print: a sandbox's guest writes this listing, and the
+    /// name ends up in daemon.log and in `rekcod status` on the Mac's terminal.
+    fn name(&self) -> String {
+        let name = self.names.first().map_or("", |n| n.trim_start_matches('/'));
+        name.chars().map(|c| if c.is_control() { '?' } else { c }).collect()
+    }
 }
 
 #[derive(Deserialize)]
@@ -66,7 +75,7 @@ pub fn desired(containers_json: &[u8]) -> serde_json::Result<BTreeMap<Binding, S
     let containers: Vec<Container> = serde_json::from_slice(containers_json)?;
     let mut out = BTreeMap::new();
     for c in containers.into_iter().filter(|c| c.state.as_deref().is_none_or(|s| s == "running")) {
-        let name = c.names.first().map(|n| n.trim_start_matches('/').to_string()).unwrap_or_default();
+        let name = c.name();
         for p in c.ports.unwrap_or_default() {
             let proto = match p.kind.as_str() {
                 "tcp" => Proto::Tcp,
@@ -118,6 +127,14 @@ mod tests {
             {"Id":"b2","Names":["/y"],"State":"exited","Labels":{"dev.rekcod.autoports":"1"}},
             {"Id":"c3","Names":["/z"],"State":"running","Labels":{}}]"#;
         assert_eq!(autoport_containers(json).unwrap(), vec![("a1".to_string(), "x".to_string())]);
+    }
+
+    #[test]
+    fn names_from_the_guest_are_printable() {
+        let json = br#"[{"Id":"a1","Names":["/x\u001b[2J\nfake: y"],"State":"running","Labels":{"dev.rekcod.autoports":"1"},
+            "Ports":[{"IP":"127.0.0.1","PrivatePort":80,"PublicPort":8080,"Type":"tcp"}]}]"#;
+        assert_eq!(autoport_containers(json).unwrap()[0].1, "x?[2J?fake: y");
+        assert!(desired(json).unwrap().values().all(|n| n == "x?[2J?fake: y"));
     }
 
     #[test]

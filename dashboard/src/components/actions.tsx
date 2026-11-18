@@ -405,6 +405,7 @@ export function short(a: Action): string {
   if (a.kind === "AppRecycle") return "Restart";
   if (a.kind === "AppWake") return "Wake";
   if (a.kind === "AppRollback") return "Roll back";
+  if (a.kind === "AppWebhook") return "Webhook";
   if (a.kind === "EdgeBan" && a.argv && a.argv.length > 2) return "Ban";
   if (a.kind === "EdgeUnban") return "Unban";
   if (a.kind === "RemoteUse") return "Use";

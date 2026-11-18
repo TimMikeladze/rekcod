@@ -26,6 +26,7 @@ notify = "8"
 rusqlite = { version = "0.43", features = ["bundled"] }
 hmac = "0.12"
 sha2 = "0.10"
+similar = "3"
 aes-gcm = "0.10"
 zstd = "0.13"
 objc2-app-kit = "0.3"
@@ -37,4 +38,5 @@ governor = "0.10"
 ipnet = "2"
 smoltcp = { version = "0.14", default-features = false, features = ["std", "log", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-native-certs = "0.8.5"
 rcgen = "0.13"

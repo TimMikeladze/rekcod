@@ -236,6 +236,11 @@ pub struct BootOptions {
     pub idle_ttl: Option<u64>,
     /// `e2fsck -fy` the data disk and reinstall the root disk before booting.
     pub repair: bool,
+    /// Sandbox: the only Mac ports it may listen on (127.0.0.1 and ::1); None is any
+    /// unprivileged port.
+    pub publish: Option<Vec<u16>>,
+    /// Sandbox: don't forward the ports its `--network host` containers listen on.
+    pub no_autoports: bool,
 }
 
 impl Default for BootOptions {
@@ -252,6 +257,8 @@ impl Default for BootOptions {
             reach: vec![],
             idle_ttl: None,
             repair: false,
+            publish: None,
+            no_autoports: false,
         }
     }
 }
@@ -314,6 +321,12 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         }
         if opts.repair {
             cmd.arg("--repair");
+        }
+        if let Some(ports) = &opts.publish {
+            cmd.arg(format!("--publish={}", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")));
+        }
+        if opts.no_autoports {
+            cmd.arg("--no-autoports");
         }
         if opts.project.is_none() && user_network(&saved) {
             cmd.arg("--network-user");

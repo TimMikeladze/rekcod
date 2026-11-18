@@ -53,8 +53,10 @@ tests, plus the dashboard checks when a staged file is under `dashboard/`. The a
 Linux-only tests run in CI on arm64 Linux; locally, `rekcod x cargo test -p rekcod-agent`.
 
 `scripts/check-docs.py` fails on a reference to a `docs/*.md` file that doesn't exist, a
-README section (`README.md, "Heading"` or `README.md#anchor`) that doesn't exist, or a
-missing `SECURITY.md`, `CONTRIBUTING.md` or CHANGELOG entry for `Cargo.toml`'s version.
+README section named in a comment or linked by anchor that doesn't exist, a broken relative
+link in a Markdown file, or a missing `SECURITY.md`, `CONTRIBUTING.md` or CHANGELOG entry for
+`Cargo.toml`'s version. Point code comments at the README by section title, as
+`(README.md, "Network and secrets")`.
 `tests::every_command_is_in_the_readme` fails when a command `--help` lists isn't in the
 README's command reference.
 

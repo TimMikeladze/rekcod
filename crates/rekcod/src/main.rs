@@ -135,7 +135,8 @@ enum Cmd {
         /// Do not change the active docker context.
         #[arg(long)]
         no_switch: bool,
-        /// Power off immediately, without letting dockerd stop containers. For a hung VM.
+        /// Power off immediately, without letting dockerd stop containers. For a hung VM;
+        /// a daemon still there after 45 s gets SIGKILL.
         #[arg(long)]
         force: bool,
     },
@@ -342,6 +343,11 @@ enum Cmd {
         repair: bool,
         #[arg(long)]
         network_user: bool,
+        /// Sandbox VM: the only Mac ports it may listen on, comma-separated (empty: none).
+        #[arg(long)]
+        publish: Option<String>,
+        #[arg(long)]
+        no_autoports: bool,
     },
 }
 
@@ -1276,9 +1282,10 @@ enum ServerCmd {
 
 #[derive(Subcommand)]
 enum Socket {
-    /// Point /var/run/docker.sock at ~/.rekcod/default.sock (sudo, once); start/stop then switch it.
+    /// Point /var/run/docker.sock at ~/.rekcod/default.sock (sudo, once), and again at every
+    /// boot (a root LaunchDaemon); start/stop then switch it.
     Install,
-    /// Put /var/run/docker.sock back to what it was before `install` (sudo).
+    /// Put /var/run/docker.sock back to what it was before `install` and remove the LaunchDaemon (sudo).
     Uninstall,
 }
 
@@ -1543,9 +1550,35 @@ fn main() {
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib, base_memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user } => daemon::run(
+        Cmd::Daemon {
+            cpus,
+            memory_mib,
+            base_memory_mib,
+            project,
+            workspace,
+            allow,
+            reach,
+            idle_ttl,
+            repair,
+            network_user,
+            publish,
+            no_autoports,
+        } => daemon::run(
             paths,
-            daemon::Options { cpus, memory_mib, base_memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user },
+            daemon::Options {
+                cpus,
+                memory_mib,
+                base_memory_mib,
+                project,
+                workspace,
+                allow,
+                reach,
+                idle_ttl,
+                repair,
+                network_user,
+                publish,
+                no_autoports,
+            },
         ),
     });
     if let Err(e) = result {

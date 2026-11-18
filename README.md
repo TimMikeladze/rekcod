@@ -542,6 +542,12 @@ only on the server Mac's own node, and nodes on other Macs build each release fr
 instead of loading it from RustFS. On a tailnet, RustFS listens on the tailnet address
 and every node can reach it.
 
+A server set up with `--addr` on a LAN address before this rule had RustFS on that
+address; `storage serve` and the controller now refuse to start with it. Run
+`rekcod server setup` again with the same options to move RustFS to loopback, then
+redeploy bucket apps so their instances get the new `S3_ENDPOINT`. `REKCOD_INSECURE=1`
+in both services' environment keeps the old layout.
+
 ## Run a self-hosted GitHub Actions runner
 
 The [runner example](examples/github-runner/compose.yaml) runs an arm64 Linux runner

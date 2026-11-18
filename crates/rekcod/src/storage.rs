@@ -77,7 +77,8 @@ pub fn ensure_binary(paths: &Paths) -> Result<PathBuf> {
     let parent = paths.home.join("bin");
     std::fs::create_dir_all(&parent)?;
     // `server setup` and a service start can both get here on a fresh Mac.
-    let _lock = crate::paths::lock(&parent.join(".rustfs-download.lock"))?;
+    // Not named `.rustfs-*`: `clear_stale` below removes those.
+    let _lock = crate::paths::lock(&parent.join(".lock-rustfs-download"))?;
     if bin.exists() {
         return Ok(bin);
     }

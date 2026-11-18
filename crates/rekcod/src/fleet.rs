@@ -3395,11 +3395,14 @@ fn register_instance(c: &Controller, app: &App, release: i32, node: &PlacementNo
     registered
 }
 
-/// Whether a node URL is on the controller's Mac (loopback).
-fn node_is_local(url: &str) -> bool {
+/// Whether a node URL is on the controller's Mac: loopback, or one of the controller's own
+/// names and addresses (`server setup --addr` joins its node on the listen IP).
+fn node_is_local(c: &Controller, url: &str) -> bool {
     authority(url).is_ok_and(|a| {
         let host = a.rsplit_once(':').map_or(a.as_str(), |(h, _)| h).trim_matches(['[', ']']).to_string();
-        host == "localhost" || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+        host == "localhost"
+            || host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
+            || c.own_names.iter().any(|n| n.eq_ignore_ascii_case(&host))
     })
 }
 
@@ -3407,9 +3410,11 @@ fn node_is_local(url: &str) -> bool {
 /// another Mac would dial its own loopback. Then a bucket app goes only to those nodes (an
 /// error when none is ready), and true says the release store is for them only.
 fn only_this_mac(c: &Controller, placement: &mut Placement, bucket: bool) -> Result<bool> {
-    let local = c.storage.as_ref().and_then(|s| authority(&s.endpoint).ok()).is_some_and(|a| node_is_local(&format!("http://{a}")));
+    let loopback =
+        |a: &str| a.rsplit_once(':').map_or(a, |(h, _)| h).trim_matches(['[', ']']).parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback());
+    let local = c.storage.as_ref().and_then(|s| authority(&s.endpoint).ok()).is_some_and(|a| loopback(&a) || a.starts_with("localhost:"));
     if local && bucket {
-        for n in placement.nodes.iter_mut().filter(|n| !node_is_local(&n.url)) {
+        for n in placement.nodes.iter_mut().filter(|n| !node_is_local(c, &n.url)) {
             n.failed = true;
         }
         if placement.nodes.iter().all(|n| n.failed) {
@@ -3460,7 +3465,7 @@ fn launch_instances(
             let n = &placement.nodes[i];
             log.push(format!("placing instance on {}", n.id));
             let mut spec = spec.clone();
-            if local_store && !node_is_local(&n.url) {
+            if local_store && !node_is_local(c, &n.url) {
                 spec["store"] = Value::Null;
             }
             let (url, secret) = (n.url.clone(), n.secret.clone());
@@ -5991,8 +5996,18 @@ fn rotate_storage_key(c: &Arc<Controller>, app: &App, who: &str) -> Result<Value
         retire_prev_key(c, &app.name)?;
         return Ok(json!({"rotated": app.short}));
     };
+    let live = || -> Result<Option<i32>> {
+        Ok(c.db
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .query_one("select live_release from apps where name = ?1", &[&app.name])?
+            .get(0))
+    };
+    let before = live()?;
     match deploy_locked(c, app, Some(commit), who) {
         Ok(v) => Ok(v),
+        // It failed after the new release went live: that release has the new key.
+        Err(e) if live()? != before => Err(e),
         Err(e) => {
             set(&old_key, &old_sealed, None)?;
             if let Err(e2) = gone(s.remove_user(&key)) {
@@ -7612,6 +7627,11 @@ mod tests {
         assert!(only_this_mac(&c, &mut p, false).unwrap() && p.nodes.iter().all(|n| !n.failed));
         let mut p = Placement { nodes: vec![node("there", "http://192.168.1.20:7701")], zones: HashMap::from([("z".to_string(), 0)]) };
         assert!(only_this_mac(&c, &mut p, true).unwrap_err().to_string().contains("loopback"));
+        // `server setup --addr 10.0.0.4`: the server's own node joins on the controller's IP.
+        let mut c = Arc::into_inner(c).unwrap();
+        c.own_names = vec!["localhost".into(), "127.0.0.1".into(), "10.0.0.4".into()];
+        let mut p = Placement { nodes: vec![node("here", "https://10.0.0.4:7701")], zones: HashMap::from([("z".to_string(), 0)]) };
+        assert!(only_this_mac(&c, &mut p, true).unwrap() && !p.nodes[0].failed);
     }
 
     #[test]

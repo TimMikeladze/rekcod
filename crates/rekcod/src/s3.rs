@@ -292,6 +292,42 @@ pub fn valid_bucket(b: &str) -> bool {
         && b.as_bytes()[b.len() - 1].is_ascii_alphanumeric()
 }
 
+/// Listings ask for keys URL-encoded: a key with a control character can't go in XML, and
+/// RustFS answers such a listing with a 500 otherwise.
+fn url_keys() -> (String, String) {
+    ("encoding-type".into(), "url".into())
+}
+
+/// The `<Key>` of a listing entry asked for with [`url_keys`].
+fn xml_key(entry: &str) -> String {
+    xml_values(entry, "Key").into_iter().next().map(|k| url_decode(&k)).unwrap_or_default()
+}
+
+/// Percent-decoding, with `+` as a space, as S3's `encoding-type=url` answers (botocore
+/// decodes it the same way).
+pub(crate) fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < b.len() {
+        match (b[i], s.get(i + 1..i + 3).and_then(|h| u8::from_str_radix(h, 16).ok())) {
+            (b'%', Some(x)) => {
+                out.push(x);
+                i += 3;
+            }
+            (b'+', _) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// SigV4 presigned URLs last at most a week.
 pub const MAX_PRESIGN_SECS: u64 = 7 * 86400;
 
@@ -621,7 +657,7 @@ impl S3 {
     /// One page of ListObjectsV2 (at most `max` keys, the server's page size when None) and
     /// the token for the next page, if there is one.
     pub fn list_page(&self, bucket: &str, prefix: &str, max: Option<usize>, token: Option<&str>) -> Result<(Vec<Object>, Option<String>)> {
-        let mut q = vec![("list-type".to_string(), "2".to_string()), ("prefix".to_string(), prefix.to_string())];
+        let mut q = vec![("list-type".to_string(), "2".to_string()), ("prefix".to_string(), prefix.to_string()), url_keys()];
         if let Some(m) = max {
             q.push(("max-keys".into(), m.to_string()));
         }
@@ -632,7 +668,7 @@ impl S3 {
         let out = xml_raw(&xml, "Contents")
             .into_iter()
             .map(|c| Object {
-                key: xml_values(c, "Key").into_iter().next().unwrap_or_default(),
+                key: xml_key(c),
                 size: xml_values(c, "Size").into_iter().next().and_then(|s| s.parse().ok()).unwrap_or(0),
                 modified: xml_values(c, "LastModified").into_iter().next().unwrap_or_default(),
             })
@@ -670,26 +706,41 @@ impl S3 {
     /// with one multi-object delete per page. In a bucket that never had versioning each
     /// object is one version, `null`.
     fn delete_versions(&self, bucket: &str) -> Result<()> {
+        let mut last: Vec<(String, Option<String>)> = Vec::new();
         loop {
-            let q = [("versions".to_string(), String::new()), ("max-keys".to_string(), "1000".to_string())];
+            let q = [("versions".to_string(), String::new()), ("max-keys".to_string(), "1000".to_string()), url_keys()];
             let xml = self.request("GET", &format!("/{bucket}"), &q, Body::Empty)?.ok(&format!("list versions of {bucket}"))?.text()?;
             let mut page: Vec<(String, Option<String>)> = Vec::new();
             for tag in ["Version", "DeleteMarker"] {
                 for v in xml_raw(&xml, tag) {
-                    let key = xml_values(v, "Key").into_iter().next().unwrap_or_default();
+                    let key = xml_key(v);
                     page.push((key, xml_values(v, "VersionId").into_iter().next()));
                 }
             }
             if page.is_empty() {
                 return Ok(());
             }
+            // Deleted ones don't come back, so the next request starts from what's left; the
+            // same page again means the deletes didn't take.
+            if page == last {
+                bail!("delete objects in {bucket}: {} object version(s) are still there after deleting them", page.len());
+            }
             self.delete_many(bucket, &page)?;
-            // Deleted ones don't come back, so the next request starts from what's left.
+            last = page;
         }
     }
 
     /// `POST /bucket?delete` for up to 1000 `(key, version)` pairs.
+    /// Keys with control characters, which XML 1.0 can't carry, go one request each.
     pub fn delete_many(&self, bucket: &str, objects: &[(String, Option<String>)]) -> Result<()> {
+        let (odd, objects): (Vec<_>, Vec<_>) = objects.iter().cloned().partition(|(k, _)| k.chars().any(char::is_control));
+        for (k, v) in odd {
+            let q: Vec<(String, String)> = v.map(|v| ("versionId".to_string(), v)).into_iter().collect();
+            let r = self.request("DELETE", &format!("/{bucket}/{k}"), &q, Body::Empty)?;
+            if r.status != 404 {
+                r.ok(&format!("delete {bucket}/{k:?}"))?;
+            }
+        }
         for chunk in objects.chunks(1000) {
             let mut xml = String::from("<Delete><Quiet>true</Quiet>");
             for (k, v) in chunk {
@@ -721,10 +772,10 @@ impl S3 {
 
     /// Aborts unfinished multipart uploads in `bucket`.
     fn abort_uploads(&self, bucket: &str) -> Result<()> {
-        let q = [("uploads".to_string(), String::new())];
+        let q = [("uploads".to_string(), String::new()), url_keys()];
         let xml = self.request("GET", &format!("/{bucket}"), &q, Body::Empty)?.ok(&format!("list uploads in {bucket}"))?.text()?;
         for u in xml_raw(&xml, "Upload") {
-            let (Some(key), Some(id)) = (xml_values(u, "Key").into_iter().next(), xml_values(u, "UploadId").into_iter().next()) else {
+            let (key, Some(id)) = (xml_key(u), xml_values(u, "UploadId").into_iter().next()) else {
                 continue;
             };
             let r = self.request("DELETE", &format!("/{bucket}/{key}"), &[("uploadId".into(), id)], Body::Empty)?;
@@ -941,6 +992,15 @@ pub(crate) mod mock {
         Ok(())
     }
 
+    /// A key as a listing shows it: URL-encoded when asked (`encoding-type=url`), else as XML text.
+    fn list_key(k: &str, query: &str) -> String {
+        if query.split('&').any(|kv| kv == "encoding-type=url") {
+            super::uri_encode(k, true)
+        } else {
+            k.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+        }
+    }
+
     fn answer(st: &mut State, method: &str, path: &str, query: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
         let path = path.trim_start_matches('/');
         let (bucket, key) = path.split_once('/').unwrap_or((path, ""));
@@ -954,7 +1014,7 @@ pub(crate) mod mock {
                     let current = st.objects.keys().filter(|k| mine(k)).map(|k| (k.clone(), "null"));
                     let old = st.old_versions.iter().filter(|k| mine(k)).map(|k| (k.clone(), "v1"));
                     for (k, v) in current.chain(old).collect::<Vec<_>>() {
-                        let k = k[bucket.len() + 1..].replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                        let k = list_key(&k[bucket.len() + 1..], query);
                         xml.push_str(&format!("<Version><Key>{k}</Key><VersionId>{v}</VersionId></Version>"));
                     }
                     (200, (xml + "</ListVersionsResult>").into_bytes())
@@ -978,7 +1038,7 @@ pub(crate) mod mock {
                     let mut xml = String::from("<ListBucketResult><IsTruncated>false</IsTruncated>");
                     let under = format!("{bucket}/{prefix}");
                     for (k, v) in st.objects.iter().filter(|(k, _)| k.starts_with(&under)).take(max) {
-                        let k = k[bucket.len() + 1..].replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+                        let k = list_key(&k[bucket.len() + 1..], query);
                         xml.push_str(&format!("<Contents><Key>{k}</Key><Size>{}</Size></Contents>", v.len()));
                     }
                     (200, (xml + "</ListBucketResult>").into_bytes())
@@ -1110,8 +1170,9 @@ mod tests {
         // Keys that literally contain entity text list as themselves, so these are what's deleted.
         m.s3.put("bucket", "report&amp;old", Body::Bytes(b"x")).unwrap();
         m.s3.put("bucket", "a<b>&#38;", Body::Bytes(b"y")).unwrap();
+        m.s3.put("bucket", "x y+z%41", Body::Bytes(b"z")).unwrap();
         let keys: Vec<String> = m.s3.list("bucket", "").unwrap().into_iter().map(|o| o.key).collect();
-        assert_eq!(keys, ["a<b>&#38;", "report&amp;old"]);
+        assert_eq!(keys, ["a<b>&#38;", "report&amp;old", "x y+z%41"]);
         m.s3.delete_bucket("bucket", true).unwrap();
         assert!(m.keys().is_empty(), "{:?}", m.keys());
     }
@@ -1202,11 +1263,12 @@ mod tests {
         // An app turned versioning on and overwrote one: the old version stays after a plain
         // delete of every current object, and the bucket DELETE answers 409.
         m.state.lock().unwrap().old_versions.push("b/k1".into());
+        m.state.lock().unwrap().objects.insert("b/ctl\x01key".into(), b"x".to_vec());
         let before = m.requests();
         m.s3.delete_bucket("b", true).unwrap();
         assert!(m.keys().is_empty() && m.state.lock().unwrap().old_versions.is_empty());
-        // HEAD, versions, 3 batch deletes, versions again (empty), uploads, DELETE.
-        assert!(m.requests() - before <= 8, "{} requests", m.requests() - before);
+        // HEAD, versions, the odd key, 3 batch deletes, versions again (empty), uploads, DELETE.
+        assert!(m.requests() - before <= 9, "{} requests", m.requests() - before);
         assert!(m.s3.is_empty("b", "").unwrap());
     }
 
@@ -1305,6 +1367,13 @@ mod tests {
             .ok("versioning")
             .unwrap();
         app.put(&bucket, "a b+c&<d>.txt", Body::Bytes(b"1")).unwrap();
+        // XML 1.0 can't carry this key, so it can't go in a batch delete.
+        let odd = app.put(&bucket, "ctl\x01key", Body::Bytes(b"1")).is_ok();
+        eprintln!("RustFS takes a key with a control character: {odd}");
+        // URL-encoded listings decode back to the keys as written: `+` and space included.
+        app.put(&bucket, "x y+z%41.txt", Body::Bytes(b"1")).unwrap();
+        let keys: Vec<String> = root.list(&bucket, "").unwrap().into_iter().map(|o| o.key).collect();
+        assert!(keys.contains(&"x y+z%41.txt".to_string()) && (!odd || keys.contains(&"ctl\x01key".to_string())), "{keys:?}");
         app.put(&bucket, "a b+c&<d>.txt", Body::Bytes(b"2")).unwrap();
         app.delete(&bucket, "a b+c&<d>.txt").unwrap();
         app.request("POST", &format!("/{bucket}/upload"), &[("uploads".into(), String::new())], Body::Empty).unwrap().ok("upload").unwrap();

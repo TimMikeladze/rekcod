@@ -1053,7 +1053,7 @@ enum AppStorageCmd {
         #[arg(long, default_value = "1h", value_parser = duration_secs)]
         expires: u64,
     },
-    /// New secret key for the app; redeploys the live release with it.
+    /// New key for the app's bucket; redeploys the live release with it, then revokes the old key.
     Rotate,
 }
 

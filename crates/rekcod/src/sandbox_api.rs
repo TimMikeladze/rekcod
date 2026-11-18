@@ -18,6 +18,37 @@ fn strs(v: &Value) -> Vec<String> {
     v.as_array().into_iter().flatten().filter_map(|s| s.as_str().map(String::from)).collect()
 }
 
+/// A boolean argument: JSON `true`/`false`, or the strings `"true"`/`"false"` a query string
+/// carries. Anything else that is present is an error, so `?check=1` can't apply for real.
+fn flag(args: &Value, key: &str) -> Result<bool> {
+    match &args[key] {
+        Value::Null => Ok(false),
+        Value::Bool(b) => Ok(*b),
+        Value::String(s) if s == "true" => Ok(true),
+        Value::String(s) if s == "false" => Ok(false),
+        v => bail!("{key} takes true or false, not {v}"),
+    }
+}
+
+/// A whole-number argument, as a JSON number or a query string's digits.
+fn num(args: &Value, key: &str) -> Result<Option<u64>> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::Number(n) if n.is_u64() => Ok(n.as_u64()),
+        Value::String(s) if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(s.parse()?)),
+        v => bail!("{key} takes a whole number, not {v}"),
+    }
+}
+
+/// A string argument; another JSON type is an error rather than absent.
+fn text<'a>(args: &'a Value, key: &str) -> Result<Option<&'a str>> {
+    match &args[key] {
+        Value::Null => Ok(None),
+        Value::String(s) => Ok(Some(s)),
+        v => bail!("{key} takes a string, not {v}"),
+    }
+}
+
 fn id_of(args: &Value) -> Result<String> {
     args["id"].as_str().map(String::from).ok_or_else(|| anyhow!("missing id"))
 }
@@ -135,7 +166,7 @@ impl Policy {
     }
 
     fn check(&self, args: &Value) -> Result<()> {
-        if args["mount"].as_bool() == Some(true) && !self.mount {
+        if flag(args, "mount")? && !self.mount {
             bail!("mount isn't allowed; start the server with --allow-mount");
         }
         if let Some(h) = strs(&args["allow_hosts"]).into_iter().find(|h| !self.host_allowed(h)) {
@@ -144,7 +175,7 @@ impl Policy {
         if let Some(s) = strs(&args["secrets"]).into_iter().find(|s| !self.secrets.contains(s)) {
             bail!("secret {s} isn't allowed; start the server with --secret {s}");
         }
-        if args["os"].as_str() == Some("macos") && !self.macos {
+        if text(args, "os")? == Some("macos") && !self.macos {
             bail!("os macos isn't allowed: a macOS guest's network isn't filtered; start the server with --allow-macos");
         }
         Ok(())
@@ -158,7 +189,7 @@ fn exec_opts(args: &Value) -> Result<ExecOptions> {
     if let Some(e) = env.iter().find(|e| !e.contains('=')) {
         bail!("env {e}: use KEY=VALUE");
     }
-    Ok(ExecOptions { workdir: args["workdir"].as_str().map(String::from), env, timeout_secs: args["timeout_secs"].as_u64(), tty: false })
+    Ok(ExecOptions { workdir: text(args, "workdir")?.map(String::from), env, timeout_secs: num(args, "timeout_secs")?, tty: false })
 }
 
 /// Runs a command to completion: (exit, stdout, stderr).
@@ -206,17 +237,17 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             };
             let o = CreateOptions {
                 dir,
-                name: args["name"].as_str().map(String::from),
-                mount: args["mount"].as_bool().unwrap_or(false),
-                image: args["image"].as_str().map(String::from),
-                golden: args["golden"].as_str().map(String::from).unwrap_or(d.golden),
-                cpus: args["cpus"].as_u64().map(|c| c as usize).unwrap_or(d.cpus),
-                memory_gib: args["memory_gib"].as_u64().unwrap_or(d.memory_gib),
+                name: text(args, "name")?.map(String::from),
+                mount: flag(args, "mount")?,
+                image: text(args, "image")?.map(String::from),
+                golden: text(args, "golden")?.map(String::from).unwrap_or(d.golden),
+                cpus: num(args, "cpus")?.map(|c| c as usize).unwrap_or(d.cpus),
+                memory_gib: num(args, "memory_gib")?.unwrap_or(d.memory_gib),
                 allow_hosts: strs(&args["allow_hosts"]),
-                offline: args["offline"].as_bool().unwrap_or(false),
+                offline: flag(args, "offline")?,
                 secrets: strs(&args["secrets"]),
-                ttl_secs: args["ttl_secs"].as_u64().unwrap_or(d.ttl_secs),
-                os: args["os"].as_str().map(String::from),
+                ttl_secs: num(args, "ttl_secs")?.unwrap_or(d.ttl_secs),
+                os: text(args, "os")?.map(String::from),
                 // Never from the API: it opens a hole to the Mac and LAN.
                 reach: vec![],
             };
@@ -264,12 +295,8 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
         "diff" => serde_json::to_value(sandbox::patch(paths, &target()?)?)?,
         "apply" => {
             let id = target()?;
-            let reviewed = match &args["reviewed"] {
-                Value::Null => None,
-                Value::String(r) => Some(r.as_str()),
-                _ => bail!("reviewed takes the review ID a diff returned"),
-            };
-            json!({"changes": sandbox::apply(paths, &id, args["check"].as_bool().unwrap_or(false), reviewed)?})
+            let reviewed = text(args, "reviewed").context("reviewed takes the review ID a diff returned")?;
+            json!({"changes": sandbox::apply(paths, &id, flag(args, "check")?, reviewed)?})
         }
         "stop" => {
             let id = target()?;
@@ -523,16 +550,28 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
             return respond(r.get_mut(), 401, "application/json", br#"{"error":"bad token"}"#);
         }
     }
+    // Only Content-Length bodies are read; a chunked one would arrive empty and its
+    // arguments be taken as absent.
+    if req.header("transfer-encoding").is_some() {
+        return respond(r.get_mut(), 400, "application/json", br#"{"error":"send the body with Content-Length, not Transfer-Encoding"}"#);
+    }
     if let Err(e) = read_body(&mut r, &mut req, MAX_BODY) {
         return respond(r.get_mut(), 413, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
     }
     let mut w = r.into_inner();
-    let body: Value = if req.body.is_empty() { json!({}) } else { serde_json::from_slice(&req.body).unwrap_or(json!({})) };
+    let body: Option<Value> =
+        if req.body.is_empty() { Some(json!({})) } else { serde_json::from_slice(&req.body).ok().filter(Value::is_object) };
     // Node-only routes don't exist on `sandbox serve`.
-    let found = route(&req.method, &req.path, &req.query, &body).filter(|(name, _)| policy.node || !NODE_ONLY.contains(name));
+    let found = route(&req.method, &req.path, &req.query, body.as_ref().unwrap_or(&json!({})))
+        .filter(|(name, _)| policy.node || !NODE_ONLY.contains(name));
     let Some((name, mut args)) = found else {
         return respond(&mut w, 404, "application/json", br#"{"error":"no such endpoint"}"#);
     };
+    // A body that doesn't parse is refused, not read as no arguments: `{"check": true,}`
+    // mustn't apply for real. `write_file`'s body is the file.
+    if body.is_none() && name != "write_file" {
+        return respond(&mut w, 400, "application/json", br#"{"error":"the body isn't a JSON object"}"#);
+    }
     if name == "write_file" {
         args["content"] = json!(String::from_utf8_lossy(&req.body));
     }
@@ -1000,6 +1039,37 @@ mod tests {
         assert_eq!(http(&paths, &node, "GET", &format!("/sandboxes/{}", sb.id), "").0, 200);
         let everything = Policy { roots: vec![base.clone()], ..Default::default() };
         assert_eq!(http(&paths, &everything, "GET", &format!("/sandboxes/{}", sb.id), "").0, 404);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn apply_arguments_never_fail_open() {
+        let base = tmp("failopen");
+        let project = base.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("f"), "old").unwrap();
+        let paths = Paths { home: base.join("home") };
+        let pol = Policy { roots: vec![base.clone()], ..Default::default() };
+        let sb = fake(&paths, &project, |_| {});
+        std::fs::write(paths.home.join("sb").join(&sb.id).join("ws/f"), "from-sandbox").unwrap();
+        let apply = format!("/sandboxes/{}/apply", sb.id);
+        assert_eq!(
+            http(&paths, &pol, "POST", &format!("{apply}?check=true"), ""),
+            (200, r#"{"changes":[{"kind":"M","path":"f"}]}"#.into())
+        );
+        for (path, body) in [
+            (apply.clone(), r#"{"check": true,}"#),
+            (apply.clone(), "[]"),
+            (apply.clone(), r#"{"check": "yes"}"#),
+            (format!("{apply}?check=1"), ""),
+            (format!("{apply}?reviewed=true"), ""),
+            (apply.clone(), r#"{"reviewed": true}"#),
+        ] {
+            let (code, text) = http(&paths, &pol, "POST", &path, body);
+            assert_eq!(code, 400, "{path} {body}: {text}");
+        }
+        assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "old");
+        assert!(num(&json!({"t": "5"}), "t").unwrap() == Some(5) && num(&json!({"t": "-5"}), "t").is_err());
         std::fs::remove_dir_all(base).unwrap();
     }
 

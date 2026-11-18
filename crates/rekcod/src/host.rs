@@ -107,12 +107,35 @@ fn context(name: &str) -> String {
     format!("{PREFIX}{name}")
 }
 
-/// `user@host[:port]` (as in an `ssh://` URL) as ssh arguments.
+/// `user@host[:port]` (as in an `ssh://` URL) as ssh arguments. The `--` ends ssh's
+/// options, so a destination can never be read as one.
 fn ssh_dest(dest: &str) -> Vec<String> {
     match dest.rsplit_once(':') {
-        Some((host, port)) if port.parse::<u16>().is_ok() => vec!["-p".into(), port.into(), host.into()],
-        _ => vec![dest.into()],
+        Some((host, port)) if port.parse::<u16>().is_ok() => vec!["-p".into(), port.into(), "--".into(), host.into()],
+        _ => vec!["--".into(), dest.into()],
     }
+}
+
+/// `[user@]host[:port]` made of plain words: nothing ssh could take for an option (a
+/// leading `-`) and nothing a shell or ssh config would split.
+pub fn check_dest(dest: &str) -> Result<()> {
+    let (user, rest) = dest.split_once('@').map_or((None, dest), |(u, r)| (Some(u), r));
+    let host = match rest.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => h,
+        _ => rest,
+    };
+    let word = |s: &str| !s.is_empty() && !s.starts_with('-') && s.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    if !user.is_none_or(word) || !word(host) {
+        bail!("{dest:?} isn't a host to SSH to; give it as [user@]host[:port]");
+    }
+    Ok(())
+}
+
+/// Host `h`'s ssh destination, checked: contexts are files anyone with this account can edit.
+fn dest_of_host(h: &Host) -> Result<String> {
+    let dest = h.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", h.endpoint))?;
+    check_dest(dest)?;
+    Ok(dest.to_string())
 }
 
 fn ssh(dest: &str) -> Command {
@@ -190,6 +213,7 @@ fn check(paths: &Paths, name: &str, dest: &str) -> Result<()> {
     if name == "local" || name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("host name must be letters, digits, - or _ (and not `local`)");
     }
+    check_dest(dest)?;
     eprintln!("rekcod: connecting to {dest}");
     let out = ssh(dest).arg("true").stdin(Stdio::null()).output().context("run ssh")?;
     if out.status.success() {
@@ -284,7 +308,7 @@ pub fn restart(paths: &Paths, name: &str) -> Result<()> {
     }
     let (hosts, _) = list();
     let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
-    let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?.to_string();
+    let dest = dest_of_host(host)?;
     eprintln!("rekcod: connecting to {dest}");
     let bin = crate::server::ensure_binary(&dest, || ssh(&dest), &ssh_dest(&dest))?;
     // A Mac can be down and up again between two polls, so "it went down" proves nothing;
@@ -341,7 +365,7 @@ pub fn uninstall(paths: &Paths, name: &str, yes: bool) -> Result<()> {
     }
     let (hosts, _) = list();
     let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
-    let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?.to_string();
+    let dest = dest_of_host(host)?;
     if !yes {
         eprint!(
             "This removes rekcod from {dest}: its VM, containers, apps, fleet data and ~/.rekcod, and the changes setup made there. Type `yes` to go on: "
@@ -400,28 +424,25 @@ pub fn refresh(paths: &Paths, name: &str) -> Result<()> {
     let (hosts, _) = list();
     let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
     let Some(lan) = &host.bonjour else { return Ok(()) };
-    let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?;
+    let dest = dest_of_host(host)?;
+    let dest = dest.as_str();
     let (target, _) = crate::bonjour::resolve(&lan.instance, Duration::from_secs(3))?;
     let new = retarget(dest, &target);
+    check_dest(&new)?;
     if new == dest {
         return Ok(());
     }
     // Anyone on the LAN can answer for a Bonjour name, so the answer only counts once the
     // SSH server there proves it holds the pinned key: a known_hosts with nothing else in it.
     let known = tempfile_known_hosts(&known_hosts_name(&new), &lan.host_key)?;
-    let mut verify = Command::new("ssh");
-    verify.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]).args([
-        "-o",
-        &format!("UserKnownHostsFile={}", known.display()),
-        "-o",
-        "GlobalKnownHostsFile=/dev/null",
-    ]);
     // The config block is still for the old name, so offer rekcod's key by hand.
     let key = crate::sshkey::key(paths);
-    if key.exists() {
-        verify.arg("-i").arg(&key);
-    }
-    let ok = verify.args(ssh_dest(&new)).arg("true").stdin(Stdio::null()).stderr(Stdio::null()).status().context("run ssh")?.success();
+    let ok = verify_cmd(&known, key.exists().then_some(key.as_path()), &new)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("run ssh")?
+        .success();
     let _ = std::fs::remove_file(&known);
     if !ok {
         bail!("{new} answered for {name} on Bonjour but doesn't have its SSH host key; leaving {name} on {dest}");
@@ -431,6 +452,22 @@ pub fn refresh(paths: &Paths, name: &str) -> Result<()> {
     docker::run_ok(&["context", "update", &context(name), "--docker", &format!("host=ssh://{new}")])?;
     println!("host {name}: now {new}");
     Ok(())
+}
+
+/// `ssh ... DEST true` that only succeeds when DEST holds the key in `known`.
+fn verify_cmd(known: &std::path::Path, key: Option<&std::path::Path>, dest: &str) -> Command {
+    let mut verify = Command::new("ssh");
+    verify.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=yes"]).args([
+        "-o",
+        &format!("UserKnownHostsFile={}", known.display()),
+        "-o",
+        "GlobalKnownHostsFile=/dev/null",
+    ]);
+    if let Some(k) = key {
+        verify.arg("-i").arg(k);
+    }
+    verify.args(ssh_dest(dest)).arg("true");
+    verify
 }
 
 fn tempfile_known_hosts(host: &str, key: &str) -> Result<std::path::PathBuf> {
@@ -548,7 +585,7 @@ pub fn forward(paths: &Paths, name: &str, only: &[u16]) -> Result<()> {
     }
     let (hosts, _) = list();
     let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
-    let dest = host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?.to_string();
+    let dest = dest_of_host(host)?;
     let ctl = paths.home.join(format!("run/host-{name}.ctl"));
     std::fs::create_dir_all(ctl.parent().unwrap())?;
     let _ = std::fs::remove_file(&ctl);
@@ -664,7 +701,7 @@ fn engine_ssh(dest: &str, extra: &[&str]) -> Command {
 fn dest_of(name: &str) -> Result<String> {
     let (hosts, _) = list();
     let host = hosts.iter().find(|h| h.name == name).with_context(|| format!("no host {name}; `rekcod host ls`"))?;
-    Ok(host.endpoint.strip_prefix("ssh://").with_context(|| format!("{} isn't an ssh:// host", host.endpoint))?.to_string())
+    dest_of_host(host)
 }
 
 /// The remote command line for `rekcod ARGS` there, found as `host restart` finds it.
@@ -767,8 +804,25 @@ mod tests {
 
     #[test]
     fn dest_with_port() {
-        assert_eq!(ssh_dest("me@mac-mini:2222"), ["-p", "2222", "me@mac-mini"]);
-        assert_eq!(ssh_dest("me@mac-mini"), ["me@mac-mini"]);
+        assert_eq!(ssh_dest("me@mac-mini:2222"), ["-p", "2222", "--", "me@mac-mini"]);
+        assert_eq!(ssh_dest("me@mac-mini"), ["--", "me@mac-mini"]);
+        assert_eq!(ssh_dest("-oProxyCommand=x"), ["--", "-oProxyCommand=x"]);
+    }
+
+    /// A Bonjour answer or a hand-edited context can't become an ssh option.
+    #[test]
+    fn dest_is_never_an_option() {
+        for ok in ["me@mac-mini", "mac-mini.local:2222", "me.x@10.0.0.4", "Mac_Mini"] {
+            check_dest(ok).unwrap();
+        }
+        for bad in ["-oProxyCommand=x", "me@-oProxyCommand=x", "-me@mini", "a b", "mini;id", "", "me@", "@mini"] {
+            assert!(check_dest(bad).is_err(), "{bad}");
+        }
+        let h = Host { name: "m".into(), endpoint: "ssh://-oProxyCommand=x".into(), current: false, bonjour: None };
+        assert!(dest_of_host(&h).is_err());
+        let v = verify_cmd(std::path::Path::new("/k"), None, "-oProxyCommand={touch,x}");
+        let args: Vec<_> = v.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!(args[args.len() - 3..], ["--", "-oProxyCommand={touch,x}", "true"]);
     }
 
     #[test]

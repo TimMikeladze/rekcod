@@ -160,7 +160,7 @@ pub fn install(paths: &Paths, name: &str, dest: &str) -> Result<()> {
         copy.args(["-p", p]);
     }
     let target = dest.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()).map_or(dest, |(d, _)| d);
-    if !copy.arg(target).status().context("run ssh-copy-id")?.success() {
+    if !copy.arg("--").arg(target).status().context("run ssh-copy-id")?.success() {
         bail!("ssh-copy-id to {dest} failed");
     }
     write_config(paths, name, host, &k)
@@ -171,8 +171,8 @@ fn accepts(dest: &str, k: &Path) -> bool {
     let mut ssh = Command::new("ssh");
     ssh.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "IdentitiesOnly=yes", "-i"]).arg(k);
     match dest.rsplit_once(':').filter(|(_, p)| p.parse::<u16>().is_ok()) {
-        Some((d, p)) => ssh.args(["-p", p, d]),
-        None => ssh.arg(dest),
+        Some((d, p)) => ssh.args(["-p", p, "--", d]),
+        None => ssh.args(["--", dest]),
     };
     ssh.arg("true").stdin(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success())
 }

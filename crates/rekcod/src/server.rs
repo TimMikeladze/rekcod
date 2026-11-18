@@ -894,12 +894,12 @@ fn copy_signed(dest: &str, exe: &Path, ssh: &impl Fn() -> Command, scp_dest: &[S
     Ok(format!("{}/.rekcod/bin/rekcod", String::from_utf8_lossy(&o.stdout).trim()))
 }
 
-/// `scp` arguments for `scp_dest` (`[host]` or `["-p", port, host]`): the options and the
-/// `host:` prefix remote paths go after.
+/// `scp` arguments for `scp_dest` (`["--", host]` or `["-p", port, "--", host]`): the
+/// options, ended by `--`, and the `host:` prefix remote paths go after.
 fn scp_target(dest: &str, scp_dest: &[String]) -> Result<(Command, String)> {
     let (port, host) = match scp_dest {
-        [p, port, host] if p == "-p" => (Some(port.clone()), host.clone()),
-        [host] => (None, host.clone()),
+        [p, port, end, host] if p == "-p" && end == "--" => (Some(port.clone()), host.clone()),
+        [end, host] if end == "--" => (None, host.clone()),
         _ => bail!("bad destination {dest}"),
     };
     let mut scp = Command::new("scp");
@@ -907,6 +907,7 @@ fn scp_target(dest: &str, scp_dest: &[String]) -> Result<(Command, String)> {
     if let Some(p) = port {
         scp.args(["-P", &p]);
     }
+    scp.arg("--");
     Ok((scp, host))
 }
 
@@ -1179,6 +1180,14 @@ mod tests {
         assert_eq!(l.edge_listen, "0.0.0.0:8080");
         assert!(edge_layout(&Net::Lan, None).is_err());
         assert!(edge_layout(&Net::Lan, Some("bad/name.local")).is_err());
+    }
+
+    #[test]
+    fn scp_options_end_before_the_files() {
+        let (scp, host) = scp_target("me@mini:2222", &["-p", "2222", "--", "me@mini"].map(String::from)).unwrap();
+        let args: Vec<_> = scp.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert_eq!((args[args.len() - 3..].to_vec(), host.as_str()), (vec!["-P".into(), "2222".into(), "--".into()], "me@mini"));
+        assert!(scp_target("mini", &["mini".into()]).is_err());
     }
 
     #[test]

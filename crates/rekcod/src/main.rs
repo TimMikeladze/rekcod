@@ -1925,7 +1925,7 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
             let code = sandbox::exec(paths, &id, sandbox::ExecOptions { workdir, env, timeout_secs: timeout, tty }, &cmd)?;
             std::process::exit(code)
         }
-        SandboxCmd::Shell { id } => sandbox::shell(paths, &id),
+        SandboxCmd::Shell { id } => std::process::exit(sandbox::shell(paths, &id)?),
         SandboxCmd::Cp { src, dst } => sandbox::cp(paths, &src, &dst),
         SandboxCmd::Fork { id, name, json } => {
             let m = sandbox::fork(paths, &id, name)?;

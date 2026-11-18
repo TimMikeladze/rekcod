@@ -228,7 +228,15 @@ impl Sandbox {
         crate::macos::boot(main, &self.paths.home, self.meta.ttl_secs)
     }
     fn touch(&self) {
-        let _ = std::fs::write(self.paths.home.join("run/last-used"), b"");
+        touch(&self.paths.home.join("run/last-used"));
+    }
+
+    /// Keeps the idle TTL from powering the VM off while the returned guard lives.
+    fn busy(&self) -> Busy {
+        match self.meta.ttl_secs {
+            0 => Busy(None),
+            ttl => Busy::touching(self.paths.home.join("run/last-used"), std::time::Duration::from_secs((ttl / 3).clamp(1, 60))),
+        }
     }
 
     fn boot(&self, main: &Paths) -> Result<()> {
@@ -337,6 +345,46 @@ impl Sandbox {
         }
         Ok(())
     }
+}
+
+/// Sets `file`'s mtime to now, creating it if needed: the daemon's idle clock.
+fn touch(file: &Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(file) {
+        let _ = f.set_modified(SystemTime::now());
+    }
+}
+
+/// Touches a sandbox's `run/last-used` every so often until dropped, so a command or
+/// shell that runs longer than the idle TTL isn't powered off under it.
+pub struct Busy(Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>);
+
+impl Busy {
+    fn touching(file: PathBuf, every: std::time::Duration) -> Busy {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            loop {
+                touch(&file);
+                if rx.recv_timeout(every) != Err(std::sync::mpsc::RecvTimeoutError::Timeout) {
+                    break;
+                }
+            }
+        });
+        Busy(Some((tx, t)))
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        if let Some((tx, t)) = self.0.take() {
+            drop(tx);
+            let _ = t.join();
+        }
+    }
+}
+
+/// [`Busy`] for the sandbox `id`, for the API's execs.
+pub fn busy(paths: &Paths, id: &str) -> Busy {
+    find(paths, id).map(|s| s.busy()).unwrap_or(Busy(None))
 }
 
 fn load(home: &Path) -> Option<Meta> {
@@ -567,7 +615,7 @@ pub fn exec(paths: &Paths, id: &str, o: ExecOptions, cmd: &[String]) -> Result<i
     }
     let s = find(paths, id)?;
     s.boot(paths)?;
-    s.touch();
+    let _busy = s.busy();
     let t0 = Instant::now();
     let code = if s.macos() {
         let ip = s.guest(paths)?;
@@ -610,19 +658,27 @@ pub fn record(paths: &Paths, id: &str, cmd: &[String], exit: i32, ms: u128) {
     }
 }
 
-pub fn shell(paths: &Paths, id: &str) -> Result<()> {
+/// An interactive shell in the sandbox; returns its exit code. Run as a child, not `exec`ed,
+/// so the idle TTL keeps counting it as use.
+pub fn shell(paths: &Paths, id: &str) -> Result<i32> {
     let s = find(paths, id)?;
-    if s.macos() {
+    let mut c = if s.macos() {
         let ip = s.guest(paths)?;
         let sh = ["/bin/zsh".to_string(), "-l".to_string()];
-        return Err(crate::macos::exec_command(paths, &ip, None, &[], &sh, true)?.exec()).context("exec ssh");
-    }
-    s.boot(paths)?;
+        crate::macos::exec_command(paths, &ip, None, &[], &sh, true)?
+    } else {
+        s.boot(paths)?;
+        let tty = unsafe { libc::isatty(0) == 1 };
+        let o = ExecOptions { workdir: None, env: vec![], timeout_secs: None, tty };
+        let sh = ["sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"].map(String::from);
+        let mut c = s.docker()?;
+        c.args(exec_args(&s.meta, &o, &sh));
+        c
+    };
+    let _busy = s.busy();
+    let code = c.status().context("run the shell")?.code().unwrap_or(1);
     s.touch();
-    let tty = unsafe { libc::isatty(0) == 1 };
-    let o = ExecOptions { workdir: None, env: vec![], timeout_secs: None, tty };
-    let sh = ["sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"].map(String::from);
-    Err(s.docker()?.args(exec_args(&s.meta, &o, &sh)).exec()).context("exec docker")
+    Ok(if s.warn_git() && code == 0 { 1 } else { code })
 }
 
 /// `ID:/path` becomes the workspace container's path; anything else is a Mac path.
@@ -1104,6 +1160,7 @@ pub fn exec_cmd(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Res
 
 /// [`exec_cmd`], and the seconds after which the caller must kill it. `docker exec` runs
 /// `timeout_secs` in the container; ssh to a macOS guest can't, so there the caller does.
+/// Hold [`busy`] while it runs, or a command longer than the idle TTL is powered off.
 pub fn exec_command(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Result<(Command, Option<u64>)> {
     let s = find(paths, id)?;
     if s.macos() {
@@ -1818,6 +1875,23 @@ mod tests {
         let e = apply(&paths, "forkchld", true, None).unwrap_err().to_string();
         assert!(e.contains("hostnew.txt") && e.contains("keep.txt"), "{e}");
         assert!(project.join("hostnew.txt").exists());
+    }
+
+    #[test]
+    fn a_running_command_keeps_the_idle_clock_fresh() {
+        let f = tmp("busy").join("last-used");
+        touch(&f);
+        let past = SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options().write(true).open(&f).unwrap().set_modified(past).unwrap();
+        let age = || std::fs::metadata(&f).unwrap().modified().unwrap().elapsed().unwrap_or_default();
+        let busy = Busy::touching(f.clone(), std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(age() < std::time::Duration::from_millis(150), "{:?}", age());
+        let t0 = Instant::now();
+        drop(busy);
+        assert!(t0.elapsed() < std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(age() >= std::time::Duration::from_millis(150));
     }
 
     #[test]

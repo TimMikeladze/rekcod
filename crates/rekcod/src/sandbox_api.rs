@@ -280,6 +280,7 @@ fn exec_collect(paths: &Paths, id: &str, args: &Value, stdin: Option<Vec<u8>>) -
         bail!("missing cmd");
     }
     let (mut c, deadline) = sandbox::exec_command(paths, id, &exec_opts(args)?, &cmd)?;
+    let _busy = sandbox::busy(paths, id);
     let t0 = Instant::now();
     let r = collect(&mut c, stdin, MAX_OUTPUT, deadline.map(std::time::Duration::from_secs))?;
     sandbox::record(paths, id, &cmd, r.code, t0.elapsed().as_millis());
@@ -590,6 +591,7 @@ fn stream_exec(paths: &Paths, args: &Value, w: &mut (impl Write + Send)) -> Resu
         bail!("missing cmd");
     }
     let (mut c, deadline) = sandbox::exec_command(paths, &id, &exec_opts(args)?, &cmd)?;
+    let _busy = sandbox::busy(paths, &id);
     let t0 = Instant::now();
     let mut child = c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let (tx, rx) = std::sync::mpsc::channel::<(&'static str, Vec<u8>)>();

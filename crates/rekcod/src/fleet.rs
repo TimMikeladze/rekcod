@@ -162,12 +162,32 @@ fn remotes_file(paths: &Paths) -> PathBuf {
 
 pub fn remotes(paths: &Paths) -> Remotes {
     let r: Remotes = std::fs::read(remotes_file(paths)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    for rem in r.remotes.values() {
-        if let (Some(ca), Ok(a)) = (&rem.ca, authority(&rem.url)) {
-            let _ = crate::tls::trust(&a, ca);
+    for (name, rem) in &r.remotes {
+        if let (Some(ca), Ok(a)) = (&rem.ca, authority(&rem.url))
+            && let Err(e) = crate::tls::trust(&a, ca)
+        {
+            // Still listed, so it can be removed or added again.
+            eprintln!("rekcod: remote {name}: not trusting its saved CA ({e:#}); add it again with --ca-fingerprint");
         }
     }
     r
+}
+
+/// Saved CAs that aren't a single certificate, for `rekcod doctor`: remotes by name, and
+/// `node.json`.
+pub fn refused_cas(paths: &Paths) -> Vec<String> {
+    let r: Remotes = std::fs::read(remotes_file(paths)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut out: Vec<String> = r
+        .remotes
+        .iter()
+        .filter(|(_, rem)| rem.ca.as_deref().is_some_and(|ca| crate::tls::ca_cert(ca).is_err()))
+        .map(|(n, _)| format!("remote {n}"))
+        .collect();
+    let node: Option<NodeConfig> = std::fs::read(paths.home.join("node.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
+    if node.and_then(|n| n.ca).is_some_and(|ca| crate::tls::ca_cert(&ca).is_err()) {
+        out.push("node.json".into());
+    }
+    out
 }
 
 pub fn remote(paths: &Paths, name: Option<&str>) -> Result<Remote> {
@@ -242,7 +262,9 @@ pub fn remote_list(paths: &Paths) {
     let r = remotes(paths);
     for (name, rem) in &r.remotes {
         let star = if r.default.as_deref() == Some(name) { "*" } else { " " };
-        println!("{star} {name:<12} {}  ns={}", rem.url, rem.ns.as_deref().unwrap_or("default"));
+        let bad = rem.ca.as_deref().is_some_and(|ca| crate::tls::ca_cert(ca).is_err());
+        let flag = if bad { "  CA REFUSED: add it again with --ca-fingerprint" } else { "" };
+        println!("{star} {name:<12} {}  ns={}{flag}", rem.url, rem.ns.as_deref().unwrap_or("default"));
     }
 }
 
@@ -1158,7 +1180,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     let addr: SocketAddr = cfg.listen.parse()?;
     graceful_exit(None);
     if let Some(ca) = &cfg.ca {
-        crate::tls::trust_by_default(ca)?;
+        crate::tls::trust_by_default(ca).context("node.json's controller CA; join again (`rekcod node join`)")?;
     }
     let tls = match (&cfg.cert, &cfg.key) {
         (Some(c), Some(k)) => Some(crate::tls::server_config(c, k)?),

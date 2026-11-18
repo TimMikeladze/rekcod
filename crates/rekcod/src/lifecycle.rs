@@ -267,6 +267,13 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
         if open.is_empty() { "home, run/, logs/ and vm/ 700, VM disks 600".into() } else { open.join(", ") },
         "sudo chown -R \"$(whoami)\" ~/.rekcod, then any rekcod command sets the modes again",
     );
+    let refused = crate::fleet::refused_cas(paths);
+    add(
+        "fleet CA pins",
+        refused.is_empty(),
+        if refused.is_empty() { "one certificate each".into() } else { format!("more than one certificate: {}", refused.join(", ")) },
+        "rekcod remote add NAME URL --token T --ca-fingerprint sha256:... again (node.json: rekcod node join again)",
+    );
     if crate::docker::available() {
         let ctx = crate::docker::current_context().unwrap_or_default();
         // `default` is /var/run/docker.sock, which is rekcod once the socket is routed.

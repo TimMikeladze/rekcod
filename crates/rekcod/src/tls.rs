@@ -92,11 +92,33 @@ impl Ca {
     }
 }
 
-/// `sha256:<hex>` of the first certificate in `pem`.
+/// The one certificate in a CA pin. A pin is a single certificate: `fingerprint` hashes it and
+/// `roots` trusts it, so a bundle with a second certificate behind the pinned one is refused
+/// rather than trusted along with it.
+pub fn ca_cert(pem: &str) -> Result<CertificateDer<'static>> {
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(pem.as_bytes()).collect::<Result<_, _>>().map_err(|e| anyhow!("not a certificate: {e}"))?;
+    match <[_; 1]>::try_from(certs) {
+        Ok([c]) => Ok(c),
+        Err(v) if v.is_empty() => bail!("no certificate"),
+        Err(v) => bail!("{} certificates where the CA pin is one", v.len()),
+    }
+}
+
+/// `sha256:<hex>` of the certificate in `pem`, which must hold exactly one.
 pub fn fingerprint(pem: &str) -> Result<String> {
+    Ok(der_fingerprint(&ca_cert(pem)?))
+}
+
+fn der_fingerprint(der: &[u8]) -> String {
     use sha2::Digest;
-    let der = CertificateDer::from_pem_slice(pem.as_bytes()).map_err(|e| anyhow!("not a certificate: {e}"))?;
-    Ok(format!("sha256:{}", sha2::Sha256::digest(der.as_ref()).iter().map(|b| format!("{b:02x}")).collect::<String>()))
+    format!("sha256:{}", sha2::Sha256::digest(der).iter().map(|b| format!("{b:02x}")).collect::<String>())
+}
+
+fn pem_of(der: &[u8]) -> String {
+    let b64 = crate::daemon::base64(der);
+    let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect();
+    format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
 }
 
 pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::ServerConfig>> {
@@ -112,9 +134,7 @@ pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::Server
 
 fn roots(ca_pem: &str) -> Result<Arc<rustls::RootCertStore>> {
     let mut roots = rustls::RootCertStore::empty();
-    for c in CertificateDer::pem_slice_iter(ca_pem.as_bytes()) {
-        roots.add(c.map_err(|e| anyhow!("CA: {e}"))?)?;
-    }
+    roots.add(ca_cert(ca_pem).context("CA")?)?;
     Ok(Arc::new(roots))
 }
 
@@ -375,7 +395,8 @@ impl rustls::client::danger::ServerCertVerifier for AnyCert {
     }
 }
 
-/// Fetches `base`'s `/ca.pem` and returns it if its fingerprint is `want`.
+/// Fetches `base`'s `/ca.pem` and returns it if it is one certificate whose fingerprint is
+/// `want`. What comes back is that certificate encoded again, never the bytes received.
 pub fn fetch_ca(base: &str, want: &str) -> Result<String> {
     let authority = base.strip_prefix("https://").ok_or_else(|| anyhow!("--ca-fingerprint is for https:// URLs"))?.trim_end_matches('/');
     let p = provider();
@@ -390,19 +411,21 @@ pub fn fetch_ca(base: &str, want: &str) -> Result<String> {
     let name = ServerName::try_from(host_of(authority).to_string()).map_err(|e| anyhow!("{authority}: {e}"))?;
     let mut s = rustls::StreamOwned::new(rustls::ClientConnection::new(Arc::new(cfg), name)?, tcp);
     write!(s, "GET /ca.pem HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")?;
+    // A CA certificate is about 600 bytes; nothing here needs more than 64 KiB.
     let mut buf = Vec::new();
-    match s.read_to_end(&mut buf) {
+    match (&mut s).take(64 << 10).read_to_end(&mut buf) {
         Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {}
         Err(e) => return Err(e.into()),
     }
     let text = String::from_utf8_lossy(&buf);
-    let pem = text.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).context("bad /ca.pem response")?;
-    let got = fingerprint(&pem)?;
+    let body = text.split_once("\r\n\r\n").map(|(_, b)| b).context("bad /ca.pem response")?;
+    let der = ca_cert(body).with_context(|| format!("{base}/ca.pem"))?;
+    let got = der_fingerprint(&der);
     if !got.eq_ignore_ascii_case(want.trim()) {
         bail!("{base} presents CA {got}, not {want}; not trusting it");
     }
-    Ok(pem)
+    Ok(pem_of(&der))
 }
 
 #[cfg(test)]
@@ -451,6 +474,37 @@ mod tests {
         if DEFAULT_TRUST.get().is_none() {
             assert!(connect("https://10.9.9.9:1", "10.9.9.9:1", tcp).is_err());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The real CA followed by another one at `/ca.pem`, with a server certificate from the
+    /// other: the pin matches the first certificate, and the second must not be trusted.
+    #[test]
+    fn a_ca_pin_is_one_certificate() {
+        let dir = std::env::temp_dir().join(format!("rekcod-tls-pin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        let (real, other) = (ensure_ca(&dir).unwrap(), ensure_ca(&dir.join("other")).unwrap());
+        let bundle = format!("{}{}", real.pem, other.pem);
+        let (cert, key) = other.issue(&["127.0.0.1".into()]).unwrap();
+        let server = server_config(&cert, &key).unwrap();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let body = bundle.clone();
+        std::thread::spawn(move || {
+            for tcp in l.incoming().flatten() {
+                let Ok(mut s) = accept(Some(&server), tcp) else { continue };
+                let _ = s.read(&mut [0u8; 4096]);
+                let _ = write!(s, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+            }
+        });
+        let err = fetch_ca(&format!("https://{addr}"), &real.fingerprint().unwrap()).unwrap_err();
+        assert!(format!("{err:#}").contains("2 certificates"), "{err:#}");
+        // A bundle saved before this check isn't trusted, and has no fingerprint.
+        assert!(trust("127.0.0.1:1", &bundle).is_err());
+        assert!(fingerprint(&bundle).is_err());
+        // One certificate encoded again is the same certificate.
+        assert_eq!(fingerprint(&pem_of(&ca_cert(&real.pem).unwrap())).unwrap(), real.fingerprint().unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

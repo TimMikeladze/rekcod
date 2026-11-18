@@ -110,6 +110,12 @@ pub struct Meta {
     /// `IP:PORT`s on the Mac or LAN it may reach (an app instance's RustFS).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reach: Vec<String>,
+    /// The only Mac loopback ports its VM may listen on; None is any unprivileged port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<Vec<u16>>,
+    /// Ports its `--network host` containers listen on aren't forwarded to the Mac.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_autoports: bool,
 }
 
 pub struct CreateOptions {
@@ -127,6 +133,10 @@ pub struct CreateOptions {
     /// "macos" for a macOS guest; `image` then names the base image.
     pub os: Option<String>,
     pub reach: Vec<String>,
+    /// See [`Meta::publish`]; the fleet sets it, local sandboxes leave None.
+    pub publish: Option<Vec<u16>>,
+    /// See [`Meta::no_autoports`].
+    pub no_autoports: bool,
 }
 
 impl Default for CreateOptions {
@@ -145,6 +155,8 @@ impl Default for CreateOptions {
             ttl_secs: 30 * 60,
             os: None,
             reach: vec![],
+            publish: None,
+            no_autoports: false,
         }
     }
 }
@@ -366,8 +378,9 @@ impl Sandbox {
             reach: m.reach.clone(),
             idle_ttl: (m.ttl_secs > 0).then_some(m.ttl_secs),
             repair: false,
-            publish: m.offline.then(Vec::new),
-            no_autoports: m.offline,
+            // An offline sandbox has nothing to forward.
+            publish: m.publish.clone().or_else(|| m.offline.then(Vec::new)),
+            no_autoports: m.no_autoports || m.offline,
         }
     }
 
@@ -635,6 +648,8 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
             created: now(),
             os: if macos { "macos".into() } else { String::new() },
             reach: o.reach,
+            publish: o.publish,
+            no_autoports: o.no_autoports,
         },
         paths: sb,
     };
@@ -2025,6 +2040,8 @@ mod tests {
             created: 0,
             os: String::new(),
             reach: vec![],
+            publish: None,
+            no_autoports: false,
         };
         let o = ExecOptions { workdir: None, env: vec!["A=1".into()], timeout_secs: Some(5), tty: false, clean_env: false };
         let a = exec_args(&m, &o, &["npm".into(), "test".into()]).join(" ");
@@ -2445,6 +2462,23 @@ mod tests {
     }
 
     #[test]
+    fn a_sandboxs_forwarding_reaches_its_daemon() {
+        let (paths, project, _, _) = setup("fwd-meta", &[("f", "x")]);
+        let m = fake(&paths, &project, |m| (m.publish, m.no_autoports) = (Some(vec![]), true));
+        let s = find(&paths, &m.id).unwrap();
+        assert_eq!(crate::cli::forwarding_args(&s.boot_options(PathBuf::from("/g"))), vec!["--publish=", "--no-autoports"]);
+        let m = fake(&paths, &project, |m| m.publish = Some(vec![8080, 9000]));
+        let s = find(&paths, &m.id).unwrap();
+        assert_eq!(crate::cli::forwarding_args(&s.boot_options(PathBuf::from("/g"))), vec!["--publish=8080,9000"]);
+        // Saved and read back; a meta.json from before has neither.
+        assert_eq!(s.meta.publish, Some(vec![8080, 9000]));
+        let old: Meta = serde_json::from_str(&serde_json::to_string(&Meta { publish: None, ..s.meta.clone() }).unwrap()).unwrap();
+        assert_eq!((old.publish, old.no_autoports), (None, false));
+        let local = fake(&paths, &project, |_| {});
+        assert!(crate::cli::forwarding_args(&find(&paths, &local.id).unwrap().boot_options(PathBuf::from("/g"))).is_empty());
+    }
+
+    #[test]
     fn offline_sandboxes_forward_nothing() {
         let (paths, project, m, _) = setup("fwd", &[("f", "x")]);
         let o = find(&paths, &m.id).unwrap().boot_options(PathBuf::from("/g"));
@@ -2609,6 +2643,8 @@ pub(crate) mod testing {
             created: now(),
             os: String::new(),
             reach: vec![],
+            publish: None,
+            no_autoports: false,
         };
         edit(&mut meta);
         let s = Sandbox { meta, paths: Paths { home } };

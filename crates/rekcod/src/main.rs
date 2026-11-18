@@ -2094,6 +2094,8 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
                 ttl_secs: ttl,
                 os,
                 reach: vec![],
+                publish: None,
+                no_autoports: false,
             };
             let m = sandbox::create(paths, o)?;
             if json {

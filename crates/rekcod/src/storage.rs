@@ -1,4 +1,4 @@
-//! RustFS, the fleet's S3 bucket (docs/rustfs.md).
+//! RustFS, the fleet's S3 bucket (README.md, "Run S3-compatible storage").
 //!
 //! - `rekcod storage serve`: the pinned RustFS release binary, run on this Mac with root keys
 //!   from `storage/credentials.json` (created on first run).

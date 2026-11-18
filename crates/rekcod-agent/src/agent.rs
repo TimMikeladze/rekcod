@@ -480,7 +480,7 @@ fn stats() -> String {
         used = total.saturating_sub(st.f_bfree as u64 * st.f_frsize as u64).to_string();
         size = total.to_string();
     }
-    // Elastic memory in use (docs/elastic-memory.md); null without swap.
+    // Elastic memory in use (README.md, "Configure the VM"); null without swap.
     let swap_used = match (meminfo_kib("SwapTotal"), meminfo_kib("SwapFree")) {
         (Some(t), Some(f)) if t > 0 => ((t - f.min(t)) * 1024).to_string(),
         _ => "null".to_string(),
@@ -578,7 +578,7 @@ struct Dns {
     egress: Option<Egress>,
 }
 
-/// Agent sandbox egress (docs/agent-sandboxes.md): only allowed names resolve, and each
+/// Agent sandbox egress (README.md, "Network and secrets"): only allowed names resolve, and each
 /// address they resolve to is let through `REKCOD-ALLOW` before the client sees it.
 struct Egress {
     allow: Vec<String>,

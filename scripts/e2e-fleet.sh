@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fleet and app hosting checks (docs/platform.md, tracks 2-3): a controller, three nodes and
+# Fleet and app hosting checks (README.md, "Self-host apps on a Mac"): a controller, three nodes and
 # an edge on this Mac, each in its own REKCOD_HOME. Leaves the main VM alone.
 # Needs git and sqlite3 (both ship with macOS).
 set -uo pipefail

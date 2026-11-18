@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Phase 0 headroom benchmark (see docs/plan.md).
+"""Phase 0 headroom benchmark.
 
 Measures how far a bind mount is from the two reference points that matter:
   native  - same workload on the Mac's own disk

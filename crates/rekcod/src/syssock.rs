@@ -1,5 +1,5 @@
 //! The default socket (`/var/run/docker.sock`) for clients that ignore docker
-//! contexts (docs/default-socket.md).
+//! contexts (README.md, "Docker SDKs and IDEs").
 //!
 //! `/var/run/docker.sock -> ~/.rekcod/default.sock -> <engine socket>`: root sets
 //! the first link (`rekcod socket install`); start/stop retarget the second. macOS empties

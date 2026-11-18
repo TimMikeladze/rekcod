@@ -8,7 +8,7 @@
 //! so builds aren't slowed down. The page cache (the fast file-sharing cache)
 //! is kept unless macOS itself is under memory pressure.
 //!
-//! Measured on macOS 27 (docs/phase2.md): the guest inflates the balloon as
+//! Measured on macOS 27: the guest inflates the balloon as
 //! asked, but the VM process's physical footprint does not drop, so this is off
 //! by default until the host side actually releases ballooned pages.
 

@@ -31,7 +31,7 @@ pub struct VmConfig {
     pub cpus: usize,
     pub memory_mib: u64,
     pub kernel: PathBuf,
-    /// None for kernels that mount the root disk themselves (docs/custom-kernel.md).
+    /// None for kernels that mount the root disk themselves.
     pub initrd: Option<PathBuf>,
     pub cmdline: String,
     pub root_disk: PathBuf,
@@ -47,7 +47,7 @@ pub struct VmConfig {
     /// Name in the guest's `mac` virtio-fs share -> host directory.
     pub shares: Vec<(String, PathBuf)>,
     pub net: Net,
-    /// Swap backed by memory macOS gets back (docs/elastic-memory.md), on top of
+    /// Swap backed by memory macOS gets back (README.md, "Configure the VM"), on top of
     /// `memory_mib` of RAM. 0 for none; ignored before macOS 27.
     pub elastic_mib: u64,
 }
@@ -146,7 +146,7 @@ impl Vm {
         self.elastic.as_ref().map(|e| e.held())
     }
 
-    /// Maps the elastic memory in (docs/elastic-memory.md); call once the VM runs.
+    /// Maps the elastic memory in; call once the VM runs.
     pub fn map_elastic(&self) {
         if let Some(e) = &self.elastic {
             e.map();
@@ -359,7 +359,7 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
             shares.push(Retained::into_super(fs));
         }
         c.setDirectorySharingDevices(&NSArray::from_retained_slice(&shares));
-        // Elastic memory (docs/elastic-memory.md): swap the guest can hand back to macOS.
+        // Elastic memory: swap the guest can hand back to macOS.
         let elastic = if cfg.elastic_mib > 0 && crate::elastic::available() {
             let (device, elastic) = crate::elastic::configuration(cfg.elastic_mib)?;
             let devices = NSArray::from_retained_slice(&[device]);
@@ -371,7 +371,7 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
 
         c.setSocketDevices(&NSArray::from_retained_slice(&[Retained::into_super(VZVirtioSocketDeviceConfiguration::new())]));
         c.setEntropyDevices(&NSArray::from_retained_slice(&[Retained::into_super(VZVirtioEntropyDeviceConfiguration::new())]));
-        // Debug knob (VM freeze bisect, docs/phase2b-4.md): REKCOD_NO_BALLOON=1.
+        // Debug knob (VM freeze bisect): REKCOD_NO_BALLOON=1.
         if std::env::var_os("REKCOD_NO_BALLOON").is_none() {
             c.setMemoryBalloonDevices(&NSArray::from_retained_slice(&[Retained::into_super(
                 VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new(),
@@ -606,7 +606,7 @@ fn update(queue: &Mutex<Queue>, f: impl FnOnce(&mut Queue)) {
 /// If we stop reading one connection (e.g. a docker CLI that stopped draining a
 /// log stream, so `copy_bidirectional` stops reading the guest side), the
 /// write blocks, a vCPU blocks behind it, IPIs to that vCPU go unanswered, and
-/// the whole guest freezes (docs/phase2b-4.md, "VM freeze"). So a task always
+/// the whole guest freezes. So a task always
 /// reads. A reader more than [`CONN_BUFFER_MAX`] behind gets the rest from unlinked
 /// temp files; one more than [`CONN_SPILL_MAX`] further behind gets an error. Both
 /// limits count unread bytes, so a reader that catches up is back on the memory path.

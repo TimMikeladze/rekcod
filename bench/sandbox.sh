@@ -1,5 +1,5 @@
 #!/bin/sh
-# Agent sandbox timings (docs/agent-sandboxes.md, Verification). Needs a golden disk
+# Agent sandbox timings. Needs a golden disk
 # (`rekcod sandbox golden build`). Creates and removes its own sandboxes only.
 set -eu
 B=${REKCOD:-rekcod}
@@ -31,7 +31,7 @@ for id in $(cat "$proj/forks"); do
 done | p50
 $B sandbox rm "$parent" >/dev/null
 
-# Through the daemon's network stack (docs/sandbox-network.md), from an allowed host. The
+# Through the daemon's network stack (README.md, "Agent sandboxes have their own workspace and engine"), from an allowed host. The
 # internet link is usually the limit; compare with curl on the Mac.
 printf 'download              '
 id=$($B sandbox create "$proj" --image python:3.13-slim 2>/dev/null)

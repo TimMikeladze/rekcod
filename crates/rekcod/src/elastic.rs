@@ -1,4 +1,4 @@
-//! Elastic memory (docs/elastic-memory.md): a custom virtio device whose shared memory
+//! Elastic memory (README.md, "Configure the VM"): a custom virtio device whose shared memory
 //! region is memory this process maps in. The guest swaps to it and tells us, chunk by
 //! chunk, when it no longer holds data there; `MADV_FREE_REUSABLE` then gives those pages
 //! back to macOS while the VM keeps running. Needs macOS 27 (`VZCustomVirtioDevice`).

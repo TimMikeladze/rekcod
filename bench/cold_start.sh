@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # First access to a bind-mounted tree right after `rekcod start`, with and
-# without the boot-time warming of recently used bind sources (docs/phase5.md §1).
+# without the boot-time warming of recently used bind sources.
 #
 #   bench/cold_start.sh            # needs rekcod built (target/release/rekcod)
 set -euo pipefail

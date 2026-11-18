@@ -4,7 +4,7 @@ import { expect, test, type Page } from "@playwright/test"
 import type { State } from "../src/lib/types"
 
 // Sorting, bulk select, tabs, the log viewer, shortcuts, the palette, pins, density and the
-// rest of docs/dashboard-round4.md. Same fixture server as dashboard.spec.ts.
+// rest of the dashboard's fourth round. Same fixture server as dashboard.spec.ts.
 
 const FIXTURE = JSON.parse(readFileSync(path.resolve("fixtures/state.json"), "utf8")) as State
 

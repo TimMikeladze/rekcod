@@ -1,4 +1,4 @@
-//! A small S3 client for RustFS (docs/rustfs.md): SigV4, path-style URLs, HTTP/1.1 over
+//! A small S3 client for RustFS (README.md, "Run S3-compatible storage"): SigV4, path-style URLs, HTTP/1.1 over
 //! plain TCP or TLS (`https://` endpoints are checked against the Mac's trusted roots).
 //! Covers what rekcod needs: buckets, objects streamed from and to files, presigned GETs,
 //! and RustFS's MinIO-style admin API for per-app users and policies.

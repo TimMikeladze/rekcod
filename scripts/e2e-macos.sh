@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# macOS sandbox checks (docs/platform.md, track 4). Needs a ready base image:
+# macOS sandbox checks (README.md, "macOS sandboxes"). Needs a ready base image:
 #   rekcod macos fetch && rekcod macos install && rekcod macos setup   (once, by hand)
 # Creates and removes its own sandboxes only.
 set -uo pipefail

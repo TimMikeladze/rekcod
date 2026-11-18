@@ -32,6 +32,8 @@ jobs:
       - uses: ./.github/actions/rust
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo fmt --all --check
+      # docs/*.md paths, README sections and anchors that code, scripts and docs point at.
+      - run: python3 scripts/check-docs.py
       - run: cargo test --workspace --locked
       - run: cargo build --locked -p rekcod
       - run: REKCOD=target/debug/rekcod python3 scripts/e2e-edges.py

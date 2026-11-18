@@ -1,5 +1,5 @@
 //! Thin wrappers over the `docker` CLI: the user's own for contexts and
-//! save/load, or a bundled one when there is none (docs/cli-passthrough.md).
+//! save/load, or a bundled one when there is none.
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};

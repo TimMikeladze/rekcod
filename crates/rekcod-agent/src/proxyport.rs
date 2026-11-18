@@ -1,5 +1,5 @@
 //! Published port -> container address, so forwarded Mac connections skip docker-proxy
-//! (about 30 µs per round trip; docs/perf-plan.md §1).
+//! (about 30 µs per round trip).
 //!
 //! dockerd starts one docker-proxy per published port and binding, with the container
 //! address on its command line. Only children of dockerd count: any container can run a

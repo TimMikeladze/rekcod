@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# End-to-end check of the switch-over flow (docs/mvp.md "Done when").
+# End-to-end check of the switch-over flow (README.md, "Run your first container").
 # Uses the real docker CLI and compose against rekcod; restores your context.
 #
 #   scripts/e2e.sh                       # core checks
@@ -105,7 +105,7 @@ check "a read after the Mac deleted the file fails (not EBADF)" sh -c 'docker lo
 docker rm -f rekcod-e2e-lazy >/dev/null 2>&1
 check "rekcod compact" "$R" compact
 
-echo "docker passthrough (docs/cli-passthrough.md)"
+echo "docker passthrough"
 check "rekcod run keeps docker's exit code" sh -c '"$0" run --rm alpine:3.24 sh -c "exit 7"; test $? = 7' "$R"
 check "rekcod compose version" "$R" compose version
 "$R" run -d --name rekcod-e2e-pt -l "$run_label" alpine:3.24 sleep 60 >/dev/null
@@ -172,7 +172,7 @@ echo x >"$coh/case3" && mv "$coh/case3" "$coh/Case3"
 check "Mac case-only rename visible" see 'ls /c | grep -qx Case3 && test "$(cat /c/CASE3)" = x'
 docker rm -f rekcod-e2e-coh >/dev/null 2>&1
 
-echo "phase 5 (docs/phase5.md)"
+echo "phase 5"
 check "status --json" sh -c '"$0" status --json | python3 -c "import json,sys; d=json.load(sys.stdin); assert d[\"running\"] and d[\"disk\"][\"size\"] > 0"' "$R"
 lw="$work/local"; mkdir -p "$lw"
 check "dev.rekcod.local puts node_modules on a VM volume" sh -c "docker run --rm --name rekcod-e2e-lbl -l dev.rekcod.local=node_modules -w /app -v '$lw:/app' alpine:3.24 sh -c 'echo x > node_modules/f && mount | grep -q \" /app/node_modules type ext4\"' && test ! -e '$lw/node_modules/f'"

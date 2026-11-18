@@ -1,6 +1,6 @@
 //! The docker socket proxy: a byte pipe that understands just enough HTTP/1.1
 //! on the client→engine side to rewrite `POST /containers/create`
-//! (docs/phase5.md §2).
+//! (README.md, "Keep dependency writes inside Linux").
 //!
 //! `labels: { dev.rekcod.local: "node_modules,.next" }` on a container puts
 //! those paths on named volumes in the VM, so installs and build output never

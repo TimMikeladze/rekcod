@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Regression test for the VM freeze (docs/phase2b-4.md): a Mac-side client
+# Regression test for the VM freeze: a Mac-side client
 # that stops reading a stream (here `docker logs -f` into a pipe nobody reads)
 # must not stall the guest. Before the fix, Virtualization.framework blocked in
 # writev on the vsock queue and every vCPU waited behind it.

@@ -1,5 +1,5 @@
 //! `rekcod snap`: save and restore a compose project's named volumes
-//! (docs/phase5.md §5, plan.md §3a).
+//! (README.md, "Restore your database to a known state").
 //!
 //! A snapshot of volume `v` is another volume, labelled so it can be found again. Save pauses
 //! the project's running containers for a crash-consistent copy (databases recover through
@@ -26,7 +26,7 @@
 //! it replaced, which no push still in flight can be. An interrupted push leaves the old
 //! manifest pointing at its own archives. `restore --pull`
 //! checks every archive against the manifest before using it, and still reads pushes from
-//! before generations (`<volume>.tar.zst` beside the manifest, no hashes) (docs/rustfs.md).
+//! before generations (`<volume>.tar.zst` beside the manifest, no hashes).
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};

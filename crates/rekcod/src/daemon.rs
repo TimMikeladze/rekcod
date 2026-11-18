@@ -53,14 +53,14 @@ macro_rules! log {
 
 pub struct Options {
     pub cpus: usize,
-    /// Memory the guest may use: base RAM plus elastic swap (docs/elastic-memory.md).
+    /// Memory the guest may use: base RAM plus elastic swap (README.md, "Configure the VM").
     pub memory_mib: u64,
     /// Base RAM; default from `rekcod_proto::split_memory`.
     pub base_memory_mib: Option<u64>,
-    /// Sandbox VM (docs/sandbox.md): share only this directory, and nothing
+    /// Sandbox VM (README.md, "Run it in a separate VM"): share only this directory, and nothing
     /// on the Mac is reachable from the guest.
     pub project: Option<PathBuf>,
-    /// Agent sandbox (docs/agent-sandboxes.md): the Mac directory shared as `project`,
+    /// Agent sandbox (README.md, "Review an agent's changes before applying them"): the Mac directory shared as `project`,
     /// when it's a copy of the project rather than the project itself.
     pub workspace: Option<PathBuf>,
     /// Egress allowlist (comma-separated names); none means the internet is open.
@@ -169,7 +169,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             .collect(),
     };
     // Sandbox VMs: the network card is a socket this daemon serves, and every connection is
-    // checked here (docs/sandbox-network.md). The guest's own firewall stays as a second layer.
+    // checked here (README.md, "Network and secrets"). The guest's own firewall stays as a second layer.
     let allow: Option<Vec<String>> = opts
         .allow
         .as_deref()

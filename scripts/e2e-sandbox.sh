@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Agent sandbox checks (docs/agent-sandboxes.md). Creates and removes its own sandboxes
+# Agent sandbox checks (README.md, "Review an agent's changes before applying them"). Creates and removes its own sandboxes
 # only and leaves the main VM alone, so it's safe to run while your containers are up.
 # scripts/e2e.sh runs it too.
 set -uo pipefail
@@ -36,7 +36,7 @@ check "egress: direct IPs rejected" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z 
 check "egress: denial logged" sh -c '"$0" sandbox log e2e-sb1 --net | grep -q example.com' "$R"
 check "Mac unreachable" sh -c '! "$0" sandbox exec e2e-sb1 -- nc -z -w 2 10.0.2.2 22' "$R"
 # The network checks again, after guest root flushed the guest's own firewall: the rekcod
-# daemon on the Mac decides every connection (docs/sandbox-network.md).
+# daemon on the Mac decides every connection (README.md, "Network and secrets").
 lan=$(ipconfig getifaddr en0 || ipconfig getifaddr en1 || echo 192.168.64.1)
 id=$("$R" sandbox ls --json | python3 -I -c 'import json,sys; print([s["id"] for s in json.load(sys.stdin) if s.get("name")=="e2e-sb1"][0])')
 DOCKER_HOST="unix://${REKCOD_HOME:-$HOME/.rekcod}/sb/$id/run/docker.sock" docker run --rm --privileged --pid=host alpine:3.24 \

@@ -37,7 +37,7 @@ pub const MAC_SHARE_TAG: &str = "mac";
 /// virtio-fs tag for Rosetta.
 pub const ROSETTA_SHARE_TAG: &str = "rosetta";
 
-/// Virtio device ID of the elastic-memory device (docs/elastic-memory.md). Inside the
+/// Virtio device ID of the elastic-memory device (README.md, "Configure the VM"). Inside the
 /// modern virtio-pci range (0x1040 + id), unused by Linux.
 pub const ELASTIC_DEVICE_ID: u16 = 63;
 /// Unit the guest releases and reuses elastic memory in.

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RustFS checks (docs/rustfs.md): `storage serve`, a controller with --storage and one node,
+# RustFS checks (README.md, "Run S3-compatible storage"): `storage serve`, a controller with --storage and one node,
 # each in its own REKCOD_HOME. Leaves the main VM alone. The app is alpine + busybox nc, so
 # the sandboxes don't need the internet. Needs git, curl and sqlite3 (all ship with macOS).
 set -uo pipefail

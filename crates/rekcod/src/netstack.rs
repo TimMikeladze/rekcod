@@ -1,4 +1,4 @@
-//! Sandbox VM network on the Mac (docs/sandbox-network.md).
+//! Sandbox VM network on the Mac (README.md, "Network and secrets" and "Sandbox limitations").
 //!
 //! A sandbox VM's network card is one end of a `socketpair(AF_UNIX, SOCK_DGRAM)`, one
 //! datagram per Ethernet frame. This module is the other end: smoltcp plays the guest's
@@ -113,7 +113,7 @@ pub enum Verdict {
 }
 
 /// Stands for the Mac's loopback in a sandbox's `reach` list (a node's RustFS on
-/// 127.0.0.1, docs/lan-discovery.md). 198.18.0.0/15 is for benchmarks and never routed.
+/// 127.0.0.1). 198.18.0.0/15 is for benchmarks and never routed.
 pub const MAC_LOOPBACK: Ipv4Addr = Ipv4Addr::new(198, 18, 0, 1);
 
 pub struct Policy {

@@ -49,24 +49,56 @@ pub fn ensure_node_ca(dir: &Path) -> Result<Ca> {
     ensure_named(dir, "node-ca", "rekcod node CA")
 }
 
+/// Makes the pair only when neither file exists. With one of them missing or unreadable, or a
+/// key that didn't sign the certificate, it stops: a new CA would quietly break every pin
+/// (remotes, edges, nodes) or every node certificate.
 fn ensure_named(dir: &Path, name: &str, common_name: &str) -> Result<Ca> {
     let (pem_path, key_path) = (dir.join(format!("{name}.pem")), dir.join(format!("{name}.key")));
-    if let (Ok(pem), Ok(key)) = (std::fs::read_to_string(&pem_path), std::fs::read_to_string(&key_path)) {
-        let key = rcgen::KeyPair::from_pem(&key).with_context(|| format!("controller/{name}.key"))?;
-        return Ok(Ca { pem, params: ca_params(common_name)?, key });
+    let missing = |r: &std::io::Result<String>| matches!(r, Err(e) if e.kind() == std::io::ErrorKind::NotFound);
+    match (std::fs::read_to_string(&pem_path), std::fs::read_to_string(&key_path)) {
+        (Ok(pem), Ok(key)) => {
+            let key = rcgen::KeyPair::from_pem(&key).with_context(|| key_path.display().to_string())?;
+            let ca = Ca { pem, params: ca_params(common_name)?, key };
+            ca.check().with_context(|| format!("{} doesn't belong to {}", key_path.display(), pem_path.display()))?;
+            Ok(ca)
+        }
+        (p, k) if missing(&p) && missing(&k) => {
+            let key = rcgen::KeyPair::generate()?;
+            let params = ca_params(common_name)?;
+            let pem = ca_params(common_name)?.self_signed(&key)?.pem();
+            crate::paths::write_private(&key_path, key.serialize_pem().as_bytes())?;
+            crate::paths::write_private(&pem_path, pem.as_bytes())?;
+            Ok(Ca { pem, params, key })
+        }
+        (p, k) => {
+            let (path, e) = match (p, k) {
+                (Err(e), _) => (&pem_path, e),
+                (_, Err(e)) => (&key_path, e),
+                _ => unreachable!("both read"),
+            };
+            bail!(
+                "{}: {e}; restore it from your backup of {} (making a new CA would break every remote, edge and node that trusts this one)",
+                path.display(),
+                dir.display()
+            )
+        }
     }
-    let key = rcgen::KeyPair::generate()?;
-    let params = ca_params(common_name)?;
-    let pem = ca_params(common_name)?.self_signed(&key)?.pem();
-    crate::paths::write_private(&key_path, key.serialize_pem().as_bytes())?;
-    std::fs::write(&pem_path, &pem)?;
-    Ok(Ca { pem, params, key })
 }
+
+/// How long a certificate from `Ca::issue` lasts. Nodes ask for a new one in their heartbeat
+/// once theirs has [`RENEW_WITHIN`] left.
+pub const CERT_LIFETIME: std::time::Duration = std::time::Duration::from_secs(2 * 365 * 86400);
+pub const RENEW_WITHIN: std::time::Duration = std::time::Duration::from_secs(90 * 86400);
 
 impl Ca {
     /// A certificate for `names` (host names or IP addresses), valid for two years, and its
     /// key, both PEM.
     pub fn issue(&self, names: &[String]) -> Result<(String, String)> {
+        self.issue_until(names).map(|(c, k, _)| (c, k))
+    }
+
+    /// `issue`, plus when the certificate expires (Unix seconds).
+    pub fn issue_until(&self, names: &[String]) -> Result<(String, String, i64)> {
         let mut p = rcgen::CertificateParams::new(Vec::<String>::new())?;
         for n in names {
             match n.parse::<IpAddr>() {
@@ -79,12 +111,21 @@ impl Ca {
         p.use_authority_key_identifier_extension = true;
         let now = std::time::SystemTime::now();
         p.not_before = now.checked_sub(std::time::Duration::from_secs(86400)).unwrap_or(now).into();
-        p.not_after = (now + std::time::Duration::from_secs(2 * 365 * 86400)).into();
+        let not_after = now + CERT_LIFETIME;
+        p.not_after = not_after.into();
         let key = rcgen::KeyPair::generate()?;
         // Same name and key as ca.pem, so what it signs verifies against ca.pem.
         let issuer = self.params.clone().self_signed(&self.key)?;
         let cert = p.signed_by(&key, &issuer, &self.key)?;
-        Ok((cert.pem(), key.serialize_pem()))
+        let expires = not_after.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        Ok((cert.pem(), key.serialize_pem(), expires))
+    }
+
+    /// Whether what this CA's key signs verifies against its certificate.
+    fn check(&self) -> Result<()> {
+        let name = "check.rekcod.invalid";
+        let (cert, _) = self.issue(&[name.into()])?;
+        verify(&self.pem, &cert, name)
     }
 
     pub fn fingerprint(&self) -> Result<String> {
@@ -119,6 +160,16 @@ fn pem_of(der: &[u8]) -> String {
     let b64 = crate::daemon::base64(der);
     let lines: Vec<&str> = b64.as_bytes().chunks(64).map(|c| std::str::from_utf8(c).unwrap_or_default()).collect();
     format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n", lines.join("\n"))
+}
+
+/// Checks `cert_pem` against the CA in `ca_pem` for `name`, as a client would now.
+pub fn verify(ca_pem: &str, cert_pem: &str, name: &str) -> Result<()> {
+    use rustls::client::danger::ServerCertVerifier;
+    let v = rustls::client::WebPkiServerVerifier::builder_with_provider(roots(ca_pem)?, provider()).build()?;
+    let end = CertificateDer::from_pem_slice(cert_pem.as_bytes()).map_err(|e| anyhow!("certificate: {e}"))?;
+    let name = ServerName::try_from(name.to_string()).map_err(|e| anyhow!("{name}: {e}"))?;
+    v.verify_server_cert(&end, &[], &name, &[], rustls::pki_types::UnixTime::now())?;
+    Ok(())
 }
 
 pub fn server_config(cert_pem: &str, key_pem: &str) -> Result<Arc<rustls::ServerConfig>> {
@@ -562,6 +613,29 @@ mod tests {
         assert!(fingerprint(&bundle).is_err());
         // One certificate encoded again is the same certificate.
         assert_eq!(fingerprint(&pem_of(&ca_cert(&real.pem).unwrap())).unwrap(), real.fingerprint().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Only a first start makes a CA. A missing half or a key from elsewhere stops it, and
+    /// what's there is left alone.
+    #[test]
+    fn a_ca_with_a_file_missing_is_an_error_not_a_new_ca() {
+        let dir = std::env::temp_dir().join(format!("rekcod-tls-ca-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("other")).unwrap();
+        let fp = ensure_ca(&dir).unwrap().fingerprint().unwrap();
+        assert_eq!(ensure_ca(&dir).unwrap().fingerprint().unwrap(), fp);
+        let key = std::fs::read(dir.join("ca.key")).unwrap();
+        std::fs::rename(dir.join("ca.pem"), dir.join("ca.pem.bak")).unwrap();
+        let e = ensure_ca(&dir).err().unwrap();
+        assert!(format!("{e:#}").contains("ca.pem"), "{e:#}");
+        assert_eq!(std::fs::read(dir.join("ca.key")).unwrap(), key, "the key is untouched");
+        assert!(!dir.join("ca.pem").exists());
+        std::fs::rename(dir.join("ca.pem.bak"), dir.join("ca.pem")).unwrap();
+        ensure_ca(&dir.join("other")).unwrap();
+        std::fs::copy(dir.join("other/ca.key"), dir.join("ca.key")).unwrap();
+        let e = ensure_ca(&dir).err().unwrap();
+        assert!(format!("{e:#}").contains("doesn't belong"), "{e:#}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

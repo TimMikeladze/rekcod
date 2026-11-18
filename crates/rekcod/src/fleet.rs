@@ -1152,6 +1152,10 @@ struct NodeConfig {
     cert: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     key: Option<String>,
+    /// When `cert` expires (Unix seconds); missing on nodes that joined before renewal, which
+    /// ask for a new certificate at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cert_expires: Option<i64>,
 }
 
 pub struct NodeJoinOptions<'a> {
@@ -1199,6 +1203,7 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, options: Nod
         ca,
         cert: r["cert"].as_str().map(String::from),
         key: r["key"].as_str().map(String::from),
+        cert_expires: r["cert_expires"].as_i64(),
     };
     if r["state"] == "pending" {
         eprintln!("rekcod: waiting for an admin: `rekcod node approve {}`", cfg.id);
@@ -1225,6 +1230,8 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             None
         }
     };
+    // The heartbeat thread swaps in a renewed certificate; connections after that get it.
+    let tls = Arc::new(RwLock::new(tls));
     let ip = if addr.ip().is_unspecified() { IpAddr::from([0, 0, 0, 0]) } else { addr.ip() };
     let _ = NODE_IP.set(ip);
     let host = authority(&cfg.advertise).ok().and_then(|a| a.rsplit_once(':').map(|(h, _)| h.trim_matches(['[', ']']).to_string()));
@@ -1257,6 +1264,7 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     }
     let hb_paths = paths.clone();
     let (controller, id, secret) = (cfg.controller.clone(), cfg.id.clone(), cfg.secret.clone());
+    let (hb_tls, mut cert_expires) = (tls.clone(), cfg.cert.as_ref().map(|_| cfg.cert_expires.unwrap_or(0)));
     std::thread::spawn(move || {
         loop {
             let sbs: Vec<Value> = sandbox::list(&hb_paths)
@@ -1272,11 +1280,22 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
             // Readings that fail go as null; the controller keeps them unknown.
             let disk = crate::cli::disk_gib(&hb_paths.home);
             let (disk_total, disk_free) = (disk.map(|d| d.0), disk.map(|d| d.1));
+            let renew = cert_expires.is_some_and(|t| t < now() + crate::tls::RENEW_WITHIN.as_secs() as i64);
             let body = json!({"mem_free_mib": sandbox::free_mib(&hb_paths), "macos_free": macos_free, "sandboxes": sbs,
                               "cpus": crate::cli::sysctl_u64("hw.ncpu"), "load": load_average(),
-                              "disk_total_gib": disk_total, "disk_free_gib": disk_free});
+                              "disk_total_gib": disk_total, "disk_free_gib": disk_free, "renew_cert": renew});
             match call_within(&controller, "POST", &format!("/nodes/{id}/heartbeat"), Some(&secret), &body, QUICK) {
                 Ok(v) => {
+                    if let (Some(c), Some(k), Some(t)) = (v["cert"].as_str(), v["key"].as_str(), v["cert_expires"].as_i64()) {
+                        match renew_node_cert(&hb_paths, c, k, t) {
+                            Ok(cfg) => {
+                                *hb_tls.write().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(cfg);
+                                cert_expires = Some(t);
+                                eprintln!("rekcod: new node certificate, valid until {t} (Unix time)");
+                            }
+                            Err(e) => eprintln!("rekcod: renewing the node certificate: {e:#}"),
+                        }
+                    }
                     let mut ips: Vec<IpAddr> =
                         v["ingress"].as_array().into_iter().flatten().filter_map(|i| i.as_str()?.parse().ok()).collect();
                     // The controller's health checks come from wherever its URL points.
@@ -1312,7 +1331,8 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
     let l = TcpListener::bind(addr).with_context(|| format!("bind {addr}"))?;
     eprintln!("rekcod: node {} serving sandboxes on {} ({})", cfg.id, cfg.listen, cfg.advertise);
     for s in l.incoming().flatten() {
-        let (p, t, tls) = (paths.clone(), cfg.secret.clone(), tls.clone());
+        let tls = tls.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        let (p, t) = (paths.clone(), cfg.secret.clone());
         let _ = s.set_read_timeout(Some(crate::sandbox_api::READ_TIMEOUT));
         crate::sandbox_api::spawn_limited(move || -> Result<()> {
             let stream = crate::tls::accept(tls.as_ref(), s)?;
@@ -1320,6 +1340,16 @@ pub fn node_serve(paths: &Paths) -> Result<()> {
         });
     }
     Ok(())
+}
+
+/// Saves a certificate the controller renewed into `node.json` and returns its server config.
+fn renew_node_cert(paths: &Paths, cert: &str, key: &str, expires: i64) -> Result<Arc<rustls::ServerConfig>> {
+    let server = crate::tls::server_config(cert, key)?;
+    let file = paths.home.join("node.json");
+    let mut cfg: NodeConfig = serde_json::from_slice(&std::fs::read(&file)?)?;
+    (cfg.cert, cfg.key, cfg.cert_expires) = (Some(cert.into()), Some(key.into()), Some(expires));
+    crate::paths::write_private(&file, &serde_json::to_vec_pretty(&cfg)?)?;
+    Ok(server)
 }
 
 /// Deletes clones in `remote-ws/` no sandbox uses and finished job directories, once older
@@ -2380,9 +2410,10 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                             bail!("{host} is one of the controller's own names");
                         }
                         // Named for the node, not the host it advertised (`tls::node_name`).
-                        let (cert, key) = ca.issue(&[crate::tls::node_name(&id)])?;
+                        let (cert, key, expires) = ca.issue_until(&[crate::tls::node_name(&id)])?;
                         reply["cert"] = json!(cert);
                         reply["key"] = json!(key);
+                        reply["cert_expires"] = json!(expires);
                     }
                     (None, true) => bail!("this controller serves plain http; join it with an http:// address"),
                     (_, false) => check_plain_http(&a, "the node")?,
@@ -2424,7 +2455,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         }
         ("POST", ["nodes", id, "heartbeat"]) => {
             let r = (|| {
-                let (_, sec, state) = c.node(id)?;
+                let (url, sec, state) = c.node(id)?;
                 if !crate::sandbox_api::ct_eq(sec.as_bytes(), bearer.as_bytes()) {
                     bail!("bad node secret");
                 }
@@ -2481,7 +2512,19 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
                     .filter(|(_, t)| **t > now() - 600)
                     .map(|(ip, _)| ip.to_string())
                     .collect();
-                Ok(json!({"ingress": ingress, "delete": delete}))
+                let mut reply = json!({"ingress": ingress, "delete": delete});
+                // The node asks once its certificate is near its end (`tls::RENEW_WITHIN`); the
+                // new one names the same node, so the controller's check of it doesn't change.
+                if body["renew_cert"] == true
+                    && let (Some(ca), true) = (&c.node_ca, url.starts_with("https://"))
+                {
+                    let (cert, key, expires) = ca.issue_until(&[crate::tls::node_name(id)])?;
+                    reply["cert"] = json!(cert);
+                    reply["key"] = json!(key);
+                    reply["cert_expires"] = json!(expires);
+                    eprintln!("rekcod: node {id}: issued a new certificate");
+                }
+                Ok(reply)
             })();
             return json_reply(&mut w, r);
         }
@@ -5404,6 +5447,42 @@ mod job_and_node_tests {
         // Removing the node itself forgets it: its address has no CA of its own.
         call(&url, "DELETE", &format!("/nodes/{}", node["id"].as_str().unwrap()), Some("admin-t"), &Value::Null).unwrap();
         assert!(call(&format!("https://{a}"), "GET", "/", None, &Value::Null).is_err());
+    }
+
+    /// A node whose certificate is near its end asks in its heartbeat and gets a new one for
+    /// the same node, which it saves to node.json.
+    #[test]
+    fn a_heartbeat_renews_a_node_certificate_on_request() {
+        let dir = temp("node-renew");
+        let ca = crate::tls::ensure_node_ca(&dir).unwrap();
+        let ca_pem = ca.pem.clone();
+        let (url, _c) = serve({
+            let mut ctl = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
+            ctl.node_ca = Some(ca);
+            ctl.db.lock().unwrap().execute("insert or replace into config values ('join_token', 'jt')", &[]).unwrap();
+            ctl
+        });
+        let n = call(&url, "POST", "/nodes/register", None, &json!({"join_token": "jt", "url": "https://127.0.0.1:17994"})).unwrap();
+        let (id, sec) = (n["id"].as_str().unwrap(), n["secret"].as_str().unwrap());
+        assert!(n["cert_expires"].as_i64().unwrap() > now() + 700 * 86400);
+        let hb = |renew: bool| call(&url, "POST", &format!("/nodes/{id}/heartbeat"), Some(sec), &json!({"renew_cert": renew})).unwrap();
+        assert!(hb(false)["cert"].is_null(), "no certificate unless the node asks");
+        let r = hb(true);
+        let cert = r["cert"].as_str().unwrap();
+        assert_ne!(cert, n["cert"].as_str().unwrap());
+        crate::tls::verify(&ca_pem, cert, &crate::tls::node_name(id)).unwrap();
+        // The node keeps it, and its expiry, for the next start.
+        let home = Paths { home: dir.clone() };
+        std::fs::write(
+            dir.join("node.json"),
+            json!({"controller": url, "id": id, "secret": sec, "listen": "127.0.0.1:0", "advertise": "x", "cert": "old", "key": "old"})
+                .to_string(),
+        )
+        .unwrap();
+        renew_node_cert(&home, cert, r["key"].as_str().unwrap(), r["cert_expires"].as_i64().unwrap()).unwrap();
+        let saved: NodeConfig = serde_json::from_slice(&std::fs::read(dir.join("node.json")).unwrap()).unwrap();
+        assert_eq!((saved.cert.as_deref(), saved.cert_expires), (Some(cert), r["cert_expires"].as_i64()));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A node from before node-named certificates holds one naming its host. The first start

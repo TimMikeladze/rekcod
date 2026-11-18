@@ -394,9 +394,18 @@ rekcod controller backups --remote mini
 ```
 
 These backups are stored on the server's RustFS disk. Copy them off the server for
-recovery from disk loss. Back up the server's `~/.rekcod/controller/secret-key` separately: it is
-needed to decrypt app secrets and is not included in the database backup. Application
-buckets need their own backups too.
+recovery from disk loss. Back up these files from the server's `~/.rekcod/controller/`
+separately; the database backup doesn't include them:
+
+- `secret-key` decrypts app secrets.
+- `ca.pem` and `ca.key` are the CA that remotes and edges pinned with `--ca-fingerprint`.
+- `node-ca.pem` and `node-ca.key` sign node certificates.
+
+The controller makes a CA only when both of its files are missing. With one of a pair
+missing or unreadable, or a key that doesn't match its certificate, it refuses to start
+and names the file, since a new CA would break every remote, edge and node. Node
+certificates last two years; a node asks the controller for a new one in its heartbeat
+once its certificate has 90 days left. Application buckets need their own backups too.
 
 ## Run jobs on the server
 

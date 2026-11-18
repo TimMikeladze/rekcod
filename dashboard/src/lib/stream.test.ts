@@ -126,6 +126,25 @@ describe("event stream backpressure", () => {
     expect(teardown).toHaveBeenCalledTimes(1)
   })
 
+  it("tells a page that lost stats samples to reload them, once it has caught up", async () => {
+    let send!: (event: string, data: unknown) => void
+    const ac = new AbortController()
+    const body = eventStream(ac.signal, (s) => {
+      send = s
+      return () => {}
+    })
+    for (let i = 0; i < 10; i++) send("stats", { i, big })
+    const got: string[] = []
+    const reading = readEvents(body, (event) => {
+      got.push(event)
+    })
+    await vi.waitFor(() => expect(got).toContain("resync"))
+    ac.abort()
+    await reading
+    expect(got.at(-1)).toBe("resync")
+    expect(got.filter((e) => e === "resync")).toHaveLength(1)
+  })
+
   it("drops a page that falls more than MAX_PENDING frames behind", async () => {
     let send!: (event: string, data: unknown) => void
     const teardown = vi.fn()

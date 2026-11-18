@@ -814,8 +814,9 @@ impl DnsPolicy {
         }
         let answer = resolve(query).await?;
         if let Some(f) = &self.filter {
+            let raw = name.as_deref().map(|n| rekcod_proto::raw_ports(&f.allow, n)).unwrap_or_default();
             for (ip, ttl) in dns::answer_a(&answer) {
-                f.resolved.record(ip, ttl);
+                f.resolved.record_ports(ip, ttl, &raw);
             }
         }
         Some(answer)

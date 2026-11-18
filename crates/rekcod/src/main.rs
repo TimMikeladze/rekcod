@@ -443,6 +443,8 @@ enum SandboxCmd {
         #[arg(long, default_value_t = 2)]
         memory: u64,
         /// Also allow this host (`*.example.com` for subdomains, `*` for the whole internet).
+        /// Ports other than 443 and 80 carry TLS or HTTP only; `db.example.com:5432` also lets
+        /// any TCP through to that name on that port.
         #[arg(long = "allow-host")]
         allow_hosts: Vec<String>,
         /// No network at all.

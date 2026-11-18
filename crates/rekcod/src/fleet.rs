@@ -2863,8 +2863,48 @@ fn revoke(c: &Arc<Controller>, who: &Caller, name: &str, body: &Value) -> Result
     }
     db.execute("delete from members where who = ?1", &[&name])?;
     drop(db);
+    let left = forget_owner(c, name, None)?;
     c.audit("-", &who.name, "token rm", name, true);
-    Ok(json!({"removed": name, "tokens": n}))
+    Ok(json!({"removed": name, "tokens": n, "schedules_removed": left.0, "jobs_cancelled": left.1, "still_running": left.2}))
+}
+
+/// Someone lost access (all of it, or to `ns`): their schedules there go and their jobs
+/// there are cancelled (`poll_jobs` tells the nodes). Returns the schedules removed, the jobs
+/// cancelled, and the sandboxes and apps of theirs that keep running for an owner or admin
+/// to deal with.
+fn forget_owner(c: &Controller, name: &str, ns: Option<&str>) -> Result<(Vec<String>, Vec<String>, Value)> {
+    let mut db = c.db();
+    let schedules: Vec<String> = db
+        .query("delete from schedules where owner = ?1 and (?2 is null or ns = ?2) returning name", &[&name, &ns])?
+        .iter()
+        .map(|r| short_name(&r.get::<String>(0)).to_string())
+        .collect();
+    let jobs: Vec<String> = db
+        .query(
+            &format!(
+                "update jobs set state = 'cancelling' where owner = ?1 and (?2 is null or ns = ?2)
+                   and state in {JOB_ACTIVE_SQL} and state <> 'cancelling' returning id"
+            ),
+            &[&name, &ns],
+        )?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let sandboxes: Vec<String> = db
+        .query(
+            "select id from sandboxes s where owner = ?1 and (?2 is null or ns = ?2) and state = 'running'
+               and not exists(select 1 from instances i where i.sandbox = s.id)",
+            &[&name, &ns],
+        )?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    let apps: Vec<String> = db
+        .query("select name from apps where owner = ?1 and (?2 is null or ns = ?2) and destroying is null", &[&name, &ns])?
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    Ok((schedules, jobs, json!({"sandboxes": sandboxes, "apps": apps})))
 }
 
 /// The fields a user may set on a remote sandbox. Everything else in the body (`dir`,
@@ -3034,8 +3074,9 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
             if k == 0 {
                 bail!("no member {name} in {n}");
             }
+            let left = forget_owner(c, name, Some(n))?;
             c.audit(n, &who.name, "member removed", name, true);
-            Ok(json!({"ns": n, "removed": name}))
+            Ok(json!({"ns": n, "removed": name, "schedules_removed": left.0, "jobs_cancelled": left.1, "still_running": left.2}))
         }
         ("DELETE", ["namespaces", n]) => {
             admin_only()?;
@@ -4820,27 +4861,33 @@ fn poll_jobs(c: &Controller) -> Result<()> {
 
 /// Starts a schedule's next run once no run of it may still be going and `every` has
 /// passed. A run on a node that went quiet keeps the turn until its node answers or is
-/// removed, so two never overlap.
+/// removed, so two never overlap. The owner needs an unexpired token with the member role
+/// in the schedule's namespace, as when they made it; without one the run is skipped.
 fn run_schedules(c: &Controller) -> Result<()> {
-    let rows = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner).query(
+    let rows = c.db().query(
         &format!(
-            "select s.name, s.owner, s.spec, coalesce(t.max_sandboxes, 10), s.ns from schedules s
-               left join (select name, max(max_sandboxes) as max_sandboxes from tokens group by name) t on t.name = s.owner
+            "select s.name, s.owner, s.spec, s.ns,
+               (select max(t.max_sandboxes) from tokens t where t.name = s.owner and (t.expires is null or t.expires > ?1)
+                  and (t.admin or case when s.ns = 'default' then t.default_role in ('member', 'owner')
+                       else exists(select 1 from members m where m.ns = s.ns and m.who = s.owner and m.role in ('member', 'owner')) end))
+             from schedules s
              where s.last_run <= ?1 - s.every
                and not exists(select 1 from jobs j where (j.id = s.last_job or j.schedule = s.name) and j.state in {JOB_ACTIVE_SQL})"
         ),
         &[&now()],
     )?;
     for r in rows {
-        let (name, owner, spec, max, ns): (String, String, String, i64, String) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
-        let max = cap(max);
-        let spec: Value = serde_json::from_str(&spec)?;
+        let (name, owner, spec, ns, max): (String, String, String, String, Option<i64>) =
+            (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
         // Marked as run even when it can't start, so a full fleet isn't retried every 5 s.
-        let job = start_job(c, &ns, &owner, max, &spec, Some(&name));
+        let job = match max {
+            None => Err(anyhow!("{owner} has no unexpired token with the member role in {ns}; skipped")),
+            Some(max) => serde_json::from_str(&spec)
+                .map_err(anyhow::Error::from)
+                .and_then(|spec: Value| start_job(c, &ns, &owner, cap(max), &spec, Some(&name))),
+        };
         let id = job.as_ref().ok().and_then(|v| v["id"].as_str().map(String::from));
-        c.db.lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .execute("update schedules set last_run = ?2, last_job = ?3 where name = ?1", &[&name, &now(), &id])?;
+        c.db().execute("update schedules set last_run = ?2, last_job = ?3 where name = ?1", &[&name, &now(), &id])?;
         if let Err(e) = job {
             eprintln!("rekcod: schedule {name}: {e:#}");
         }
@@ -5269,6 +5316,45 @@ mod job_and_node_tests {
     }
 
     #[test]
+    fn schedules_stop_when_their_owner_loses_access() {
+        let (url, c) = serve(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        let token = |t: &str, name: &str, admin: bool, expires: Option<i64>| {
+            c.db()
+                .execute(
+                    "insert into tokens (token, name, admin, max_sandboxes, hashed, expires) values (?1, ?2, ?3, 10, 1, ?4)",
+                    &[&hash_token(t), &name, &admin, &expires],
+                )
+                .unwrap();
+        };
+        token("admin-t", "admin", true, None);
+        token("bob-t", "bob", false, None);
+        token("carl-t", "carl", false, None);
+        token("dora-t", "dora", false, Some(now() + 3600));
+        worker(&c, "n1", |_, _| Some((200, json!({"running": true, "log": ""}))));
+        call(&url, "POST", "/namespaces", Some("admin-t"), &json!({"name": "team"})).unwrap();
+        call(&url, "POST", "/namespaces/team/members", Some("admin-t"), &json!({"who": "carl", "role": "member"})).unwrap();
+        let every = |name: &str| json!({"name": name, "every_secs": 60, "cmd": ["true"], "git": {"url": "https://example.invalid/r"}});
+        call(&url, "POST", "/jobs", Some("bob-t"), &every("bobs")).unwrap();
+        call(&url, "POST", "/ns/team/jobs", Some("carl-t"), &every("carls")).unwrap();
+        call(&url, "POST", "/jobs", Some("dora-t"), &every("doras")).unwrap();
+        let bob_job =
+            call(&url, "POST", "/jobs", Some("bob-t"), &json!({"cmd": ["true"], "git": {"url": "https://example.invalid/r"}})).unwrap();
+
+        let v = call(&url, "DELETE", "/tokens/bob", Some("admin-t"), &json!({})).unwrap();
+        assert_eq!((v["schedules_removed"].clone(), v["jobs_cancelled"].clone()), (json!(["bobs"]), json!([bob_job["id"]])));
+        let v = call(&url, "DELETE", "/namespaces/team/members/carl", Some("admin-t"), &json!({})).unwrap();
+        assert_eq!(v["schedules_removed"], json!(["carls"]));
+        // Dora's token runs out; her schedule stays but doesn't start.
+        c.db().execute("update tokens set expires = ?1 where name = 'dora'", &[&(now() - 1)]).unwrap();
+        run_schedules(&c).unwrap();
+        let rows: Vec<(String, Option<String>)> =
+            c.db().query("select name, last_job from schedules", &[]).unwrap().iter().map(|r| (r.get(0), r.get(1))).collect();
+        assert_eq!(rows, [("doras".to_string(), None)]);
+        let scheduled: i64 = c.db().query_one("select count(*) from jobs where schedule is not null", &[]).unwrap().get(0);
+        assert_eq!(scheduled, 0);
+    }
+
+    #[test]
     fn a_start_whose_reply_is_lost_stays_tracked_and_is_sent_again_with_its_id() {
         let c = Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]);
         let posts = Arc::new(AtomicUsize::new(0));
@@ -5313,6 +5399,8 @@ mod job_and_node_tests {
             .unwrap()
             .execute("insert into tokens (token, name, admin, hashed) values (?1, 'admin', 1, 1)", &[&hash_token("admin-t")])
             .unwrap();
+        // The schedule's owner; without a token of theirs it wouldn't run.
+        c.db().execute("insert into tokens (token, name, hashed) values (?1, 'alice', 1)", &[&hash_token("alice-t")]).unwrap();
         let answer = Arc::new(Mutex::new(json!({"running": true, "log": "busy"})));
         let a = answer.clone();
         let seen = worker(&c, "n1", move |m, _| match m {

@@ -36,6 +36,7 @@ jobs:
       - run: cargo build --locked -p rekcod
       - run: REKCOD=target/debug/rekcod python3 scripts/e2e-edges.py
       - run: python3 -m unittest scripts/test_bump_versions.py
+      - run: python3 .github/scripts/check_release_jobs.py
       - run: packaging/server/test.sh
       - run: cargo clippy --locked -p rekcod -p rekcod-proto -- -D warnings
       - run: cargo clippy --locked -p rekcod-agent --target aarch64-unknown-linux-musl -- -D warnings
@@ -119,10 +120,16 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # No caches when building the guest a release ships: target/ holds the agent that goes
+      # into root.img, and the kernel cache holds the Image.
+      - if: ${{ !inputs.upload-guest }}
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       # The agent's cfg(target_os = "linux") tests, which the macOS job compiles out.
       - run: cargo test --locked -p rekcod-agent --target aarch64-unknown-linux-musl
+      # Builds the image and boots it under QEMU (guest/smoke.sh).
       - uses: ./.github/actions/guest
+        with:
+          kernel-cache: ${{ !inputs.upload-guest }}
       - if: inputs.upload-guest
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

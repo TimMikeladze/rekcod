@@ -93,7 +93,7 @@ for _ in range(100):
         break
     time.sleep(0.1)
 try:
-    # 5 bytes, the file's size: reading past EOF would GETATTR (and fail) first.
+    # 5 bytes, the size of the file: reading past EOF would GETATTR (and fail) first.
     print("read", os.read(fd, 5))
 except OSError as e:
     print("error", errno.errorcode.get(e.errno, e.errno))

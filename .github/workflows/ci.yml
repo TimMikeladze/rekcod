@@ -34,6 +34,9 @@ jobs:
       - run: cargo fmt --all --check
       # docs/*.md paths, README sections and anchors that code, scripts and docs point at.
       - run: python3 scripts/check-docs.py
+      # Shell scripts parse. The VM suites run only on the self-hosted e2e runner, so a quoting
+      # mistake in one would otherwise show up there first.
+      - run: git ls-files -z '*.sh' packaging/server/scripts | xargs -0 -n1 bash -n
       - run: cargo test --workspace --locked
       - run: cargo build --locked -p rekcod
       - run: REKCOD=target/debug/rekcod python3 scripts/e2e-edges.py

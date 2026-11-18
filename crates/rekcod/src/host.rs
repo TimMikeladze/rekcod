@@ -182,6 +182,8 @@ pub struct Fleet {
     pub lan: bool,
     pub no_power: bool,
     pub docker: bool,
+    /// The server's `--backup-dir`.
+    pub backup_dir: Option<String>,
 }
 
 /// SSH to `dest` must work without a prompt (docker's ssh can't answer one). When it
@@ -213,7 +215,16 @@ pub fn add_server(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet
     let bin = crate::server::ensure_binary(dest, || ssh(dest), &ssh_dest(dest))?;
     crate::server::ensure_guest(paths, dest, || ssh(dest), &ssh_dest(dest))?;
     let tty: &[&str] = if std::io::IsTerminal::is_terminal(&std::io::stdin()) { &["-t"] } else { &[] };
-    let (url, token, fp) = crate::server::remote_setup(dest, ssh_opts(dest, tty), &bin, &f.domain, f.addr.as_deref(), f.lan, f.no_power)?;
+    let (url, token, fp) = crate::server::remote_setup(
+        dest,
+        ssh_opts(dest, tty),
+        &bin,
+        &f.domain,
+        f.addr.as_deref(),
+        f.lan,
+        f.no_power,
+        f.backup_dir.as_deref(),
+    )?;
     crate::fleet::remote_add(paths, name, &url, &token, None, fp.as_deref())?;
     println!("remote {name}: {url}  (rekcod app deploy --remote {name})");
     if !f.docker {

@@ -501,6 +501,9 @@ pub struct ExecOptions {
     pub env: Vec<String>,
     pub timeout_secs: Option<u64>,
     pub tty: bool,
+    /// Start the docker CLI with only PATH, HOME and what rekcod sets on it, not this
+    /// process's environment (fleet jobs: the node's environment isn't the job's business).
+    pub clean_env: bool,
 }
 
 /// `docker exec` arguments for a command in the workspace container.
@@ -582,7 +585,7 @@ pub fn shell(paths: &Paths, id: &str) -> Result<()> {
     s.boot(paths)?;
     s.touch();
     let tty = unsafe { libc::isatty(0) == 1 };
-    let o = ExecOptions { workdir: None, env: vec![], timeout_secs: None, tty };
+    let o = ExecOptions { workdir: None, env: vec![], timeout_secs: None, tty, clean_env: false };
     let sh = ["sh", "-c", "command -v bash >/dev/null && exec bash || exec sh"].map(String::from);
     Err(s.docker()?.args(exec_args(&s.meta, &o, &sh)).exec()).context("exec docker")
 }
@@ -901,8 +904,25 @@ pub fn exec_cmd(paths: &Paths, id: &str, o: &ExecOptions, cmd: &[String]) -> Res
     s.boot(paths)?;
     s.touch();
     let mut c = s.docker()?;
+    if o.clean_env {
+        clear_env(&mut c);
+    }
     c.args(exec_args(&s.meta, o, cmd));
     Ok(c)
+}
+
+/// Drops the inherited environment, keeping PATH, HOME and the variables set on `c` itself
+/// (`DOCKER_HOST`, `DOCKER_CONFIG`).
+pub fn clear_env(c: &mut Command) {
+    let set: Vec<(std::ffi::OsString, std::ffi::OsString)> =
+        c.get_envs().filter_map(|(k, v)| v.map(|v| (k.to_os_string(), v.to_os_string()))).collect();
+    c.env_clear();
+    for k in ["PATH", "HOME"] {
+        if let Some(v) = std::env::var_os(k) {
+            c.env(k, v);
+        }
+    }
+    c.envs(set);
 }
 
 pub fn screenshot(paths: &Paths, id: &str, out: &Path) -> Result<()> {
@@ -1415,11 +1435,24 @@ mod tests {
             os: String::new(),
             reach: vec![],
         };
-        let o = ExecOptions { workdir: None, env: vec!["A=1".into()], timeout_secs: Some(5), tty: false };
+        let o = ExecOptions { workdir: None, env: vec!["A=1".into()], timeout_secs: Some(5), tty: false, clean_env: false };
         let a = exec_args(&m, &o, &["npm".into(), "test".into()]).join(" ");
         assert_eq!(a, "exec -i -w /Users/me/app -e A=1 rekcod-ws timeout -s KILL 5 npm test");
         let back: Meta = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
         assert_eq!(back, m);
+    }
+
+    #[test]
+    fn a_cleared_docker_env_keeps_only_path_home_and_what_rekcod_set() {
+        let mut c = Command::new("docker");
+        c.env("DOCKER_HOST", "unix:///x.sock").env_remove("DOCKER_CONTEXT");
+        clear_env(&mut c);
+        let mut keys: Vec<String> = c.get_envs().filter(|(_, v)| v.is_some()).map(|(k, _)| k.to_string_lossy().into()).collect();
+        keys.sort();
+        let want: Vec<&str> =
+            ["DOCKER_HOST", "HOME", "PATH"].into_iter().filter(|k| *k == "DOCKER_HOST" || std::env::var_os(k).is_some()).collect();
+        assert_eq!(keys, want);
+        assert!(c.get_envs().any(|(k, v)| k == "DOCKER_HOST" && v == Some(std::ffi::OsStr::new("unix:///x.sock"))));
     }
 
     use std::os::unix::fs::{PermissionsExt, symlink};

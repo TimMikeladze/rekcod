@@ -88,6 +88,8 @@ s1=$(cr sandbox create --remote alice --git "$url" --ref main --image alpine:3.2
 check "remote create from git" test -n "$s1"
 check "remote exec sees the clone" sh -c 'test "$("$0" sandbox exec --remote alice "$1" -- cat VERSION)" = v1' "$R" "$s1"
 check "remote exec keeps the exit code" sh -c '"$0" sandbox exec --remote alice "$1" -- sh -c "exit 5"; test $? = 5' "$R" "$s1"
+# Output in two chunks: each chunk is flushed, and the stream must stay open for the next.
+check "remote exec streams every chunk" sh -c 'o=$("$0" sandbox exec --remote alice "$1" -- sh -c "echo a; sleep 1; echo b; exit 3"); test $? = 3 && test "$o" = "$(printf "a\nb")"' "$R" "$s1"
 check "another user can't reach it" sh -c '! "$0" sandbox exec --remote bob "$1" -- true' "$R" "$s1"
 check "apply isn't offered remotely" sh -c '! "$0" sandbox apply --remote alice "$1"' "$R" "$s1"
 first=$(cr sandbox ls --remote alice | sed -n 's/.*"node": "\(.*\)".*/\1/p' | head -1)
@@ -147,10 +149,10 @@ check "secret value isn't shown" sh -c '"$0" app secret set --remote admin hello
 check "logs" sh -c '"$0" app logs --remote admin hello | grep -q GET' "$R"
 
 body=$(printf '{"action":"opened","number":7,"repository":{"clone_url":"%s","html_url":"x"},"pull_request":{"head":{"sha":"%s","repo":{"clone_url":"%s"}}}}' "$url" "$v2" "$url")
-ws=$(cat "$C/controller/webhook-secret")
+ws=$(cr app webhook --remote admin hello | sed -n 's/.*"secret": "\(.*\)".*/\1/p')
 sig="sha256=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$ws" | awk '{print $NF}')"
-hook() { curl -s -m 120 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: $2" -d "$1" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github; }
-check "webhook with a bad signature is refused" sh -c '! curl -sf -m 5 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: sha256=00" -d "{}" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github'
+hook() { curl -s -m 120 -X POST -H "X-GitHub-Event: pull_request" -H "X-GitHub-Delivery: $RANDOM$RANDOM" -H "X-Hub-Signature-256: $2" -d "$1" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github/default/hello; }
+check "webhook with a bad signature is refused" sh -c '! curl -sf -m 5 -X POST -H "X-GitHub-Event: pull_request" -H "X-Hub-Signature-256: sha256=00" -d "{}" --cacert "$C/controller/ca.pem" https://127.0.0.1:17700/webhooks/github/default/hello'
 hook "$body" "$sig" >>"$C/hook.log"; echo >>"$C/hook.log"
 sleep 2.5
 check "PR preview deployed (inherits env)" sh -c 'test "$(curl -s -m 3 -H "Host: hello-pr-7.apps.test" http://127.0.0.1:18088/)" = "v2 hi"'

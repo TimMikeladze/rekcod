@@ -31,6 +31,21 @@ pub fn parse_shasum(out: &str) -> Option<&str> {
     (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hash)
 }
 
+/// Passed to every download's curl: give up on a connection that doesn't open in 15 s or
+/// stays under 1 KiB/s for a minute, instead of holding the download lock for good.
+pub const CURL_LIMITS: [&str; 6] = ["--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "60"];
+
+/// Removes what interrupted downloads left in `parent`: entries named `<prefix><pid>`. The
+/// caller holds the lock every download there takes, so none of them is in use.
+pub fn clear_stale(parent: &Path, prefix: &str) {
+    for e in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with(prefix) {
+            let p = e.path();
+            let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        }
+    }
+}
+
 /// `~/.rekcod/guest/<version>`, downloading and verifying it first if needed.
 /// `None` for builds without an embedded guest (dev builds).
 pub fn ensure_guest(rekcod_home: &Path) -> Result<Option<PathBuf>> {
@@ -46,8 +61,8 @@ pub fn ensure_guest(rekcod_home: &Path) -> Result<Option<PathBuf>> {
     if dir.join("Image").exists() && dir.join("root.img").exists() {
         return Ok(Some(dir));
     }
+    clear_stale(parent, ".download-");
     let tmp = parent.join(format!(".download-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let result = download(gv, sha, &tmp)
         .and_then(|()| std::fs::rename(tmp.join("unpacked"), &dir).with_context(|| format!("install {}", dir.display())));
@@ -75,7 +90,7 @@ fn download(gv: &str, sha: &str, tmp: &Path) -> Result<()> {
     let base = std::env::var("REKCOD_RELEASE_URL").ok();
     let url = release_url(base.as_deref(), version, &file);
     eprintln!("rekcod: downloading the guest image ({file})");
-    let curl = Command::new("curl").args(["-fL", "--progress-bar", "-o"]).arg(&tarball).arg(&url).status();
+    let curl = Command::new("curl").args(CURL_LIMITS).args(["-fL", "--progress-bar", "-o"]).arg(&tarball).arg(&url).status();
     if !curl.is_ok_and(|s| s.success()) {
         // Fallback for networks where curl to GitHub fails but an authenticated gh works.
         let gh = Command::new("gh").args(["release", "download", &format!("v{version}"), "-R", REPO, "-p", &file, "-D"]).arg(tmp).status();

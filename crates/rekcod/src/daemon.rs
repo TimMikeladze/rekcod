@@ -133,7 +133,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     // `rekcod sandbox rm`, `rekcod stop --force`: skip the graceful shutdown.
     let mut kill = signal(SignalKind::user_defined1())?;
     let _ = std::fs::remove_file(paths.last_exit());
-    raise_fd_limit();
+    crate::lifecycle::raise_fd_limit();
     // Every minute: what a sandbox's guest does reaches this log, limited but not silenced.
     crate::lifecycle::trim_log_every(paths.daemon_log(), Duration::from_secs(60));
     let guest = paths.guest_dir()?;
@@ -411,21 +411,6 @@ async fn force_stop(vm: &Vm) {
 /// Tells `rekcod start --foreground` (the login agent) that this stop was on purpose.
 fn clean_exit(paths: &Paths) {
     let _ = std::fs::write(paths.last_exit(), b"clean");
-}
-
-/// launchd starts agents with a soft limit of 256 descriptors; every forwarded connection
-/// and docker client takes two.
-fn raise_fd_limit() {
-    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
-    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
-        return;
-    }
-    let per_proc = crate::cli::sysctl_u64("kern.maxfilesperproc").unwrap_or(10240) as libc::rlim_t;
-    let want = lim.rlim_max.min(per_proc);
-    if want > lim.rlim_cur {
-        lim.rlim_cur = want;
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
-    }
 }
 
 /// After a failed accept (EMFILE, ENFILE), wait before the next one instead of spinning.
@@ -819,7 +804,8 @@ impl DnsPolicy {
             false
         };
         if refuse {
-            let line = format!("rekcod-egress: refused dns {}", name.as_deref().unwrap_or("(not one plain query)"));
+            // The name is the guest's: escaped, cut short, and rate-limited.
+            let line = format!("rekcod-egress: refused dns {}", dns::printable(name.as_deref().unwrap_or("(not one plain query)")));
             let lines = self.limit.lock().unwrap_or_else(std::sync::PoisonError::into_inner).lines(line, Instant::now());
             for l in lines {
                 (self.log)(l);
@@ -847,16 +833,31 @@ async fn dns_bridge(vm: Vm, policy: Arc<DnsPolicy>) {
     }
 }
 
-/// Queries answered at once, and answers waiting for the guest to read them. A guest that
-/// sends without reading fills both and then isn't read either, so its answers can't pile
-/// up on the Mac.
-const DNS_IN_FLIGHT: usize = 256;
-
 async fn dns_session<S>(stream: S, policy: &Arc<DnsPolicy>) -> Result<()>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
+    let policy = policy.clone();
+    dns_serve(stream, move |query: Vec<u8>| {
+        let policy = policy.clone();
+        async move { policy.answer(&query).await }
+    })
+    .await
+}
+
+/// Queries answered at once; more wait, so a flood can't spawn tasks without limit.
+const DNS_IN_FLIGHT: usize = 256;
+
+/// Length-prefixed DNS queries in, `answer`'s replies out, until the stream ends.
+async fn dns_serve<S, F, Fut>(stream: S, answer: F) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
+    F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Option<Vec<u8>>> + Send + 'static,
+{
     let (mut rd, mut wr) = tokio::io::split(stream);
+    // Bounded, and a query's permit is held until its answer is queued: a guest that stops
+    // reading answers stops having its queries read.
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(DNS_IN_FLIGHT);
     let in_flight = Arc::new(tokio::sync::Semaphore::new(DNS_IN_FLIGHT));
     let writer = tokio::spawn(async move {
@@ -873,12 +874,12 @@ where
             let mut query = vec![0u8; u16::from_be_bytes(len) as usize];
             rd.read_exact(&mut query).await?;
             let tx = tx.clone();
-            let policy = policy.clone();
             let permit = in_flight.clone().acquire_owned().await?;
+            let answering = answer(query);
             tokio::spawn(async move {
                 // Held until the answer is queued.
                 let _permit = permit;
-                if let Some(frame) = policy.answer(&query).await.as_deref().and_then(frame) {
+                if let Some(frame) = answering.await.as_deref().and_then(frame) {
                     let _ = tx.send(frame).await;
                 }
             });
@@ -915,36 +916,18 @@ async fn resolve(query: &[u8]) -> Option<Vec<u8>> {
         servers = dns::nameservers(&resolv, dns::if_index);
     }
     for server in servers {
-        if let Some(answer) = ask_resolver(query, server, Duration::from_secs(2)).await {
-            return Some(answer);
+        if let Some(buf) = dns::ask_udp(query, server, Duration::from_secs(2)).await {
+            // Truncated (TC): the full answer only comes over TCP.
+            if buf.len() > 2
+                && buf[2] & 0x02 != 0
+                && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
+            {
+                return Some(full);
+            }
+            return Some(buf);
         }
     }
     None
-}
-
-/// One resolver's answer to `query`. The socket is connected, so only `server` is heard,
-/// and a datagram that doesn't answer this query is ignored.
-async fn ask_resolver(query: &[u8], server: SocketAddr, wait: Duration) -> Option<Vec<u8>> {
-    let local: SocketAddr = if server.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }.parse().unwrap();
-    let sock = UdpSocket::bind(local).await.ok()?;
-    sock.connect(server).await.ok()?;
-    sock.send(query).await.ok()?;
-    let deadline = tokio::time::Instant::now() + wait;
-    let mut buf = vec![0u8; 4096];
-    loop {
-        let n = tokio::time::timeout_at(deadline, sock.recv(&mut buf)).await.ok()?.ok()?;
-        let answer = &buf[..n];
-        if !dns::answers(query, answer) {
-            continue;
-        }
-        // Truncated (TC): the full answer only comes over TCP.
-        if answer[2] & 0x02 != 0
-            && let Ok(Ok(full)) = tokio::time::timeout(Duration::from_secs(4), resolve_tcp(query, server)).await
-        {
-            return Some(full);
-        }
-        return Some(answer.to_vec());
-    }
 }
 
 async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
@@ -1694,6 +1677,31 @@ fn meta_reply(req: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_guest_that_never_reads_answers_stops_being_read() {
+        let (ours, mut guest) = tokio::io::duplex(64 << 10);
+        let answered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n = answered.clone();
+        tokio::spawn(dns_serve(ours, move |q: Vec<u8>| {
+            n.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move { dns::refused(&q) }
+        }));
+        let q = [&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x04evil\x03com\x00\x00\x01\x00\x01"].concat();
+        let framed = frame(&q).unwrap();
+        tokio::spawn(async move {
+            for _ in 0..100_000 {
+                if guest.write_all(&framed).await.is_err() {
+                    return;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let settled = answered.load(std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(answered.load(std::sync::atomic::Ordering::SeqCst), settled, "still reading");
+        assert!(settled < 10_000, "{settled} queries read");
+    }
+
     #[test]
     fn stats_carry_elastic_held_only_with_elastic_memory() {
         assert_eq!(with_elastic_held(r#"{"disk_used":1}"#.into(), Some(5)), r#"{"disk_used":1,"elastic_held":5}"#);
@@ -1919,31 +1927,6 @@ mod tests {
         };
         assert!(tokio::time::timeout(Duration::from_secs(3), flood).await.is_err(), "the bridge kept reading");
         assert!(logged.load(std::sync::atomic::Ordering::Relaxed) <= 20, "{logged:?} lines");
-    }
-
-    #[tokio::test]
-    async fn a_resolver_answer_comes_from_the_resolver_and_answers_the_query() {
-        let server = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let query = dns_query(0x1234, "npmjs.org", 1);
-        let q = query.clone();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 512];
-            let (n, client) = server.recv_from(&mut buf).await.unwrap();
-            assert_eq!(&buf[..n], &q[..]);
-            // Someone else races the resolver, then the resolver sends a stale answer first.
-            let forger = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-            let mut fake = q.clone();
-            fake[2] |= 0x80;
-            forger.send_to(&fake, client).await.unwrap();
-            let mut stale = fake.clone();
-            stale[1] ^= 1;
-            server.send_to(&stale, client).await.unwrap();
-            fake[3] = 3; // NXDOMAIN, from the real resolver this time
-            server.send_to(&fake, client).await.unwrap();
-        });
-        let answer = ask_resolver(&query, addr, Duration::from_secs(5)).await.unwrap();
-        assert_eq!((answer[1], answer[3]), (0x34, 3));
     }
 
     #[tokio::test]

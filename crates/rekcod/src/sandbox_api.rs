@@ -151,14 +151,30 @@ impl Policy {
     }
 }
 
-/// `env` entries must be `KEY=VALUE`: a bare `KEY` makes docker copy the value from this
-/// process's environment, which would hand the caller any secret it can name.
-fn exec_opts(args: &Value) -> Result<ExecOptions> {
-    let env = strs(&args["env"]);
-    if let Some(e) = env.iter().find(|e| !e.contains('=')) {
+/// An environment variable name: a letter or `_`, then letters, digits and `_`.
+pub(crate) fn valid_env_key(k: &str) -> bool {
+    k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `env` entries must be `KEY=VALUE`: a bare `KEY` makes docker copy the value from the
+/// docker CLI's environment, which would hand the caller any secret it can name.
+pub(crate) fn check_env(env: &[String]) -> Result<()> {
+    if let Some(e) = env.iter().find(|e| !e.split_once('=').is_some_and(|(k, _)| valid_env_key(k))) {
         bail!("env {e}: use KEY=VALUE");
     }
-    Ok(ExecOptions { workdir: args["workdir"].as_str().map(String::from), env, timeout_secs: args["timeout_secs"].as_u64(), tty: false })
+    Ok(())
+}
+
+fn exec_opts(args: &Value) -> Result<ExecOptions> {
+    let env = strs(&args["env"]);
+    check_env(&env)?;
+    Ok(ExecOptions {
+        workdir: args["workdir"].as_str().map(String::from),
+        env,
+        timeout_secs: args["timeout_secs"].as_u64(),
+        tty: false,
+        clean_env: false,
+    })
 }
 
 /// Runs a command to completion: (exit, stdout, stderr).
@@ -283,7 +299,10 @@ pub fn op(paths: &Paths, policy: &Policy, name: &str, args: &Value) -> Result<Va
             json!({"stopped": true})
         }
         "remove" => {
-            sandbox::rm(paths, &[target()?], false)?;
+            let id = target()?;
+            sandbox::rm(paths, std::slice::from_ref(&id), false)?;
+            // An app instance's relay goes with it.
+            crate::fleet::close_relay(&id);
             json!({"removed": true})
         }
         "screenshot" => {
@@ -358,8 +377,12 @@ fn read_line_capped(r: &mut impl BufRead, out: &mut String) -> Result<usize> {
 pub(crate) fn read_head(r: &mut impl BufRead) -> Result<Request> {
     let mut line = String::new();
     read_line_capped(r, &mut line)?;
-    let mut parts = line.split_whitespace();
-    let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("/").to_string());
+    // Exactly METHOD TARGET VERSION: a space in the target would otherwise cut it short
+    // (`DELETE /tokens/alice smith` acting on `alice`).
+    let (method, target) = match line.split_whitespace().collect::<Vec<_>>()[..] {
+        [m, t, v] if v.starts_with("HTTP/") => (m.to_string(), t.to_string()),
+        _ => bail!("bad request line"),
+    };
     let mut headers = Vec::new();
     loop {
         let mut h = String::new();
@@ -601,6 +624,9 @@ pub fn serve(paths: Paths, policy: Policy, listen: Option<String>) -> Result<()>
 /// Connections served at once by the threaded HTTP servers (sandbox API, node, controller).
 const MAX_CONNECTIONS: usize = 256;
 static CONNECTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Unix time of the last connection refused for that; the controller doesn't mark nodes lost
+/// right after, since their heartbeats may have been refused too.
+pub(crate) static LAST_REFUSED: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 
 /// Runs `f` on its own thread unless [`MAX_CONNECTIONS`] are already being served; then the
 /// connection (owned by `f`) is dropped, which closes it.
@@ -608,6 +634,8 @@ pub(crate) fn spawn_limited<T: Send + 'static>(f: impl FnOnce() -> T + Send + 's
     use std::sync::atomic::Ordering;
     if CONNECTIONS.fetch_add(1, Ordering::SeqCst) >= MAX_CONNECTIONS {
         CONNECTIONS.fetch_sub(1, Ordering::SeqCst);
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64);
+        LAST_REFUSED.store(t, Ordering::SeqCst);
         eprintln!("rekcod: {MAX_CONNECTIONS} connections open; refusing another");
         return;
     }
@@ -621,6 +649,65 @@ pub(crate) fn spawn_limited<T: Send + 'static>(f: impl FnOnce() -> T + Send + 's
         let _done = Done;
         f()
     });
+}
+
+/// Connection slots for the controller: at most `max` at once, at most `per_peer` per
+/// address (loopback exempt: on a one-Mac fleet the node, edge and CLI all connect from
+/// there), and `reserved` more past `max` for addresses that recently proved themselves as
+/// a node or edge, so heartbeats and route polls get through a full pool.
+pub(crate) struct Slots {
+    max: usize,
+    per_peer: usize,
+    reserved: usize,
+    open: std::sync::Mutex<(usize, std::collections::HashMap<std::net::IpAddr, usize>)>,
+}
+
+impl Slots {
+    pub(crate) fn new(max: usize, per_peer: usize, reserved: usize) -> std::sync::Arc<Slots> {
+        std::sync::Arc::new(Slots { max, per_peer, reserved, open: Default::default() })
+    }
+
+    /// Runs `f` on its own thread if a slot is free; otherwise drops it (closing the
+    /// connection it owns) and returns false.
+    pub(crate) fn spawn<T: Send + 'static>(
+        self: &std::sync::Arc<Self>,
+        peer: std::net::IpAddr,
+        trusted: bool,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> bool {
+        {
+            let mut open = self.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mine = open.1.get(&peer).copied().unwrap_or(0);
+            let cap = if trusted { self.max + self.reserved } else { self.max };
+            if (!peer.is_loopback() && mine >= self.per_peer) || open.0 >= cap {
+                if open.0 >= cap {
+                    eprintln!("rekcod: {} connections open; refusing another", open.0);
+                }
+                return false;
+            }
+            open.0 += 1;
+            *open.1.entry(peer).or_default() += 1;
+        }
+        struct Done(std::sync::Arc<Slots>, std::net::IpAddr);
+        impl Drop for Done {
+            fn drop(&mut self) {
+                let mut open = self.0.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                open.0 -= 1;
+                if let Some(n) = open.1.get_mut(&self.1) {
+                    *n -= 1;
+                    if *n == 0 {
+                        open.1.remove(&self.1);
+                    }
+                }
+            }
+        }
+        let done = Done(self.clone(), peer);
+        std::thread::spawn(move || {
+            let _done = done;
+            f()
+        });
+        true
+    }
 }
 
 fn base64_decode(s: &str) -> Vec<u8> {

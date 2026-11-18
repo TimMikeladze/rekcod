@@ -59,6 +59,13 @@ docker rm -f rekcod-e2e-udp >/dev/null 2>&1
 python3 -m http.server 18077 --bind 127.0.0.1 --directory tests/e2e/stack/www >/dev/null 2>&1 & srv=$!
 until_ok 50 0.1 curl -sf -o /dev/null http://127.0.0.1:18077/
 check "host.docker.internal reaches Mac 127.0.0.1" sh -c 'docker run --rm alpine:3.24 wget -qO- http://host.docker.internal:18077/ | grep -q "rekcod e2e"'
+# The guest's own iptables (nsenter -m), not the container's.
+ipt="docker run --rm --privileged --pid=host alpine:3.24 nsenter -t 1 -m -n iptables"
+check "the redirect skips traffic arriving on eth0" sh -c "$ipt -t nat -S PREROUTING | grep -q -- '! -i eth0 .*--to-ports 2379'"
+check "eth0 can't reach the reverse listener" sh -c "$ipt -S INPUT | grep -q -- '-i eth0 .*--dport 2379 -j DROP'"
+docker create --name rekcod-e2e-log -l "$run_label" alpine:3.24 true >/dev/null
+check "container logs are capped" sh -c "docker inspect -f '{{.HostConfig.LogConfig.Config}}' rekcod-e2e-log | grep -q 'max-file:3 max-size:10m'"
+docker rm rekcod-e2e-log >/dev/null
 kill $srv 2>/dev/null
 tmpf=$(mktemp /tmp/rekcod-e2e.XXXX); echo mac-tmp >"$tmpf"
 check "Mac /tmp bind mount" sh -c "test \"\$(docker run --rm -v $tmpf:/f alpine:3.24 cat /f)\" = mac-tmp"

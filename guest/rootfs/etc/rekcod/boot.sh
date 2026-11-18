@@ -171,18 +171,22 @@ if grep -q 'rekcod.sandbox=1' /proc/cmdline; then
   log "sandbox network: internet only"
 # host.docker.internal is the gateway address. Its TCP goes to rekcod-agent,
 # which has the daemon connect to 127.0.0.1:<port> on the Mac, so services
-# listening only on the Mac's loopback are reachable too.
+# listening only on the Mac's loopback are reachable too. Only for containers
+# (docker0, br-*) and the guest itself (OUTPUT): another VM on the NAT segment
+# could route the gateway address through this one and arrive on eth0.
 elif [ -n "$gw" ]; then
-  iptables -t nat -I PREROUTING -d "$gw" -p tcp -j REDIRECT --to-ports 2379
+  iptables -t nat -I PREROUTING ! -i eth0 -d "$gw" -p tcp -j REDIRECT --to-ports 2379
   iptables -t nat -I OUTPUT -d "$gw" -p tcp -j REDIRECT --to-ports 2379
+  iptables -I INPUT -i eth0 -p tcp --dport 2379 -j DROP
 fi
 
-# Build cache would otherwise grow until the data disk is full.
+# Build cache and container logs would otherwise grow until the data disk is full.
+# The log limit applies to containers created after it; older ones keep their own.
 # shutdown-timeout: containers get 10 s after SIGTERM, inside shutdown.sh's 18 s wait.
-gc='"shutdown-timeout": 10, "builder": {"gc": {"enabled": true, "defaultMaxUsedSpace": "20GB"}}'
+opts='"shutdown-timeout": 10, "log-driver": "json-file", "log-opts": {"max-size": "10m", "max-file": "3"}, "builder": {"gc": {"enabled": true, "defaultMaxUsedSpace": "20GB"}}'
 if [ -n "$gw" ]; then
-  echo "{\"host-gateway-ips\": [\"$gw\"], $gc}" >/etc/docker/daemon.json
+  echo "{\"host-gateway-ips\": [\"$gw\"], $opts}" >/etc/docker/daemon.json
 else
-  echo "{$gc}" >/etc/docker/daemon.json
+  echo "{$opts}" >/etc/docker/daemon.json
 fi
 log "ready (ip ${ip4:-none}, gateway ${gw:-none})"

@@ -33,7 +33,13 @@ pub fn dns_name(status_json: &str) -> Option<String> {
 }
 
 fn run(exe: &Path, args: &[&str]) -> Result<()> {
-    let st = Command::new(exe).args(args).status().with_context(|| format!("run rekcod {}", redacted(args)))?;
+    run_env(exe, args, &[])
+}
+
+/// `run` with environment variables: tokens go to the child this way, not on its argv, where
+/// any account on the Mac can read them from the process list.
+fn run_env(exe: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
+    let st = Command::new(exe).args(args).envs(env.iter().copied()).status().with_context(|| format!("run rekcod {}", redacted(args)))?;
     if !st.success() {
         bail!("`rekcod {}` failed", redacted(args));
     }
@@ -424,17 +430,10 @@ fn edge_node_args(
         }
         return Ok(["node", "serve", "--install"].map(String::from).into());
     }
-    let token = join_token.filter(|s| !s.is_empty()).context("a new node needs --join-token TOKEN (from the existing controller)")?;
-    let mut args = vec![
-        "node".into(),
-        "join".into(),
-        remote.url.clone(),
-        token.into(),
-        "--listen".into(),
-        l.node_listen.clone(),
-        "--advertise".into(),
-        advertise,
-    ];
+    // The token itself goes to `node join` as REKCOD_JOIN_TOKEN.
+    join_token.filter(|s| !s.is_empty()).context("a new node needs --join-token TOKEN (from the existing controller)")?;
+    let mut args =
+        vec!["node".into(), "join".into(), remote.url.clone(), "--listen".into(), l.node_listen.clone(), "--advertise".into(), advertise];
     if secure {
         let ca = remote.ca.as_deref().context("the remote needs its pinned CA; add it with remote add --ca-fingerprint first")?;
         args.extend(["--ca-fingerprint".into(), crate::tls::fingerprint(ca)?]);
@@ -527,7 +526,8 @@ pub fn setup_edge(paths: &Paths, remote_name: &str, join_token: Option<&str>, ad
     crate::fleet::call(&remote.url, "GET", "/nodes", Some(&remote.token), &serde_json::Value::Null)?;
     let exe = std::env::current_exe()?.canonicalize()?;
     let daemons = prepare_services(paths, &exe, no_power)?;
-    run(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let env: Vec<(&str, &str)> = join_token.map(|t| ("REKCOD_JOIN_TOKEN", t)).into_iter().collect();
+    run_env(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>(), &env)?;
     let node: serde_json::Value = serde_json::from_slice(&std::fs::read(&node_file)?)?;
     let id = node["id"].as_str().context("node.json has no node id")?;
     let edge_name = format!("edge-{id}");
@@ -622,7 +622,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    run(&exe, &["remote", "add", "local", url, "--token", &admin, "--ca-fingerprint", &fp])?;
+    run_env(&exe, &["remote", "add", "local", url, "--ca-fingerprint", &fp], &[("REKCOD_TOKEN", &admin)])?;
     // A node that joined on another address (the LAN IP it had, a switch to or from --lan)
     // would serve its old one forever: forget it and join again.
     let node_file = paths.home.join("node.json");
@@ -641,7 +641,11 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
         run(&exe, &["node", "serve", "--install"])?;
     } else {
         let join = std::fs::read_to_string(ctl.join("join-token")).context("no join token")?;
-        run(&exe, &["node", "join", url, join.trim(), "--listen", &l.node_listen, "--ca-fingerprint", &fp, "--install"])?;
+        run_env(
+            &exe,
+            &["node", "join", url, "--listen", &l.node_listen, "--ca-fingerprint", &fp, "--install"],
+            &[("REKCOD_JOIN_TOKEN", join.trim())],
+        )?;
     }
     // The edge gets a token that can only read routes and bans: taking over whatever runs
     // the edge shouldn't mean owning the fleet.
@@ -653,7 +657,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
         let v = crate::fleet::call(url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
         v["token"].as_str().context("no edge token")?.to_string()
     };
-    run(&exe, &["remote", "add", "edge", url, "--token", &edge_token, "--ca-fingerprint", &fp])?;
+    run_env(&exe, &["remote", "add", "edge", url, "--ca-fingerprint", &fp], &[("REKCOD_TOKEN", &edge_token)])?;
     run(&exe, &["edge", "serve", "--remote", "edge", "--listen", &l.edge_listen, "--public-listen", "127.0.0.1:8081", "--install"])?;
 
     // The docker VM, so docker over SSH works after a reboot too.
@@ -1175,17 +1179,7 @@ mod tests {
         let args = edge_node_args(&remote, &l, Some("join-secret"), None).unwrap();
         assert_eq!(
             args,
-            [
-                "node",
-                "join",
-                "http://100.64.0.1:7700",
-                "join-secret",
-                "--listen",
-                "100.64.0.2:7701",
-                "--advertise",
-                "http://100.64.0.2:7701",
-                "--install"
-            ]
+            ["node", "join", "http://100.64.0.1:7700", "--listen", "100.64.0.2:7701", "--advertise", "http://100.64.0.2:7701", "--install"]
         );
         assert!(edge_node_args(&remote, &l, None, None).is_err());
         let matching = serde_json::json!({"controller":remote.url, "listen":l.node_listen, "advertise":l.advertise});

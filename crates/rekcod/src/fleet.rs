@@ -205,6 +205,25 @@ pub fn remote(paths: &Paths, name: Option<&str>) -> Result<Remote> {
     r.remotes.get(&name).cloned().ok_or_else(|| anyhow!("no remote {name}"))
 }
 
+/// A token from `--token-file` (`-`: stdin), else from the argument or its environment
+/// variable. The file wins, so a token exported in the shell doesn't get in its way.
+pub fn token_arg(value: Option<String>, file: Option<&Path>, what: &str) -> Result<String> {
+    let t = match file {
+        Some(f) if f == Path::new("-") => {
+            let mut s = String::new();
+            std::io::stdin().read_to_string(&mut s).context("reading the token from stdin")?;
+            s
+        }
+        Some(f) => std::fs::read_to_string(f).with_context(|| format!("reading the token from {}", f.display()))?,
+        None => value.unwrap_or_default(),
+    };
+    let t = t.trim();
+    if t.is_empty() {
+        bail!("no token: pass {what} or --token-file PATH");
+    }
+    Ok(t.to_string())
+}
+
 pub fn remote_add(paths: &Paths, name: &str, url: &str, token: &str, ns: Option<&str>, ca_fingerprint: Option<&str>) -> Result<()> {
     let url = url.trim_end_matches('/');
     let a = authority(url)?;
@@ -1213,7 +1232,11 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, options: Nod
     if install {
         return crate::service::install(paths, "node", &["node".into(), "serve".into()]);
     }
-    node_serve(paths)
+    // Serve as `node serve`, so the join token on this process's argv doesn't stay in the
+    // process list for as long as the node runs. REKCOD_HOME carries through the environment.
+    use std::os::unix::process::CommandExt;
+    let e = Command::new(std::env::current_exe()?).args(["node", "serve"]).env_remove("REKCOD_JOIN_TOKEN").exec();
+    Err(anyhow!(e).context("running rekcod node serve"))
 }
 
 pub fn node_serve(paths: &Paths) -> Result<()> {

@@ -286,6 +286,19 @@ address is checked again before every request, so a `.ts.net` name stops working
 Tailscale is off. `REKCOD_INSECURE=1` allows plain http on a network you trust; services
 installed with it set keep it.
 
+To add a remote or join a node by hand, pass tokens through a file, stdin or the
+environment. Tokens on the command line are visible to other accounts on the Mac in the
+process list:
+
+```sh
+# admin-token is from the controller's ~/.rekcod/controller/; REKCOD_TOKEN also works
+rekcod remote add mini https://mini.tail1234.ts.net:7700 --token-file - --ca-fingerprint sha256:... < admin-token
+REKCOD_JOIN_TOKEN="$(cat join-token)" rekcod node join https://mini.tail1234.ts.net:7700 --ca-fingerprint sha256:... --install
+```
+
+`--token TOKEN` and `node join URL TOKEN` still work. A `node join` without `--install`
+keeps serving in the terminal as `rekcod node serve`, without the token in its arguments.
+
 From your development Mac:
 
 ```sh

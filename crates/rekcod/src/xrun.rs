@@ -1,5 +1,5 @@
-//! `rekcod x <cmd>`: run a command in a container with no Dockerfile
-//! (docs/phase5.md §6-7, plan.md §3b).
+//! `rekcod x <cmd>`: run a command in a container with no Dockerfile (README, "Run project
+//! tools without installing them on your Mac").
 //!
 //! The image comes from the command or the project's version files, the
 //! current directory is mounted at the same path, Linux dependencies live on
@@ -187,7 +187,8 @@ fn runtime_of_tool(tool: &str) -> Option<Runtime> {
     })
 }
 
-/// The runtime a project's files point to, in the order of docs/phase5.md §6.
+/// The runtime a project's files point to: asdf/mise pins first, then each runtime's own
+/// files in this order.
 fn runtime_of_project(p: &Project) -> Option<Runtime> {
     if let Some(r) = tool_versions(p).iter().find_map(|(t, _)| runtime_of_tool(t)) {
         return Some(r);
@@ -378,7 +379,7 @@ pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, 
         }
     } else {
         // The VM's network: listeners are on the VM's 127.0.0.1, where the
-        // daemon's port forwarding dials (docs/phase5.md §6).
+        // daemon's port forwarding dials.
         a.extend(["--network".into(), "host".into(), "--label".into(), format!("{AUTOPORTS_LABEL}=1")]);
         if !opts.sandbox {
             a.extend(["--add-host".into(), "host.docker.internal:host-gateway".into()]);

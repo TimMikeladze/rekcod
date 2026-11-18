@@ -1,4 +1,5 @@
-//! Agent sandboxes (docs/agent-sandboxes.md): many throwaway VMs, each a full dockerd
+//! Agent sandboxes (README, "Review an agent's changes before applying them" and "Agent
+//! sandboxes have their own workspace and engine"): many throwaway VMs, each a full dockerd
 //! that sees one copy of one project. State lives in `~/.rekcod/sb/<id>`, kept short
 //! because the docker socket path has to fit in `sun_path`.
 
@@ -1611,7 +1612,7 @@ pub fn log(paths: &Paths, id: &str, follow: bool, json: bool, net: bool) -> Resu
     let s = find(paths, id)?;
     if net {
         // Lookups the guest agent refused (console), then lookups and connections the
-        // daemon refused (docs/sandbox-network.md).
+        // daemon refused.
         for log in [s.paths.console_log(), s.paths.daemon_log()] {
             let text = std::fs::read_to_string(log).unwrap_or_default();
             for l in text.lines().filter(|l| l.contains("rekcod-egress:")) {

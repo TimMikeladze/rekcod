@@ -1,6 +1,6 @@
-//! The sandbox API for agents (docs/agent-sandboxes.md): HTTP on a unix socket
-//! (`rekcod sandbox serve`) and MCP over stdio (`rekcod mcp`). Both call `op`, which
-//! calls `sandbox.rs`, so they offer what the CLI offers.
+//! The sandbox API for agents (README, "Review an agent's changes before applying them"):
+//! HTTP on a unix socket (`rekcod sandbox serve`) and MCP over stdio (`rekcod mcp`). Both
+//! call `op`, which calls `sandbox.rs`, so they offer what the CLI offers.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;

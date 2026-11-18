@@ -163,7 +163,7 @@ enum Cmd {
         /// Don't forward listening ports automatically.
         #[arg(long)]
         no_autoports: bool,
-        /// Run in a separate VM that sees only this directory (docs/sandbox.md).
+        /// Run in a separate VM that sees only this directory, read-write.
         #[arg(long)]
         sandbox: bool,
         /// No network at all.
@@ -179,7 +179,7 @@ enum Cmd {
         #[arg(required = true, allow_hyphen_values = true)]
         cmd: Vec<String>,
     },
-    /// Throwaway VMs for AI agents: a full dockerd that sees a copy of one project (docs/agent-sandboxes.md).
+    /// Throwaway VMs for AI agents: a full dockerd that sees a copy of one project.
     Sandbox {
         /// Run on a fleet controller (`rekcod remote add`); no NAME means the default remote.
         #[arg(long, global = true, num_args = 0..=1, default_missing_value = "")]

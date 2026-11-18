@@ -811,7 +811,7 @@ const STATE_DEADLINE: Duration = Duration::from_secs(20);
 
 /// `cmd`'s output, or an error once `deadline` passes, with the child killed. Both pipes
 /// are drained meanwhile: a state larger than a pipe buffer would otherwise stall the child.
-fn output_within(mut cmd: Command, deadline: Duration) -> Result<std::process::Output> {
+pub(crate) fn output_within(mut cmd: Command, deadline: Duration) -> Result<std::process::Output> {
     use std::io::Read;
     let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let drain = |r: Option<Box<dyn Read + Send>>| {

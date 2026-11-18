@@ -593,6 +593,7 @@ fn leftovers(paths: &Paths, keep_data: bool) {
 }
 
 /// One `rekcod doctor` line: what was checked, whether it's fine, and what to do if not.
+#[derive(Debug, serde::Serialize)]
 struct Check {
     name: &'static str,
     ok: bool,
@@ -600,8 +601,54 @@ struct Check {
     fix: &'static str,
 }
 
-/// `rekcod doctor [--bundle]`.
-pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
+/// What the docker side of `doctor` looked at.
+struct DockerSeen {
+    /// `DOCKER_HOST` in this environment.
+    docker_host: Option<String>,
+    /// `unix://<home>/run/docker.sock`: what `host add`'s ~/.zshenv block exports.
+    ours: String,
+    /// `/var/run/docker.sock` goes to rekcod.
+    socket_routed: bool,
+    /// The current docker context, when a docker CLI is there.
+    context: Option<String>,
+}
+
+/// The checks that depend only on the environment. Optional setup (the socket route,
+/// starting at login) is shown, never a failure: `doctor` is a health check.
+fn docker_checks(s: &DockerSeen) -> Vec<Check> {
+    let mut out = Vec::new();
+    let dh_ours = s.docker_host.as_deref() == Some(s.ours.as_str());
+    if let Some(ctx) = &s.context {
+        // `default` is /var/run/docker.sock, which is rekcod once the socket is routed; a
+        // DOCKER_HOST at rekcod's socket overrides any context.
+        let ours = dh_ours || ctx == crate::docker::CONTEXT || (ctx == "default" && s.socket_routed && s.docker_host.is_none());
+        out.push(Check { name: "docker context", ok: ours, detail: ctx.clone(), fix: "rekcod start (or `docker context use rekcod`)" });
+    }
+    out.push(Check {
+        name: "DOCKER_HOST",
+        ok: s.docker_host.is_none() || dh_ours,
+        detail: match &s.docker_host {
+            None => "unset".into(),
+            Some(_) if dh_ours => "rekcod's socket".into(),
+            Some(h) => h.clone(),
+        },
+        fix: "unset DOCKER_HOST (it overrides docker contexts)",
+    });
+    out.push(Check {
+        name: "/var/run/docker.sock",
+        ok: true,
+        detail: if s.socket_routed {
+            "routed to rekcod".into()
+        } else {
+            "not routed (optional: `rekcod socket install`, for clients that ignore contexts)".into()
+        },
+        fix: "",
+    });
+    out
+}
+
+/// `rekcod doctor [--bundle] [--json]`.
+pub fn doctor(paths: &Paths, bundle: bool, json: bool) -> Result<()> {
     let mut checks = Vec::new();
     let mut add = |name, ok, detail: String, fix| checks.push(Check { name, ok, detail, fix });
     let pid = crate::cli::running_pid(paths);
@@ -621,6 +668,9 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
         let same = v == env!("CARGO_PKG_VERSION");
         add("daemon version", same, format!("daemon {v}, cli {}", env!("CARGO_PKG_VERSION")), "rekcod stop && rekcod start");
     }
+    if let (Some(g), Some(want)) = (status["guest_version"].as_str().filter(|g| !g.is_empty()), crate::fetch::GUEST_VERSION) {
+        add("guest version", g == want, format!("running {g}, this build's {want}"), "rekcod stop && rekcod start");
+    }
     let free = crate::cli::free_disk_gib(&paths.home).unwrap_or(0);
     add("free disk on the Mac", free >= 10, format!("{free} GiB"), "free some space; the VM's disk fails when the Mac's fills");
     let console = std::fs::read(paths.console_log()).unwrap_or_default();
@@ -634,80 +684,87 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
         if open.is_empty() { "home, run/, logs/ and vm/ 700, VM disks 600".into() } else { open.join(", ") },
         "sudo chown -R \"$(whoami)\" ~/.rekcod, then any rekcod command sets the modes again",
     );
-    if crate::docker::available() {
-        let ctx = crate::docker::current_context().unwrap_or_default();
-        // `default` is /var/run/docker.sock, which is rekcod once the socket is routed.
-        let ours = ctx == crate::docker::CONTEXT
-            || (ctx == "default" && crate::syssock::installed(paths) && std::env::var_os("DOCKER_HOST").is_none());
-        add("docker context", ours, ctx, "rekcod start (or `docker context use rekcod`)");
-    }
-    let dh = std::env::var("DOCKER_HOST").ok();
-    add("DOCKER_HOST unset", dh.is_none(), dh.unwrap_or("unset".into()), "unset DOCKER_HOST (it overrides docker contexts)");
-    add(
-        "/var/run/docker.sock",
-        crate::syssock::installed(paths),
-        if crate::syssock::installed(paths) { "routed to rekcod".into() } else { "not routed".into() },
-        "rekcod socket install (for clients that ignore contexts)",
-    );
+    checks.extend(docker_checks(&DockerSeen {
+        docker_host: std::env::var("DOCKER_HOST").ok(),
+        ours: paths.docker_host(),
+        socket_routed: crate::syssock::installed(paths),
+        context: crate::docker::available().then(|| crate::docker::current_context().unwrap_or_default()),
+    }));
     // Optional: shown, never a failure.
-    add(
-        "starts at login",
-        true,
-        if crate::service::installed(crate::cli::AUTOSTART) { "yes".into() } else { "no (`rekcod start --install` if you want it)".into() },
-        "",
-    );
+    checks.push(Check {
+        name: "starts at login",
+        ok: true,
+        detail: if crate::service::installed(crate::cli::AUTOSTART) {
+            "yes".into()
+        } else {
+            "no (`rekcod start --install` if you want it)".into()
+        },
+        fix: "",
+    });
     if ping {
-        let net = crate::docker::any_cli(paths)?
-            .args([
-                "-H",
-                &paths.docker_host(),
-                "run",
-                "--rm",
-                "--network",
-                "bridge",
-                "alpine:3.24",
-                "nc",
-                "-z",
-                "-w",
-                "5",
-                "1.1.1.1",
-                "443",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
-        add(
-            "VM reaches the internet",
-            net,
-            format!(
-                "{} ({} network)",
-                if net { "1.1.1.1:443 answers" } else { "a container can't connect out" },
-                status["network"].as_str().unwrap_or("nat")
-            ),
-            if status["network"].as_str().unwrap_or("nat") == "nat" {
-                "a VPN or firewall is dropping the VM's NAT traffic: `rekcod stop && rekcod start --network user` routes it through rekcod instead"
-            } else {
-                "check the Mac's own internet, then `rekcod stop && rekcod start`"
-            },
-        );
+        checks.push(internet_check(paths, &status)?);
     }
-    let mut bad = 0;
-    for c in &checks {
-        println!("{} {:<26} {}", if c.ok { "ok  " } else { "FAIL" }, c.name, c.detail);
-        if !c.ok {
-            bad += 1;
-            println!("     fix: {}", c.fix);
+    let bad = checks.iter().filter(|c| !c.ok).count();
+    if json {
+        println!("{}", serde_json::json!({"ok": bad == 0, "checks": checks}));
+    } else {
+        for c in &checks {
+            println!("{} {:<26} {}", if c.ok { "ok  " } else { "FAIL" }, c.name, c.detail);
+            if !c.ok {
+                println!("     fix: {}", c.fix);
+            }
         }
     }
     if bundle {
         let path = write_bundle(paths)?;
-        println!("\ndiagnostics: {}", path.display());
+        if json {
+            eprintln!("diagnostics: {}", path.display());
+        } else {
+            println!("\ndiagnostics: {}", path.display());
+        }
     }
     if bad > 0 {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// A container connects out. Only with `alpine:3.24` already there (doctor doesn't pull),
+/// and given up after 30 s.
+fn internet_check(paths: &Paths, status: &serde_json::Value) -> Result<Check> {
+    let nat = status["network"].as_str().unwrap_or("nat") == "nat";
+    let mode = status["network"].as_str().unwrap_or("nat");
+    let docker = |args: &[&str]| -> Result<Command> {
+        let mut c = crate::docker::any_cli(paths)?;
+        c.args(["-H", &paths.docker_host()]).args(args).stdin(Stdio::null());
+        Ok(c)
+    };
+    let have =
+        docker(&["image", "inspect", "alpine:3.24"])?.stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    if !have {
+        return Ok(Check {
+            name: "VM reaches the internet",
+            ok: true,
+            detail: "not checked (needs alpine:3.24; `docker pull alpine:3.24` and run doctor again)".into(),
+            fix: "",
+        });
+    }
+    let probe = docker(&["run", "--rm", "--network", "bridge", "alpine:3.24", "nc", "-z", "-w", "5", "1.1.1.1", "443"])?;
+    let (net, detail) = match crate::host::output_within(probe, Duration::from_secs(30)) {
+        Ok(o) if o.status.success() => (true, format!("1.1.1.1:443 answers ({mode} network)")),
+        Ok(_) => (false, format!("a container can't connect out ({mode} network)")),
+        Err(e) => (false, format!("the probe container didn't finish: {e:#} ({mode} network)")),
+    };
+    Ok(Check {
+        name: "VM reaches the internet",
+        ok: net,
+        detail,
+        fix: if nat {
+            "a VPN or firewall is dropping the VM's NAT traffic: `rekcod stop && rekcod start --network user` routes it through rekcod instead"
+        } else {
+            "check the Mac's own internet, then `rekcod stop && rekcod start`"
+        },
+    })
 }
 
 /// A tarball of status, versions, logs (last 2000 lines each) and config. No tokens or keys.
@@ -772,6 +829,26 @@ pub fn trim_log(log: &Path, max: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Setups rekcod made itself pass: DOCKER_HOST at rekcod's socket (host add's
+    /// ~/.zshenv block), and no /var/run/docker.sock route.
+    #[test]
+    fn doctor_passes_rekcods_own_setups() {
+        let ours = "unix:///Users/me/.rekcod/run/docker.sock".to_string();
+        let seen = |dh: Option<&str>, ctx: &str| DockerSeen {
+            docker_host: dh.map(String::from),
+            ours: ours.clone(),
+            socket_routed: false,
+            context: Some(ctx.into()),
+        };
+        for s in [seen(Some(&ours), "default"), seen(None, "rekcod")] {
+            let failed: Vec<_> = docker_checks(&s).into_iter().filter(|c| !c.ok).map(|c| c.name).collect();
+            assert!(failed.is_empty(), "{failed:?}");
+        }
+        let other = docker_checks(&seen(Some("tcp://10.0.0.9:2375"), "rekcod"));
+        assert!(other.iter().any(|c| c.name == "DOCKER_HOST" && !c.ok));
+        assert!(!docker_checks(&seen(None, "orbstack"))[0].ok);
+    }
 
     #[test]
     fn check_exit_codes() {

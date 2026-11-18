@@ -211,29 +211,30 @@ impl Paths {
     /// then the repo's `out/guest` for dev builds, then (release builds) the
     /// embedded guest version under `~/.rekcod/guest/<version>`, downloaded if missing.
     pub fn guest_dir(&self) -> Result<PathBuf> {
-        let mut candidates = Vec::new();
-        if let Some(dir) = std::env::var_os("REKCOD_GUEST_DIR") {
-            candidates.push(PathBuf::from(dir));
-        }
         // A release build boots the guest it was built with; a leftover dev guest in
         // ~/.rekcod/guest must not win over it. Dev builds (no pinned guest) look there.
         #[cfg(target_os = "macos")]
-        let pinned = crate::fetch::GUEST_VERSION.is_some();
+        let pinned = crate::fetch::GUEST_VERSION;
         #[cfg(not(target_os = "macos"))]
-        let pinned = false;
-        if !pinned {
-            candidates.push(self.home.join("guest"));
+        let pinned: Option<&str> = None;
+        // (dir, whether a release build takes it only at its own guest version)
+        let mut candidates: Vec<(PathBuf, bool)> = Vec::new();
+        if let Some(dir) = std::env::var_os("REKCOD_GUEST_DIR") {
+            candidates.push((PathBuf::from(dir), false));
+        }
+        if pinned.is_none() {
+            candidates.push((self.home.join("guest"), false));
         }
         if let Some(bin_dir) = std::env::current_exe()?.canonicalize()?.parent() {
-            candidates.push(bin_dir.join("../share/rekcod/guest"));
-            if !pinned {
-                candidates.push(bin_dir.join("../../out/guest"));
+            // The server pkg's guest. `upgrade` replaces only the binary, so after one it's
+            // an older guest than this build's.
+            candidates.push((bin_dir.join("../share/rekcod/guest"), true));
+            if pinned.is_none() {
+                candidates.push((bin_dir.join("../../out/guest"), false));
             }
         }
-        for dir in &candidates {
-            if dir.join("Image").exists() && dir.join("root.img").exists() {
-                return Ok(dir.canonicalize()?);
-            }
+        if let Some(dir) = choose_guest(&candidates, pinned) {
+            return Ok(dir.canonicalize()?);
         }
         // Release builds: the guest they were built with, downloaded on first use.
         #[cfg(target_os = "macos")]
@@ -242,9 +243,21 @@ impl Paths {
         }
         bail!(
             "guest image not found (looked in {}); build it with scripts/build.sh",
-            candidates.iter().map(|c| c.display().to_string()).collect::<Vec<_>>().join(", ")
+            candidates.iter().map(|(c, _)| c.display().to_string()).collect::<Vec<_>>().join(", ")
         )
     }
+}
+
+/// The first candidate with a kernel and root image whose `VERSION` is `pinned`, when the
+/// candidate asks for that check.
+fn choose_guest<'a>(candidates: &'a [(PathBuf, bool)], pinned: Option<&str>) -> Option<&'a PathBuf> {
+    candidates
+        .iter()
+        .find(|(dir, versioned)| {
+            let version = || std::fs::read_to_string(dir.join("VERSION")).unwrap_or_default();
+            dir.join("Image").exists() && dir.join("root.img").exists() && (!versioned || pinned.is_none_or(|p| version().trim() == p))
+        })
+        .map(|(d, _)| d)
 }
 
 #[cfg(test)]
@@ -279,6 +292,30 @@ mod tests {
         assert_eq!((mode(&paths.root_disk()), mode(&paths.data_disk())), (0o600, 0o600));
         assert!(paths.not_private().is_empty());
         std::fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    /// A guest beside the binary from an older install is passed over for the one this
+    /// build pins; a dev build takes it as it is.
+    #[test]
+    fn stale_share_guest_is_skipped() {
+        let t = std::env::temp_dir().join(format!("rekcod-guest-pick-{}", std::process::id()));
+        let guest = |name: &str, v: &str| {
+            let d = t.join(name);
+            std::fs::create_dir_all(&d).unwrap();
+            for f in ["Image", "root.img"] {
+                std::fs::write(d.join(f), "").unwrap();
+            }
+            std::fs::write(d.join("VERSION"), format!("{v}\n")).unwrap();
+            d
+        };
+        let share = guest("share", "g-old");
+        let dev = guest("dev", "g-dev");
+        let c = vec![(share.clone(), true), (dev.clone(), false)];
+        assert_eq!(choose_guest(&c, Some("g-new")), Some(&dev));
+        assert_eq!(choose_guest(&c[..1], Some("g-new")), None, "falls through to the download");
+        assert_eq!(choose_guest(&c, Some("g-old")), Some(&share));
+        assert_eq!(choose_guest(&c, None), Some(&share));
+        std::fs::remove_dir_all(&t).unwrap();
     }
 
     #[test]

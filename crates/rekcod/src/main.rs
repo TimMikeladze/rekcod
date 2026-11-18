@@ -222,10 +222,14 @@ enum Cmd {
         yes: bool,
     },
     /// Check what usually goes wrong and say how to fix it.
+    /// Exits 1 when a check fails.
     Doctor {
         /// Also write ~/.rekcod/doctor-<time>.tar.gz with status and logs (no tokens or keys).
         #[arg(long)]
         bundle: bool,
+        /// The checks as JSON: {"ok": bool, "checks": [{"name", "ok", "detail", "fix"}]}.
+        #[arg(long)]
+        json: bool,
     },
     /// macOS guests: base images for `rekcod sandbox create --os macos`.
     #[command(subcommand)]
@@ -1356,7 +1360,7 @@ fn main() {
         Cmd::Upgrade { rollback: true, .. } => lifecycle::rollback(),
         Cmd::Upgrade { check, restart_services, .. } => lifecycle::upgrade(check, restart_services),
         Cmd::Uninstall { keep_data, yes } => lifecycle::uninstall(&paths, keep_data, yes),
-        Cmd::Doctor { bundle } => lifecycle::doctor(&paths, bundle),
+        Cmd::Doctor { bundle, json } => lifecycle::doctor(&paths, bundle, json),
         Cmd::Macos(MacosCmd::Fetch) => macos::fetch(&paths),
         Cmd::Macos(MacosCmd::Install { name, disk, cpus, memory }) => macos::install(&paths, &name, disk, cpus, memory),
         Cmd::Macos(MacosCmd::Setup { name }) => macos::setup(&paths, &name),

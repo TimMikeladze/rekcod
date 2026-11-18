@@ -21,6 +21,9 @@ pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 pub const DOWN_FOR: Duration = Duration::from_secs(5);
 /// Idle connections kept per instance.
 const IDLE_MAX: usize = 32;
+/// Requests in flight to one instance; past it the instance is skipped, and when every
+/// instance is there the request gets a 503.
+pub const MAX_IN_FLIGHT: usize = 512;
 /// Time constant of the latency decay.
 const TAU_MS: f64 = 10_000.0;
 static EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
@@ -148,9 +151,17 @@ impl Pool {
         all
     }
 
+    /// Whether every one of `eps` already has [`MAX_IN_FLIGHT`] requests.
+    pub fn all_full(&self, eps: &[String]) -> bool {
+        !eps.is_empty() && eps.iter().all(|e| self.stats(e).in_flight.load(Ordering::Relaxed) >= MAX_IN_FLIGHT)
+    }
+
     /// A connection to the best instance that answers, or `None` when none did.
     pub async fn lease(&self, eps: &[String]) -> Option<Lease> {
         for (ep, stats) in self.order(eps) {
+            if stats.in_flight.load(Ordering::Relaxed) >= MAX_IN_FLIGHT {
+                continue;
+            }
             let pooled = {
                 let mut idle = stats.idle.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 idle.retain(|s| !s.is_closed());
@@ -207,6 +218,19 @@ mod tests {
         *p.stats("b:1").down_until.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Instant::now() + DOWN_FOR);
         let o = p.order(&eps);
         assert_eq!(o.iter().map(|(e, _)| e.as_str()).collect::<Vec<_>>(), ["a:1", "b:1"]);
+    }
+
+    #[tokio::test]
+    async fn a_full_instance_is_skipped() {
+        let p = Pool::default();
+        let eps: Vec<String> = vec!["full:1".into(), "127.0.0.1:1".into()];
+        p.stats("full:1").in_flight.store(MAX_IN_FLIGHT, Ordering::Relaxed);
+        assert!(!p.all_full(&eps));
+        p.stats("127.0.0.1:1").in_flight.store(MAX_IN_FLIGHT, Ordering::Relaxed);
+        assert!(p.all_full(&eps));
+        // Nothing is tried: "full:1" would fail to resolve and be marked down otherwise.
+        assert!(p.lease(&eps).await.is_none());
+        assert!(!p.stats("full:1").is_down());
     }
 
     #[test]

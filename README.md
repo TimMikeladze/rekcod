@@ -469,6 +469,8 @@ Timeouts and caps:
 - A connection that moves no bytes for 90 s is closed, also in the middle of a response.
   A server-sent event stream needs a heartbeat more often than that. WebSockets close after
   an hour without traffic.
+- An instance takes at most 512 requests at once; with every instance at that, the client
+  gets 503 with `Retry-After: 1`.
 - One address (an IPv6 /64) may hold 200 connections and 100 WebSockets. The edge raises its
   descriptor limit at start and prints the connection and WebSocket totals it derived from it.
 - A request for a sleeping app waits up to 120 s for the wake, then gets 503 with

@@ -358,6 +358,10 @@ of `rekcod.toml` over the app's env, so a key in both takes the value from the f
 `rekcod app env unset blog KEY` removes one. `[resources]` values the file leaves out
 keep the app's current ones.
 
+Deploys of one app run one at a time. While one runs and another waits, a third
+(deploy, rollback, scale, env or secret change) is refused with a 409; run it again
+once one finishes.
+
 To make `mini` the default for fleet commands:
 
 ```sh

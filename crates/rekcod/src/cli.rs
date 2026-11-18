@@ -572,7 +572,10 @@ fn default_socket_on_start(paths: &Paths, no_switch: bool) -> Result<()> {
     // whether it worked or not; the menu bar (no terminal) only shows the menu item.
     let asked = paths.home.join("default.sock.asked");
     let tty = unsafe { libc::isatty(0) } == 1;
-    if tty && !asked.exists() {
+    if crate::syssock::lost(paths) {
+        // Another engine may have taken it on purpose, so no sudo prompt.
+        println!("default socket: /var/run/docker.sock no longer goes through rekcod; `rekcod socket install` routes it again");
+    } else if tty && !asked.exists() {
         std::fs::write(&asked, "")?;
         println!("routing /var/run/docker.sock to rekcod too, for clients that ignore docker contexts");
         if let Err(e) = crate::syssock::install(paths, true) {

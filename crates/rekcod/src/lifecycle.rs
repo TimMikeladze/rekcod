@@ -197,7 +197,7 @@ pub fn uninstall(paths: &Paths, keep_data: bool, yes: bool) -> Result<()> {
             step(&format!("remove {}", crate::service::label(a)), crate::service::uninstall(a));
         }
     }
-    if crate::syssock::installed(paths) {
+    if crate::syssock::present(paths) {
         step("hand back /var/run/docker.sock", crate::syssock::uninstall(paths));
     }
     if crate::docker::available() {
@@ -279,7 +279,7 @@ pub fn doctor(paths: &Paths, bundle: bool) -> Result<()> {
     add(
         "/var/run/docker.sock",
         crate::syssock::installed(paths),
-        if crate::syssock::installed(paths) { "routed to rekcod".into() } else { "not routed".into() },
+        if crate::syssock::installed(paths) { "routed to rekcod".into() } else { crate::syssock::state(paths).into() },
         "rekcod socket install (for clients that ignore contexts)",
     );
     // Optional: shown, never a failure.

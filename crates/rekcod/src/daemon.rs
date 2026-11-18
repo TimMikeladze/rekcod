@@ -67,7 +67,8 @@ pub struct Options {
     pub allow: Option<String>,
     /// `IP:PORT,...` the sandbox may reach although it's on the Mac or LAN.
     pub reach: Option<String>,
-    /// Power off after this many seconds without an exec (`run/last-used`).
+    /// Power off after this many seconds without an exec (`run/last-used`) and with no
+    /// connection open on the docker socket.
     pub idle_ttl: Option<u64>,
     /// `e2fsck -fy` the data disk at boot (`rekcod start --repair`).
     pub repair: bool,
@@ -251,7 +252,8 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         let sock = paths.socket();
         let _ = std::fs::remove_file(&sock);
         let listener = crate::paths::with_umask(0o077, || UnixListener::bind(&sock)).with_context(|| format!("bind {}", sock.display()))?;
-        tokio::spawn(docker_proxy(vm.clone(), listener));
+        // Only a VM with an idle TTL (a sandbox) counts its connections.
+        tokio::spawn(docker_proxy(vm.clone(), listener, opts.idle_ttl.map(|_| paths.home.join("run/last-used"))));
         if fresh {
             tokio::spawn(forget_fresh_disk(vm.clone(), paths.data_fresh()));
         }
@@ -368,8 +370,11 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
             }
             _ = tick.tick() => {
                 if let Some(ttl) = opts.idle_ttl
-                    && let Ok(used) = std::fs::metadata(paths.home.join("run/last-used")).and_then(|m| m.modified())
-                    && used.elapsed().is_ok_and(|e| e.as_secs() > ttl)
+                    && idle(
+                        std::fs::metadata(paths.home.join("run/last-used")).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()),
+                        ttl,
+                        DOCKER_OPEN.load(std::sync::atomic::Ordering::SeqCst),
+                    )
                 {
                     log!("idle for {ttl}s, stopping");
                     break;
@@ -932,7 +937,37 @@ async fn resolve_tcp(query: &[u8], server: SocketAddr) -> Result<Vec<u8>> {
     Ok(answer)
 }
 
-async fn docker_proxy(vm: Vm, listener: UnixListener) {
+/// Connections open on the docker socket. A `docker exec`, attach or shell holds one for as
+/// long as it runs, so a sandbox isn't idle while one is open, however long ago it started.
+static DOCKER_OPEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether a sandbox has been idle past its TTL: nothing connected to its docker socket and
+/// `run/last-used` older than `ttl` seconds.
+fn idle(last_used_age: Option<Duration>, ttl: u64, open: usize) -> bool {
+    open == 0 && last_used_age.is_some_and(|a| a.as_secs() > ttl)
+}
+
+/// Counts a docker connection in [`DOCKER_OPEN`] while it lives; closing it is use, so the
+/// TTL then starts from that moment.
+struct DockerOpen(PathBuf);
+
+impl DockerOpen {
+    fn new(used: PathBuf) -> DockerOpen {
+        DOCKER_OPEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        DockerOpen(used)
+    }
+}
+
+impl Drop for DockerOpen {
+    fn drop(&mut self) {
+        if let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(&self.0) {
+            let _ = f.set_modified(SystemTime::now());
+        }
+        DOCKER_OPEN.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+async fn docker_proxy(vm: Vm, listener: UnixListener, used: Option<PathBuf>) {
     loop {
         let client = match listener.accept().await {
             Ok((c, _)) => c,
@@ -941,8 +976,9 @@ async fn docker_proxy(vm: Vm, listener: UnixListener) {
                 continue;
             }
         };
-        let vm = vm.clone();
+        let (vm, open) = (vm.clone(), used.clone().map(DockerOpen::new));
         tokio::spawn(async move {
+            let _open = open;
             match vm.connect(DOCKER_PORT).await {
                 Ok(guest) => {
                     if let Err(e) = crate::proxy::pipe(client, guest).await
@@ -1665,6 +1701,24 @@ fn meta_reply(req: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_open_docker_connection_keeps_a_sandbox_up() {
+        let hour = Some(Duration::from_secs(3600));
+        assert!(idle(hour, 60, 0));
+        assert!(!idle(hour, 60, 1), "a long exec still running");
+        assert!(!idle(Some(Duration::from_secs(10)), 60, 0));
+        assert!(!idle(None, 60, 0));
+        let used = std::env::temp_dir().join(format!("rekcod-dopen-{}", std::process::id()));
+        let _ = std::fs::remove_file(&used);
+        let before = DOCKER_OPEN.load(std::sync::atomic::Ordering::SeqCst);
+        let open = DockerOpen::new(used.clone());
+        assert!(DOCKER_OPEN.load(std::sync::atomic::Ordering::SeqCst) > before);
+        drop(open);
+        // Closing counts as use.
+        assert!(std::fs::metadata(&used).unwrap().modified().unwrap().elapsed().unwrap() < Duration::from_secs(5));
+        let _ = std::fs::remove_file(&used);
+    }
 
     #[test]
     fn stats_carry_elastic_held_only_with_elastic_memory() {

@@ -922,6 +922,7 @@ fn cancel_point(id: &str) -> Result<()> {
 
 fn job_body(host: &dyn JobHost, id: &str, a: &Value, log: std::fs::File) -> Result<i32> {
     let cmd: Vec<String> = a["cmd"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(String::from)).collect();
+    crate::sandbox_api::check_env(&job_env(a))?;
     let src = host.clone(a["git"]["url"].as_str().context("missing git.url")?, a["git"]["ref"].as_str().unwrap_or("HEAD"))?;
     let r = job_in_checkout(host, id, a, &cmd, &src, log);
     let _ = std::fs::remove_dir_all(&src);
@@ -957,8 +958,8 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
                 bail!("cancelled before the command started");
             }
         }
-        let env = a["env"].as_array().into_iter().flatten().filter_map(|e| e.as_str().map(String::from)).collect();
-        let eo = sandbox::ExecOptions { workdir: None, env, timeout_secs: a["timeout_secs"].as_u64(), tty: false };
+        let eo =
+            sandbox::ExecOptions { workdir: None, env: job_env(a), timeout_secs: a["timeout_secs"].as_u64(), tty: false, clean_env: true };
         let mut c = host.exec(&sb, &eo, cmd)?;
         c.stdin(Stdio::null()).stdout(log.try_clone()?).stderr(log);
         let child = {
@@ -975,6 +976,11 @@ fn job_in_checkout(host: &dyn JobHost, id: &str, a: &Value, cmd: &[String], src:
     })();
     host.remove(&sb);
     r
+}
+
+/// A job spec's `env` entries; anything that isn't a string is an error for `check_env`.
+fn job_env(a: &Value) -> Vec<String> {
+    a["env"].as_array().into_iter().flatten().map(|e| e.as_str().map(String::from).unwrap_or_else(|| e.to_string())).collect()
 }
 
 /// Waits for the command without reaping it first, then clears its pid under the lock, so
@@ -4609,6 +4615,7 @@ fn start_job(c: &Controller, ns: &str, owner: &str, max: i32, spec: &Value, sche
     if spec["git"]["url"].as_str().is_none() {
         bail!("jobs need git.url (and git.ref)");
     }
+    crate::sandbox_api::check_env(&job_env(spec))?;
     let (cpus, gib) = job_resources(spec)?;
     let id = format!("j-{}", sandbox::new_id()?);
     let node = {
@@ -4811,6 +4818,7 @@ fn jobs_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             if b["git"]["url"].as_str().is_none() {
                 bail!("jobs need git.url (and git.ref)");
             }
+            crate::sandbox_api::check_env(&job_env(b))?;
             job_resources(b)?;
             let key = app_key(ns, name);
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -5047,6 +5055,19 @@ mod job_and_node_tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn a_job_env_without_a_value_never_reaches_the_node_sandbox() {
+        let home = temp("job-env");
+        let paths = Paths { home: home.clone() };
+        let host = FakeHost::new("", &home.join("work"));
+        run_job_on(host.clone(), &paths, &json!({"id": "j-env", "git": {"url": "u"}, "cmd": ["printenv"], "env": ["HOME"]})).unwrap();
+        let v = finished(&paths, "j-env");
+        assert_eq!(v["exit"].as_i64(), Some(-1), "{v}");
+        assert!(v["log"].as_str().unwrap().contains("use KEY=VALUE"), "{v}");
+        assert_eq!(host.created.load(Ordering::SeqCst), 0);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -6979,13 +7000,20 @@ mod tests {
         let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
         add_token(&c, "alice-t", "alice", false, "member", false, None);
         let base = json!({"name": "nightly", "every_secs": 3600, "cmd": ["true"], "git": {"url": "https://example.invalid/r"}});
-        for (field, value) in [("cpus", json!(-1)), ("memory_gib", json!(10_000)), ("cmd", json!([]))] {
+        for (field, value) in [("cpus", json!(-1)), ("memory_gib", json!(10_000)), ("cmd", json!([])), ("env", json!(["HOME"]))] {
             let mut b = base.clone();
             b[field] = value.clone();
             let e = call(&url, "POST", "/jobs", Some("alice-t"), &b).unwrap_err().to_string();
             assert!(e.contains("(400)"), "{field}={value}: {e}");
         }
         assert_eq!(c.db.lock().unwrap().query_one("select count(*) from schedules", &[]).unwrap().get::<i64>(0), 0);
+        // A bare KEY would make docker on the node copy that variable from its own environment.
+        let mut once = base.clone();
+        once["every_secs"] = json!(0);
+        once["env"] = json!(["A=1", "GITHUB_TOKEN"]);
+        let e = call(&url, "POST", "/jobs", Some("alice-t"), &once).unwrap_err().to_string();
+        assert!(e.contains("(400)") && e.contains("GITHUB_TOKEN"), "{e}");
+        assert_eq!(c.db.lock().unwrap().query_one("select count(*) from jobs", &[]).unwrap().get::<i64>(0), 0);
         call(&url, "POST", "/jobs", Some("alice-t"), &base).unwrap();
     }
 

@@ -1909,7 +1909,8 @@ fn run_sandbox(paths: &paths::Paths, c: SandboxCmd) -> anyhow::Result<()> {
         }
         SandboxCmd::Exec { id, workdir, env, timeout, cmd } => {
             let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
-            let code = sandbox::exec(paths, &id, sandbox::ExecOptions { workdir, env, timeout_secs: timeout, tty }, &cmd)?;
+            let code =
+                sandbox::exec(paths, &id, sandbox::ExecOptions { workdir, env, timeout_secs: timeout, tty, clean_env: false }, &cmd)?;
             std::process::exit(code)
         }
         SandboxCmd::Shell { id } => sandbox::shell(paths, &id),

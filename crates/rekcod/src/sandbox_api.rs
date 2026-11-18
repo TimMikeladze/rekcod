@@ -151,14 +151,30 @@ impl Policy {
     }
 }
 
-/// `env` entries must be `KEY=VALUE`: a bare `KEY` makes docker copy the value from this
-/// process's environment, which would hand the caller any secret it can name.
-fn exec_opts(args: &Value) -> Result<ExecOptions> {
-    let env = strs(&args["env"]);
-    if let Some(e) = env.iter().find(|e| !e.contains('=')) {
+/// An environment variable name: a letter or `_`, then letters, digits and `_`.
+pub(crate) fn valid_env_key(k: &str) -> bool {
+    k.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_') && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// `env` entries must be `KEY=VALUE`: a bare `KEY` makes docker copy the value from the
+/// docker CLI's environment, which would hand the caller any secret it can name.
+pub(crate) fn check_env(env: &[String]) -> Result<()> {
+    if let Some(e) = env.iter().find(|e| !e.split_once('=').is_some_and(|(k, _)| valid_env_key(k))) {
         bail!("env {e}: use KEY=VALUE");
     }
-    Ok(ExecOptions { workdir: args["workdir"].as_str().map(String::from), env, timeout_secs: args["timeout_secs"].as_u64(), tty: false })
+    Ok(())
+}
+
+fn exec_opts(args: &Value) -> Result<ExecOptions> {
+    let env = strs(&args["env"]);
+    check_env(&env)?;
+    Ok(ExecOptions {
+        workdir: args["workdir"].as_str().map(String::from),
+        env,
+        timeout_secs: args["timeout_secs"].as_u64(),
+        tty: false,
+        clean_env: false,
+    })
 }
 
 /// Runs a command to completion: (exit, stdout, stderr).

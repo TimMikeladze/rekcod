@@ -1072,7 +1072,8 @@ mod tests {
         // And a team-signed one passes its own team's requirement, so the requirement
         // itself parses (a malformed one would refuse everything too). Only a bundle whose
         // signature verifies at all counts: CI images patch some apps after signing.
-        let verifies = |b: &Path| Command::new("/usr/bin/codesign").args(["--verify", "--deep"]).arg(b).status().is_ok_and(|s| s.success());
+        let verifies =
+            |b: &Path| Command::new("/usr/bin/codesign").args(["--verify", "--strict"]).arg(b).status().is_ok_and(|s| s.success());
         let signed = ["/Applications/Google Chrome.app", "/Applications/Docker.app", "/Applications/Slack.app"]
             .iter()
             .map(Path::new)

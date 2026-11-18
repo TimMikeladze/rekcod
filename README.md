@@ -280,6 +280,12 @@ run `sudo` to install services that start at boot.
 For access between networks, connect both Macs to the same Tailscale tailnet. Without
 Tailscale, rekcod uses Bonjour discovery on the LAN; both Macs need the same subnet.
 
+Server setup uses https. A plain `http://` controller or node URL is accepted only when it
+resolves to a loopback or tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48), and the
+address is checked again before every request, so a `.ts.net` name stops working while
+Tailscale is off. `REKCOD_INSECURE=1` allows plain http on a network you trust; services
+installed with it set keep it.
+
 From your development Mac:
 
 ```sh

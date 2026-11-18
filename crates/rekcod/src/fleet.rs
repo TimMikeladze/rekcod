@@ -77,6 +77,15 @@ pub fn send_within(
 ) -> Result<(u16, BufReader<crate::tls::Stream>)> {
     let addr = authority(base)?;
     let sock = crate::bonjour::socket_addr(&addr)?;
+    // A name was checked when it was added, but it may resolve elsewhere now (Tailscale off,
+    // another network's resolver). An IP address can't change.
+    if base.starts_with("http://")
+        && std::env::var_os("REKCOD_INSECURE").is_none()
+        && addr.rsplit_once(':').is_some_and(|(h, _)| h.trim_matches(['[', ']']).parse::<IpAddr>().is_err())
+        && !plain_http_ip(sock.ip())
+    {
+        bail!("{base} resolves to {}, not a loopback or tailnet address; not sending a token in clear text", sock.ip());
+    }
     let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).with_context(|| format!("connect {base}"))?;
     tcp.set_read_timeout(timeout)?;
     tcp.set_write_timeout(Some(QUICK))?;
@@ -284,27 +293,36 @@ fn hostname() -> Vec<String> {
 }
 
 /// Plain `http://` is for loopback and tailnet addresses (Tailscale encrypts those); anything
-/// else needs https, or `REKCOD_INSECURE=1` for a network you trust.
+/// else needs https, or `REKCOD_INSECURE=1` for a network you trust. A name passes when every
+/// address it resolves to does; `send_within` checks the address again before each request.
 pub fn check_plain_http(authority: &str, what: &str) -> Result<()> {
     if std::env::var_os("REKCOD_INSECURE").is_some() {
         return Ok(());
     }
     let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h).trim_matches(['[', ']']);
-    let ok = |ip: IpAddr| match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64),
-        IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
-    };
-    let tailnet_name = host.ends_with(".ts.net") || host == "localhost";
     let ips: Vec<IpAddr> = match host.parse::<IpAddr>() {
         Ok(ip) => vec![ip],
         Err(_) => (host, 0).to_socket_addrs().map(|a| a.map(|s| s.ip()).collect()).unwrap_or_default(),
     };
-    if tailnet_name || (!ips.is_empty() && ips.iter().all(|ip| ok(*ip))) {
+    if plain_http_ok(host, &ips) {
         return Ok(());
     }
     bail!(
         "{what} at http://{authority} would send tokens in clear text; use https, a loopback or tailnet address, or set REKCOD_INSECURE=1"
     )
+}
+
+/// Whether `host`, resolved to `ips`, may be sent tokens over plain http. A `.ts.net` name
+/// counts only by its addresses: with Tailscale off, another resolver answers it.
+fn plain_http_ok(host: &str, ips: &[IpAddr]) -> bool {
+    host == "localhost" || (!ips.is_empty() && ips.iter().all(|ip| plain_http_ip(*ip)))
+}
+
+fn plain_http_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 64),
+        IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
+    }
 }
 
 /// Tells `tls::connect` which node answers at each https address. Nodes that joined before
@@ -6532,9 +6550,16 @@ mod tests {
         assert!(authority("ftp://x").is_err());
         assert_eq!(percent_encode("/a b"), "%2Fa%20b");
         // Plain HTTP only where it can't be read in transit.
-        for ok in ["127.0.0.1:7700", "[::1]:7700", "100.101.102.103:7700", "mini.tail1.ts.net:7700", "localhost:1"] {
+        for ok in ["127.0.0.1:7700", "[::1]:7700", "100.101.102.103:7700", "localhost:1"] {
             assert!(check_plain_http(ok, "x").is_ok(), "{ok}");
         }
+        // A tailnet name passes by what it resolves to, not by its suffix.
+        let ip = |s: &str| s.parse::<IpAddr>().unwrap();
+        assert!(plain_http_ok("mini.tail1.ts.net", &[ip("100.100.1.2")]));
+        assert!(plain_http_ok("mini.tail1.ts.net", &[ip("fd7a:115c:a1e0::1")]));
+        assert!(!plain_http_ok("mini.tail1.ts.net", &[ip("203.0.113.5")]));
+        assert!(!plain_http_ok("mini.tail1.ts.net", &[ip("100.100.1.2"), ip("203.0.113.5")]));
+        assert!(!plain_http_ok("mini.tail1.ts.net", &[]));
         if std::env::var_os("REKCOD_INSECURE").is_none() {
             for bad in ["10.0.0.5:7700", "192.168.1.9:7700", "203.0.113.1:7700", "100.200.0.1:7700"] {
                 assert!(check_plain_http(bad, "x").is_err(), "{bad}");

@@ -313,9 +313,10 @@ pub struct Options {
 }
 
 /// `.git` entries under a project shared live, keyed by path from the project: kind (`f`,
-/// `d`, `l`) and, for a link, its target. Git on the Mac runs what a `.git` names (hooks,
-/// `core.fsmonitor`), from a worktree's or submodule's `.git` file as much as a directory.
-pub type GitEntries = std::collections::BTreeMap<PathBuf, (char, Option<PathBuf>)>;
+/// `d`, `l`), inode and, for a link, its target. Git on the Mac runs what a `.git` names
+/// (hooks, `core.fsmonitor`), from a worktree's or submodule's `.git` file as much as a
+/// directory. The inode catches one swapped for another of the same kind.
+pub type GitEntries = std::collections::BTreeMap<PathBuf, (char, u64, Option<PathBuf>)>;
 
 /// Every `.git` under `project`, under any spelling the Mac's filesystem takes for it, not
 /// entering one or a link. `skip` names directories at the root the container sees as
@@ -335,7 +336,8 @@ pub fn git_entries(project: &Path, skip: &[&str]) -> GitEntries {
                     'f'
                 };
                 let target = t.is_symlink().then(|| std::fs::read_link(base.join(&r)).ok()).flatten();
-                out.insert(r, (kind, target));
+                let ino = std::fs::symlink_metadata(base.join(&r)).map(|m| std::os::unix::fs::MetadataExt::ino(&m)).unwrap_or(0);
+                out.insert(r, (kind, ino, target));
             } else if t.is_dir() && !(rel.as_os_str().is_empty() && skip.iter().any(|s| name == *s)) {
                 walk(base, &r, skip, out);
             }
@@ -351,12 +353,12 @@ pub fn git_entries(project: &Path, skip: &[&str]) -> GitEntries {
 pub fn git_binds(project: &Path, git: &GitEntries) -> Vec<String> {
     let p = project.to_string_lossy();
     git.iter()
-        .filter(|(_, (k, _))| *k != 'l')
+        .filter(|(_, (k, ..))| *k != 'l')
         .flat_map(|(r, _)| ["-v".into(), format!("{p}/{}:{p}/{}:ro", r.display(), r.display())])
         .collect()
 }
 
-/// `.git` entries in `after` that weren't in `before`, or are a different kind or link now.
+/// `.git` entries in `after` that weren't in `before`, or are another entry or link now.
 pub fn new_git_entries(before: &GitEntries, after: &GitEntries) -> Vec<PathBuf> {
     after.iter().filter(|(r, v)| before.get(*r) != Some(v)).map(|(r, _)| r.clone()).collect()
 }
@@ -715,8 +717,11 @@ mod tests {
         std::fs::create_dir_all(dir.join("new/.git")).unwrap();
         std::fs::remove_dir_all(dir.join("sub/vendor/.git")).unwrap();
         std::fs::write(dir.join("sub/vendor/.git"), "gitdir: /tmp/evil").unwrap();
+        // So is one swapped for another of the same kind.
+        std::fs::remove_file(dir.join("sub/.git")).unwrap();
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
         let made = new_git_entries(&git, &git_entries(&dir, &["node_modules"]));
-        assert_eq!(made, vec![PathBuf::from("new/.git"), PathBuf::from("sub/vendor/.git")]);
+        assert_eq!(made, vec![PathBuf::from("new/.git"), PathBuf::from("sub/.git"), PathBuf::from("sub/vendor/.git")]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

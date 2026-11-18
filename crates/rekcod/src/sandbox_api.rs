@@ -704,8 +704,13 @@ pub(crate) fn handle(paths: &Paths, policy: &Policy, stream: impl Read + Write +
         return respond(r.get_mut(), 413, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes());
     }
     let mut w = r.into_inner();
-    let body: Option<Value> =
-        if req.body.is_empty() { Some(json!({})) } else { serde_json::from_slice(&req.body).ok().filter(Value::is_object) };
+    // `null` is what some clients send for no arguments.
+    let body: Option<Value> = match serde_json::from_slice::<Value>(&req.body) {
+        _ if req.body.is_empty() => Some(json!({})),
+        Ok(Value::Null) => Some(json!({})),
+        Ok(v) => Some(v).filter(Value::is_object),
+        Err(_) => None,
+    };
     // Node-only routes don't exist on `sandbox serve`.
     let found = route(&req.method, &req.path, &req.query, body.as_ref().unwrap_or(&json!({})))
         .filter(|(name, _)| policy.node || !NODE_ONLY.contains(name));
@@ -1317,6 +1322,7 @@ mod tests {
             assert_eq!(code, 400, "{path} {body}: {text}");
         }
         assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "old");
+        assert_eq!(http(&paths, &pol, "GET", &format!("/sandboxes/{}", sb.id), "null").0, 200);
         assert!(num(&json!({"t": "5"}), "t").unwrap() == Some(5) && num(&json!({"t": "-5"}), "t").is_err());
         std::fs::remove_dir_all(base).unwrap();
     }

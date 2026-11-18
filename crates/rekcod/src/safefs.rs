@@ -92,6 +92,14 @@ fn stat_at(fd: RawFd, name: &OsStr) -> Option<libc::stat> {
     (unsafe { libc::fstatat(fd, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } == 0).then_some(st)
 }
 
+/// Whether `name` is one [`temp_name`] makes: `.rekcod-<pid>-<n>-`, then the file's name.
+pub fn is_temp(name: &OsStr) -> bool {
+    let Some(rest) = name.as_bytes().strip_prefix(b".rekcod-") else { return false };
+    let mut parts = rest.splitn(3, |b| *b == b'-');
+    let digits = |p: Option<&[u8]>| p.is_some_and(|p| !p.is_empty() && p.iter().all(u8::is_ascii_digit));
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_some()
+}
+
 /// A name beside `name` for a file being written, unique in this process.
 fn temp_name(name: &OsStr) -> OsString {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -257,7 +265,11 @@ impl Dir {
             if unsafe { libc::fchmod(out.as_raw_fd(), mode as libc::mode_t) } != 0 {
                 return Err(last_err("chmod", rel.as_os_str()));
             }
-            out.sync_all()?;
+            // fsync, not sync_all's F_FULLFSYNC: rename is what keeps a kill from leaving half a
+            // file, and a full flush per file makes applying thousands of them crawl.
+            if unsafe { libc::fsync(out.as_raw_fd()) } != 0 {
+                return Err(last_err("fsync", rel.as_os_str()));
+            }
             self.rename_over(&dir, &tmp, &name, rel)
         })();
         if written.is_err() {
@@ -516,6 +528,7 @@ mod tests {
         assert!(d.write_from(Path::new("f"), &mut Fails(false), 0o644).is_err());
         assert_eq!(std::fs::read_to_string(base.join("f")).unwrap(), "old bytes");
         assert_eq!(std::fs::read_dir(&base).unwrap().count(), 1);
+        assert!(is_temp(&temp_name(OsStr::new("f"))) && !is_temp(OsStr::new(".rekcod-x-1-f")) && !is_temp(OsStr::new("f")));
         d.write_from(Path::new("f"), &mut &b"new"[..], 0o600).unwrap();
         assert_eq!(std::fs::read_to_string(base.join("f")).unwrap(), "new");
         assert_eq!(std::fs::metadata(base.join("f")).unwrap().permissions().mode() & 0o777, 0o600);

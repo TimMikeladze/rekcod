@@ -723,7 +723,8 @@ pub fn exec(paths: &Paths, id: &str, o: ExecOptions, cmd: &[String]) -> Result<i
     let cwd = o.workdir.clone().unwrap_or_else(|| s.meta.project.to_string_lossy().into());
     log_exec(&s, cmd, &cwd, code, t0.elapsed().as_millis());
     s.touch();
-    Ok(if s.warn_git() && code == 0 { 1 } else { code })
+    s.warn_git();
+    Ok(code)
 }
 
 /// Runs `c`, killing it after `timeout` seconds (exit 124, like `timeout`).
@@ -772,7 +773,8 @@ pub fn shell(paths: &Paths, id: &str) -> Result<i32> {
     let _busy = s.busy();
     let code = c.status().context("run the shell")?.code().unwrap_or(1);
     s.touch();
-    Ok(if s.warn_git() && code == 0 { 1 } else { code })
+    s.warn_git();
+    Ok(code)
 }
 
 /// `ID:/path` becomes the workspace container's path; anything else is a Mac path.
@@ -807,6 +809,11 @@ pub fn cp(paths: &Paths, src: &str, dst: &str) -> Result<()> {
 /// Mac's files against what the parent copied, not guess from times.
 fn clone_workspace(parent: &Sandbox, child: &Path) -> Result<()> {
     if parent.meta.mode != "copy" {
+        // A --mount fork shares the same project: it warns about the same new .git entries.
+        let git = parent.paths.home.join("git.json");
+        if git.exists() {
+            std::fs::copy(git, child.join("git.json"))?;
+        }
         return Ok(());
     }
     clonefile(&parent.ws(), &child.join("ws"))?;
@@ -893,7 +900,8 @@ fn walk(base: &Path, project: &Dir) -> Vec<(PathBuf, char)> {
         let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
         for e in rd.flatten() {
             let name = e.file_name();
-            if is_git(&name) {
+            // A `.git`, or a file a killed apply was writing.
+            if is_git(&name) || crate::safefs::is_temp(&name) {
                 continue;
             }
             let r = rel.join(&name);
@@ -1799,8 +1807,9 @@ pub fn prune(paths: &Paths, older_than: u64, removed: &mut dyn FnMut(&str)) -> R
     };
     let cutoff = now().saturating_sub(older_than);
     for s in all(paths) {
-        let used = secs(&s.paths.home.join("run/last-used")).unwrap_or(0).max(s.meta.created);
-        if s.running() || used >= cutoff || s.paths.home.join(crate::fleet::FLEET_MARKER).exists() {
+        let used = ["run/last-used", "log.jsonl"].iter().filter_map(|f| secs(&s.paths.home.join(f))).max().unwrap_or(0).max(s.meta.created);
+        let fleet = [crate::fleet::FLEET_MARKER, crate::fleet::JOB_MARKER].iter().any(|m| s.paths.home.join(m).exists());
+        if s.running() || used >= cutoff || fleet {
             continue;
         }
         remove(&s)?;
@@ -2120,6 +2129,20 @@ mod tests {
         );
         assert!(p.contains("Binary files /dev/null and b/bin differ"), "{p}");
         assert!(!p.contains("same"), "{p}");
+        // `git apply` takes it, for remote users told to apply the patch themselves.
+        std::fs::remove_file(ws.join("bin")).unwrap();
+        std::fs::set_permissions(ws.join("same"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let p = patch(&paths, &m.id).unwrap().patch;
+        let out = Command::new("git")
+            .args(["apply", "--check", "-"])
+            .current_dir(&project)
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        out.stdin.as_ref().unwrap().write_all(p.as_bytes()).unwrap();
+        let out = out.wait_with_output().unwrap();
+        assert!(out.status.success(), "{}\n{p}", String::from_utf8_lossy(&out.stderr));
     }
 
     #[test]
@@ -2343,6 +2366,28 @@ mod tests {
         prune(&paths, 3600, &mut |id| gone.push(id.to_string())).unwrap();
         assert_eq!(gone, vec!["zzzzzzzz".to_string()]);
         assert!(find(&paths, &fresh.id).is_ok() && find(&paths, &fleet.id).is_ok());
+    }
+
+    #[test]
+    fn links_and_leftovers_apply_cleanly() {
+        let base = tmp("links-at-copy");
+        let project = base.join("p");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("f"), "f").unwrap();
+        std::fs::write(project.join("g"), "g").unwrap();
+        symlink("f", project.join("l")).unwrap();
+        let paths = Paths { home: base.join("home") };
+        let m = fake(&paths, &project, |_| {});
+        let ws = root(&paths).join(&m.id).join("ws");
+        // A link the project had, retargeted in the sandbox: the clone's manifest entry for it
+        // must match the Mac's, or this is a conflict.
+        std::fs::remove_file(ws.join("l")).unwrap();
+        symlink("g", ws.join("l")).unwrap();
+        // What a killed apply leaves in the project is neither shown nor deleted.
+        std::fs::write(project.join(".rekcod-123-0-f"), "half").unwrap();
+        assert_eq!(paths_of(&apply(&paths, &m.id, false, None).unwrap()), vec![('M', "l")]);
+        assert_eq!(std::fs::read_link(project.join("l")).unwrap(), Path::new("g"));
+        assert!(project.join(".rekcod-123-0-f").exists());
     }
 
     #[test]

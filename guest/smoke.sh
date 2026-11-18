@@ -78,7 +78,7 @@ timeout 900 qemu-system-aarch64 -nodefaults -display none -no-reboot \
   -device virtio-serial-pci -chardev "file,id=con,path=$W/console.log" -device virtconsole,chardev=con \
   -drive "if=none,id=root,format=raw,file=$W/root.img" -device virtio-blk-pci,drive=root \
   -drive "if=none,id=data,format=raw,file=$W/data.img" -device virtio-blk-pci,drive=data \
-  -netdev user,id=net -device virtio-net-pci,netdev=net \
+  -netdev user,id=net -device virtio-net-pci,netdev=net,romfile= \
   -device virtio-rng-pci || st=$?
 [ "$st" != 124 ] || log "QEMU still running after 900 s"
 

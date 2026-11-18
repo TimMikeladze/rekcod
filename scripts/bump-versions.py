@@ -90,16 +90,19 @@ def dearmor(text):
 
 
 def gpgv(key, signed, sig=None):
-    """gpgv-verified content: `signed` is a clearsigned text, or the data for detached `sig`.
+    """Verifies `signed`: a clearsigned text, or the data for the detached `sig`.
 
-    Returns what gpgv says was signed, so nothing outside the signature is ever read.
+    For a clearsigned text, returns what gpgv says was signed, so nothing outside the
+    signature is ever read.
     """
     with tempfile.TemporaryDirectory() as d:
         ring, data = Path(d, "ring.gpg"), Path(d, "data")
         ring.write_bytes(dearmor((KEYS / key).read_text()))
         data.write_bytes(signed if isinstance(signed, bytes) else signed.encode())
-        args = ["gpgv", "--homedir", d, "--keyring", str(ring), "--output", "-"]
-        if sig is not None:
+        args = ["gpgv", "--homedir", d, "--keyring", str(ring)]
+        if sig is None:
+            args += ["--output", "-"]
+        else:
             Path(d, "sig").write_bytes(sig)
             args.append(str(Path(d, "sig")))
         r = subprocess.run(args + [str(data)], capture_output=True)

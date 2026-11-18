@@ -11,10 +11,27 @@ permissions: {}
 # token and the provenance permissions. .github/scripts/check_release_jobs.py (ci.yml)
 # fails if a job here mixes a build tool with the signing secrets.
 jobs:
+  # Before anything else: a tag on a commit that isn't on main, or that doesn't match
+  # Cargo.toml's version, publishes nothing.
+  tag:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          # The whole history, for the ancestry check.
+          fetch-depth: 0
+      - run: |
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "$GITHUB_REF_NAME isn't on main"; exit 1; }
+          test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
+
   # fmt, clippy, host and agent tests, cargo-deny, dashboard checks, the guest build and
   # its QEMU boot. Nothing is published unless all of it passes. Without caches: the
   # shipped guest holds only what this run compiled.
   ci:
+    needs: tag
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
@@ -46,12 +63,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-          # The whole history, for the ancestry check below.
-          fetch-depth: 0
-      - name: check the tag is on main and matches Cargo.toml
-        run: |
-          git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo "$GITHUB_REF_NAME isn't on main"; exit 1; }
-          test "v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)" = "$GITHUB_REF_NAME"
       - uses: ./.github/actions/rust
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:

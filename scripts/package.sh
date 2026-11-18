@@ -55,6 +55,11 @@ build() {
   cp -R LICENSES "$rel/stage/LICENSES"
 
   guest_tar="rekcod-guest-$gv.tar.gz"
+  # NOTICE points at these two for the GPL parts' source; a guest built before build.sh
+  # wrote them can't be released.
+  for f in Image root.img VERSION config packages.txt; do
+    [[ -f $guest/$f ]] || { echo "$0: $guest/$f is missing; rebuild the guest (guest/build.sh)" >&2; exit 1; }
+  done
   mkdir -p "$rel/guest-notices"
   python3 scripts/third-party-notices.py crates rekcod-agent aarch64-unknown-linux-musl >"$rel/guest-notices/THIRD-PARTY-NOTICES.txt"
   # COPYFILE_DISABLE: no macOS ._ metadata files in the archive.

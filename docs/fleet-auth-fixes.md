@@ -10,10 +10,11 @@ Fixes for the fleet-auth findings in `docs/audit-2026-11-18.md` that land on the
   the node refuses it again before it makes the job's sandbox. Fleet jobs also run the
   docker CLI with a cleared environment (`ExecOptions::clean_env`): PATH, HOME and the
   variables rekcod set on the command itself. Local `sandbox exec --secret` keeps inheriting.
-- FA-10, FD-21: `docker run` for an app instance gets `-e KEY` on argv and the value in the
-  docker client's own environment, so multi-line values keep working. Keys the docker
-  client reads itself (PATH, HOME, `DOCKER_*`) go through a 0600 `--env-file` that is
-  removed after the call. The alert webhook URL goes to curl on stdin (`-K -`).
+- FA-10, FD-21: `docker run` for an app instance reads values from a 0600 `--env-file` in
+  the sandbox home, removed after the call. A value with a line break (a PEM key) can't go in
+  an env file; it goes in the docker client's environment with `-e KEY`, except for names
+  the client or the macOS loader act on (PATH, `DOCKER_*`, `DYLD_*`, `LD_*`, ...), which are
+  refused. The alert webhook URL goes to curl on stdin (`-K -`).
 
 ## Tokens, schedules, namespaces
 

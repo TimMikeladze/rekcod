@@ -778,15 +778,16 @@ pub fn deploy_instance(paths: &Paths, a: &Value) -> Result<Value> {
 }
 
 /// Puts an app's env on `docker run` without its values on argv, where `ps` would show app
-/// secrets and bucket keys to every account on the node: `-e KEY` with the value in the
-/// docker client's environment. Variables the docker client reads itself (PATH, HOME,
-/// `DOCKER_*`, proxies) go through a 0600 `--env-file` at `file` instead, which the caller
-/// removes; those can't hold a newline.
+/// secrets and bucket keys to every account on the node. Values go in a 0600 `--env-file`
+/// at `file`, which the caller removes. An env file can't hold a line break, so a multi-line
+/// value (a PEM key) goes in the docker client's own environment with `-e KEY`; names the
+/// client or the dynamic loader would act on (PATH, `DOCKER_*`, `DYLD_*`, ...) can't take
+/// that path.
 fn pass_env(d: &mut Command, env: &serde_json::Map<String, Value>, file: &Path) -> Result<()> {
-    let client = |k: &str| {
+    let host_reads = |k: &str| {
         let u = k.to_ascii_uppercase();
-        ["PATH", "HOME", "TMPDIR", "SSH_AUTH_SOCK"].contains(&u.as_str())
-            || ["DOCKER_", "BUILDKIT_", "BUILDX_"].iter().any(|p| u.starts_with(p))
+        ["PATH", "HOME", "TMPDIR", "SSH_AUTH_SOCK", "TERM"].contains(&u.as_str())
+            || ["DOCKER_", "BUILDKIT_", "BUILDX_", "DYLD_", "LD_", "MALLOC", "GIT_"].iter().any(|p| u.starts_with(p))
             || u.ends_with("_PROXY")
     };
     let mut lines = String::new();
@@ -799,11 +800,10 @@ fn pass_env(d: &mut Command, env: &serde_json::Map<String, Value>, file: &Path) 
             Value::Null => String::new(),
             v => v.to_string(),
         };
-        if client(k) {
-            if v.contains(['\n', '\r']) {
-                bail!("env {k} can't hold a line break");
-            }
+        if !v.contains(['\n', '\r']) {
             lines.push_str(&format!("{k}={v}\n"));
+        } else if host_reads(k) {
+            bail!("env {k} can't hold a line break");
         } else {
             d.env(k, v).args(["-e", k]);
         }
@@ -1539,6 +1539,8 @@ struct Controller {
     edges: Mutex<HashMap<IpAddr, i64>>,
     /// Addresses nodes heartbeat from, and when: they get reserved connection slots.
     node_addrs: Mutex<HashMap<IpAddr, i64>>,
+    /// When each address last got an audit row for a bad token.
+    bad_tokens: Mutex<HashMap<IpAddr, i64>>,
     /// RustFS with root keys (`--storage`): app buckets, release images, backups.
     storage: Option<crate::s3::S3>,
     /// Edge client reports by minute: (minute, ip) -> (requests, rate-limited). Ten minutes kept.
@@ -1681,6 +1683,7 @@ impl Controller {
             key,
             edges: Default::default(),
             node_addrs: Default::default(),
+            bad_tokens: Default::default(),
             storage: None,
             clients: Default::default(),
             auto_approve: true,
@@ -1766,12 +1769,16 @@ impl Controller {
     /// A request with a token that matched nothing: one row per address per minute, so
     /// guessing leaves a trace without filling the table.
     fn audit_bad_token(&self, peer: Option<IpAddr>, path: &str) {
-        let ip = peer.map_or("-".to_string(), |p| p.to_string());
-        let _ = self.db().execute(
-            "insert into audit (ts, who, action, target, ok, ns) select ?1, ?2, 'bad token', ?3, 0, '-'
-               where not exists(select 1 from audit where action = 'bad token' and who = ?2 and ts > ?1 - 60)",
-            &[&now(), &ip, &path],
-        );
+        let ip = peer.unwrap_or(IpAddr::from([0, 0, 0, 0]));
+        {
+            let mut last = self.bad_tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            if last.get(&ip).is_some_and(|t| *t > now() - 60) {
+                return;
+            }
+            last.retain(|_, t| *t > now() - 60);
+            last.insert(ip, now());
+        }
+        self.audit("-", &ip.to_string(), "bad token", path, false);
     }
 
     fn audit(&self, ns: &str, who: &str, action: &str, target: &str, ok: bool) {
@@ -5901,7 +5908,10 @@ fn github_webhook(c: &Arc<Controller>, ns: &str, app_name: &str, req: &crate::sa
     // One answer for an unknown app and a bad signature: the hook URL names apps.
     let refuse = || anyhow!("bad signature");
     let key = app_key(ns, app_name);
-    let row = c.db().query_opt("select webhook_secret from apps where name = ?1 and preview_of is null and destroying is null", &[&key])?;
+    let row = c.db().query_opt(
+        "select webhook_secret from apps where name = ?1 and ns = ?2 and preview_of is null and destroying is null",
+        &[&key, &ns],
+    )?;
     let sealed: String = row.and_then(|r| r.get::<Option<String>>(0)).ok_or_else(refuse)?;
     let secret = c.open_sealed(ns, &sealed)?;
     let sig = req.header("x-hub-signature-256").unwrap_or("");
@@ -7062,25 +7072,25 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("rekcod-pass-env-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("run-env");
-        let env = json!({"API_KEY": "s3cr3t\n-----END KEY-----", "AWS_SECRET_ACCESS_KEY": "wJalr", "PATH": "/app/bin", "N": 5});
+        let env = json!({"API_KEY": "s3cr3t", "PEM": "-----BEGIN-----\nabc\n-----END-----", "DYLD_INSERT_LIBRARIES": "/x.dylib", "N": 5});
         let mut d = Command::new("docker");
         d.arg("run");
         pass_env(&mut d, env.as_object().unwrap(), &file).unwrap();
         let argv: Vec<String> = d.get_args().map(|a| a.to_string_lossy().into()).collect();
-        for v in ["s3cr3t", "wJalr", "/app/bin"] {
+        for v in ["s3cr3t", "abc", "/x.dylib"] {
             assert!(!argv.iter().any(|a| a.contains(v)), "{v} on argv: {argv:?}");
         }
-        assert!(argv.windows(2).any(|w| w == ["-e", "API_KEY"]) && argv.windows(2).any(|w| w == ["-e", "N"]), "{argv:?}");
-        let set: HashMap<String, String> =
-            d.get_envs().filter_map(|(k, v)| Some((k.to_string_lossy().into(), v?.to_string_lossy().into()))).collect();
-        assert_eq!((set["API_KEY"].as_str(), set["N"].as_str()), ("s3cr3t\n-----END KEY-----", "5"));
-        assert!(!set.contains_key("PATH"), "the docker client keeps its own PATH");
+        assert!(argv.windows(2).any(|w| w == ["-e", "PEM"]), "{argv:?}");
+        // Only the multi-line value is in the docker client's environment.
+        let set: Vec<String> = d.get_envs().map(|(k, _)| k.to_string_lossy().into()).collect();
+        assert_eq!(set, ["PEM"]);
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
-        assert_eq!(std::fs::read_to_string(&file).unwrap(), "PATH=/app/bin\n");
-        let bad = json!({"DOCKER_HOST": "tcp://x\nEVIL=1"});
-        assert!(pass_env(&mut Command::new("docker"), bad.as_object().unwrap(), &file).is_err());
-        assert!(pass_env(&mut Command::new("docker"), json!({"A B": "x"}).as_object().unwrap(), &file).is_err());
+        let lines = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(lines, "API_KEY=s3cr3t\nDYLD_INSERT_LIBRARIES=/x.dylib\nN=5\n");
+        for bad in [json!({"DYLD_INSERT_LIBRARIES": "/x.dylib\n"}), json!({"DOCKER_HOST": "tcp://x\nEVIL=1"}), json!({"A B": "x"})] {
+            assert!(pass_env(&mut Command::new("docker"), bad.as_object().unwrap(), &file).is_err(), "{bad}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -7309,6 +7319,13 @@ mod tests {
             let e = github_webhook(&c, "default", path_app, &hook_request(secret, &json!({}), Some("d"))).unwrap_err().to_string();
             assert_eq!(e, "bad signature", "{path_app}");
         }
+        // Another namespace's app named by its row key from `default`.
+        c.db().execute("insert into namespaces (name, created, salt) values ('team', 0, x'01')", &[]).unwrap();
+        upsert_app(&c, "team", &Caller::system("t"), &json!({"name": "web", "git": {"url": "https://github.com/t/web"}}), None).unwrap();
+        let sealed = c.seal("team", "team-secret").unwrap();
+        c.db().execute("update apps set webhook_secret = ?1 where name = 'web--team'", &[&sealed]).unwrap();
+        let e = github_webhook(&c, "default", "web--team", &hook_request("team-secret", &json!({}), Some("d"))).unwrap_err();
+        assert_eq!(e.to_string(), "bad signature");
         // foo's own secret, naming bar's repository.
         let mut ev = pr_event("opened", 5, "d5");
         let mut body: Value = serde_json::from_slice(&ev.body).unwrap();

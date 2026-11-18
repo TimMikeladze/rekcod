@@ -1,4 +1,4 @@
-//! Another Mac's rekcod as the docker engine, over SSH (docs/remote-docker.md).
+//! Another Mac's rekcod as the docker engine, over SSH.
 //!
 //! A host is the docker context `rekcod-<name>` with `host=ssh://<dest>`; nothing else is stored.
 
@@ -25,7 +25,10 @@ d=$(command -v docker)
 [[ -n $d ]] || { echo nodocker; exit 4; }
 f=~/.zshenv
 touch $f
-sed -i '' '/^# >>> rekcod host/,/^# <<< rekcod host/d' $f
+# An unterminated block would make sed drop the rest of the file. sed -i can't edit a
+# symlink (dotfiles), so the result is written back through it.
+if grep -q '^# >>> rekcod host' $f && ! grep -q '^# <<< rekcod host' $f; then exit 5; fi
+sed '/^# >>> rekcod host/,/^# <<< rekcod host/d' $f > $f.rekcod && cat $f.rekcod > $f && rm -f $f.rekcod || exit 6
 cat >> $f <<EOF
 # >>> rekcod host (written by rekcod host add): rekcod and docker on PATH; docker over SSH reaches rekcod
 export PATH="\$HOME/.rekcod/bin:${d:h}:\$PATH"
@@ -230,7 +233,7 @@ pub struct Fleet {
 }
 
 /// SSH to `dest` must work without a prompt (docker's ssh can't answer one). When it
-/// only takes a password, rekcod's own key goes on it first (docs/ssh-keys.md).
+/// only takes a password, rekcod's own key goes on it first.
 fn check(paths: &Paths, name: &str, dest: &str) -> Result<()> {
     if name == "local" || name.is_empty() || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
         bail!("host name must be letters, digits, - or _ (and not `local`)");
@@ -252,7 +255,7 @@ fn check(paths: &Paths, name: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Provisions the server as a fleet (docs/server.md), adds it as remote NAME, then as a docker host.
+/// Provisions the server as a fleet, adds it as remote NAME, then as a docker host.
 pub fn add_server(paths: &Paths, name: &str, dest: &str, switch: bool, f: &Fleet) -> Result<()> {
     let dest = dest.strip_prefix("ssh://").unwrap_or(dest);
     check(paths, name, dest)?;
@@ -304,6 +307,10 @@ fn add_described(paths: &Paths, name: &str, dest: &str, switch: bool, descriptio
             stdout.trim().trim_start_matches("shell:")
         ),
         Some(4) => bail!("no docker CLI on {dest}; run `rekcod version` there once (it downloads one)"),
+        Some(5) => {
+            bail!("{dest}'s ~/.zshenv has a `# >>> rekcod host` line with no `# <<< rekcod host` after it; fix it there and run this again")
+        }
+        Some(6) => bail!("couldn't rewrite {dest}'s ~/.zshenv (is its disk full?)"),
         _ => bail!("setting up {dest} failed: {}", stdout.trim()),
     }
     let ctx = context(name);

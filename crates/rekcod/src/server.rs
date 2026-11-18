@@ -1,4 +1,4 @@
-//! This Mac as a server: a one-machine fleet that runs headless (docs/server.md).
+//! This Mac as a server: a one-machine fleet that runs headless.
 //!
 //! `rekcod server setup` runs on the server; `rekcod host add --server` runs it over SSH from
 //! your Mac and adds the remote it prints.
@@ -200,21 +200,39 @@ fn sudo(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// The `~/.zshenv` block `host add` writes, removed (the rest of the file stays).
-pub fn without_zshenv_block(s: &str) -> String {
-    let mut out = String::new();
+/// The `~/.zshenv` block `host add` writes, removed (the rest of the file stays). A start
+/// line with no end line after it is an error: everything below it would go.
+pub fn without_zshenv_block(s: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(s.len());
     let mut skipping = false;
-    for line in s.lines() {
-        if line.starts_with("# >>> rekcod host") {
+    for line in s.split_inclusive(|b| *b == b'\n') {
+        if !skipping && line.starts_with(b"# >>> rekcod host") {
             skipping = true;
-        } else if skipping && line.starts_with("# <<< rekcod host") {
+        } else if skipping && line.starts_with(b"# <<< rekcod host") {
             skipping = false;
         } else if !skipping {
-            out.push_str(line);
-            out.push('\n');
+            out.extend_from_slice(line);
         }
     }
-    out
+    if skipping {
+        bail!("its `# >>> rekcod host` line has no `# <<< rekcod host` after it; remove the block by hand");
+    }
+    Ok(out)
+}
+
+/// Replaces `path`'s contents through a temp file and a rename, so a crash can't leave a
+/// half-written shell startup file. A symlink (dotfiles) is written through and the mode kept.
+fn replace_file(path: &Path, data: &[u8]) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::fs::canonicalize(path)?;
+    let mode = std::fs::metadata(&path)?.permissions().mode();
+    let tmp = path.with_extension("rekcod-tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    std::fs::rename(&tmp, &path).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })?;
+    Ok(())
 }
 
 /// What `rekcod uninstall` undoes outside `~/.rekcod` on a Mac `server setup` or `host add`
@@ -224,12 +242,12 @@ pub fn undo_system(paths: &Paths) -> Vec<(String, Result<()>)> {
     let mut steps = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {
         let f = PathBuf::from(home).join(".zshenv");
-        if let Ok(s) = std::fs::read_to_string(&f)
-            && s.contains("# >>> rekcod host")
+        if let Ok(s) = std::fs::read(&f)
+            && s.windows(17).any(|w| w == b"# >>> rekcod host")
         {
             steps.push((
                 "remove the rekcod block from ~/.zshenv".to_string(),
-                std::fs::write(&f, without_zshenv_block(&s)).map_err(Into::into),
+                without_zshenv_block(&s).and_then(|next| replace_file(&f, &next)),
             ));
         }
     }
@@ -465,7 +483,7 @@ fn pick_net(addr: Option<&str>, lan: bool) -> Net {
             Net::Tailnet { ip, name }
         }
         None => {
-            eprintln!("rekcod: no Tailscale address up; the fleet goes on the LAN and is found over Bonjour (docs/lan-discovery.md)");
+            eprintln!("rekcod: no Tailscale address up; the fleet goes on the LAN and is found over Bonjour");
             Net::Lan
         }
     }
@@ -474,7 +492,7 @@ fn pick_net(addr: Option<&str>, lan: bool) -> Net {
 fn prepare_services(paths: &Paths, exe: &Path, no_power: bool) -> Result<bool> {
     let dry = std::env::var_os("REKCOD_NO_LAUNCHCTL").is_some();
     // LaunchDaemons start at boot with nobody logged in; they need root to install.
-    // Without it, LaunchAgents, which need a login (docs/server.md).
+    // Without it, LaunchAgents, which need a login.
     let daemons = !dry && crate::service::can_install_daemons();
     if daemons {
         // SAFETY: nothing else runs yet; the children `run` starts read it to install
@@ -1067,9 +1085,22 @@ mod tests {
 
     #[test]
     fn zshenv_block_removed_rest_kept() {
-        let s = "export A=1\n# >>> rekcod host (written by rekcod host add)\nexport PATH=x\n# <<< rekcod host\nexport B=2\n";
-        assert_eq!(without_zshenv_block(s), "export A=1\nexport B=2\n");
-        assert_eq!(without_zshenv_block("export A=1\n"), "export A=1\n");
+        let s = b"export A=1\n# >>> rekcod host (written by rekcod host add)\nexport PATH=x\n# <<< rekcod host\nexport B=2";
+        assert_eq!(without_zshenv_block(s).unwrap(), b"export A=1\nexport B=2");
+        assert_eq!(without_zshenv_block(b"export A=1\n").unwrap(), b"export A=1\n");
+        assert!(without_zshenv_block(b"# >>> rekcod host\nexport PATH=x\nexport MINE=1\n").is_err());
+        // Through a symlink, with the file's mode.
+        let dir = std::env::temp_dir().join(format!("rekcod-zshenv-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (real, link) = (dir.join("dotfiles-zshenv"), dir.join(".zshenv"));
+        std::fs::write(&real, s).unwrap();
+        std::fs::set_permissions(&real, std::os::unix::fs::PermissionsExt::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        replace_file(&link, &without_zshenv_block(s).unwrap()).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(&real).unwrap(), b"export A=1\nexport B=2");
+        assert_eq!(std::os::unix::fs::PermissionsExt::mode(&std::fs::metadata(&real).unwrap().permissions()) & 0o777, 0o640);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

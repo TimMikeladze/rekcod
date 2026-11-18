@@ -51,7 +51,7 @@ fn pid_is_rekcod(pid: i32) -> bool {
 pub struct Saved {
     pub cpus: Option<usize>,
     pub memory_gib: Option<u64>,
-    /// `rekcod start --base-memory` (docs/elastic-memory.md); None is the default split.
+    /// `rekcod start --base-memory`; None is the default split.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_memory_gib: Option<u64>,
     pub disk_gib: Option<u64>,
@@ -216,14 +216,14 @@ fn tail(path: &std::path::Path, lines: usize) -> String {
 pub struct BootOptions {
     pub cpus: Option<usize>,
     pub memory_gib: Option<u64>,
-    /// RAM part of `memory_gib`; None is the default split (docs/elastic-memory.md).
+    /// RAM part of `memory_gib`; None is the default split.
     pub base_memory_gib: Option<u64>,
     pub disk_gib: u64,
-    /// Sandbox VM: share only this directory (docs/sandbox.md).
+    /// Sandbox VM: share only this directory.
     pub project: Option<PathBuf>,
     /// Guest image to boot (the sandbox uses the main install's).
     pub guest_dir: Option<PathBuf>,
-    /// Agent sandbox: share this copy as the project (docs/agent-sandboxes.md).
+    /// Agent sandbox: share this copy as the project.
     pub workspace: Option<PathBuf>,
     /// Agent sandbox: egress allowlist, comma-separated.
     pub allow: Option<String>,

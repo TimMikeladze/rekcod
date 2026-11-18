@@ -3,7 +3,7 @@
 //!
 //! Each is a LaunchAgent (`~/Library/LaunchAgents`, starts at login) or, on a server, a
 //! LaunchDaemon (`/Library/LaunchDaemons`, starts at boot with nobody logged in) that runs
-//! as the same user (docs/server.md). A name that already has a daemon stays one;
+//! as the same user. A name that already has a daemon stays one;
 //! `REKCOD_LAUNCHD=system` makes new ones daemons. Daemons need root to install, so this
 //! runs `launchctl` and the plist copy through sudo unless it is root.
 

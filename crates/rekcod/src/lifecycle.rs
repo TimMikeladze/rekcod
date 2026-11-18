@@ -1,4 +1,4 @@
-//! Upgrading, removing and diagnosing rekcod (docs/install-upgrade.md).
+//! Upgrading, removing and diagnosing rekcod.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};

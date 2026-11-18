@@ -1,4 +1,4 @@
-//! macOS guests (docs/platform.md, track 4): base images and macOS sandboxes.
+//! macOS guests: base images and macOS sandboxes.
 //!
 //! Apple's licence allows two macOS VMs per Mac, for development and testing, and
 //! Virtualization.framework refuses a third. A base image is installed from Apple's restore

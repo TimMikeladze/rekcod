@@ -374,8 +374,12 @@ fn read_line_capped(r: &mut impl BufRead, out: &mut String) -> Result<usize> {
 pub(crate) fn read_head(r: &mut impl BufRead) -> Result<Request> {
     let mut line = String::new();
     read_line_capped(r, &mut line)?;
-    let mut parts = line.split_whitespace();
-    let (method, target) = (parts.next().unwrap_or("").to_string(), parts.next().unwrap_or("/").to_string());
+    // Exactly METHOD TARGET VERSION: a space in the target would otherwise cut it short
+    // (`DELETE /tokens/alice smith` acting on `alice`).
+    let (method, target) = match line.split_whitespace().collect::<Vec<_>>()[..] {
+        [m, t, v] if v.starts_with("HTTP/") => (m.to_string(), t.to_string()),
+        _ => bail!("bad request line"),
+    };
     let mut headers = Vec::new();
     loop {
         let mut h = String::new();

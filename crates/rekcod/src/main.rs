@@ -1429,9 +1429,13 @@ fn main() {
         Cmd::Storage(StorageCmd::Up) => storage::up(&paths),
         Cmd::Storage(StorageCmd::Down) => storage::down(&paths),
         Cmd::Storage(StorageCmd::Env) => storage::env(&paths),
-        Cmd::Controller(ControllerCmd::Limit { name, max_sandboxes, remote }) => {
-            remote_call(&paths, &remote, "POST", &format!("/tokens/{name}"), &serde_json::json!({"max_sandboxes": max_sandboxes}))
-        }
+        Cmd::Controller(ControllerCmd::Limit { name, max_sandboxes, remote }) => remote_call(
+            &paths,
+            &remote,
+            "POST",
+            &format!("/tokens/{}", fleet::percent_encode(&name)),
+            &serde_json::json!({"max_sandboxes": max_sandboxes}),
+        ),
         Cmd::Controller(ControllerCmd::Token { name, max_sandboxes, admin, ns, role, edge, expires, remote }) => remote_call(
             &paths,
             &remote,
@@ -1441,7 +1445,8 @@ fn main() {
                                 "edge": edge, "expires_secs": expires}),
         ),
         Cmd::Controller(ControllerCmd::Revoke { name, remote }) => {
-            remote_call(&paths, &remote, "DELETE", &format!("/tokens/{name}"), &serde_json::json!({}))
+            // The name in the body: it reaches names from before they were checked, too.
+            remote_call(&paths, &remote, "DELETE", "/tokens", &serde_json::json!({"name": name}))
         }
         Cmd::Controller(ControllerCmd::Ca) => {
             let pem = std::fs::read_to_string(paths.home.join("controller/ca.pem"))
@@ -1580,9 +1585,13 @@ fn run_ns(paths: &paths::Paths, remote: &Option<String>, c: NsCmd) -> anyhow::Re
         NsCmd::Member(NsMember::Add { ns, who, role }) => {
             remote_call(paths, remote, "POST", &format!("/namespaces/{ns}/members"), &json!({"who": who, "role": role}))
         }
-        NsCmd::Member(NsMember::Rm { ns, who }) => {
-            remote_call(paths, remote, "DELETE", &format!("/namespaces/{ns}/members/{who}"), &serde_json::Value::Null)
-        }
+        NsCmd::Member(NsMember::Rm { ns, who }) => remote_call(
+            paths,
+            remote,
+            "DELETE",
+            &format!("/namespaces/{ns}/members/{}", fleet::percent_encode(&who)),
+            &serde_json::Value::Null,
+        ),
         NsCmd::Use { name } => fleet::remote_use_ns(paths, remote.as_deref().filter(|r| !r.is_empty()), &name),
         NsCmd::Rm { name, force } => remote_call(paths, remote, "DELETE", &format!("/namespaces/{name}"), &json!({"force": force})),
     }

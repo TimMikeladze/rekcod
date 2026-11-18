@@ -2302,6 +2302,24 @@ fn proxy(node_url: &str, secret: &str, req: &crate::sandbox_api::Request, path: 
     Ok(())
 }
 
+/// The path's segments, percent-decoded (`+` stays itself). None when one decodes to
+/// something with `/` or a control character in it.
+fn path_segments(path: &str) -> Option<Vec<String>> {
+    path.trim_matches('/')
+        .split('/')
+        .map(|s| crate::sandbox_api::percent_decode(&s.replace('+', "%2B")))
+        .map(|s| (!s.contains('/') && !s.chars().any(char::is_control)).then_some(s))
+        .collect()
+}
+
+/// Token and member names: 1 to 64 of letters, digits, `.`, `_`, `@` and `-`, not
+/// starting with `-`. They go in paths and in the audit log as they are.
+fn valid_token_name(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && !s.starts_with('-')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'@' | b'-'))
+}
+
 fn json_reply(w: &mut impl Write, r: Result<Value>) -> Result<()> {
     match r {
         Ok(v) => respond(w, 200, "application/json", v.to_string().as_bytes()),
@@ -2314,7 +2332,15 @@ fn json_reply(w: &mut impl Write, r: Result<Value>) -> Result<()> {
 
 fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Read + Write) -> Result<()> {
     let mut r = BufReader::new(stream);
-    let mut req = crate::sandbox_api::read_head(&mut r)?;
+    let mut req = match crate::sandbox_api::read_head(&mut r) {
+        Ok(req) => req,
+        Err(e) => return respond(r.get_mut(), 400, "application/json", json!({"error": format!("{e:#}")}).to_string().as_bytes()),
+    };
+    // Segments are percent-decoded once, here; one that decodes to `/` would name another path.
+    let Some(all) = path_segments(&req.path) else {
+        return respond(r.get_mut(), 400, "application/json", br#"{"error":"bad path"}"#);
+    };
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
     // Requests that need a user token are checked before their body is read, so nobody
     // without one can make the controller buffer a large body. Registration, heartbeats
     // and webhooks prove themselves in the body; theirs is capped lower.
@@ -2330,10 +2356,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             format!("this controller runs rekcod {}, you have {v}; upgrade the older one (`rekcod upgrade`)", env!("CARGO_PKG_VERSION"));
         return respond(r.get_mut(), 400, "application/json", json!({"error": msg}).to_string().as_bytes());
     }
-    let open = matches!(
-        req.path.trim_matches('/').split('/').collect::<Vec<_>>().as_slice(),
-        ["nodes", "register"] | ["nodes", _, "heartbeat"] | ["webhooks", "github"]
-    );
+    let open = matches!(all.as_slice(), ["nodes", "register"] | ["nodes", _, "heartbeat"] | ["webhooks", "github"]);
     if !open {
         let bearer = req.header("authorization").and_then(|v| v.strip_prefix("Bearer ")).unwrap_or("");
         if c.caller(bearer)?.is_none() {
@@ -2346,7 +2369,6 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
     }
     let mut w = r.into_inner();
     let body: Value = serde_json::from_slice(&req.body).unwrap_or(json!({}));
-    let all: Vec<&str> = req.path.trim_matches('/').split('/').collect();
     // `/ns/NS/apps/...`; the same paths without the prefix are the `default` namespace.
     let (ns, seg) = match all.as_slice() {
         ["ns", ns, rest @ ..] if !rest.is_empty() => (ns.to_string(), rest.to_vec()),
@@ -2625,6 +2647,9 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         }),
         ("POST", ["tokens"]) => admin_only().and_then(|_| {
             let (t, name) = (secret()?, body["name"].as_str().context("missing name")?.to_string());
+            if !valid_token_name(&name) {
+                bail!("token names are 1 to 64 letters, digits, . _ @ and -, not starting with -");
+            }
             let max = if body["max_sandboxes"].is_null() { 10 } else { token_cap(&body["max_sandboxes"])? };
             let admin = body["admin"].as_bool().unwrap_or(false);
             let edge = body["edge"].as_bool().unwrap_or(false);
@@ -2648,21 +2673,10 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             c.audit("-", &who.name, "token", &name, true);
             Ok(json!({"token": t, "name": name}))
         }),
-        // Every token with this name: they're one person's tokens.
-        ("DELETE", ["tokens", name]) => admin_only().and_then(|_| {
-            if *name == "admin" && !body["force"].as_bool().unwrap_or(false) {
-                bail!("that's the controller's own admin token; pass force to remove it");
-            }
-            let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let n = db.execute("delete from tokens where name = ?1", &[name])?;
-            if n == 0 {
-                bail!("no token named {name}");
-            }
-            db.execute("delete from members where who = ?1", &[name])?;
-            drop(db);
-            c.audit("-", &who.name, "token rm", name, true);
-            Ok(json!({"removed": name, "tokens": n}))
-        }),
+        // Every token with this name: they're one person's tokens. `DELETE /tokens` with the
+        // name in the body reaches names from before they were checked (`ci/deploy`).
+        ("DELETE", ["tokens", name]) => admin_only().and_then(|_| revoke(c, &who, name, &body)),
+        ("DELETE", ["tokens"]) => admin_only().and_then(|_| revoke(c, &who, body["name"].as_str().context("missing name")?, &body)),
         ("POST", ["tokens", name]) => admin_only().and_then(|_| {
             let max = token_cap(&body["max_sandboxes"])?;
             let n =
@@ -2786,7 +2800,8 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             let fork = m == "POST" && rest == ["fork"];
             let delete = m == "DELETE" && rest.is_empty();
             let need = if m == "GET" { Role::Viewer } else { Role::Member };
-            let node_path = format!("/{}", seg.join("/"));
+            // Re-encoded: the node sees the segments the controller authorized, no more.
+            let node_path = format!("/{}", seg.iter().map(|s| percent_encode(s)).collect::<Vec<_>>().join("/"));
             match c.sandbox_node(&ns, id, &who, need) {
                 Err(e) => Err(e),
                 Ok((url, sec, _)) if fork => (|| {
@@ -2834,6 +2849,22 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         return Ok(());
     }
     json_reply(&mut w, r)
+}
+
+/// `DELETE /tokens/NAME`: every token with that name and its memberships.
+fn revoke(c: &Arc<Controller>, who: &Caller, name: &str, body: &Value) -> Result<Value> {
+    if name == "admin" && !body["force"].as_bool().unwrap_or(false) {
+        bail!("that's the controller's own admin token; pass force to remove it");
+    }
+    let mut db = c.db();
+    let n = db.execute("delete from tokens where name = ?1", &[&name])?;
+    if n == 0 {
+        bail!("no token named {name}");
+    }
+    db.execute("delete from members where who = ?1", &[&name])?;
+    drop(db);
+    c.audit("-", &who.name, "token rm", name, true);
+    Ok(json!({"removed": name, "tokens": n}))
 }
 
 /// The fields a user may set on a remote sandbox. Everything else in the body (`dir`,
@@ -2981,6 +3012,9 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
                 bail!("everyone is in default");
             }
             let name = b["who"].as_str().context("missing who")?;
+            if !valid_token_name(name) {
+                bail!("no token named {name}");
+            }
             let role = Role::parse(b["role"].as_str().unwrap_or("member"))?;
             let mut db = c.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if db.query_opt("select 1 from tokens where name = ?1", &[&name])?.is_none() {
@@ -7060,6 +7094,34 @@ mod tests {
         c.db().execute("insert into nodes (id, url, secret, last_seen) values ('n-1', 'http://127.0.0.1:9', 's', ?1)", &[&now()]).unwrap();
         let e = call(&url, "POST", "/sandboxes/own0/fork", Some("alice-t"), &json!({})).unwrap_err().to_string();
         assert!(e.contains("quota: 10 of 10"), "{e}");
+    }
+
+    #[test]
+    fn token_names_are_checked_and_revoke_hits_exactly_that_name() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        for (t, name) in [("alice-t", "alice"), ("ab-t", "a@b"), ("ci-t", "ci/deploy")] {
+            add_token(&c, t, name, false, "member", false, None);
+        }
+        for bad in ["alice smith", "", "ci/x", "a?b", "-x", "%41"] {
+            let e = call(&url, "POST", "/tokens", Some("admin-t"), &json!({"name": bad})).unwrap_err().to_string();
+            assert!(e.contains("(400)"), "{bad:?}: {e}");
+        }
+        let names = |c: &Controller| -> Vec<String> {
+            c.db().query("select name from tokens order by name", &[]).unwrap().iter().map(|r| r.get(0)).collect()
+        };
+        // A space in the request line is a bad request, not `/tokens/alice`.
+        let addr = url.trim_start_matches("http://");
+        let mut s = TcpStream::connect(addr).unwrap();
+        write!(s, "DELETE /tokens/alice smith HTTP/1.1\r\nAuthorization: Bearer admin-t\r\nContent-Length: 0\r\n\r\n").unwrap();
+        let mut reply = String::new();
+        let _ = s.read_to_string(&mut reply);
+        assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+        assert_eq!(names(&c), ["a@b", "admin", "alice", "ci/deploy"]);
+        call(&url, "DELETE", "/tokens/a%40b", Some("admin-t"), &json!({})).unwrap();
+        call(&url, "DELETE", "/tokens", Some("admin-t"), &json!({"name": "ci/deploy"})).unwrap();
+        assert!(call(&url, "DELETE", "/tokens/ci%2Fdeploy", Some("admin-t"), &json!({})).unwrap_err().to_string().contains("(400)"));
+        assert_eq!(names(&c), ["admin", "alice"]);
     }
 
     #[test]

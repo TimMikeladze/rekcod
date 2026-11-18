@@ -447,6 +447,24 @@ fn sw_vers() -> String {
 /// Past this, a long-running process's log is copied to `.1` and truncated.
 const LOG_MAX: u64 = 20 << 20;
 
+/// launchd starts agents with a soft limit of 256 descriptors; every proxied or forwarded
+/// connection takes two. Raises the soft limit as far as the system allows and returns it.
+pub fn raise_fd_limit() -> u64 {
+    let mut lim = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        return 256;
+    }
+    let per_proc = crate::cli::sysctl_u64("kern.maxfilesperproc").unwrap_or(10240) as libc::rlim_t;
+    let want = lim.rlim_max.min(per_proc);
+    if want > lim.rlim_cur {
+        let raised = libc::rlimit { rlim_cur: want, rlim_max: lim.rlim_max };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } == 0 {
+            return want;
+        }
+    }
+    lim.rlim_cur
+}
+
 /// Checks `log` every hour for as long as this process runs. Its writers opened it
 /// `O_APPEND`, so after truncation they carry on at the new end.
 pub fn trim_log_hourly(log: PathBuf) {

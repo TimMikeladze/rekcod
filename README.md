@@ -424,6 +424,63 @@ has are removed; deleting a sandbox while its node is away removes the VM once t
 node is back. A controller that was itself away (the Mac slept, the process was
 stopped) waits 20 s for heartbeats before it marks any node lost.
 
+### Edge limits and client addresses
+
+Server setup installs the edge as `rekcod edge serve --remote edge --listen <addr>:8080
+--public-listen 127.0.0.1:8081 --install`. The options that change what it accepts:
+
+```sh
+# Peers whose X-Forwarded-For names the client. Default: loopback, where cloudflared runs.
+rekcod edge serve --trusted-proxy 10.0.0.5 --trusted-proxy 127.0.0.1
+# Read the client address from a header the proxy overwrites, instead of X-Forwarded-For.
+rekcod edge serve --client-ip-header cf-connecting-ip
+# A TCP load balancer that sends a PROXY v2 header; anyone else is disconnected.
+rekcod edge serve --public-listen 0.0.0.0:8081 --proxy-protocol --proxy-protocol-from 10.0.0.2
+# Requests per client across all apps (IPv6 counts per /64).
+rekcod edge serve --rate 50/s --burst 100
+```
+
+X-Forwarded-For is read from the right: the first address that isn't a trusted proxy is the
+client. CF-Connecting-IP is removed from the request unless `--client-ip-header` names it,
+because only Cloudflare overwrites it. Through cloudflared that's fine: Cloudflare appends the
+address it saw to X-Forwarded-For, so the rightmost entry is the visitor. The app gets `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`
+and `X-Request-Id` from the edge; `Forwarded`, `True-Client-IP`, `X-Client-IP`,
+`X-Forwarded-Port` and `X-Forwarded-Server` from the client are removed.
+
+A client over the edge-wide rate gets 429. 100 of those within a minute ban its address (its
+/64 for IPv6) on every edge for 10 minutes. An app's own `[http] rate` only answers 429; it
+never bans. Bans are managed with `rekcod edge ban`, `unban` and `bans`. An edge token can
+only ban an IPv4 /24 or IPv6 /48 or narrower, for at most a day.
+
+Per-app settings go in `rekcod.toml`:
+
+```toml
+[http]
+rate = "10/s"        # per client, on top of the edge-wide rate
+burst = 20
+max_body = "20MB"    # 100 MiB by default; larger bodies get 413
+timeout = "5m"       # to answer once the request body is in; 60s by default, at most 1h
+```
+
+Timeouts and caps:
+
+- A request head has 10 s from its first byte. A request body has to send something every
+  30 s or the client gets 408. The response timeout starts when the body is in.
+- A connection that moves no bytes for 90 s is closed, also in the middle of a response.
+  A server-sent event stream needs a heartbeat more often than that. WebSockets close after
+  an hour without traffic.
+- One address (an IPv6 /64) may hold 200 connections and 100 WebSockets. The edge raises its
+  descriptor limit at start and prints the connection and WebSocket totals it derived from it.
+- A request for a sleeping app waits up to 120 s for the wake, then gets 503 with
+  `Retry-After`. After a failed wake the app gets 503s for 30 s.
+- A GET, HEAD or OPTIONS without a body that fails on a reused instance connection is sent
+  once more on a new one. Other failures are a 502 naming the request ID; the instance's
+  address and the error are in `~/.rekcod/logs/edge.log`.
+- On SIGTERM the edge stops accepting and waits up to 15 s for requests in flight.
+
+Traffic from the edge to the nodes' relays, and both edge listeners, are plain HTTP. Keep the
+private listener on a tailnet or LAN.
+
 ### Back up the controller
 
 Server setup configures RustFS for release images, build caches and hourly controller

@@ -7,10 +7,18 @@
 use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+/// The most `get` reads; dockerd's answers are far smaller, so more is a guest misbehaving.
+const MAX_BODY: u64 = 32 << 20;
+/// The longest line `Lines::next` waits for.
+const MAX_LINE: usize = 1 << 20;
+
 pub async fn get<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, path: &str) -> Result<Vec<u8>> {
     send_get(&mut stream, path).await?;
     let mut buf = Vec::new();
-    stream.read_to_end(&mut buf).await?;
+    (&mut stream).take(MAX_BODY + 1).read_to_end(&mut buf).await?;
+    if buf.len() as u64 > MAX_BODY {
+        bail!("GET {path}: reply over {MAX_BODY} bytes");
+    }
     let (status, body_at) = parse_head(&buf)?.context("incomplete HTTP response")?;
     if status != 200 {
         bail!("GET {path}: HTTP {status}: {}", String::from_utf8_lossy(&buf[body_at..]).trim());
@@ -54,6 +62,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Lines<S> {
                 let mut line: Vec<u8> = self.buf.drain(..=nl).collect();
                 line.pop();
                 return Ok(Some(line));
+            }
+            if self.buf.len() > MAX_LINE {
+                bail!("line over {MAX_LINE} bytes");
             }
             let n = self.stream.read(&mut chunk).await?;
             if n == 0 {
@@ -110,5 +121,28 @@ mod tests {
             lines.push(line);
         }
         assert_eq!(lines, vec![b"{\"a\":1}".to_vec(), b"{\"b\":2}".to_vec()]);
+    }
+
+    /// A server that answers 200 and then sends `n` bytes of `fill`.
+    fn endless(fill: u8, n: usize) -> tokio::io::DuplexStream {
+        let (mut server, client) = tokio::io::duplex(64 << 10);
+        tokio::spawn(async move {
+            let mut req = [0u8; 256];
+            let _ = server.read(&mut req).await;
+            server.write_all(b"HTTP/1.0 200 OK\r\n\r\n").await.unwrap();
+            let chunk = vec![fill; 64 << 10];
+            let mut left = n;
+            while left > 0 && server.write_all(&chunk[..left.min(chunk.len())]).await.is_ok() {
+                left = left.saturating_sub(chunk.len());
+            }
+        });
+        client
+    }
+
+    #[tokio::test]
+    async fn a_guest_cant_send_without_end() {
+        let mut lines = Lines::open(endless(b'x', 2 << 20), "/events").await.unwrap();
+        assert!(lines.next().await.is_err());
+        assert!(get(endless(b'x', MAX_BODY as usize + (1 << 20)), "/containers/json").await.is_err());
     }
 }

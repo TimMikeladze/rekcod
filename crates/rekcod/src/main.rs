@@ -916,12 +916,20 @@ enum EdgeCmd {
         #[arg(long)]
         public_listen: Option<String>,
         /// The public listener's clients send a PROXY v2 header (a TCP load balancer in front).
-        #[arg(long, requires = "public_listen")]
+        #[arg(long, requires_all = ["public_listen", "proxy_protocol_from"])]
         proxy_protocol: bool,
-        /// Peers (IP or CIDR) whose CF-Connecting-IP / X-Forwarded-For name the client, such
-        /// as cloudflared. Repeat it; giving any replaces the loopback default.
+        /// The load balancer's address (IP or CIDR) for --proxy-protocol; connections from
+        /// anywhere else are closed. Repeat it for more than one.
+        #[arg(long = "proxy-protocol-from", value_name = "NET", requires = "proxy_protocol")]
+        proxy_protocol_from: Vec<String>,
+        /// Peers (IP or CIDR) whose X-Forwarded-For names the client, such as cloudflared.
+        /// Repeat it; giving any replaces the loopback default.
         #[arg(long = "trusted-proxy", value_name = "NET", default_values = ["127.0.0.0/8", "::1"])]
         trusted_proxies: Vec<String>,
+        /// A header the trusted proxy overwrites with the client's address, read instead of
+        /// X-Forwarded-For: `cf-connecting-ip` behind cloudflared.
+        #[arg(long, value_name = "HEADER")]
+        client_ip_header: Option<String>,
         /// Requests per client IP across all apps (N/s, N/m or N/h).
         #[arg(long, default_value = "50/s")]
         rate: String,
@@ -1470,10 +1478,28 @@ fn main() {
             remote_call(&paths, &remote, "POST", "/join-token", &serde_json::json!({}))
         }
         Cmd::Edge(EdgeCmd::Serve { install: true, .. }) => service::install(&paths, "edge", &service::args_without_install()),
-        Cmd::Edge(EdgeCmd::Serve { listen, public_listen, proxy_protocol, trusted_proxies, rate, burst, access_log, remote, .. }) => {
+        Cmd::Edge(EdgeCmd::Serve {
+            listen,
+            public_listen,
+            proxy_protocol,
+            proxy_protocol_from,
+            trusted_proxies,
+            client_ip_header,
+            rate,
+            burst,
+            access_log,
+            remote,
+            ..
+        }) => {
             let rate = edge::limit::parse_rate(&rate)?;
-            let trusted_proxies = trusted_proxies.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<_>>()?;
-            let settings = edge::Settings { rate, burst, access_log, trusted_proxies };
+            let nets = |v: &[String]| v.iter().map(|n| edge::ban::parse_net(n)).collect::<anyhow::Result<Vec<_>>>();
+            let (trusted_proxies, proxy_protocol_from) = (nets(&trusted_proxies)?, nets(&proxy_protocol_from)?);
+            let client_ip_header = client_ip_header
+                .map(|h| hyper::header::HeaderName::from_bytes(h.trim().to_ascii_lowercase().as_bytes()))
+                .transpose()
+                .map_err(|e| anyhow::anyhow!("--client-ip-header: {e}"))?;
+            let settings =
+                edge::Settings { rate, burst, access_log, trusted_proxies, client_ip_header, proxy_protocol_from, ..Default::default() };
             let o = edge::Options { listen, public_listen, proxy_protocol, settings };
             edge::serve(&paths, remote.as_deref().filter(|r| !r.is_empty()), o)
         }
@@ -1613,8 +1639,8 @@ fn run_ns(paths: &paths::Paths, remote: &Option<String>, c: NsCmd) -> anyhow::Re
 /// `[http]` from rekcod.toml; null (keep the app's current settings) when there's none.
 #[cfg(target_os = "macos")]
 fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Result<serde_json::Value> {
-    let (rate, burst, max_body) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"));
-    if rate.is_none() && burst.is_none() && max_body.is_none() {
+    let (rate, burst, max_body, timeout) = (t.get("http.rate"), t.get("http.burst"), t.get("http.max_body"), t.get("http.timeout"));
+    if rate.is_none() && burst.is_none() && max_body.is_none() && timeout.is_none() {
         return Ok(serde_json::Value::Null);
     }
     if let Some(r) = rate {
@@ -1622,7 +1648,15 @@ fn http_settings(t: &std::collections::HashMap<String, String>) -> anyhow::Resul
     }
     let burst = burst.map(|b| b.parse::<u32>().map_err(|_| anyhow::anyhow!("rekcod.toml http.burst: {b} isn't a number"))).transpose()?;
     let max_body = max_body.map(|m| edge::limit::parse_size(m)).transpose()?;
-    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body}))
+    let timeout = timeout
+        .map(|t| {
+            duration_secs(t)
+                .ok()
+                .filter(|t| (1..=3600).contains(t))
+                .ok_or_else(|| anyhow::anyhow!("rekcod.toml http.timeout: {t} isn't between 1s and 1h"))
+        })
+        .transpose()?;
+    Ok(serde_json::json!({"rate": rate, "burst": burst, "max_body": max_body, "timeout": timeout}))
 }
 
 fn remote_call(paths: &paths::Paths, remote: &Option<String>, method: &str, path: &str, body: &serde_json::Value) -> anyhow::Result<()> {
@@ -2013,6 +2047,16 @@ mod tests {
         // The node's 64 KiB window moved past the start of what was shown.
         assert_eq!(super::new_output("xxhello\n", "hello\nworld\n"), "world\n");
         assert_eq!(super::new_output("gone", "fresh\n"), "fresh\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn http_timeout_from_rekcod_toml() {
+        let t = |v: &str| std::collections::HashMap::from([("http.timeout".to_string(), v.to_string())]);
+        assert_eq!(http_settings(&t("5m")).unwrap()["timeout"], 300);
+        assert_eq!(http_settings(&t("90")).unwrap()["timeout"], 90);
+        assert!(http_settings(&t("0")).is_err());
+        assert!(http_settings(&t("2h")).is_err());
     }
 
     #[test]

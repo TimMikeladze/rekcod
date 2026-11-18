@@ -526,7 +526,7 @@ async fn wait_for_agent(vm: &Vm, repair: bool, console_log: &std::path::Path) ->
         if in_check {
             checking += before.elapsed();
         }
-        if matches!(vm.state(), State::Stopped | State::Error) {
+        if matches!(probe_state(vm).await, Some(State::Stopped | State::Error)) {
             bail!("guest stopped during boot (see ~/.rekcod/logs/console.log)");
         }
     }
@@ -1046,6 +1046,8 @@ struct Status {
     listening: Mutex<BTreeMap<Binding, String>>,
     scope: PortScope,
     watch_scope: WatchScope,
+    /// One `apply_forwards` at a time: it waits for closed listeners between deciding and binding.
+    applying: tokio::sync::Mutex<()>,
     /// Bindings `scope` refused at the last apply, so each is logged once.
     refused: Mutex<BTreeSet<Binding>>,
 }
@@ -1064,13 +1066,20 @@ struct PortScope {
 }
 
 impl PortScope {
-    /// `want` narrowed to what this VM may open, and the bindings refused.
-    fn apply(&self, want: BTreeMap<Binding, String>) -> (BTreeMap<Binding, String>, BTreeSet<Binding>) {
+    /// The listeners to open: Docker's published ports, then the autoports ones (on ports
+    /// nothing publishes), narrowed to what this VM may open; and the bindings refused.
+    fn apply(
+        &self,
+        published: BTreeMap<Binding, String>,
+        mut listening: BTreeMap<Binding, String>,
+    ) -> (BTreeMap<Binding, String>, BTreeSet<Binding>) {
         if !self.sandbox {
-            return (want, BTreeSet::new());
+            listening.extend(published);
+            return (listening, BTreeSet::new());
         }
         let (mut out, mut refused, mut ports) = (BTreeMap::new(), BTreeSet::new(), BTreeSet::new());
-        for (b, name) in want {
+        // Published first, so a guest listening on many ports can't crowd them out of the cap.
+        for (b, name) in published.into_iter().chain(listening) {
             let addrs: Vec<std::net::IpAddr> = if b.addr.is_unspecified() {
                 vec![std::net::Ipv4Addr::LOCALHOST.into(), std::net::Ipv6Addr::LOCALHOST.into()]
             } else if b.addr.is_loopback() {
@@ -1149,6 +1158,7 @@ impl Status {
             autoport: Mutex::default(),
             listening: Mutex::default(),
             scope,
+            applying: tokio::sync::Mutex::new(()),
             refused: Mutex::default(),
         }
     }
@@ -1313,9 +1323,10 @@ fn next(fwd: &Forward, wanted: Option<&String>, retry_failed: bool) -> Next {
 }
 
 async fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
-    let mut want = status.listening.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-    want.extend(status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
-    let (want, refused) = status.scope.apply(want);
+    let _one = status.applying.lock().await;
+    let listening = status.listening.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let published = status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let (want, refused) = status.scope.apply(published, listening);
     {
         let mut last = status.refused.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for b in refused.difference(&last) {
@@ -1833,21 +1844,25 @@ mod tests {
         let b = |addr: &str, port: u16| Binding { proto: Proto::Tcp, addr: addr.parse().unwrap(), port };
         let want: BTreeMap<Binding, String> =
             [b("::", 8080), b("192.168.1.5", 9000), b("0.0.0.0", 22), b("127.0.0.1", 5432)].into_iter().map(|b| (b, "x".into())).collect();
+        let none = BTreeMap::new;
         let main = PortScope::default();
-        assert_eq!(main.apply(want.clone()).0, want, "the main VM opens what Docker publishes");
+        assert_eq!(main.apply(want.clone(), none()).0, want, "the main VM opens what Docker publishes");
 
         let sandbox = PortScope { sandbox: true, allowed: None };
-        let (open, refused) = sandbox.apply(want.clone());
+        let (open, refused) = sandbox.apply(want.clone(), none());
         assert_eq!(open.keys().copied().collect::<Vec<_>>(), [b("127.0.0.1", 5432), b("127.0.0.1", 8080), b("::1", 8080)]);
         assert_eq!(refused, [b("0.0.0.0", 22), b("192.168.1.5", 9000)].into());
 
         let fleet = PortScope { sandbox: true, allowed: Some([5432].into()) };
-        assert_eq!(fleet.apply(want).0.keys().copied().collect::<Vec<_>>(), [b("127.0.0.1", 5432)]);
+        assert_eq!(fleet.apply(want, none()).0.keys().copied().collect::<Vec<_>>(), [b("127.0.0.1", 5432)]);
 
-        // A guest that listens on everything gets a few ports, not the Mac's loopback.
+        // A guest that listens on everything gets a few ports, not the Mac's loopback, and
+        // the port Docker publishes still opens.
         let many: BTreeMap<Binding, String> = (2000..3000).map(|p| (b("127.0.0.1", p), "x".into())).collect();
-        let (open, refused) = sandbox.apply(many);
-        assert_eq!((open.len(), refused.len()), (SANDBOX_PORTS_MAX, 1000 - SANDBOX_PORTS_MAX));
+        let web: BTreeMap<Binding, String> = [(b("127.0.0.1", 9999), "web".into())].into();
+        let (open, refused) = sandbox.apply(web, many);
+        assert_eq!((open.len(), refused.len()), (SANDBOX_PORTS_MAX, 1001 - SANDBOX_PORTS_MAX));
+        assert!(open.contains_key(&b("127.0.0.1", 9999)));
         assert!(publish_ports("3000, 8080").is_ok_and(|p| p == [3000, 8080].into()));
         assert!(publish_ports("").is_ok_and(|p| p.is_empty()));
         assert!(publish_ports("0").is_err() && publish_ports("http").is_err());

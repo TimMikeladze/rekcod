@@ -94,7 +94,9 @@ pub fn answers(query: &[u8], answer: &[u8]) -> bool {
         return false;
     }
     match rekcod_proto::dns_question(query) {
-        Some((_, end)) => answer.get(4..6) == Some(&[0, 1]) && answer.get(12..end).is_some_and(|q| q.eq_ignore_ascii_case(&query[12..end])),
+        // An error reply (FORMERR, SERVFAIL) may come without the question.
+        Some(_) if answer[4..6] == [0, 0] => true,
+        Some((_, end)) => answer[4..6] == [0, 1] && answer.get(12..end).is_some_and(|q| q.eq_ignore_ascii_case(&query[12..end])),
         None => true,
     }
 }
@@ -191,6 +193,9 @@ mod tests {
         assert!(!answers(&q, &other_id));
         let other_name = [&r[..12], b"\x03npm\x03com\x00\x00\x01\x00\x01"].concat();
         assert!(!answers(&q, &other_name), "an answer for another question");
+        let mut bare = r[..12].to_vec();
+        bare[5] = 0;
+        assert!(answers(&q, &bare), "an error reply without the question");
         assert!(!answers(&q, &q), "a query isn't an answer");
     }
 

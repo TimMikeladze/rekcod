@@ -450,13 +450,22 @@ pub(crate) fn stop_daemon(paths: &Paths) -> Result<bool> {
 /// Sends `sig` to the daemon and waits for it to exit (SIGUSR1: force stop the VM).
 pub(crate) fn signal_daemon(paths: &Paths, sig: libc::c_int) -> Result<bool> {
     let Some(pid) = running_pid(paths) else { return Ok(false) };
-    signal_pid(pid, sig, Duration::from_secs(45)).with_context(|| format!("see {}", paths.daemon_log().display()))?;
+    let killed = signal_pid(pid, sig, Duration::from_secs(45)).with_context(|| format!("see {}", paths.daemon_log().display()))?;
+    if killed {
+        // What the daemon does on its way out, so nothing reads this as a crash (the login
+        // agent would boot it again) or finds its sockets.
+        for f in [paths.socket(), paths.control_socket(), paths.pid_file(), paths.status_file()] {
+            let _ = std::fs::remove_file(f);
+        }
+        let _ = std::fs::write(paths.last_exit(), b"clean");
+    }
     Ok(true)
 }
 
 /// Sends `sig` to `pid` and waits up to `wait` for it to exit. A force stop (SIGUSR1)
-/// that doesn't end it within that time ends it with SIGKILL, which takes the VM with it.
-fn signal_pid(pid: i32, sig: libc::c_int, wait: Duration) -> Result<()> {
+/// that doesn't end it within that time ends it with SIGKILL, which takes the VM with it;
+/// returns true then.
+fn signal_pid(pid: i32, sig: libc::c_int, wait: Duration) -> Result<bool> {
     let gone = |within: Duration| {
         let deadline = Instant::now() + within;
         while unsafe { libc::kill(pid, 0) } == 0 {
@@ -473,7 +482,7 @@ fn signal_pid(pid: i32, sig: libc::c_int, wait: Duration) -> Result<()> {
     };
     unsafe { libc::kill(pid, sig) };
     if gone(wait) {
-        return Ok(());
+        return Ok(false);
     }
     if sig != libc::SIGUSR1 {
         bail!("daemon (pid {pid}) did not exit");
@@ -483,7 +492,7 @@ fn signal_pid(pid: i32, sig: libc::c_int, wait: Duration) -> Result<()> {
     if !gone(Duration::from_secs(5)) {
         bail!("daemon (pid {pid}) did not exit after SIGKILL");
     }
-    Ok(())
+    Ok(true)
 }
 
 pub fn start(
@@ -1095,7 +1104,7 @@ mod tests {
         assert!(err.to_string().contains("did not exit"), "{err}");
         assert!(a.try_wait().unwrap().is_none(), "a plain stop leaves it running");
         // Reaped by signal_pid, as a sandbox daemon `rekcod x` spawned would be.
-        signal_pid(b.id() as i32, libc::SIGUSR1, Duration::from_millis(300)).unwrap();
+        assert!(signal_pid(b.id() as i32, libc::SIGUSR1, Duration::from_millis(300)).unwrap());
         assert_ne!(unsafe { libc::kill(b.id() as i32, 0) }, 0);
         let _ = a.kill();
         let _ = a.wait();

@@ -61,6 +61,8 @@ else
     log "checking data disk (repair)"
     e2fsck -fy /dev/vdb >/dev/console 2>&1
   else
+    # The host waits for the agent longer while this line is the last one about the disk.
+    log "checking data disk"
     e2fsck -p /dev/vdb >/dev/console 2>&1
   fi
   rc=$?

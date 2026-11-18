@@ -341,15 +341,19 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         }
         let mut child = cmd.spawn().context("spawn rekcod daemon")?;
 
-        let deadline = Instant::now() + Duration::from_secs(if opts.repair { 1800 } else { 120 });
+        let limit = if opts.repair { crate::daemon::BOOT_WAIT_MAX } else { Duration::from_secs(120) };
+        // Time the guest spent running e2fsck on its data disk doesn't count against the limit.
+        let (waiting, mut checking, mut in_check) = (Instant::now(), Duration::ZERO, false);
         let mut checked = Instant::now();
         loop {
+            let round = Instant::now();
             if api_get(paths, "/_ping").is_ok_and(|b| b == b"OK") {
                 let _ = std::fs::remove_file(paths.data_fresh());
                 break;
             }
             if checked.elapsed() > Duration::from_millis(500) {
                 checked = Instant::now();
+                in_check = crate::vm::checking_disk(&paths.console_log());
                 if let Some(err) = data_disk_error(paths, console_start) {
                     bail!(
                         "the VM's data disk can't be used: {err}\nNothing was formatted. `rekcod stop`, then `rekcod start --repair` runs e2fsck -fy on it.\nsee {}",
@@ -366,10 +370,13 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
                     tail(&paths.console_log(), 25),
                 );
             }
-            if Instant::now() > deadline {
-                bail!("dockerd did not answer within 120s; see {}", paths.console_log().display());
+            if crate::daemon::boot_wait_over(waiting.elapsed(), checking, limit) {
+                bail!("dockerd did not answer within {}s; see {}", limit.as_secs(), paths.console_log().display());
             }
             std::thread::sleep(Duration::from_millis(50));
+            if in_check {
+                checking += round.elapsed();
+            }
         }
     }
     Ok(None)

@@ -37,6 +37,9 @@ pub struct VmConfig {
     pub data_disk: PathBuf,
     pub mac_address: String,
     pub console_log: PathBuf,
+    /// Console bytes per second kept; the rest is dropped (sandboxes: the guest may be
+    /// hostile and the file is on the Mac's disk). None keeps everything.
+    pub console_rate: Option<u64>,
     /// Name in the guest's `mac` virtio-fs share -> host directory.
     pub shares: Vec<(String, PathBuf)>,
     pub net: Net,
@@ -362,13 +365,20 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
             )]));
         }
 
-        // Kernel console (hvc0) appends to the console log.
+        // Kernel console (hvc0): a pipe a thread copies to the console log, so the file
+        // can be rotated while the VM runs (the guest writes it as fast as it likes).
         let log = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&cfg.console_log)
             .with_context(|| format!("open {}", cfg.console_log.display()))?;
-        let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), log.into_raw_fd(), true);
+        let (read, write) = pipe().context("console pipe")?;
+        let (path, rate) = (cfg.console_log.clone(), cfg.console_rate);
+        std::thread::Builder::new()
+            .name("console".into())
+            .spawn(move || copy_console(std::fs::File::from(read), log, &path, CONSOLE_MAX, rate))
+            .context("start the console thread")?;
+        let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(NSFileHandle::alloc(), write.into_raw_fd(), true);
         let attachment = VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
             VZFileHandleSerialPortAttachment::alloc(),
             None,
@@ -381,6 +391,95 @@ unsafe fn build_config(cfg: &VmConfig) -> Result<(Retained<VZVirtualMachineConfi
         c.validateWithError().map_err(|e| anyhow!("invalid VM config: {}", e.localizedDescription()))?;
         Ok((c, rosetta, elastic))
     }
+}
+
+/// A pipe whose ends close on exec.
+fn pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let pair = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    for fd in [fds[0], fds[1]] {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Ok(pair)
+}
+
+/// `console.log` is rotated past this, keeping one `.1`.
+const CONSOLE_MAX: u64 = 20 << 20;
+
+/// Copies the guest's console from `read` to `file` (open on `path`) until the VM closes
+/// it. Past `max` bytes the file becomes `path.1` and a new one starts. With `rate`, bytes
+/// over that many per second are dropped, with one line saying so. It always reads: the
+/// guest's console writes wait on this pipe.
+fn copy_console(mut read: impl std::io::Read, mut file: std::fs::File, path: &Path, max: u64, rate: Option<u64>) {
+    use std::io::Write;
+    let mut size = file.metadata().map_or(0, |m| m.len());
+    let mut buf = vec![0u8; 64 << 10];
+    let (mut window, mut used, mut dropped) = (std::time::Instant::now(), 0u64, 0u64);
+    loop {
+        let n = match read.read(&mut buf) {
+            Ok(0) => return,
+            Ok(n) => n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => return,
+        };
+        let mut data = &buf[..n];
+        if let Some(rate) = rate {
+            if window.elapsed() >= std::time::Duration::from_secs(1) {
+                if dropped > 0 {
+                    let _ = writeln!(file, "\nrekcod: dropped {dropped} bytes of console output (over {rate} bytes/s)");
+                }
+                (window, used, dropped) = (std::time::Instant::now(), 0, 0);
+            }
+            let keep = (rate.saturating_sub(used) as usize).min(data.len());
+            dropped += (data.len() - keep) as u64;
+            used += keep as u64;
+            data = &data[..keep];
+        }
+        if data.is_empty() {
+            continue;
+        }
+        if size + data.len() as u64 > max {
+            let mut old = path.as_os_str().to_owned();
+            old.push(".1");
+            let reopened = std::fs::rename(path, &old).and_then(|()| std::fs::OpenOptions::new().create(true).append(true).open(path));
+            if let Ok(f) = reopened {
+                (file, size) = (f, 0);
+            }
+        }
+        if file.write_all(data).is_ok() {
+            size += data.len() as u64;
+        }
+    }
+}
+
+/// Lines the guest's boot logs around its data disk check (boot.sh, data-disk.sh).
+const DISK_CHECK_START: [&str; 3] = ["checking data disk", "data disk has no readable ext4 superblock", "trying backup superblock"];
+const DISK_CHECK_END: [&str; 2] = ["data disk mounted", "data disk error"];
+
+/// Whether the console log's last word on the data disk is that e2fsck is running on it
+/// (only the log's last 64 KiB are read).
+pub fn checking_disk(console_log: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = std::fs::File::open(console_log) else { return false };
+    let len = f.metadata().map_or(0, |m| m.len());
+    let mut tail = Vec::new();
+    if f.seek(SeekFrom::Start(len.saturating_sub(64 << 10))).is_err() || f.take(64 << 10).read_to_end(&mut tail).is_err() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(&tail);
+    let last = text.lines().rev().filter(|l| l.contains("rekcod-boot:")).find_map(|l| {
+        if DISK_CHECK_START.iter().any(|m| l.contains(m)) {
+            Some(true)
+        } else if DISK_CHECK_END.iter().any(|m| l.contains(m)) {
+            Some(false)
+        } else {
+            None
+        }
+    });
+    last == Some(true)
 }
 
 /// Unread bytes a connection keeps in memory for a slow reader; past this it spills to files.
@@ -647,6 +746,29 @@ impl tokio::io::AsyncWrite for Conn {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn console_log_is_rotated_and_keeps_the_latest_lines() {
+        let dir = std::env::temp_dir().join(format!("rekcod-console-copy-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("console.log");
+        let open = || std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        let mut input: Vec<u8> = (0..700_000).flat_map(|i| format!("line {i:070}\n").into_bytes()).collect();
+        input.extend_from_slice(b"the last line\n");
+        assert!(input.len() > 50 << 20);
+        copy_console(&input[..], open(), &path, CONSOLE_MAX, None);
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let old = dir.join("console.log.1");
+        assert!(size(&path) + size(&old) <= 2 * CONSOLE_MAX, "{} + {}", size(&path), size(&old));
+        assert!(std::fs::read_to_string(&path).unwrap().ends_with("the last line\n"));
+
+        // A sandbox past its rate keeps what fits in each second and says what it dropped.
+        std::fs::remove_file(&path).unwrap();
+        copy_console(&input[..1 << 20], open(), &path, CONSOLE_MAX, Some(4096));
+        assert_eq!(size(&path), 4096);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[tokio::test]
     async fn a_stalled_reader_gets_every_byte_in_order() {

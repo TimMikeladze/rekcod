@@ -210,6 +210,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         data_disk: paths.data_disk(),
         mac_address: std::fs::read_to_string(paths.mac_address())?.trim().to_string(),
         console_log: paths.console_log(),
+        console_rate: opts.project.is_some().then_some(SANDBOX_CONSOLE_RATE),
         shares,
         net,
     };
@@ -242,7 +243,13 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         tokio::spawn(forget_fresh_disk(vm.clone(), paths.data_fresh()));
     }
 
-    let caps = wait_for_agent(&vm).await?;
+    let caps = match wait_for_agent(&vm, opts.repair, &paths.console_log()).await {
+        Ok(caps) => caps,
+        Err(e) => {
+            cleanup(&paths);
+            return Err(e);
+        }
+    };
     let fs_cache = caps.split_whitespace().any(|c| c == CAP_FS_NOTIFY);
     log!("guest agent up after {:.2}s (cached file sharing: {fs_cache})", t0.elapsed().as_secs_f64());
 
@@ -427,15 +434,41 @@ async fn forget_fresh_disk(vm: Vm, marker: PathBuf) {
     }
 }
 
-/// Waits for the agent; returns its capabilities (the rest of the ping reply).
-async fn wait_for_agent(vm: &Vm) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(90);
+/// A sandbox's console output kept per second; the rest is dropped.
+const SANDBOX_CONSOLE_RATE: u64 = 64 << 10;
+
+/// Longest any boot waits, `--repair` included: e2fsck -fy may run from every backup superblock.
+pub(crate) const BOOT_WAIT_MAX: Duration = Duration::from_secs(1800);
+
+/// Whether a boot that has waited `waited`, `checking` of it while the guest ran e2fsck
+/// on its data disk, has run out of its `limit`. The disk check doesn't count: it takes as
+/// long as the disk needs, and stopping the VM in the middle of it helps nobody.
+pub(crate) fn boot_wait_over(waited: Duration, checking: Duration, limit: Duration) -> bool {
+    waited > BOOT_WAIT_MAX || waited.saturating_sub(checking) > limit
+}
+
+/// Waits for the agent; returns its capabilities (the rest of the ping reply). 90 s,
+/// plus the time the guest spends checking its data disk; `repair` waits up to
+/// [`BOOT_WAIT_MAX`], as `rekcod start --repair` does.
+async fn wait_for_agent(vm: &Vm, repair: bool, console_log: &std::path::Path) -> Result<String> {
+    let limit = if repair { BOOT_WAIT_MAX } else { Duration::from_secs(90) };
+    let (start, mut checking, mut in_check, mut looked) = (Instant::now(), Duration::ZERO, false, Instant::now());
     loop {
+        let before = Instant::now();
         match control(vm, Control::Ping).await {
             Ok(reply) if reply.starts_with("pong") => return Ok(reply.trim_start_matches("pong").trim().to_string()),
             Ok(reply) => bail!("unexpected ping reply {reply:?}"),
-            Err(_) if Instant::now() < deadline => tokio::time::sleep(Duration::from_millis(50)).await,
-            Err(e) => return Err(e.context("guest agent did not come up (see ~/.rekcod/logs/console.log)")),
+            Err(e) if boot_wait_over(start.elapsed(), checking, limit) => {
+                return Err(e.context("guest agent did not come up (see ~/.rekcod/logs/console.log)"));
+            }
+            Err(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+        if looked.elapsed() >= Duration::from_secs(1) {
+            looked = Instant::now();
+            in_check = crate::vm::checking_disk(console_log);
+        }
+        if in_check {
+            checking += before.elapsed();
         }
         if matches!(vm.state(), State::Stopped | State::Error) {
             bail!("guest stopped during boot (see ~/.rekcod/logs/console.log)");
@@ -1631,6 +1664,31 @@ mod tests {
         assert_eq!(WatchScope::Within(app.clone()).filter(binds.clone()), [app.clone(), app.join("src")].into());
         assert!(WatchScope::Nothing.filter(binds).is_empty(), "a copy-mode sandbox watches nothing");
         std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn a_boot_waits_out_the_disk_check() {
+        let s = Duration::from_secs;
+        assert!(!boot_wait_over(s(80), s(0), s(90)));
+        assert!(boot_wait_over(s(91), s(0), s(90)));
+        assert!(!boot_wait_over(s(400), s(350), s(90)), "e2fsck ran for most of it");
+        assert!(boot_wait_over(s(400), s(250), s(90)));
+        assert!(!boot_wait_over(s(1200), s(0), BOOT_WAIT_MAX), "--repair");
+        assert!(boot_wait_over(s(1801), s(1801), s(90)), "never past the cap");
+
+        let t = std::env::temp_dir().join(format!("rekcod-console-{}", std::process::id()));
+        let line = |m: &str| format!("rekcod-boot: [1.2s] {m}\n");
+        for (lines, want) in [
+            (vec![line("init"), line("checking data disk"), "e2fsck 1.47: /dev/vdb: 12/400 files\n".into()], true),
+            (vec![line("checking data disk"), line("data disk mounted")], false),
+            (vec![line("data disk has no readable ext4 superblock; trying the backup"), line("trying backup superblock 98304")], true),
+            (vec![line("checking data disk"), line("data disk error: e2fsck found errors")], false),
+            (vec![line("init")], false),
+        ] {
+            std::fs::write(&t, lines.concat()).unwrap();
+            assert_eq!(crate::vm::checking_disk(&t), want, "{lines:?}");
+        }
+        std::fs::remove_file(&t).unwrap();
     }
 
     #[test]

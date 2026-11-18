@@ -474,15 +474,6 @@ fn ssh_to(paths: &Paths, ip: &str, image: Option<&str>, quiet: bool) -> Result<C
     Ok(c)
 }
 
-/// `scp -r` to the guest at `ip`, with the same host key pinning as ssh; add the paths
-/// (`rekcod@IP:path` remote).
-pub fn scp_command(paths: &Paths, ip: &str) -> Result<Command> {
-    let mut c = Command::new("scp");
-    c.arg("-r");
-    ssh_options(&mut c, paths, image_at(paths, ip).as_deref(), &key(paths)?, true)?;
-    Ok(c)
-}
-
 /// Boots the sandbox's guest if needed and waits for SSH; returns its address.
 pub fn boot(paths: &Paths, home: &Path, idle_ttl: u64) -> Result<String> {
     let sb = Paths::at(home.to_path_buf())?;
@@ -652,6 +643,19 @@ pub fn input(paths: &Paths, ip: &str, action: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// `scp -r` to or from the guest at `ip`, pinning its host key as [`ssh_base`] does; add the
+/// paths (`rekcod@IP:path` for the guest's side).
+pub fn scp_command(paths: &Paths, ip: &str) -> Result<Command> {
+    scp_with(paths, ip, &key(paths)?)
+}
+
+fn scp_with(paths: &Paths, ip: &str, key: &Path) -> Result<Command> {
+    let mut c = Command::new("scp");
+    c.arg("-r");
+    ssh_options(&mut c, paths, image_at(paths, ip).as_deref(), key, true)?;
+    Ok(c)
+}
+
 /// `rekcod macos run HOME`: the process that owns a macOS sandbox's VM.
 pub fn run(home: PathBuf, idle_ttl: u64) -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -753,6 +757,10 @@ mod tests {
         assert!(a.contains("StrictHostKeyChecking=accept-new") && a.contains(&format!("UserKnownHostsFile={}", file.display())), "{a}");
         assert!(a.contains("HostKeyAlias=rekcod-macos-base"), "{a}");
         assert!(!a.contains("StrictHostKeyChecking=no") && !a.contains("/dev/null"), "{a}");
+        // scp_command's own path: a guest whose image isn't known keeps the shared file.
+        let a: Vec<String> =
+            scp_with(&paths, "192.168.64.7", Path::new("/k")).unwrap().get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        assert!(a.join(" ").contains(&format!("UserKnownHostsFile={}", home.join("macos/known_hosts").display())), "{a:?}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

@@ -1949,6 +1949,7 @@ pub mod tests {
         a.dir = Some("/Users/me/my app".into());
         let s = a.terminal_script().unwrap();
         assert!(s.starts_with("#!/bin/sh\nrm -f -- \"$0\"\ncd '/Users/me/my app' || exit\nexec "), "{s}");
+        // A leading `=` is quoted too (HO-21: zsh expands it; harmless under sh).
         assert!(s.trim_end().ends_with(r" logs 'it'\''s' '=x'"), "{s:?}");
         for bad in ["\u{15}touch x\n#", "\u{3}", "\u{7f}", "\u{9b}"] {
             let a = Action::rekcod(Kind::ContainerLogs, "Logs", &["logs", bad]).interactive();

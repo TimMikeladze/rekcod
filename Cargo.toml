@@ -17,3 +17,7 @@ serde_json = "1"
 [profile.release]
 lto = "thin"
 strip = true
+
+# Arithmetic on sizes a client or guest sends panics (ending that task) instead of wrapping.
+[profile.release.package.rekcod]
+overflow-checks = true

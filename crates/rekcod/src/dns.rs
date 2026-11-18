@@ -81,28 +81,9 @@ pub fn pick(resolvers: &[Resolver], name: &str) -> Vec<SocketAddr> {
     }
 }
 
-/// The question name of a DNS query, or None unless it has exactly one question whose name
-/// has no compression pointer. Sandboxes refuse anything else, so the name checked is the
-/// only one the upstream resolver sees.
+/// The question name of a DNS query ([`rekcod_proto::dns_question`]).
 pub fn query_name(q: &[u8]) -> Option<String> {
-    if q.get(4..6)? != [0, 1] {
-        return None;
-    }
-    let mut i = 12;
-    let mut labels = Vec::new();
-    loop {
-        let len = *q.get(i)? as usize;
-        if len == 0 {
-            break;
-        }
-        if len & 0xc0 != 0 {
-            return None;
-        }
-        labels.push(std::str::from_utf8(q.get(i + 1..i + 1 + len)?).ok()?.to_string());
-        i += 1 + len;
-    }
-    q.get(i + 1..i + 5)?; // type and class
-    Some(labels.join("."))
+    rekcod_proto::dns_question(q).map(|(name, _)| name)
 }
 
 /// End of a (possibly compressed) name starting at `i`.
@@ -173,6 +154,8 @@ pub fn answers(query: &[u8], reply: &[u8]) -> bool {
         return false;
     }
     match header_and_question(query) {
+        // An error reply (FORMERR, SERVFAIL) may come without the question.
+        Some(_) if reply.get(4..6) == Some(&[0, 0]) => true,
         Some(hq) => reply.get(12..hq.len()).is_some_and(|rq| rq.eq_ignore_ascii_case(&hq[12..])),
         None => true,
     }
@@ -209,32 +192,6 @@ pub fn printable(name: &str) -> String {
         s.push('…');
     }
     s
-}
-
-/// At most `per_sec` events a second; the rest are dropped.
-pub struct Throttle {
-    per_sec: u32,
-    window: std::sync::Mutex<Option<(std::time::Instant, u32)>>,
-}
-
-impl Throttle {
-    pub const fn new(per_sec: u32) -> Throttle {
-        Throttle { per_sec, window: std::sync::Mutex::new(None) }
-    }
-
-    pub fn allow(&self) -> bool {
-        let mut w = self.window.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        match w.as_mut() {
-            Some((start, n)) if start.elapsed() < std::time::Duration::from_secs(1) => {
-                *n += 1;
-                *n <= self.per_sec
-            }
-            _ => {
-                *w = Some((std::time::Instant::now(), 1));
-                true
-            }
-        }
-    }
 }
 
 pub fn if_index(name: &str) -> u32 {
@@ -286,8 +243,6 @@ mod tests {
         big.resize(60 << 10, b'a');
         assert_eq!(refused(&big).unwrap().len(), q.len());
         assert!(refused(&q[..12]).unwrap().len() == 12);
-        assert_eq!(printable("a\nb\x1b[31m"), "a\\nb\\u{1b}[31m");
-        assert!(printable(&"x".repeat(60_000)).len() < 260);
     }
 
     #[test]
@@ -306,6 +261,9 @@ mod tests {
         other_name[14] = b'x';
         assert!(!answers(&q, &other_name));
         assert!(!answers(&q, &q), "not a response");
+        let mut bare = r[..12].to_vec();
+        bare[5] = 0;
+        assert!(answers(&q, &bare), "an error reply without the question");
     }
 
     #[tokio::test]

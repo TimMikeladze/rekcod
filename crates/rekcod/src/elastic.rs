@@ -32,10 +32,23 @@ fn config_bytes(ready: bool) -> [u8; 16] {
     c
 }
 
+/// Most chunks one request names (the guest driver's `MAX_BATCH`).
+const REQUEST_MAX: usize = 256;
+
+/// The chunk count a request header announces, refused before its list is read when no
+/// honest guest would send that many.
+fn request_count(header: &[u8], chunks: u64) -> Result<usize> {
+    let count = u32::from_le_bytes(header.get(4..8).ok_or_else(|| anyhow!("short header"))?.try_into()?) as usize;
+    if count > REQUEST_MAX || count as u64 > chunks {
+        bail!("{count} chunks in one request (at most {REQUEST_MAX}, and the region has {chunks})");
+    }
+    Ok(count)
+}
+
 /// A request's chunk list, checked against the region: `(op, chunks)`.
 fn parse_request(header: &[u8], body: &[u8], chunks: u64) -> Result<(u32, Vec<u64>)> {
     let op = u32::from_le_bytes(header.get(..4).ok_or_else(|| anyhow!("short header"))?.try_into()?);
-    let count = u32::from_le_bytes(header.get(4..8).ok_or_else(|| anyhow!("short header"))?.try_into()?) as usize;
+    let count = request_count(header, chunks)?;
     if op != ELASTIC_OP_RELEASE && op != ELASTIC_OP_REUSE {
         bail!("unknown op {op}");
     }
@@ -127,7 +140,7 @@ fn read_exact(element: &AnyObject, len: usize) -> Result<Vec<u8>> {
 
 fn read_request(inner: &Inner, element: &AnyObject) -> Result<(u32, Vec<u64>)> {
     let header = read_exact(element, 8)?;
-    let count = u32::from_le_bytes(header[4..8].try_into()?) as usize;
+    let count = request_count(&header, inner.size / ELASTIC_CHUNK)?;
     let available: usize = unsafe { msg_send![element, readBuffersAvailableByteCount] };
     if count * 4 > available {
         bail!("{count} chunks but {available} bytes");
@@ -516,6 +529,12 @@ mod tests {
         assert!(parse_request(&h, &b, 4).is_err(), "unknown op");
         let (h, _) = req(ELASTIC_OP_RELEASE, &[0, 1]);
         assert!(parse_request(&h, &[0; 4], 4).is_err(), "count disagrees with body");
+        let (h, _) = req(ELASTIC_OP_RELEASE, &[0; 5]);
+        assert!(request_count(&h, 4).is_err(), "more chunks than the region has");
+        let (h, _) = req(ELASTIC_OP_RELEASE, &vec![0; REQUEST_MAX + 1]);
+        assert!(request_count(&h, 1 << 20).is_err(), "more than the driver ever batches");
+        let (h, _) = req(ELASTIC_OP_RELEASE, &vec![0; REQUEST_MAX]);
+        assert_eq!(request_count(&h, 1 << 20).unwrap(), REQUEST_MAX);
     }
 
     #[test]

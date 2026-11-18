@@ -24,10 +24,24 @@ pub const LOCAL_LABEL: &str = "dev.rekcod.local";
 const CREATE_MAX: usize = 4 << 20;
 const HEAD_MAX: usize = 64 << 10;
 
+/// The client hung up mid-stream (a `docker logs -f` stopped with ^C): not worth a log line.
+#[derive(Debug)]
+pub struct ClientGone;
+
+impl std::fmt::Display for ClientGone {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the client hung up")
+    }
+}
+
+impl std::error::Error for ClientGone {}
+
 /// Pipes one client connection to the engine. A direction that ends cleanly half-closes
 /// (attach and exec rely on it). A bad request from the client ends both and is returned.
 /// A failed write to the engine doesn't: the engine closed its side (a container that
 /// exited while stdin still had data), and its output may still be queued for the client.
+/// A read error from the engine is returned after everything read before it reached the
+/// client; a client that hung up is [`ClientGone`].
 pub async fn pipe<C, G>(client: C, guest: G) -> Result<()>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -52,8 +66,16 @@ where
         anyhow::Ok(shut?)
     };
     let down = async {
-        tokio::io::copy(&mut guest_rd, &mut client_wr).await?;
-        client_wr.shutdown().await?;
+        // Not tokio::io::copy: it returns a read error with bytes it read still unwritten.
+        let mut buf = vec![0u8; 64 << 10];
+        loop {
+            let n = guest_rd.read(&mut buf).await.context("reading from the engine")?;
+            if n == 0 {
+                break;
+            }
+            client_wr.write_all(&buf[..n]).await.map_err(|_| ClientGone)?;
+        }
+        client_wr.shutdown().await.map_err(|_| ClientGone)?;
         anyhow::Ok(())
     };
     tokio::pin!(up, down);
@@ -232,11 +254,11 @@ async fn read_body<R: AsyncBufRead + Unpin>(rd: &mut R, req: &Head) -> Result<Ve
                 skip_trailers(rd).await?;
                 return Ok(body);
             }
-            if body.len() + size > CREATE_MAX {
+            let Some(end) = body.len().checked_add(size).filter(|&e| e <= CREATE_MAX) else {
                 bail!("create body too large");
-            }
+            };
             let start = body.len();
-            body.resize(start + size, 0);
+            body.resize(end, 0);
             rd.read_exact(&mut body[start..]).await?;
             let mut crlf = [0u8; 2];
             rd.read_exact(&mut crlf).await?;
@@ -293,8 +315,9 @@ where
             }
         }
         // data + CRLF
-        let copied = tokio::io::copy(&mut (&mut *rd).take(size as u64 + 2), wr).await?;
-        if copied < size as u64 + 2 {
+        let Some(want) = (size as u64).checked_add(2) else { bail!("bad chunk size {line:?}") };
+        let copied = tokio::io::copy(&mut (&mut *rd).take(want), wr).await?;
+        if copied < want {
             bail!("client closed mid-chunk");
         }
     }
@@ -510,6 +533,66 @@ mod tests {
         guest_far.read_to_end(&mut seen).await.unwrap();
         assert_eq!(seen, ping);
         assert_eq!(client_far.read_to_end(&mut Vec::new()).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn chunk_sizes_that_overflow_are_refused() {
+        for body in [&b"1\r\n{\r\nffffffffffffffff\r\n"[..], b"fffffffffffffffe\r\n"] {
+            let (client, mut client_far) = tokio::io::duplex(1 << 16);
+            let (guest, _guest_far) = tokio::io::duplex(1 << 16);
+            let task = tokio::spawn(pipe(client, guest));
+            client_far.write_all(b"POST /containers/create HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+            client_far.write_all(body).await.unwrap();
+            let r = tokio::time::timeout(std::time::Duration::from_secs(5), task).await.expect("pipe returns").expect("no panic");
+            assert!(r.as_ref().is_err_and(|e| e.to_string().contains("create body too large")), "{r:?}");
+        }
+        let (client, mut client_far) = tokio::io::duplex(1 << 16);
+        let (guest, _guest_far) = tokio::io::duplex(1 << 16);
+        let task = tokio::spawn(pipe(client, guest));
+        client_far.write_all(b"POST /build HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\n").await.unwrap();
+        let r = tokio::time::timeout(std::time::Duration::from_secs(5), task).await.expect("pipe returns").expect("no panic");
+        assert!(r.as_ref().is_err_and(|e| e.to_string().contains("bad chunk size")), "{r:?}");
+    }
+
+    /// An engine stream that sends `data`, then fails.
+    struct Cut {
+        data: Vec<u8>,
+    }
+
+    impl AsyncRead for Cut {
+        fn poll_read(mut self: Pin<&mut Self>, _: &mut Context<'_>, out: &mut tokio::io::ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.data.is_empty() {
+                return Poll::Ready(Err(std::io::ErrorKind::ConnectionReset.into()));
+            }
+            let n = out.remaining().min(self.data.len());
+            out.put_slice(&self.data[..n]);
+            self.data.drain(..n);
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for Cut {
+        fn poll_write(self: Pin<&mut Self>, _: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+            Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slow_client_gets_every_byte_before_the_engine_error() {
+        let data: Vec<u8> = (0..100_000u32).map(|i| i as u8).collect();
+        let (client, mut client_far) = tokio::io::duplex(1);
+        let task = tokio::spawn(pipe(client, Cut { data: data.clone() }));
+        let mut got = Vec::new();
+        client_far.read_to_end(&mut got).await.unwrap_or_default();
+        assert_eq!(got.len(), data.len());
+        let err = task.await.unwrap().unwrap_err();
+        assert!(err.to_string().contains("reading from the engine"), "{err:#}");
     }
 
     #[tokio::test]

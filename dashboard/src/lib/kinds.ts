@@ -21,4 +21,5 @@ export const DESTRUCTIVE = new Set([
   "NetworkRemove",
   "NetworkPrune",
   "SystemPrune",
+  "SandboxPrune",
 ])

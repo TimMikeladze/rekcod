@@ -1,0 +1,78 @@
+name: audit
+# Weekly checks on main that don't depend on a push: a new RustSec or npm advisory against
+# a locked dependency fails a scheduled run here, not the next release. Also builds the
+# guest twice from scratch and compares the results (guest/build.sh is meant to be
+# reproducible).
+on:
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  deny:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked check
+
+  npm:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      # Same threshold as ci.yml: what ships in the dashboard bundle, high and up.
+      - run: npm audit --omit=dev --audit-level=high
+        working-directory: dashboard
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.4
+      - run: bun install --frozen-lockfile && bun audit --audit-level=high
+        working-directory: website
+
+  reproducible:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust
+      - run: cargo build --locked --release -p rekcod-agent --target aarch64-unknown-linux-musl
+      # Two builds, each with its own work directory and an empty kernel cache.
+      - name: build twice
+        run: |
+          agent=target/aarch64-unknown-linux-musl/release/rekcod-agent
+          for n in 1 2; do
+            sudo REKCOD_GUEST_WORK="$RUNNER_TEMP/work$n" REKCOD_KERNEL_CACHE="$RUNNER_TEMP/kernel$n" \
+              guest/build.sh "$agent" "out/guest$n"
+          done
+      - name: compare
+        run: |
+          st=0
+          for f in VERSION Image root.img config packages.txt; do
+            if cmp -s "out/guest1/$f" "out/guest2/$f"; then
+              echo "  same     $f"
+            else
+              echo "  differs  $f ($(cmp -l "out/guest1/$f" "out/guest2/$f" 2>/dev/null | wc -l) bytes)"
+              st=1
+            fi
+          done
+          exit $st

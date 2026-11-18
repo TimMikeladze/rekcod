@@ -177,18 +177,231 @@ impl Control {
     }
 }
 
+/// One allowlist entry: its name pattern, and the TCP port when it names one
+/// (`db.example.com:5432`). An entry whose port doesn't parse names no port and, with the
+/// colon left in, no host either.
+pub fn allow_entry(entry: &str) -> (&str, Option<u16>) {
+    match entry.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) => {
+            match port.parse::<u16>() {
+                Ok(p) if p > 0 => (host, Some(p)),
+                _ => (entry, None),
+            }
+        }
+        _ => (entry, None),
+    }
+}
+
+/// Whether `entry` is something the allowlist understands: `*`, a name, `*.name`, either
+/// of those with `:PORT`.
+pub fn valid_allow_entry(entry: &str) -> bool {
+    let (host, port) = allow_entry(entry);
+    if host == "*" {
+        return port.is_none();
+    }
+    let name = host.strip_prefix("*.").unwrap_or(host);
+    !name.is_empty() && name.split('.').all(|l| !l.is_empty() && l.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_'))
+}
+
+fn name_matches(pattern: &str, port: Option<u16>, name: &str) -> bool {
+    let p = pattern.to_ascii_lowercase();
+    (p == "*" && port.is_none()) || p == name || p.strip_prefix("*.").is_some_and(|base| name.ends_with(&format!(".{base}")))
+}
+
 /// Agent sandbox egress allowlist (`rekcod.allow=` on the kernel command line): exact
-/// names, `*.example.com` for any subdomain, `*` for everything.
+/// names, `*.example.com` for any subdomain, `*` for everything. An entry with a port
+/// (`db.example.com:5432`) allows the name too.
 pub fn host_allowed(allow: &[String], name: &str) -> bool {
     let name = name.trim_end_matches('.').to_ascii_lowercase();
-    allow.iter().any(|p| {
-        let p = p.to_ascii_lowercase();
-        p == "*" || p == name || p.strip_prefix("*.").is_some_and(|base| name.ends_with(&format!(".{base}")))
+    allow.iter().any(|e| {
+        let (pattern, port) = allow_entry(e);
+        name_matches(pattern, port, &name)
     })
+}
+
+/// The TCP ports `name`'s addresses may carry anything on, not only TLS or HTTP: the ports
+/// of the entries that name it (`db.example.com:5432`).
+pub fn raw_ports(allow: &[String], name: &str) -> Vec<u16> {
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let mut ports: Vec<u16> = allow
+        .iter()
+        .filter_map(|e| match allow_entry(e) {
+            (pattern, Some(port)) if name_matches(pattern, Some(port), &name) => Some(port),
+            _ => None,
+        })
+        .collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+/// A DNS query's one question: its name, dotted, and the offset just past it. None unless
+/// the query has exactly one question whose name has no compression pointer and whose
+/// labels are letters, digits, `-` and `_`. The whole packet goes upstream, so the name
+/// checked against an allowlist has to be the only one in it, and it ends up in logs.
+pub fn dns_question(q: &[u8]) -> Option<(String, usize)> {
+    if q.get(4..6)? != [0, 1] {
+        return None;
+    }
+    let mut i = 12;
+    let mut labels = Vec::new();
+    loop {
+        let len = *q.get(i)? as usize;
+        if len == 0 {
+            break;
+        }
+        if len & 0xc0 != 0 {
+            return None;
+        }
+        let label = q.get(i + 1..i + 1 + len)?;
+        if !label.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_') {
+            return None;
+        }
+        labels.push(String::from_utf8_lossy(label).into_owned());
+        i += 1 + len;
+    }
+    q.get(i + 1..i + 5)?; // type and class
+    Some((labels.join("."), i + 5))
+}
+
+/// Largest query a sandbox may send upstream.
+pub const DNS_QUERY_MAX: usize = 512;
+
+/// A standard query a sandbox may send upstream: QR 0, opcode QUERY, one plain question
+/// ([`dns_question`]), no answer or authority records, and at most one additional record,
+/// EDNS's OPT. UPDATE, NOTIFY and the rest would reach the Mac's resolvers, VPN and
+/// corporate ones included, from the Mac's address.
+pub fn dns_plain_query(q: &[u8]) -> bool {
+    let Some((_, end)) = dns_question(q) else { return false };
+    let count = |i: usize| u16::from_be_bytes([q[i], q[i + 1]]);
+    let opt = match count(10) {
+        0 => end == q.len(),
+        // Root name, then TYPE 41.
+        1 => q.get(end..end + 3) == Some(&[0, 0, 41][..]),
+        _ => false,
+    };
+    q.len() <= DNS_QUERY_MAX && q[2] & 0xf8 == 0 && count(6) == 0 && count(8) == 0 && opt
+}
+
+/// The answer REFUSED to `query`: its header and question only, never more than the
+/// client sent. None if it's shorter than a header.
+pub fn dns_refused(query: &[u8]) -> Option<Vec<u8>> {
+    let mut out = query.get(..12)?.to_vec();
+    out[2] |= 0x80; // QR
+    out[3] = (out[3] & 0xf0) | 5;
+    out[4..12].fill(0);
+    if let Some((_, end)) = dns_question(query) {
+        out[5] = 1;
+        out.extend_from_slice(&query[12..end]);
+    }
+    Some(out)
+}
+
+/// Rate limit for log lines a guest can cause: the same line at most once per `window`,
+/// and at most `burst` lines per window in all. What's held back is counted and reported
+/// with the next line logged after the window, as `{prefix}N similar line(s) ...`.
+pub struct LogLimit {
+    prefix: &'static str,
+    window: std::time::Duration,
+    burst: u32,
+    start: std::time::Instant,
+    lines: u32,
+    held: u64,
+    seen: std::collections::HashMap<String, std::time::Instant>,
+}
+
+impl LogLimit {
+    pub fn new(window: std::time::Duration, burst: u32, prefix: &'static str) -> LogLimit {
+        LogLimit { prefix, window, burst, start: std::time::Instant::now(), lines: 0, held: 0, seen: Default::default() }
+    }
+
+    /// The lines to log for `line` now: none, or `line` after a count of what was held back.
+    pub fn lines(&mut self, line: String, now: std::time::Instant) -> Vec<String> {
+        let mut out = Vec::new();
+        if now.duration_since(self.start) >= self.window {
+            if self.held > 0 {
+                out.push(format!("{}{} similar line(s) not logged in the last {} s", self.prefix, self.held, self.window.as_secs()));
+            }
+            (self.start, self.lines, self.held) = (now, 0, 0);
+            let window = self.window;
+            self.seen.retain(|_, t| now.duration_since(*t) < window);
+        }
+        if self.seen.get(&line).is_some_and(|t| now.duration_since(*t) < self.window) || self.lines >= self.burst {
+            self.held += 1;
+            return out;
+        }
+        self.lines += 1;
+        self.seen.insert(line.clone(), now);
+        out.push(line);
+        out
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_dns_queries_only() {
+        let q = [&[0x12, 0x34, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..], b"\x03npm\x03org\x00\x00\x01\x00\x01"].concat();
+        assert_eq!(dns_question(&q), Some(("npm.org".into(), q.len())));
+        assert!(dns_plain_query(&q));
+        let with_opt = [&q[..11], &[1], &q[12..], &[0, 0, 41, 4, 0, 0, 0, 0, 0, 0, 0]].concat();
+        assert!(dns_plain_query(&with_opt));
+        // UPDATE (opcode 5) for a corporate zone, and a response.
+        let mut update = q.clone();
+        update[2] = 0x28;
+        assert!(dns_question(&update).is_some() && !dns_plain_query(&update));
+        let mut response = q.clone();
+        response[2] |= 0x80;
+        assert!(!dns_plain_query(&response));
+        let mut answers = q.clone();
+        answers[7] = 1;
+        assert!(!dns_plain_query(&answers));
+        assert!(!dns_plain_query(&[&q[..], &[0; 600]].concat()), "trailing bytes");
+        // A label that would write a fake line, or clear a terminal, when logged.
+        let esc = [&q[..12], b"\x0a\x1b[2Jx\nfake:\x01y\x03com\x00\x00\x01\x00\x01"].concat();
+        assert_eq!(dns_question(&esc), None);
+
+        let r = dns_refused(&[&q[..], &[0xff; 300]].concat()).unwrap();
+        assert_eq!(r.len(), q.len(), "header and question only");
+        assert_eq!((r[2] & 0x80, r[3] & 0x0f, &r[4..12]), (0x80, 5, &[0, 1, 0, 0, 0, 0, 0, 0][..]));
+        assert_eq!(dns_refused(&[1, 2, 3]), None);
+        assert_eq!(dns_refused(&update[..12]).unwrap()[4..12], [0; 8]);
+    }
+
+    #[test]
+    fn allowlist_entries_may_name_a_port() {
+        let allow: Vec<String> =
+            ["registry.npmjs.org", "db.example.com:5432", "*.corp.example:22000", "x.io:99999"].map(String::from).into();
+        assert!(host_allowed(&allow, "db.example.com"), "a port entry allows the name");
+        assert!(host_allowed(&allow, "git.corp.example"));
+        assert!(!host_allowed(&allow, "x.io"), "a port that doesn't parse names nothing");
+        assert_eq!(raw_ports(&allow, "DB.example.com."), [5432]);
+        assert_eq!(raw_ports(&allow, "git.corp.example"), [22000]);
+        assert!(raw_ports(&allow, "registry.npmjs.org").is_empty());
+        assert!(!host_allowed(&["*:5432".into()], "anything.example"), "no port for every name");
+        for ok in ["*", "a.com", "*.a.com", "a.com:5432", "*.a.com:1"] {
+            assert!(valid_allow_entry(ok), "{ok}");
+        }
+        for bad in ["*:5432", "a.com:0", "a.com:99999", "a.com:", "", "a..com", "a com", "http://a.com"] {
+            assert!(!valid_allow_entry(bad), "{bad}");
+        }
+    }
+
+    #[test]
+    fn log_lines_a_guest_causes_are_rate_limited() {
+        let t0 = std::time::Instant::now();
+        let mut l = LogLimit::new(std::time::Duration::from_secs(10), 3, "x: ");
+        let mut logged = Vec::new();
+        for i in 0..1000 {
+            logged.extend(l.lines(format!("refused dns n{}.evil", i % 5), t0));
+        }
+        assert_eq!(logged, ["refused dns n0.evil", "refused dns n1.evil", "refused dns n2.evil"]);
+        let next = l.lines("refused dns n0.evil".into(), t0 + std::time::Duration::from_secs(11));
+        assert_eq!(next, ["x: 997 similar line(s) not logged in the last 10 s", "refused dns n0.evil"]);
+    }
+
     #[test]
     fn splits_memory_into_base_and_elastic() {
         assert_eq!(split_memory(8192, None), (4096, 4096));
@@ -198,8 +411,6 @@ mod tests {
         assert_eq!(split_memory(8192, Some(6144)), (6144, 2048));
         assert_eq!(split_memory(8192, Some(10240)), (8192, 0), "base can't exceed memory");
     }
-
-    use super::*;
 
     #[test]
     fn forward_header_round_trips() {

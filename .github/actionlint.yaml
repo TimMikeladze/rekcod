@@ -1,4 +1,4 @@
-# Custom label of the self-hosted Mac that runs e2e.yml (docs/releasing.md).
+# Custom label of the self-hosted Mac that runs e2e.yml (the runner rule is at the top of that file).
 self-hosted-runner:
   labels:
     - rekcod-e2e

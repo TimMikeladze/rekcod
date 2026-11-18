@@ -454,17 +454,32 @@ fn host_key_opts(paths: &Paths, image: Option<&str>) -> Result<Vec<String>> {
     Ok(o)
 }
 
+/// Options ssh and scp share: the guest's host key pinned for its image, our key.
+fn ssh_options(c: &mut Command, paths: &Paths, image: Option<&str>, key: &Path, quiet: bool) -> Result<()> {
+    c.args(if quiet { ["-q"].as_slice() } else { ["-o", "LogLevel=ERROR"].as_slice() })
+        .args(host_key_opts(paths, image)?)
+        .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-i"])
+        .arg(key);
+    Ok(())
+}
+
 fn ssh_base(paths: &Paths, ip: &str) -> Result<Command> {
     ssh_to(paths, ip, image_at(paths, ip).as_deref(), true)
 }
 
 fn ssh_to(paths: &Paths, ip: &str, image: Option<&str>, quiet: bool) -> Result<Command> {
     let mut c = Command::new("ssh");
-    c.args(if quiet { ["-q"].as_slice() } else { ["-o", "LogLevel=ERROR"].as_slice() })
-        .args(host_key_opts(paths, image)?)
-        .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-i"])
-        .arg(key(paths)?)
-        .arg(format!("{USER}@{ip}"));
+    ssh_options(&mut c, paths, image, &key(paths)?, quiet)?;
+    c.arg(format!("{USER}@{ip}"));
+    Ok(c)
+}
+
+/// `scp -r` to the guest at `ip`, with the same host key pinning as ssh; add the paths
+/// (`rekcod@IP:path` remote).
+pub fn scp_command(paths: &Paths, ip: &str) -> Result<Command> {
+    let mut c = Command::new("scp");
+    c.arg("-r");
+    ssh_options(&mut c, paths, image_at(paths, ip).as_deref(), &key(paths)?, true)?;
     Ok(c)
 }
 
@@ -483,7 +498,9 @@ pub fn boot(paths: &Paths, home: &Path, idle_ttl: u64) -> Result<String> {
                 Ok(())
             });
         }
-        cmd.spawn().context("spawn macOS guest")?;
+        let mut child = cmd.spawn().context("spawn macOS guest")?;
+        // Reaped when it exits, so a server that boots guests collects no zombies.
+        std::thread::spawn(move || child.wait());
     }
     let t0 = Instant::now();
     loop {
@@ -532,7 +549,7 @@ pub fn pull_ws(paths: &Paths, ip: &str, ws: &Path) -> Result<()> {
         }
     }
     std::fs::create_dir_all(&fresh)?;
-    let mut ssh = ssh_base(paths, ip)?.arg("tar -C ~/ws --exclude ./.git -cf - .").stdout(Stdio::piped()).spawn()?;
+    let mut ssh = ssh_base(paths, ip)?.arg("tar -C ~/ws --exclude ./.git -cf - .").stdin(Stdio::null()).stdout(Stdio::piped()).spawn()?;
     let out = ssh.stdout.take().context("ssh stdout")?;
     let ok = Command::new("tar").arg("-C").arg(&fresh).args(["-xf", "-"]).stdin(out).status()?.success();
     if !ssh.wait()?.success() || !ok {
@@ -624,7 +641,11 @@ pub fn input_script(action: &[String]) -> Result<String> {
 
 pub fn input(paths: &Paths, ip: &str, action: &[String]) -> Result<()> {
     let script = input_script(action)?;
-    let ok = ssh_base(paths, ip)?.arg(format!("osascript -l JavaScript -e {}", crate::actions::shell_quote(&script))).status()?.success();
+    let ok = ssh_base(paths, ip)?
+        .arg(format!("osascript -l JavaScript -e {}", crate::actions::shell_quote(&script)))
+        .stdin(Stdio::null())
+        .status()?
+        .success();
     if !ok {
         bail!("input failed; the guest needs Accessibility allowed for sshd-keygen-wrapper");
     }
@@ -717,6 +738,21 @@ mod tests {
         assert!(legacy.ends_with(&format!("UserKnownHostsFile={}", home.join("macos/known_hosts").display())), "{legacy}");
         let old: GuestConfig = serde_json::from_str(r#"{"cpus":4,"memory_gib":8,"mac":"aa:bb:cc:dd:ee:ff"}"#).unwrap();
         assert_eq!(old.image, None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn scp_pins_host_keys_like_ssh() {
+        let home = std::env::temp_dir().join(format!("rekcod-macos-scp-{}", std::process::id()));
+        let paths = Paths { home: home.clone() };
+        let mut c = Command::new("scp");
+        ssh_options(&mut c, &paths, Some("base"), Path::new("/k"), true).unwrap();
+        let a: Vec<String> = c.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
+        let a = a.join(" ");
+        let file = home.join("macos/known_hosts.d/base");
+        assert!(a.contains("StrictHostKeyChecking=accept-new") && a.contains(&format!("UserKnownHostsFile={}", file.display())), "{a}");
+        assert!(a.contains("HostKeyAlias=rekcod-macos-base"), "{a}");
+        assert!(!a.contains("StrictHostKeyChecking=no") && !a.contains("/dev/null"), "{a}");
         let _ = std::fs::remove_dir_all(&home);
     }
 

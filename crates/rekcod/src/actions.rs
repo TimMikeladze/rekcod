@@ -34,6 +34,7 @@ pub enum Kind {
     SandboxStop,
     SandboxRemove,
     SandboxScreenshot,
+    SandboxPrune,
     AppOpen,
     AppLogs,
     AppRollback,
@@ -42,6 +43,7 @@ pub enum Kind {
     AppPrivate,
     AppWake,
     AppRecycle,
+    AppWebhook,
     JobLogs,
     JobCancel,
     NsUse,
@@ -67,6 +69,8 @@ pub enum Kind {
     NodeDrain,
     NodeUndrain,
     BackupNow,
+    ControllerTokens,
+    ControllerAudit,
     RemoteUse,
     DashboardOpen,
     VmRepair,
@@ -98,7 +102,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 79] = [
+    pub const ALL: [Kind; 83] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -119,6 +123,7 @@ impl Kind {
         Kind::SandboxStop,
         Kind::SandboxRemove,
         Kind::SandboxScreenshot,
+        Kind::SandboxPrune,
         Kind::AppOpen,
         Kind::AppLogs,
         Kind::AppRollback,
@@ -127,6 +132,7 @@ impl Kind {
         Kind::AppPrivate,
         Kind::AppWake,
         Kind::AppRecycle,
+        Kind::AppWebhook,
         Kind::JobLogs,
         Kind::JobCancel,
         Kind::NsUse,
@@ -152,6 +158,8 @@ impl Kind {
         Kind::NodeDrain,
         Kind::NodeUndrain,
         Kind::BackupNow,
+        Kind::ControllerTokens,
+        Kind::ControllerAudit,
         Kind::RemoteUse,
         Kind::DashboardOpen,
         Kind::VmRepair,
@@ -541,6 +549,8 @@ pub struct FleetNode {
     pub id: String,
     pub state: String,
     pub last_seen: Option<u64>,
+    /// Drained by an admin; stays so while the node is `lost`.
+    pub drained: bool,
 }
 
 /// A client IP the edges saw in the last 10 minutes.
@@ -641,6 +651,8 @@ pub struct RemoteApp {
     pub public: bool,
     /// Scaled to zero; the next request (or `app wake`) starts it.
     pub sleeping: bool,
+    /// A pull request preview; its base app has the webhook.
+    pub preview: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -714,6 +726,7 @@ fn remote_data(paths: &Paths) -> RemoteData {
                         id: n["id"].as_str().unwrap_or_default().into(),
                         state: n["state"].as_str().unwrap_or_default().into(),
                         last_seen: n["last_seen"].as_u64(),
+                        drained: n["drained"].as_bool().unwrap_or(false),
                     })
                     .collect(),
             )
@@ -786,6 +799,7 @@ pub fn parse_apps(v: &Value) -> Vec<RemoteApp> {
             live_release: a["live_release"].as_i64(),
             public: a["public"].as_bool().unwrap_or(false),
             sleeping: a["sleeping"].as_bool().unwrap_or(false),
+            preview: !a["preview_of"].is_null(),
         })
         .collect()
 }
@@ -1383,8 +1397,12 @@ pub fn volume_actions(v: &Volume) -> Vec<Action> {
 
 /// Prunes, while the VM runs. Snapshot volumes are left out of `volume prune`.
 pub fn disk_actions(running: bool, images: &[Image], volumes: &[Volume], disk: Option<&Disk>) -> Vec<Action> {
+    // Sandboxes are files on the Mac; removing them needs no VM.
+    let sandboxes = Action::rekcod(Kind::SandboxPrune, "Remove unused agent sandboxes", &["sandbox", "prune"]).confirm(
+        "Delete agent sandboxes stopped and unused for a week, and what failed creates left? Unapplied changes in them are lost.".into(),
+    );
     if !running {
-        return vec![];
+        return vec![sandboxes];
     }
     let dangling: Vec<&Image> = images.iter().filter(|i| i.dangling && i.containers.is_empty()).collect();
     let loose: Vec<&Volume> = volumes.iter().filter(|v| v.anonymous && !v.snapshot && v.containers.is_empty()).collect();
@@ -1412,6 +1430,7 @@ pub fn disk_actions(running: bool, images: &[Image], volumes: &[Volume], disk: O
             .confirm("Remove every network no container uses? Compose recreates its networks on the next up.".into()),
         Action::rekcod(Kind::SystemPrune, "Remove everything unused", &["system", "prune", "-f"])
             .confirm("Remove stopped containers, unused networks, dangling images and unused build cache? Volumes are kept.".into()),
+        sandboxes,
     ]
 }
 
@@ -1466,7 +1485,7 @@ pub fn sandbox_actions(s: &AgentSandbox) -> Vec<Action> {
 
 pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
     let n = a.name.as_str();
-    vec![
+    let mut out = vec![
         Action {
             kind: Kind::AppOpen,
             label: format!("Open {}", a.url),
@@ -1492,7 +1511,12 @@ pub fn app_actions(a: &RemoteApp) -> Vec<Action> {
         },
         Action::rekcod(Kind::AppDestroy, "Destroy", &["app", "destroy", n])
             .confirm(format!("Destroy {n}? Its instances and release history are deleted.")),
-    ]
+    ];
+    if !a.preview {
+        // Interactive: it prints the secret to paste into GitHub.
+        out.push(Action::rekcod(Kind::AppWebhook, "GitHub webhook (URL and secret)", &["app", "webhook", n]).interactive());
+    }
+    out
 }
 
 pub fn job_actions(j: &RemoteJob) -> Vec<Action> {
@@ -1515,7 +1539,7 @@ pub fn job_actions(j: &RemoteJob) -> Vec<Action> {
 /// Admin token only: drain a node, or put a drained one back.
 pub fn node_actions(n: &FleetNode) -> Vec<Action> {
     let id = n.id.as_str();
-    if n.state == "drain" {
+    if n.drained || n.state == "drain" {
         vec![Action::rekcod(Kind::NodeUndrain, "Undrain (place sandboxes again)", &["node", "undrain", id])]
     } else {
         vec![
@@ -1530,7 +1554,11 @@ pub fn controller_actions(admin: bool) -> Vec<Action> {
     if !admin {
         return vec![];
     }
-    vec![Action::rekcod(Kind::BackupNow, "Back up the controller now", &["controller", "backup"])]
+    vec![
+        Action::rekcod(Kind::BackupNow, "Back up the controller now", &["controller", "backup"]),
+        Action::rekcod(Kind::ControllerTokens, "Tokens", &["controller", "tokens"]).interactive(),
+        Action::rekcod(Kind::ControllerAudit, "Audit log", &["controller", "audit"]).interactive(),
+    ]
 }
 
 /// Make another configured remote the default.
@@ -1650,7 +1678,14 @@ pub mod tests {
     }
 
     pub fn sample_app() -> RemoteApp {
-        RemoteApp { name: "dash".into(), url: "http://dash.apps.test".into(), live_release: Some(3), public: false, sleeping: false }
+        RemoteApp {
+            name: "dash".into(),
+            url: "http://dash.apps.test".into(),
+            live_release: Some(3),
+            public: false,
+            sleeping: false,
+            preview: false,
+        }
     }
 
     pub fn sample_job() -> RemoteJob {
@@ -1708,8 +1743,8 @@ pub mod tests {
 
     pub fn sample_nodes() -> Vec<FleetNode> {
         vec![
-            FleetNode { id: "n-1".into(), state: "ready".into(), last_seen: Some(0) },
-            FleetNode { id: "n-2".into(), state: "drain".into(), last_seen: Some(0) },
+            FleetNode { id: "n-1".into(), state: "ready".into(), last_seen: Some(0), drained: false },
+            FleetNode { id: "n-2".into(), state: "drain".into(), last_seen: Some(0), drained: true },
         ]
     }
 
@@ -1798,6 +1833,12 @@ pub mod tests {
     }
 
     #[test]
+    fn a_drained_node_that_went_lost_is_still_undrained() {
+        let n = FleetNode { id: "n-3".into(), state: "lost".into(), last_seen: Some(0), drained: true };
+        assert_eq!(node_actions(&n).iter().map(|a| a.kind).collect::<Vec<_>>(), [Kind::NodeUndrain]);
+    }
+
+    #[test]
     fn every_kind_is_offered() {
         let actions = reachable_kinds();
         for kind in Kind::ALL {
@@ -1837,6 +1878,7 @@ pub mod tests {
                     | Kind::NetworkRemove
                     | Kind::NetworkPrune
                     | Kind::SystemPrune
+                    | Kind::SandboxPrune
             ) || (a.kind == Kind::EdgeBan && !a.interactive);
             assert_eq!(a.confirm.is_some(), destructive, "{:?}", a.kind);
         }
@@ -1856,7 +1898,7 @@ pub mod tests {
         let vp = d.iter().find(|a| a.kind == Kind::VolumePrune).unwrap();
         assert!(matches!(&vp.run, Run::Rekcod(v) if v.contains(&"label!=dev.rekcod.snap".to_string())));
         assert!(!volume_actions(&sample_volumes()[0]).iter().any(|a| a.kind == Kind::VolumeRemove), "a volume in use can't be removed");
-        assert!(disk_actions(false, &[], &[], None).is_empty());
+        assert_eq!(disk_actions(false, &[], &[], None).iter().map(|a| a.kind).collect::<Vec<_>>(), vec![Kind::SandboxPrune]);
     }
 
     #[test]

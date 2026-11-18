@@ -2,7 +2,8 @@
 //! contexts (docs/default-socket.md).
 //!
 //! `/var/run/docker.sock -> ~/.rekcod/default.sock -> <engine socket>`: root sets
-//! the first link once (`rekcod socket install`); start/stop retarget the second.
+//! the first link (`rekcod socket install`); start/stop retarget the second. macOS empties
+//! `/var/run` at boot, so install also leaves a root LaunchDaemon that sets it again then.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -28,9 +29,84 @@ fn prev_file(paths: &Paths) -> PathBuf {
     paths.home.join("run/prev-default-sock")
 }
 
+const BOOT_LABEL: &str = "dev.rekcod.socket";
+
+/// The LaunchDaemon that puts the link back at boot.
+fn boot_job() -> PathBuf {
+    std::env::var_os("REKCOD_SYSTEM_LAUNCHD")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| format!("/Library/LaunchDaemons/{BOOT_LABEL}.plist").into())
+}
+
+fn boot_plist(link: &Path, sys: &Path) -> String {
+    let esc = |p: &Path| p.display().to_string().replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{BOOT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/ln</string>
+    <string>-sfn</string>
+    <string>{}</string>
+    <string>{}</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+</dict>
+</plist>
+"#,
+        esc(link),
+        esc(sys)
+    )
+}
+
+/// Writes the boot job (as root unless its directory is writable, as in tests).
+fn install_boot_job(paths: &Paths, sys: &Path, link: &Path) -> Result<()> {
+    let job = boot_job();
+    let plist = boot_plist(link, sys);
+    if std::fs::read_to_string(&job).is_ok_and(|p| p == plist) {
+        return Ok(());
+    }
+    if writable(&job) {
+        return std::fs::write(&job, plist).with_context(|| format!("write {}", job.display()));
+    }
+    let tmp = paths.home.join("run/socket-boot-job.plist");
+    std::fs::write(&tmp, plist)?;
+    let r = sudo(&["install", "-m", "0644", "-o", "root", "-g", "wheel", &tmp.display().to_string(), &job.display().to_string()]);
+    let _ = std::fs::remove_file(&tmp);
+    r
+}
+
+fn remove_boot_job() -> Result<()> {
+    let job = boot_job();
+    if !job.exists() {
+        return Ok(());
+    }
+    if writable(&job) {
+        return Ok(std::fs::remove_file(&job)?);
+    }
+    // Loaded since the last boot (it ran once and exited); unloading it may find nothing.
+    let _ =
+        Command::new("sudo").args(["launchctl", "bootout", &format!("system/{BOOT_LABEL}")]).stderr(std::process::Stdio::null()).status();
+    sudo(&["rm", "-f", &job.display().to_string()])
+}
+
 /// True when `/var/run/docker.sock` goes through `~/.rekcod/default.sock`.
 pub fn installed(paths: &Paths) -> bool {
     std::fs::read_link(system_socket()).is_ok_and(|t| t == default_link(paths))
+}
+
+/// Installed once, and `/var/run/docker.sock` doesn't go through rekcod now: a reboot
+/// before the boot job existed, or another engine took it.
+pub fn lost(paths: &Paths) -> bool {
+    !installed(paths) && original_file(paths).exists()
+}
+
+/// Anything `socket install` left: the link, its records, the boot job.
+pub fn present(paths: &Paths) -> bool {
+    installed(paths) || original_file(paths).exists() || boot_job().exists()
 }
 
 /// Atomically point the user-owned link at `target`.
@@ -86,9 +162,13 @@ pub fn install(paths: &Paths, running: bool) -> Result<()> {
     let link = default_link(paths);
     if installed(paths) {
         println!("{} already goes through rekcod ({})", sys.display(), link.display());
+        install_boot_job(paths, &sys, &link)?;
     } else {
-        let original = std::fs::read_link(&sys).ok().filter(|t| t != &link);
-        let original = original.map(|o| o.display().to_string()).unwrap_or_default();
+        // Nothing there after a reboot emptied /var/run: what install recorded before still holds.
+        let original = match std::fs::read_link(&sys).ok().filter(|t| t != &link) {
+            Some(o) => o.display().to_string(),
+            None => std::fs::read_to_string(original_file(paths)).unwrap_or_default().trim().to_string(),
+        };
         std::fs::write(original_file(paths), &original)?;
         std::fs::write(prev_file(paths), &original)?;
         match original.as_str() {
@@ -105,6 +185,7 @@ pub fn install(paths: &Paths, running: bool) -> Result<()> {
             std::fs::remove_file(&sys).ok();
             std::os::unix::fs::symlink(&link, &sys)?;
         }
+        install_boot_job(paths, &sys, &link)?;
     }
     if running {
         on_start(paths)?;
@@ -124,8 +205,17 @@ fn writable(path: &Path) -> bool {
 
 pub fn uninstall(paths: &Paths) -> Result<()> {
     let sys = system_socket();
-    if !installed(paths) {
+    if !present(paths) {
         println!("{} does not go through rekcod; nothing to do", sys.display());
+        return Ok(());
+    }
+    remove_boot_job()?;
+    if !installed(paths) {
+        // Lost since install: leave whatever has it now alone.
+        for f in [default_link(paths), original_file(paths), prev_file(paths)] {
+            let _ = std::fs::remove_file(f);
+        }
+        println!("{} no longer goes through rekcod; removed what `socket install` left", sys.display());
         return Ok(());
     }
     let original = std::fs::read_to_string(original_file(paths)).unwrap_or_default();
@@ -147,7 +237,9 @@ pub fn uninstall(paths: &Paths) -> Result<()> {
 
 /// One word for `rekcod status`.
 pub fn state(paths: &Paths) -> &'static str {
-    if !installed(paths) {
+    if lost(paths) {
+        "not routed since install, reset by a reboot or another engine (`rekcod socket install`)"
+    } else if !installed(paths) {
         "not installed (`rekcod socket install`)"
     } else if std::fs::read_link(default_link(paths)).ok().as_deref() == Some(paths.socket().as_path()) {
         "rekcod"
@@ -168,14 +260,31 @@ mod tests {
         let sys = dir.join("var/docker.sock");
         let orb = dir.join("orbstack.sock");
         std::os::unix::fs::symlink(&orb, &sys).unwrap();
-        // SAFETY: only this test reads REKCOD_SYSTEM_SOCKET.
-        unsafe { std::env::set_var("REKCOD_SYSTEM_SOCKET", &sys) };
+        let job = dir.join("var/dev.rekcod.socket.plist");
+        // SAFETY: only this test reads REKCOD_SYSTEM_SOCKET and REKCOD_SYSTEM_LAUNCHD.
+        unsafe {
+            std::env::set_var("REKCOD_SYSTEM_SOCKET", &sys);
+            std::env::set_var("REKCOD_SYSTEM_LAUNCHD", &job);
+        }
         let paths = Paths::at(dir.join("home")).unwrap();
 
         assert!(!on_start(&paths).unwrap(), "not installed: start leaves it alone");
         install(&paths, false).unwrap();
         assert!(installed(&paths));
         assert_eq!(std::fs::read_link(default_link(&paths)).unwrap(), orb);
+        let plist = std::fs::read_to_string(&job).unwrap();
+        assert!(
+            plist.contains(&format!("<string>{}</string>\n    <string>{}</string>", default_link(&paths).display(), sys.display())),
+            "{plist}"
+        );
+
+        // A reboot empties /var/run: the boot job puts the link back, and until then it's
+        // reported as lost rather than never installed.
+        std::fs::remove_file(&sys).unwrap();
+        assert!(lost(&paths) && state(&paths).starts_with("not routed since install"), "{}", state(&paths));
+        install(&paths, false).unwrap();
+        assert!(installed(&paths) && !lost(&paths));
+        assert_eq!(std::fs::read_link(default_link(&paths)).unwrap(), orb, "what it had before install is kept");
 
         assert!(on_start(&paths).unwrap());
         assert_eq!(std::fs::read_link(default_link(&paths)).unwrap(), paths.socket());
@@ -186,6 +295,7 @@ mod tests {
         uninstall(&paths).unwrap();
         assert_eq!(std::fs::read_link(&sys).unwrap(), orb);
         assert!(!default_link(&paths).exists() && std::fs::symlink_metadata(default_link(&paths)).is_err());
+        assert!(!job.exists() && !present(&paths), "the boot job goes with it");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -33,7 +33,13 @@ pub fn dns_name(status_json: &str) -> Option<String> {
 }
 
 fn run(exe: &Path, args: &[&str]) -> Result<()> {
-    let st = Command::new(exe).args(args).status().with_context(|| format!("run rekcod {}", redacted(args)))?;
+    run_env(exe, args, &[])
+}
+
+/// `run` with environment variables: tokens go to the child this way, not on its argv, where
+/// any account on the Mac can read them from the process list.
+fn run_env(exe: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
+    let st = Command::new(exe).args(args).envs(env.iter().copied()).status().with_context(|| format!("run rekcod {}", redacted(args)))?;
     if !st.success() {
         bail!("`rekcod {}` failed", redacted(args));
     }
@@ -320,8 +326,30 @@ fn firewall_allows(listapps: &str, exe: &str) -> bool {
     false
 }
 
-/// With the application firewall on, other Macs' connections to the controller and edge
-/// are accepted and then get no data back.
+/// For `doctor`: when this Mac's RustFS listens beyond loopback and the firewall is on,
+/// whether the RustFS binary may accept connections, and what was checked. None when
+/// neither applies.
+pub fn storage_firewall(paths: &Paths) -> Option<(bool, String)> {
+    let creds = crate::storage::read_credentials(&crate::storage::credentials_file(paths)).ok()?;
+    let listen = creds.endpoint.strip_prefix("http://")?.parse::<std::net::SocketAddr>().ok()?;
+    if listen.ip().is_loopback() {
+        return None;
+    }
+    let out = |arg: &str| Command::new(SOCKETFILTERFW).arg(arg).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
+    if !out("--getglobalstate").is_ok_and(|s| s.contains("enabled")) {
+        return None;
+    }
+    let bin = crate::storage::binary_path(paths).display().to_string();
+    let ok = out("--listapps").is_ok_and(|s| firewall_allows(&s, &bin));
+    Some((ok, format!("{bin} on {listen}")))
+}
+
+fn storage_takes_outside_connections(l: &Layout) -> bool {
+    l.storage_listen.parse::<std::net::SocketAddr>().is_ok_and(|a| !a.ip().is_loopback())
+}
+
+/// With the application firewall on, other Macs' connections to the controller, edge and
+/// storage are accepted and then get no data back.
 fn firewall(exe: &Path) {
     let out = |arg: &str| Command::new(SOCKETFILTERFW).arg(arg).output().map(|o| String::from_utf8_lossy(&o.stdout).to_string());
     if !out("--getglobalstate").is_ok_and(|s| s.contains("enabled")) {
@@ -334,9 +362,7 @@ fn firewall(exe: &Path) {
     let cmds = firewall_allow(&exe);
     if !can_sudo() {
         let line = cmds.iter().map(|c| format!("sudo {}", c.join(" "))).collect::<Vec<_>>().join(" && ");
-        eprintln!(
-            "rekcod: the firewall is on and blocks other Macs from the controller and edge; run once (sudo needs a terminal):\n  {line}"
-        );
+        eprintln!("rekcod: the firewall is on and blocks other Macs from {exe}; run once (sudo needs a terminal):\n  {line}");
         return;
     }
     eprintln!("rekcod: the firewall is on; letting {exe} accept connections");
@@ -389,9 +415,12 @@ pub fn layout(net: &Net) -> Layout {
                 Net::Tailnet { name: Some(n), .. } => n.clone(),
                 _ => ip.clone(),
             };
+            // RustFS speaks plain HTTP: on a tailnet address Tailscale encrypts it, anywhere
+            // else it stays on loopback and only this Mac's node uses it.
+            let storage = if crate::fleet::check_plain_http(&format!("{ip}:7710"), "storage").is_ok() { ip.as_str() } else { "127.0.0.1" };
             Layout {
-                storage_listen: format!("{ip}:7710"),
-                storage_url: format!("http://{ip}:7710"),
+                storage_listen: format!("{storage}:7710"),
+                storage_url: format!("http://{storage}:7710"),
                 controller_listen: format!("{ip}:7700"),
                 tls_name: Some(host),
                 bonjour: false,
@@ -440,26 +469,12 @@ fn edge_layout(net: &Net, lan_name: Option<&str>) -> Result<EdgeLayout> {
     }
 }
 
-/// How the edge-only setup brings up this Mac's node.
-#[derive(Debug, PartialEq, Eq)]
-enum EdgeNode {
-    /// Already joined to this fleet at this address: `node serve --install`.
-    Serve,
-    Join {
-        controller: String,
-        token: String,
-        listen: String,
-        advertise: String,
-        ca_fingerprint: Option<String>,
-    },
-}
-
-fn edge_node(
+fn edge_node_args(
     remote: &crate::fleet::Remote,
     l: &EdgeLayout,
     join_token: Option<&str>,
     joined: Option<&serde_json::Value>,
-) -> Result<EdgeNode> {
+) -> Result<Vec<String>> {
     let secure = remote.url.starts_with("https://");
     let advertise = if secure { l.advertise.replacen("http://", "https://", 1) } else { l.advertise.clone() };
     if let Some(j) = joined {
@@ -469,23 +484,18 @@ fn edge_node(
         {
             bail!("this Mac's node is already joined with a different controller or address; use node serve or configure it separately");
         }
-        return Ok(EdgeNode::Serve);
+        return Ok(["node", "serve", "--install"].map(String::from).into());
     }
-    let token = join_token.filter(|s| !s.is_empty()).context("a new node needs --join-token TOKEN (from the existing controller)")?;
-    let ca_fingerprint = if secure {
+    // The token itself goes to `node join` as REKCOD_JOIN_TOKEN.
+    join_token.filter(|s| !s.is_empty()).context("a new node needs --join-token TOKEN (from the existing controller)")?;
+    let mut args =
+        vec!["node".into(), "join".into(), remote.url.clone(), "--listen".into(), l.node_listen.clone(), "--advertise".into(), advertise];
+    if secure {
         let ca = remote.ca.as_deref().context("the remote needs its pinned CA; add it with remote add --ca-fingerprint first")?;
-        Some(crate::tls::fingerprint(ca)?)
-    } else {
-        None
-    };
-    Ok(EdgeNode::Join { controller: remote.url.clone(), token: token.into(), listen: l.node_listen.clone(), advertise, ca_fingerprint })
-}
-
-/// `node join ... --install`, in this process: a token in a child's argv is readable by
-/// every account on this Mac while it runs.
-fn join_node(paths: &Paths, controller: &str, token: &str, listen: &str, advertise: Option<&str>, fp: Option<&str>) -> Result<()> {
-    let options = crate::fleet::NodeJoinOptions { listen, advertise, install: true, ca_fingerprint: fp, zone: None };
-    crate::fleet::node_join(paths, controller, token, options).context("node join")
+        args.extend(["--ca-fingerprint".into(), crate::tls::fingerprint(ca)?]);
+    }
+    args.push("--install".into());
+    Ok(args)
 }
 
 /// Whether `ip` is on one of this Mac's interfaces.
@@ -567,19 +577,15 @@ pub fn setup_edge(paths: &Paths, remote_name: &str, join_token: Option<&str>, ad
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e.into()),
     };
-    let node = edge_node(&remote, &l, join_token, joined.as_ref())?;
+    let args = edge_node_args(&remote, &l, join_token, joined.as_ref())?;
     // Check admin access before installing anything or changing power settings.
     crate::fleet::call(&remote.url, "GET", "/nodes", Some(&remote.token), &serde_json::Value::Null)?;
     // The jobs and the firewall exception keep this path: a Homebrew keg's would be gone
     // after the next `brew upgrade`.
     let exe = crate::service::stable_exe()?;
     let daemons = prepare_services(paths, &exe, no_power)?;
-    match &node {
-        EdgeNode::Serve => run(&exe, &["node", "serve", "--install"])?,
-        EdgeNode::Join { controller, token, listen, advertise, ca_fingerprint } => {
-            join_node(paths, controller, token, listen, Some(advertise), ca_fingerprint.as_deref())?
-        }
-    }
+    let env: Vec<(&str, &str)> = join_token.map(|t| ("REKCOD_JOIN_TOKEN", t)).into_iter().collect();
+    run_env(&exe, &args.iter().map(String::as_str).collect::<Vec<_>>(), &env)?;
     let node: serde_json::Value = serde_json::from_slice(&std::fs::read(&node_file)?)?;
     let id = node["id"].as_str().context("node.json has no node id")?;
     let edge_name = format!("edge-{id}");
@@ -604,13 +610,18 @@ pub fn setup_edge(paths: &Paths, remote_name: &str, join_token: Option<&str>, ad
     Ok(())
 }
 
-pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_power: bool) -> Result<()> {
+pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_power: bool, backup_dir: Option<&Path>) -> Result<()> {
     let exe = crate::service::stable_exe()?;
     let net = pick_net(addr, lan);
     let l = layout(&net);
     let daemons = prepare_services(paths, &exe, no_power)?;
 
     let ctl = paths.home.join("controller");
+    // Other Macs' nodes and apps dial RustFS directly; with the firewall on, its own binary
+    // needs the same exception as rekcod (after `ensure_binary` patched and signed it).
+    if storage_takes_outside_connections(&l) && std::env::var_os("REKCOD_NO_LAUNCHCTL").is_none() {
+        firewall(&crate::storage::ensure_binary(paths)?);
+    }
     // RustFS first: the controller reads its keys on start.
     run(&exe, &["storage", "serve", "--listen", &l.storage_listen, "--install"])?;
     let creds = crate::storage::credentials_file(paths);
@@ -627,6 +638,11 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
     }
     if l.bonjour {
         args.push("--bonjour");
+    }
+    // launchd runs it from `/`: the path must not be relative.
+    let backup_dir = backup_dir.map(std::path::absolute).transpose()?.map(|d| d.display().to_string());
+    if let Some(d) = &backup_dir {
+        args.extend(["--backup-dir", d]);
     }
     args.push("--install");
     run(&exe, &args)?;
@@ -664,8 +680,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
             std::thread::sleep(Duration::from_millis(500));
         }
     }
-    // Tokens stay in this process: another account's `ps` would see them in a child's argv.
-    crate::fleet::remote_add(paths, "local", url, &admin, None, Some(&fp)).context("remote add local")?;
+    run_env(&exe, &["remote", "add", "local", url, "--ca-fingerprint", &fp], &[("REKCOD_TOKEN", &admin)])?;
     // A node that joined on another address (the LAN IP it had, a switch to or from --lan)
     // would serve its old one forever: forget it and join again.
     let node_file = paths.home.join("node.json");
@@ -684,7 +699,11 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
         run(&exe, &["node", "serve", "--install"])?;
     } else {
         let join = std::fs::read_to_string(ctl.join("join-token")).context("no join token")?;
-        join_node(paths, url, join.trim(), &l.node_listen, None, Some(&fp))?;
+        run_env(
+            &exe,
+            &["node", "join", url, "--listen", &l.node_listen, "--ca-fingerprint", &fp, "--install"],
+            &[("REKCOD_JOIN_TOKEN", join.trim())],
+        )?;
     }
     // The edge gets a token that can only read routes and bans: taking over whatever runs
     // the edge shouldn't mean owning the fleet.
@@ -696,7 +715,7 @@ pub fn setup(paths: &Paths, domain: &str, addr: Option<&str>, lan: bool, no_powe
         let v = crate::fleet::call(url, "POST", "/tokens", Some(&admin), &serde_json::json!({"name": "edge", "edge": true}))?;
         v["token"].as_str().context("no edge token")?.to_string()
     };
-    crate::fleet::remote_add(paths, "edge", url, &edge_token, None, Some(&fp)).context("remote add edge")?;
+    run_env(&exe, &["remote", "add", "edge", url, "--ca-fingerprint", &fp], &[("REKCOD_TOKEN", &edge_token)])?;
     run(&exe, &["edge", "serve", "--remote", "edge", "--listen", &l.edge_listen, "--public-listen", "127.0.0.1:8081", "--install"])?;
 
     // The docker VM, so docker over SSH works after a reboot too.
@@ -1067,6 +1086,7 @@ fn pass_through(src: impl Read, mut out: impl Write) -> Result<Option<(String, S
 
 /// Runs `server setup` over SSH, streaming its output, and returns the remote it printed.
 /// `ssh` should have `-t` when this terminal is one, so sudo can prompt.
+#[allow(clippy::too_many_arguments)]
 pub fn remote_setup(
     dest: &str,
     mut ssh: Command,
@@ -1075,9 +1095,13 @@ pub fn remote_setup(
     addr: Option<&str>,
     lan: bool,
     no_power: bool,
+    backup_dir: Option<&str>,
 ) -> Result<(String, String, Option<String>)> {
     if !shell_safe(domain) || addr.is_some_and(|a| !shell_safe(a)) || bin.contains('\'') {
         bail!("--domain and --addr take letters, digits and - . : only");
+    }
+    if backup_dir.is_some_and(|d| !shell_safe(d) || !d.starts_with('/')) {
+        bail!("--backup-dir takes an absolute path on the server of letters, digits and - . _ / only");
     }
     let mut cmd = format!("'{bin}' server setup --domain {domain}");
     if let Some(a) = addr {
@@ -1088,6 +1112,9 @@ pub fn remote_setup(
     }
     if no_power {
         cmd += " --no-power";
+    }
+    if let Some(d) = backup_dir {
+        cmd += &format!(" --backup-dir '{d}'");
     }
     eprintln!("rekcod: running `rekcod server setup` on {dest}; sudo there asks for the password of that Mac's account");
     let mut child = ssh.arg(cmd).stdout(Stdio::piped()).spawn().context("run ssh")?;
@@ -1116,6 +1143,14 @@ mod tests {
         assert_eq!(t.tls_name.as_deref(), Some("mini.tail1.ts.net"));
         assert_eq!((t.node_listen.as_str(), t.bonjour), ("100.64.0.9:7701", false));
         assert_eq!(layout(&Net::Fixed("10.0.0.4".into())).tls_name.as_deref(), Some("10.0.0.4"));
+        // RustFS speaks plain HTTP: a tailnet address may carry it, a LAN one may not.
+        assert_eq!(t.storage_url, "http://100.64.0.9:7710");
+        assert!(storage_takes_outside_connections(&t) && !storage_takes_outside_connections(&l));
+        if std::env::var_os("REKCOD_INSECURE").is_none() {
+            let f = layout(&Net::Fixed("10.0.0.4".into()));
+            assert_eq!((f.storage_listen.as_str(), f.storage_url.as_str()), ("127.0.0.1:7710", "http://127.0.0.1:7710"));
+            assert_eq!(f.controller_listen, "10.0.0.4:7700");
+        }
     }
 
     /// The test binary has no entitlements, like a plain `cargo build`: what gets sent is a
@@ -1253,9 +1288,11 @@ mod tests {
         std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
         let mut sh = Command::new("sh");
         sh.arg("-c");
-        let r = remote_setup("mini", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), false, true);
+        let r = remote_setup("mini", sh, &bin.display().to_string(), "apps.test", Some("10.0.0.2"), false, true, Some("/Volumes/B/rekcod"));
         std::fs::remove_file(&bin).unwrap();
         assert_eq!(r.unwrap(), ("http://mini:7700".into(), "tok".into(), None));
+        let relative = remote_setup("mini", Command::new("true"), "/x", "apps.test", None, false, true, Some("backups"));
+        assert!(relative.unwrap_err().to_string().contains("absolute"));
     }
 
     #[test]
@@ -1264,7 +1301,7 @@ mod tests {
         let r = pass_through(&b"Password:ok\r\nremote http://s:7700 t\r\nreminder\n"[..], &mut out).unwrap();
         assert_eq!(String::from_utf8(out).unwrap(), "Password:ok\r\nreminder\n");
         assert_eq!(r, Some(("http://s:7700".into(), "t".into(), None)));
-        assert!(remote_setup("s", Command::new("true"), "/x", "a.com'; rm -rf ~", None, false, true).is_err());
+        assert!(remote_setup("s", Command::new("true"), "/x", "a.com'; rm -rf ~", None, false, true, None).is_err());
     }
 
     #[test]
@@ -1273,32 +1310,16 @@ mod tests {
         let l = edge_layout(&Net::Fixed("100.64.0.2".into()), None).unwrap();
         assert_eq!(l.node_listen, "100.64.0.2:7701");
         assert_eq!(l.advertise, "http://100.64.0.2:7701");
-        let node = edge_node(&remote, &l, Some("join-secret"), None).unwrap();
+        let args = edge_node_args(&remote, &l, Some("join-secret"), None).unwrap();
         assert_eq!(
-            node,
-            EdgeNode::Join {
-                controller: "http://100.64.0.1:7700".into(),
-                token: "join-secret".into(),
-                listen: "100.64.0.2:7701".into(),
-                advertise: "http://100.64.0.2:7701".into(),
-                ca_fingerprint: None
-            }
+            args,
+            ["node", "join", "http://100.64.0.1:7700", "--listen", "100.64.0.2:7701", "--advertise", "http://100.64.0.2:7701", "--install"]
         );
-        assert!(edge_node(&remote, &l, None, None).is_err());
+        assert!(edge_node_args(&remote, &l, None, None).is_err());
         let matching = serde_json::json!({"controller":remote.url, "listen":l.node_listen, "advertise":l.advertise});
-        assert_eq!(edge_node(&remote, &l, None, Some(&matching)).unwrap(), EdgeNode::Serve);
+        assert_eq!(edge_node_args(&remote, &l, None, Some(&matching)).unwrap(), ["node", "serve", "--install"]);
         let other = serde_json::json!({"controller":"http://100.64.0.3:7700", "listen":l.node_listen});
-        assert!(edge_node(&remote, &l, Some("join-secret"), Some(&other)).is_err());
-    }
-
-    /// No child process `setup` starts gets a token in its argv.
-    #[test]
-    fn setup_children_carry_no_tokens() {
-        let src = include_str!("server.rs");
-        let body = &src[src.find("pub fn setup_edge(").unwrap()..src.find("/// Reads a line from the terminal").unwrap()];
-        for line in body.lines().filter(|l| l.contains("run(&exe")) {
-            assert!(!line.contains("token") && !line.contains("\"join\"") && !line.contains("admin"), "{line}");
-        }
+        assert!(edge_node_args(&remote, &l, Some("join-secret"), Some(&other)).is_err());
     }
 
     #[test]

@@ -279,13 +279,18 @@ fn other_home(paths: &Paths, name: &str) -> Option<String> {
     (!owns(paths, recorded.as_deref())).then(|| recorded.map_or("~/.rekcod".into(), |h| h.display().to_string()))
 }
 
-/// The command that restarts job `name` on the binary its plist names.
-pub fn kickstart_line(name: &str) -> String {
-    let target = format!("{}/{}", domain_of(name), label(name));
-    if is_daemon(name) { format!("sudo launchctl kickstart -k {target}") } else { format!("launchctl kickstart -k {target}") }
+/// Fleet services in the order `upgrade` restarts them. The controller goes first: it
+/// accepts nodes and edges one minor version behind it, never ahead.
+pub const FLEET_SERVICES: &[&str] = &["controller", "node", "edge", "storage"];
+
+/// The installed job's command line (the binary first), read back from its plist.
+pub fn job_args(name: &str) -> Option<Vec<String>> {
+    let path = if is_daemon(name) { daemon_path(name) } else { plist_path(name).ok().filter(|p| p.exists())? };
+    agent_job(name, &path).ok().map(|j| std::iter::once(j.exe.display().to_string()).chain(j.args).collect())
 }
 
-/// Restarts job `name` now (`kickstart -k`): it comes back on the binary its plist names.
+/// Stops the job and starts it again from its plist (`launchctl kickstart -k`), so it
+/// runs whatever binary is at its path now.
 pub fn restart(name: &str) -> Result<()> {
     let target = format!("{}/{}", domain_of(name), label(name));
     let out =

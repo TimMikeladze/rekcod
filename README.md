@@ -55,6 +55,9 @@ rekcod import --from orbstack        # OrbStack
 
 Import copies images and named volumes, leaving the originals at the source. Volumes
 still in use are skipped. Use `--images-only` or `--volumes-only` to limit the copy.
+When an image or volume fails to copy, import exits non-zero and names it. A volume
+that failed is incomplete on rekcod, since the copy empties it first; run the import
+again before removing the old engine.
 
 ## Run the project you already have
 
@@ -121,7 +124,18 @@ rekcod snap ls
 ```
 
 Before replacing data, a restore saves the current volumes as `pre-restore`.
-Run `rekcod snap restore pre-restore` to recover that previous state.
+Run `rekcod snap restore pre-restore` to recover that previous state. If the restore
+copy fails part way (the VM's disk fills up, say), rekcod copies `pre-restore` back
+before starting the containers again. If that fails too, the containers stay stopped
+and the error prints the command to run once there's room.
+
+Before stopping anything, restore checks that the VM's disk has room for the
+`pre-restore` copy and the snapshot, and refuses with the sizes when it doesn't.
+
+Restore refuses while a project container is paused (`docker unpause` it first), and
+save refuses while one is restarting. Saves and restores of one project take turns,
+whatever the snapshot names, so a menu bar save waits for a terminal restore.
+
 Snapshots live in the VM; `save --push` and `restore --pull` also transfer them through
 S3-compatible storage.
 
@@ -280,6 +294,26 @@ run `sudo` to install services that start at boot.
 For access between networks, connect both Macs to the same Tailscale tailnet. Without
 Tailscale, rekcod uses Bonjour discovery on the LAN; both Macs need the same subnet.
 
+Server setup uses https. A plain `http://` controller or node URL is accepted only when it
+resolves to a loopback or tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48), and the
+address is checked again before every request, so a `.ts.net` name stops working while
+Tailscale is off. `REKCOD_INSECURE=1` allows plain http on a network you trust. Set it for
+every command that talks to such an address. Services installed with it set keep it;
+services installed by an older rekcod need installing again with it set.
+
+To add a remote or join a node by hand, pass tokens through a file, stdin or the
+environment. Tokens on the command line are visible to other accounts on the Mac in the
+process list:
+
+```sh
+# admin-token is from the controller's ~/.rekcod/controller/; REKCOD_TOKEN also works
+rekcod remote add mini https://mini.tail1234.ts.net:7700 --token-file - --ca-fingerprint sha256:... < admin-token
+REKCOD_JOIN_TOKEN="$(cat join-token)" rekcod node join https://mini.tail1234.ts.net:7700 --ca-fingerprint sha256:... --install
+```
+
+`--token TOKEN` and `node join URL TOKEN` still work. A `node join` without `--install`
+keeps serving in the terminal as `rekcod node serve`, without the token in its arguments.
+
 From your development Mac:
 
 ```sh
@@ -353,6 +387,15 @@ Environment and secret changes redeploy the live release. Secrets are encrypted 
 the controller database. `scale` changes the number of instances, subject to available
 node capacity. `rollback` deploys the previous good release.
 
+Keys set with `app env set` stay across deploys. `app deploy` merges the `[env]` table
+of `rekcod.toml` over the app's env, so a key in both takes the value from the file;
+`rekcod app env unset blog KEY` removes one. `[resources]` values the file leaves out
+keep the app's current ones.
+
+Deploys of one app run one at a time. While one runs and another waits, a third
+(deploy, rollback, scale, env or secret change) is refused with a 409; run it again
+once one finishes.
+
 To make `mini` the default for fleet commands:
 
 ```sh
@@ -377,6 +420,117 @@ your DNS. Marking an app public alone does not create the tunnel.
 Private apps are excluded from that public listener and remain accessible through
 the private edge on the configured tailnet or LAN.
 
+### Deploy pull request previews
+
+Each app has its own GitHub webhook. Print its payload URL and secret:
+
+```sh
+rekcod app webhook blog --remote mini
+```
+
+In the repository's settings, add a webhook with that payload URL and secret, content
+type `application/json`, and the "Pull requests" event. The secret is made the first
+time you ask for it and is stored encrypted like app secrets; `--rotate` replaces it,
+and the old one stops working. The hook only acts on events for the repository the app
+deploys from.
+
+Opening or pushing to a pull request deploys `blog-pr-N` from the PR's head commit,
+with the base app's env (not its secrets) and its own empty bucket if the app has one.
+Closing the PR destroys it. Previews stay private and sleep after 15 minutes unless the
+app sets `idle_stop`; they're removed after a week.
+
+A pull request from a fork runs someone else's code with the app's env and internet
+access, so it deploys only when a maintainer adds the `rekcod-preview` label, and only
+the head commit at that moment. A later push needs the label again: remove it and add it.
+With `GITHUB_TOKEN` set in the controller's environment, rekcod comments the preview URL
+on the PR and removes the label after each fork deploy. `GITHUB_API_URL` points it at
+GitHub Enterprise (default `https://api.github.com`).
+
+GitHub signs the body of each delivery. An identical body is handled once, and an event
+older than one already handled for that PR is ignored, so a replayed `closed` can't
+remove a reopened preview. A delivery that failed (no node had room, say) isn't recorded,
+so GitHub's Redeliver runs it again.
+
+The controller used to have one webhook secret for every app at `/webhooks/github`. That
+route is gone; set each repository's hook up again with `app webhook`.
+
+### Take a node out for maintenance
+
+```sh
+rekcod node drain NODE_ID --remote mini
+rekcod node undrain NODE_ID --remote mini
+```
+
+`drain` stops placing work on the node and moves its app instances to other nodes as
+capacity allows; instances without anywhere to go keep serving where they are. The
+node stays drained through reboots and missed heartbeats until `undrain`.
+
+A node that misses heartbeats for 15 s is `lost`: its app instances leave the routes
+and are replaced on other nodes after a minute, and its jobs and user sandboxes are
+held. When it heartbeats again, sandboxes it still has run again and ones it no longer
+has are removed; deleting a sandbox while its node is away removes the VM once the
+node is back. A controller that was itself away (the Mac slept, the process was
+stopped) waits 20 s for heartbeats before it marks any node lost.
+
+### Edge limits and client addresses
+
+Server setup installs the edge as `rekcod edge serve --remote edge --listen <addr>:8080
+--public-listen 127.0.0.1:8081 --install`. The options that change what it accepts:
+
+```sh
+# Peers whose X-Forwarded-For names the client. Default: loopback, where cloudflared runs.
+rekcod edge serve --trusted-proxy 10.0.0.5 --trusted-proxy 127.0.0.1
+# Read the client address from a header the proxy overwrites, instead of X-Forwarded-For.
+rekcod edge serve --client-ip-header cf-connecting-ip
+# A TCP load balancer that sends a PROXY v2 header; anyone else is disconnected.
+rekcod edge serve --public-listen 0.0.0.0:8081 --proxy-protocol --proxy-protocol-from 10.0.0.2
+# Requests per client across all apps (IPv6 counts per /64).
+rekcod edge serve --rate 50/s --burst 100
+```
+
+X-Forwarded-For is read from the right: the first address that isn't a trusted proxy is the
+client. CF-Connecting-IP is removed from the request unless `--client-ip-header` names it,
+because only Cloudflare overwrites it. Through cloudflared that's fine: Cloudflare appends the
+address it saw to X-Forwarded-For, so the rightmost entry is the visitor. The app gets `X-Forwarded-For`, `X-Real-IP`, `X-Forwarded-Host`, `X-Forwarded-Proto`
+and `X-Request-Id` from the edge; `Forwarded`, `True-Client-IP`, `X-Client-IP`,
+`X-Forwarded-Port` and `X-Forwarded-Server` from the client are removed.
+
+A client over the edge-wide rate gets 429. 100 of those within a minute ban its address (its
+/64 for IPv6) on every edge for 10 minutes. An app's own `[http] rate` only answers 429; it
+never bans. Bans are managed with `rekcod edge ban`, `unban` and `bans`. An edge token can
+only ban an IPv4 /24 or IPv6 /48 or narrower, for at most a day.
+
+Per-app settings go in `rekcod.toml`:
+
+```toml
+[http]
+rate = "10/s"        # per client, on top of the edge-wide rate
+burst = 20
+max_body = "20MB"    # 100 MiB by default; larger bodies get 413
+timeout = "5m"       # to answer once the request body is in; 60s by default, at most 1h
+```
+
+Timeouts and caps:
+
+- A request head has 10 s from its first byte. A request body has to send something every
+  30 s or the client gets 408. The response timeout starts when the body is in.
+- A connection that moves no bytes for 90 s is closed, also in the middle of a response.
+  A server-sent event stream needs a heartbeat more often than that. WebSockets close after
+  an hour without traffic.
+- An instance takes at most 512 requests at once; with every instance at that, the client
+  gets 503 with `Retry-After: 1`.
+- One address (an IPv6 /64) may hold 200 connections and 100 WebSockets. The edge raises its
+  descriptor limit at start and prints the connection and WebSocket totals it derived from it.
+- A request for a sleeping app waits up to 120 s for the wake, then gets 503 with
+  `Retry-After`. After a failed wake the app gets 503s for 30 s.
+- A GET, HEAD or OPTIONS without a body that fails on a reused instance connection is sent
+  once more on a new one. Other failures are a 502 naming the request ID; the instance's
+  address and the error are in `~/.rekcod/logs/edge.log`.
+- On SIGTERM the edge stops accepting and waits up to 15 s for requests in flight.
+
+Traffic from the edge to the nodes' relays, and both edge listeners, are plain HTTP. Keep the
+private listener on a tailnet or LAN.
+
 ### Back up the controller
 
 Server setup configures RustFS for release images, build caches and hourly controller
@@ -387,10 +541,130 @@ rekcod controller backup --remote mini
 rekcod controller backups --remote mini
 ```
 
-These backups are stored on the server's RustFS disk. Copy them off the server for
-recovery from disk loss. Back up the server's `~/.rekcod/controller/secret-key` separately: it is
-needed to decrypt app secrets and is not included in the database backup. Application
-buckets need their own backups too.
+These backups are stored on the server's RustFS disk, so they're lost with it. To keep
+a second copy somewhere else, give setup a directory on another disk or a synced folder:
+
+```sh
+rekcod server setup --domain apps.example.com --backup-dir /Volumes/Backup/rekcod
+rekcod host add mini me@mac-mini --server --domain apps.example.com --backup-dir /Volumes/Backup/rekcod
+```
+
+A running controller takes `--backup-dir DIR` too. Each backup goes to RustFS and to
+the directory independently; when one fails, the other still gets it and the error
+names the one that failed. The copies are `fleet-<UTC time>.db`, mode 0600 in a 0700
+directory. Both places keep the newest 48 (two days of hourly backups), then the newest
+of each of the last 14 days and 8 weeks.
+
+A backup file is a plain SQLite database. Store it like a secret: a synced folder or a
+shared disk gives whoever reads it what's in plain text there:
+
+- each node's secret (`nodes.secret`), the bearer the controller uses on node APIs,
+  which create sandboxes and run commands
+- the join token, which lets a new node into the fleet
+- app env values (not secrets), git URLs, including any credentials written into them,
+  and app, release, job and audit history
+- token hashes (SHA-256, not the tokens)
+
+App secrets, per-app webhook secrets, app bucket keys and the RustFS root secret are in
+it sealed with `controller/secret-key`, so they're readable only with that file. Keep
+`secret-key` apart from the backups.
+
+`GET /metrics` has `rekcod_last_backup_timestamp_seconds` (the last successful backup)
+and `rekcod_backup_failures_total`, so a Prometheus rule can catch backups that stopped
+working. `controller serve --alert-webhook URL` also posts a JSON line
+(`{"text": ...}`, which Slack and Discord accept) when a backup fails, a node is lost
+or a deploy fails.
+
+The database backup doesn't hold these files from `~/.rekcod` on the server; keep a
+copy of each:
+
+| File | Without it |
+| --- | --- |
+| `controller/secret-key` | App secrets and bucket keys in the backup can't be decrypted |
+| `controller/ca.pem`, `controller/ca.key` | Remotes, which pin the CA fingerprint, reject the controller |
+| `controller/node-ca.pem`, `controller/node-ca.key` | Nodes' certificates no longer verify |
+| `controller/admin-token` | A new admin token is made and the old one stops working |
+| `storage/credentials.json` | The RustFS root keys: the controller can't reach the buckets |
+
+The controller makes a CA only when both of its files are missing. With one of a pair
+missing or unreadable, or a key that doesn't match its certificate, it refuses to start
+and names the file, since a new CA would break every remote, edge and node. Node
+certificates last two years; a node asks the controller for a new one in its heartbeat
+once its certificate has 90 days left. `rekcod doctor` flags a node or controller
+certificate with less than 90 days left (the controller makes its own again at each start),
+and the controller posts to `--alert-webhook` once a day while a node's renewal isn't
+working.
+
+Application buckets need their own backups too.
+
+### Restore the controller
+
+Stop the controller first; restore refuses while one has the database open. On a
+server set up with sudo it's a LaunchDaemon:
+
+```sh
+sudo launchctl bootout system/dev.rekcod.controller
+rekcod controller restore                    # the newest backup in RustFS
+rekcod controller restore fleet-20261118T090000Z.db
+rekcod controller restore --from /Volumes/Backup/rekcod/fleet-20261118T090000Z.db
+sudo launchctl bootstrap system /Library/LaunchDaemons/dev.rekcod.controller.plist
+```
+
+Without sudo the services are LaunchAgents: use `gui/$(id -u)/dev.rekcod.controller`
+and `~/Library/LaunchAgents/dev.rekcod.controller.plist` instead. `--from` takes a
+`--backup-dir` copy or a file you copied off the server, and needs neither RustFS nor
+its keys; use it on a new Mac after copying the files from the table above back into
+`~/.rekcod`. The file is copied, not changed.
+
+Restore checks the backup is a whole fleet database before replacing anything. The old
+database is kept as `fleet.db.before-restore-<time>`, with the writes its WAL held.
+Instances that were running when the backup was taken are marked lost, and the
+controller takes back the ones that still answer.
+
+### Give people access
+
+The server's admin token is in `~/.rekcod/controller/admin-token`; `host add --server`
+saves it in the `mini` remote. Make a token for each person instead of sharing it:
+
+```sh
+rekcod controller token alice --remote mini                       # member of default
+rekcod controller token ci --ns team --role member --expires 30d --remote mini
+rekcod controller token edge1 --edge --remote mini               # for `rekcod edge serve`
+rekcod controller tokens --remote mini
+```
+
+The token is printed once; the controller keeps only its hash. `controller tokens` lists
+each token's name, admin and edge flags, role in `default`, cap, expiry and namespaces.
+Names are 1 to 64 letters, digits, `.`, `_`, `@` and `-`. In `default` each person sees
+only their own apps, sandboxes and jobs. In other namespaces members share everything:
+viewers read, members deploy and run jobs, owners manage members.
+
+```sh
+rekcod ns create team --remote mini
+rekcod ns member add team alice --role owner --remote mini
+rekcod ns member rm team alice --remote mini
+rekcod controller limit alice --max-sandboxes 20 --remote mini
+rekcod controller revoke alice --remote mini
+```
+
+`--max-sandboxes` caps a person's sandboxes plus jobs across namespaces (0 to 100000, or
+`unlimited`); app instances count against the namespace quota instead. `revoke` deletes
+every token with that name and its memberships, deletes that person's schedules and
+cancels their running jobs. `ns member rm` does the same within the namespace. Both print
+the sandboxes and apps of theirs that keep running. A schedule also stops running once
+its owner's tokens have expired.
+
+```sh
+rekcod controller audit --remote mini --since 1d
+rekcod controller audit --remote mini --ns team
+```
+
+The audit log records deploys, destroys (with whether they worked), env and secret
+changes (names only), quota, pool, member, token and schedule changes, requests denied
+for a missing role or admin token, and bad tokens (one row per address per minute). Admins
+read all of it; a namespace's owners read it with `--ns`. Rows are kept 90 days. When a
+namespace is deleted, its rows move to `NAME (deleted TIME)`, so a namespace made later
+under the same name doesn't see them, its jobs or their logs.
 
 ## Run jobs on the server
 
@@ -406,6 +680,11 @@ Each job runs in a new sandbox VM on the fleet. `job run` follows its output by
 default; add `--detach` to print the job ID and return. Replace `JOB_ID` with the ID
 from `job ls` when reading logs later. `rekcod job cancel JOB_ID --remote mini`
 stops a job.
+
+`job run --name nightly --every 24h -- ./backup.sh` runs it on a schedule instead; the
+shortest interval is one minute. A run that can't start (no node with room, a full
+quota) shows in `job ls` as a failed job with the reason, and is tried again after
+5 minutes. A job's output on the node stops at 64 MiB; the command keeps running.
 
 ## Run S3-compatible storage
 
@@ -429,7 +708,25 @@ rekcod snap restore seeded --pull
 ```
 
 To use another S3-compatible store, set `S3_ENDPOINT`, `S3_BUCKET`,
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` before running the snapshot commands.
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` before running the snapshot commands,
+and `AWS_REGION` when the store checks it (the default is `us-east-1`):
+
+```sh
+export S3_ENDPOINT=https://s3.eu-west-1.amazonaws.com AWS_REGION=eu-west-1
+export S3_BUCKET=my-snaps AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+rekcod snap save seeded --push
+```
+
+`https://` endpoints are checked against the Mac's trusted certificates (`SSL_CERT_FILE`
+for a private CA). A plain `http://` endpoint must be on loopback or the tailnet, since
+volume archives would cross the network unencrypted; `REKCOD_INSECURE=1` allows one on
+a network you trust. Requests are path-style (`https://host/bucket/key`), and each
+volume archive is one PUT, so stores that cap a single upload at 5 GiB refuse bigger
+volumes.
+
+Two Macs can push the same snapshot. Whichever manifest is written last is what
+`--pull` gets; the other push's archives stay in the bucket until a later push is
+more than an hour newer.
 
 For a self-hosted app, add this to its `rekcod.toml` and deploy again:
 
@@ -442,6 +739,36 @@ The controller creates a bucket for the app and gives its instances `S3_ENDPOINT
 `S3_BUCKET`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` and `AWS_REGION`.
 The credentials are scoped to that bucket. `rekcod app storage blog --remote mini`
 shows its connection settings; append `ls` to list its objects.
+
+```sh
+rekcod app storage blog url reports/march.pdf --expires 24h --remote mini
+rekcod app storage blog rotate --remote mini
+```
+
+`url` prints a presigned GET URL, signed with the app's own key, for at most 7 days.
+`rotate` gives the app a new key and redeploys the live release with it. The old key
+keeps working until the new release is live and the old instances have drained, then
+it's revoked, along with URLs signed with it. If the redeploy fails, the app keeps the
+old key. A destroy revokes the key and deletes the bucket, every object version in it
+included. The instances go before `app destroy` returns; the bucket and stored images
+are deleted after, in the background. Until that's done `rekcod app status NAME`
+shows `destroying` and, if a delete failed, the error; the controller retries every
+minute, and the name stays taken until it works.
+
+`rekcod doctor` on the server checks that the firewall lets RustFS through when it
+listens beyond loopback; other Macs' connections would otherwise be accepted and stall.
+
+On a LAN server (`--lan`, or `--addr` with an address outside the tailnet) RustFS
+listens on the server's loopback, because it speaks plain HTTP. Bucket apps then run
+only on the server Mac's own node, and nodes on other Macs build each release from git
+instead of loading it from RustFS. On a tailnet, RustFS listens on the tailnet address
+and every node can reach it.
+
+A server set up with `--addr` on a LAN address before this rule had RustFS on that
+address; `storage serve` and the controller now refuse to start with it. Run
+`rekcod server setup` again with the same options to move RustFS to loopback, then
+redeploy bucket apps so their instances get the new `S3_ENDPOINT`. `REKCOD_INSECURE=1`
+in both services' environment keeps the old layout.
 
 ## Run a self-hosted GitHub Actions runner
 
@@ -474,6 +801,22 @@ rekcod doctor --bundle
 
 `upgrade` verifies the release checksum and replaces the installed binary and any
 bundled dashboard. A running VM keeps using its current daemon until restarted.
+
+On a server, `upgrade` then restarts the controller, node, edge and storage services
+that run that binary, in that order, and waits for the controller to listen again
+before the rest. A controller accepts heartbeats and route fetches from nodes and edges
+one minor version behind it, so with several Macs, upgrade the controller's Mac first.
+CLIs must be on the controller's minor version; an older one gets "this controller
+runs rekcod X, you have Y".
+
+Before a new rekcod migrates `fleet.db`, it copies it to
+`fleet.db.before-schema-N`. An older rekcod refuses a database a newer one migrated.
+To go back a release, stop the controller, put that copy back as `fleet.db`, and
+install the older version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/TimMikeladze/rekcod/main/scripts/install.sh | REKCOD_VERSION=0.3.0 bash
+```
 `doctor --bundle` writes a diagnostic archive under `~/.rekcod` with configuration,
 status and logs, excluding tokens and keys.
 

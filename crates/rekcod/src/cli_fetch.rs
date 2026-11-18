@@ -53,8 +53,8 @@ pub fn ensure_cli(rekcod_home: &Path) -> Result<PathBuf> {
     if ASSETS.iter().all(|a| dir.join(a.dest).exists()) {
         return Ok(dir);
     }
+    crate::fetch::clear_stale(&parent, ".download-");
     let tmp = parent.join(format!(".download-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(tmp.join("unpacked/cli-plugins"))?;
     eprintln!("rekcod: no docker CLI found; downloading docker {CLI_VERSION} with compose and buildx");
     let result = ASSETS.iter().try_for_each(|a| download(a, &tmp)).and_then(|()| {

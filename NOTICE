@@ -1,8 +1,66 @@
-Original rekcod code is licensed under MIT.
+Original rekcod code is licensed under MIT (LICENSE).
 
-guest/fuse/rekcod-fuse.patch modifies Linux and is covered by GPL-2.0-only;
-the license text is in LICENSES/GPL-2.0-only.txt. The combined Linux kernel
-remains covered by its upstream terms.
+guest/fuse/rekcod-fuse.patch modifies Linux and is covered by GPL-2.0-only; the license
+text is in LICENSES/GPL-2.0-only.txt. guest/fuse/rekcod.c and
+guest/kernel/elastic/rekcod_elastic.c are rekcod's own (MODULE_LICENSE "Dual MIT/GPL")
+and are built into the guest kernel, which as a whole remains covered by Linux's terms.
 
-Dependencies and bundled third-party software retain their own copyright
-and license notices.
+Third-party software in the release tarballs keeps its own copyright and license:
+
+- rekcod-<version>-darwin-arm64.tar.gz: the Rust crates linked into bin/rekcod and, with
+  share/rekcod/dashboard, the dashboard's npm packages. THIRD-PARTY-NOTICES.txt in the
+  tarball has each one's license and notice files.
+
+- rekcod-guest-<version>.tar.gz:
+  - Image: Linux (GPL-2.0-only), version and sha256 in guest/versions.env, built with
+    the `config` file in the same tarball.
+  - root.img: Alpine Linux packages (BusyBox, musl, e2fsprogs, iptables, dnsmasq, kmod
+    and others) under their own licenses, GPL-2.0 among them. `packages.txt` in the
+    tarball lists each package with its version, origin and license.
+  - root.img: Docker Engine's static binaries (dockerd, containerd,
+    containerd-shim-runc-v2, runc, docker-proxy, docker-init), Apache-2.0
+    (LICENSES/Apache-2.0.txt). Docker's NOTICE is below.
+  - root.img: rekcod-agent and the Rust crates linked into it; THIRD-PARTY-NOTICES.txt
+    in the tarball has their license and notice files.
+
+Corresponding source for the guest of a release, from the repository at that release's
+tag:
+
+- Linux: linux-$LINUX_VERSION.tar.xz from cdn.kernel.org (version and sha256 in
+  guest/versions.env), plus guest/fuse/, guest/kernel/ and guest/build.sh, which applies
+  them.
+- Alpine packages: the aports repository (https://gitlab.alpinelinux.org/alpine/aports),
+  branch <major.minor>-stable of $ALPINE_RELEASE in guest/versions.env, at the versions
+  packages.txt lists. Each package's source is under main/<origin>.
+- Docker Engine: https://github.com/moby/moby at tag docker-v$DOCKER_VERSION, and the
+  containerd and runc versions that release names.
+
+Docker's NOTICE (https://github.com/moby/moby/blob/master/NOTICE):
+
+  Docker
+  Copyright 2012-2017 Docker, Inc.
+
+  This product includes software developed at Docker, Inc. (https://www.docker.com).
+
+  This product contains software (https://github.com/creack/pty) developed
+  by Keith Rarick, licensed under the MIT License.
+
+  This product contains software derived from RackSec/srslog
+  (https://github.com/RackSec/srslog), developed by Rackspace and derived
+  from the Go standard library's log/syslog package, licensed under the
+  BSD 3-Clause License.
+
+  This product contains software derived from golang/gddo
+  (https://github.com/golang/gddo), developed by The Go Authors and licensed
+  under the BSD 3-Clause License.
+
+  The following is courtesy of our legal counsel:
+
+  Use and transfer of Docker may be subject to certain restrictions by the
+  United States and other governments.
+  It is your responsibility to ensure that your use and/or transfer does not
+  violate applicable laws.
+
+  For more information, please see https://www.bis.doc.gov
+
+  See also https://www.apache.org/dev/crypto.html and/or seek legal counsel.

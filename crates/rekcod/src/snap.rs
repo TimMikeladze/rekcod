@@ -13,15 +13,18 @@
 //! time says (a pulled backup is older than the local copy it replaces). Save checks that its
 //! generation is the one that counts now, and only then deletes the others; a save that fails
 //! or is killed leaves the previous snapshot as it was. Everything that changes one snapshot
-//! holds `run/snap/<project>.<name>.lock`, so a menu bar save and a terminal restore take
-//! turns. Restore first saves the current volumes as `pre-restore`. Snapshots from before
+//! holds `run/snap/<project>.<name>.lock`, and whatever reads or changes the project's volumes
+//! and containers also holds `run/snap/<project>.lock`, so a menu bar save and a terminal
+//! restore take turns whatever their names. Restore first saves the current volumes as
+//! `pre-restore`, and copies that back if the restore copy fails. Snapshots from before
 //! generations (`rekcod-snap.<project>.<name>.<volume>`), and markers named `....<gen>.done`
 //! from before markers had their own prefix, are still read.
 //!
 //! `save --push` uploads each snapshot volume as `snaps/<project>/<name>/<gen>/<volume>.tar.zst`,
-//! then `snaps/<project>/<name>/manifest.json` with each archive's SHA-256 and size, and then
-//! deletes archives that neither this manifest nor the one it replaced points at. An
-//! interrupted push leaves the old manifest pointing at its own archives. `restore --pull`
+//! then `snaps/<project>/<name>/manifest.json` with each archive's SHA-256 and size and the
+//! generation it replaced, and then deletes generations more than an hour older than the one
+//! it replaced, which no push still in flight can be. An interrupted push leaves the old
+//! manifest pointing at its own archives. `restore --pull`
 //! checks every archive against the manifest before using it, and still reads pushes from
 //! before generations (`<volume>.tar.zst` beside the manifest, no hashes) (docs/rustfs.md).
 
@@ -223,9 +226,31 @@ fn project_volumes(d: &dyn Engine, project: &str) -> Result<Vec<String>> {
     Ok(lines(&d.docker(&["volume", "ls", "--filter", &filter, "--format", "{{.Name}}"])?))
 }
 
-fn running_containers(d: &dyn Engine, project: &str) -> Result<Vec<String>> {
+/// The project's containers and their states (`running`, `paused`, `restarting`, `exited`, ...).
+fn containers(d: &dyn Engine, project: &str) -> Result<Vec<(String, String)>> {
     let filter = format!("label={PROJECT_LABEL}={project}");
-    Ok(lines(&d.docker(&["ps", "--filter", &filter, "--filter", "status=running", "--format", "{{.ID}}"])?))
+    let out = d.docker(&["ps", "-a", "--filter", &filter, "--format", "{{.ID}} {{.State}}"])?;
+    Ok(lines(&out).into_iter().filter_map(|l| l.split_once(' ').map(|(id, st)| (id.to_string(), st.to_string()))).collect())
+}
+
+/// What save pauses: the running ones. One that is restarting can't be paused and would
+/// write during the copy, so the save waits for nobody and refuses.
+fn to_pause(d: &dyn Engine, project: &str) -> Result<Vec<String>> {
+    let all = containers(d, project)?;
+    if let Some((id, _)) = all.iter().find(|(_, st)| st == "restarting") {
+        bail!("container {id} of {project} is restarting; stop it or let it settle, then save");
+    }
+    Ok(all.into_iter().filter(|(_, st)| st == "running").map(|(id, _)| id).collect())
+}
+
+/// What restore stops and starts again: running and restarting ones. A paused one would
+/// carry on with its old files open over the restored ones, so restore refuses.
+fn to_stop(d: &dyn Engine, project: &str) -> Result<Vec<String>> {
+    let all = containers(d, project)?;
+    if let Some((id, _)) = all.iter().find(|(_, st)| st == "paused") {
+        bail!("container {id} of {project} is paused; `docker unpause {id}` first");
+    }
+    Ok(all.into_iter().filter(|(_, st)| st == "running" || st == "restarting").map(|(id, _)| id).collect())
 }
 
 #[derive(Serialize, Debug, PartialEq)]
@@ -340,9 +365,65 @@ fn lock(d: &dyn Engine, project: &str, name: &str) -> Result<std::fs::File> {
     crate::paths::lock(&path)
 }
 
+/// Held while the project's volumes or containers are read or changed: saves and restores
+/// of different snapshots of one project take turns too.
+fn lock_project(d: &dyn Engine, project: &str) -> Result<std::fs::File> {
+    let dir = d.home().join("run/snap");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{project}.lock"));
+    if crate::paths::locked(&path) {
+        eprintln!("rekcod: waiting for another snapshot change to {project}");
+    }
+    crate::paths::lock(&path)
+}
+
+/// Where push and pull keep an archive on its way: `run/snap/tmp/snap-<what>-<pid>.tar.zst`.
+/// Files a killed process left there (its pid is gone) are deleted first.
+fn tmp_archive(d: &dyn Engine, what: &str) -> Result<std::path::PathBuf> {
+    let dir = d.home().join("run/snap/tmp");
+    std::fs::create_dir_all(&dir)?;
+    for e in std::fs::read_dir(&dir)?.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let pid = name.strip_suffix(".tar.zst").and_then(|n| n.rsplit('-').next()).and_then(|p| p.parse::<libc::pid_t>().ok());
+        if let Some(pid) = pid
+            && unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
+    Ok(dir.join(format!("snap-{what}-{}.tar.zst", std::process::id())))
+}
+
 fn ensure_helper(d: &dyn Engine) -> Result<()> {
     if d.docker(&["image", "inspect", HELPER_IMAGE]).is_err() {
         d.docker(&["pull", "-q", HELPER_IMAGE])?;
+    }
+    Ok(())
+}
+
+/// Fails unless the VM's volume disk has room for `volumes` once more, with 10% to spare:
+/// sizes from `du`, free space from `df`, in one helper container.
+fn check_room(d: &dyn Engine, volumes: &[&str], what: &str) -> Result<()> {
+    if volumes.is_empty() {
+        return Ok(());
+    }
+    ensure_helper(d)?;
+    let mut args: Vec<String> = vec!["run".into(), "--rm".into(), "--network".into(), "none".into()];
+    for (i, v) in volumes.iter().enumerate() {
+        args.extend(["-v".into(), format!("{v}:/v/{i}:ro")]);
+    }
+    let script = "echo $(du -sck /v/* | tail -1 | cut -f1) $(df -Pk /v/0 | tail -1 | awk '{print $4}')";
+    args.extend([HELPER_IMAGE.into(), "sh".into(), "-c".into(), script.into()]);
+    let out = d.docker(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
+    let mut n = out.split_whitespace().filter_map(|x| x.parse::<u64>().ok());
+    let (Some(need), Some(free)) = (n.next(), n.next()) else { bail!("can't read the VM's free space from {out:?}") };
+    if need + need / 10 > free {
+        bail!(
+            "{what} needs about {} MiB on the VM's disk and {} MiB are free; free some (docker system prune, rekcod snap rm) or grow the disk",
+            need / 1024 + 1,
+            free / 1024
+        );
     }
     Ok(())
 }
@@ -418,17 +499,31 @@ struct Saved {
     created: u64,
     /// (project volume, snapshot volume).
     pairs: Vec<(String, String)>,
+    /// The name as given (a branch like `feature/x`).
+    raw: Option<String>,
 }
 
 /// Uploads generation `saved` of snapshot `name`: each volume under the generation's own
 /// prefix, then the manifest that points at them. Until the manifest is written, `pull` gets
-/// the previous push. Archives that neither manifest uses are deleted after.
+/// the previous push. Old generations are deleted after (see [`prune`]).
 fn push(d: &dyn Engine, s3: &S3, bucket: &str, project: &str, name: &str, saved: &Saved) -> Result<()> {
+    let staged = upload(d, s3, bucket, project, name, saved)?;
+    commit(s3, bucket, project, name, saved, staged)
+}
+
+/// What [`upload`] put in the bucket, for the manifest.
+struct Staged {
+    labels: serde_json::Map<String, serde_json::Value>,
+    archives: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The archives of `saved`, each checked to be there. On failure the ones it put are deleted.
+fn upload(d: &dyn Engine, s3: &S3, bucket: &str, project: &str, name: &str, saved: &Saved) -> Result<Staged> {
     let prefix = snap_prefix(project, name);
     let mut labels = serde_json::Map::new();
     let mut archives = serde_json::Map::new();
     let mut uploaded = Vec::new();
-    let tmp = d.home().join(format!("snap-push-{}.tar.zst", std::process::id()));
+    let tmp = tmp_archive(d, "push")?;
     let staged = (|| -> Result<()> {
         for (v, snap) in &saved.pairs {
             let key = archive_key(&prefix, &saved.gen_, v);
@@ -461,10 +556,18 @@ fn push(d: &dyn Engine, s3: &S3, bucket: &str, project: &str, name: &str, saved:
         }
         return Err(e.context(format!("push `{name}` failed; what `--pull` gets is unchanged")));
     }
+    Ok(Staged { labels, archives })
+}
+
+/// Writes the manifest for `saved`, then prunes. A push of the same snapshot from another Mac
+/// may land between the two; it keeps its archives, and whichever manifest is written last
+/// is what `pull` gets.
+fn commit(s3: &S3, bucket: &str, project: &str, name: &str, saved: &Saved, staged: Staged) -> Result<()> {
+    let prefix = snap_prefix(project, name);
     let previous = s3
         .get_opt(bucket, &manifest_key(&prefix))
         .map(|m| m.and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()?["generation"].as_str().map(String::from)));
-    let m = serde_json::json!({
+    let mut m = serde_json::json!({
         "version": 2,
         "project": project,
         "name": name,
@@ -472,11 +575,25 @@ fn push(d: &dyn Engine, s3: &S3, bucket: &str, project: &str, name: &str, saved:
         "generation": saved.gen_,
         // The field pushes had before generations: an older rekcod reads it, asks for the
         // old-layout archives that `prune` deletes, and fails instead of finding no volumes.
-        "volumes": labels,
-        "archives": archives,
+        "volumes": staged.labels,
+        "archives": staged.archives,
     });
+    if let Ok(Some(p)) = &previous {
+        m["previous"] = serde_json::json!(p);
+    }
+    if let Some(raw) = saved.raw.as_deref().filter(|r| *r != name) {
+        m["raw"] = serde_json::json!(raw);
+    }
     s3.put(bucket, &manifest_key(&prefix), Body::Bytes(m.to_string().as_bytes()))?;
-    let pruned = previous.and_then(|p| prune(s3, bucket, &prefix, &[Some(saved.gen_.as_str()), p.as_deref()]));
+    let now = s3
+        .get_opt(bucket, &manifest_key(&prefix))
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok()?["generation"].as_str().map(String::from));
+    if now.as_deref().is_some_and(|g| g != saved.gen_) {
+        eprintln!("rekcod: warning: another push of `{name}` replaced this one just now; `--pull` gets that one");
+    }
+    let pruned = previous.and_then(|p| prune(s3, bucket, &prefix, &saved.gen_, p.as_deref()));
     if let Err(e) = pruned {
         eprintln!("rekcod: warning: kept older archives under {bucket}/{prefix}: {e:#}");
     }
@@ -484,19 +601,30 @@ fn push(d: &dyn Engine, s3: &S3, bucket: &str, project: &str, name: &str, saved:
     Ok(())
 }
 
-/// Deletes what's under `prefix` except the manifest and the `keep` generations' archives.
-/// That includes archives of the old layout (`<prefix>/<volume>.tar.zst`), so a rekcod from
-/// before generations fails to pull a newer push instead of restoring an older one.
-fn prune(s3: &S3, bucket: &str, prefix: &str, keep: &[Option<&str>]) -> Result<()> {
+/// When generation `g` was saved: its id starts with the Unix time.
+fn gen_created(g: &str) -> Option<u64> {
+    g.get(..g.len().checked_sub(4)?)?.parse().ok()
+}
+
+/// Deletes under `prefix` the archives of the old layout (`<prefix>/<volume>.tar.zst`), so a
+/// rekcod from before generations fails to pull a newer push instead of restoring an older
+/// one, and generations saved more than an hour before the older of `new` and `previous`.
+/// Newer ones may belong to a push from another Mac that hasn't written its manifest yet.
+fn prune(s3: &S3, bucket: &str, prefix: &str, new: &str, previous: Option<&str>) -> Result<()> {
     let under = format!("{prefix}/");
+    let oldest = [Some(new), previous].into_iter().flatten().filter_map(gen_created).min().unwrap_or(0);
+    let mut doomed = Vec::new();
     for o in s3.list(bucket, &under)? {
         let Some(rest) = o.key.strip_prefix(&under) else { continue };
-        let kept = rest == "manifest.json" || rest.split_once('/').is_some_and(|(g, _)| keep.contains(&Some(g)));
-        if !kept {
-            s3.delete(bucket, &o.key)?;
+        let old = match rest.split_once('/') {
+            None => rest != "manifest.json",
+            Some((g, _)) => Some(g) != Some(new) && Some(g) != previous && gen_created(g).is_some_and(|t| t + 3600 < oldest),
+        };
+        if old {
+            doomed.push((o.key, None));
         }
     }
-    Ok(())
+    if doomed.is_empty() { Ok(()) } else { s3.delete_many(bucket, &doomed) }
 }
 
 /// One volume of a pushed snapshot.
@@ -545,13 +673,15 @@ fn pull(d: &dyn Engine, s3: &S3, bucket: &str, project: &str, name: &str) -> Res
     let m: serde_json::Value = serde_json::from_slice(&b).with_context(|| manifest_key(&prefix))?;
     let remote = archives(&m, &prefix)?;
     let created = m["created"].as_u64().unwrap_or_else(|| d.now());
+    // The branch name the push was saved under, so a save of that branch here matches it.
+    let raw = m["raw"].as_str();
     ensure_helper(d)?;
     let gen_ = new_gen(created)?;
     let mut made = BTreeMap::new();
-    let tmp = d.home().join(format!("snap-pull-{}.tar.zst", std::process::id()));
+    let tmp = tmp_archive(d, "pull")?;
     let r = (|| -> Result<()> {
         for a in &remote {
-            let snap = create_snap_volume(d, project, name, None, &gen_, created, &a.volume, &a.labels)?;
+            let snap = create_snap_volume(d, project, name, raw, &gen_, created, &a.volume, &a.labels)?;
             made.insert(a.volume.clone(), snap.clone());
             let mut f = Hashed::new(std::fs::File::create(&tmp)?);
             s3.get(bucket, &a.key, &mut f)?;
@@ -727,6 +857,8 @@ fn save_with(
         None => git_branch().unwrap_or_default(),
     };
     let name = snap_name(name, true)?;
+    // Where it goes is checked before anything is paused.
+    let target = push_to.map(|t| t()).transpose()?;
     let _lock = lock(d, &project, &name)?;
     if let Some(other) = find(d, &project, &name)?
         && other.raw.as_deref().unwrap_or(&other.name) != raw.as_str()
@@ -737,16 +869,18 @@ fn save_with(
             other.raw.as_deref().unwrap_or(&other.name)
         );
     }
-    let saved = save_as(d, &project, &name, Some(&raw))?;
-    if let Some(target) = push_to {
-        let (s3, bucket) = target()?;
+    let saved = {
+        let _project = lock_project(d, &project)?;
+        save_as(d, &project, &name, Some(&raw))?
+    };
+    if let Some((s3, bucket)) = target {
         push(d, &s3, &bucket, &project, &name, &saved)?;
     }
     Ok(())
 }
 
 /// Saves the project's volumes as a new generation of `name` and commits it. The caller
-/// holds `name`'s lock.
+/// holds `name`'s lock and the project's.
 fn save_as(d: &dyn Engine, project: &str, name: &str, raw: Option<&str>) -> Result<Saved> {
     let t0 = Instant::now();
     let volumes = project_volumes(d, project)?;
@@ -761,7 +895,7 @@ fn save_as(d: &dyn Engine, project: &str, name: &str, raw: Option<&str>) -> Resu
             let labels = d.docker(&["volume", "inspect", "--format", "{{json .Labels}}", v])?;
             pairs.push((v.clone(), create_snap_volume(d, project, name, raw, &gen_, created, v, &labels)?));
         }
-        let running = running_containers(d, project)?;
+        let running = to_pause(d, project)?;
         let _held = HoldSignals::new();
         let mut paused = Paused { d, ids: Vec::new() };
         for id in &running {
@@ -780,7 +914,7 @@ fn save_as(d: &dyn Engine, project: &str, name: &str, raw: Option<&str>) -> Resu
     };
     finish(d, project, name, &gen_, created, &pairs.iter().cloned().collect())?;
     println!("saved `{name}` for {project}: {} volume(s), {paused} container(s) paused, {:.1}s", pairs.len(), t0.elapsed().as_secs_f64());
-    Ok(Saved { gen_, created, pairs })
+    Ok(Saved { gen_, created, pairs, raw: raw.map(String::from) })
 }
 
 pub fn restore(paths: &Paths, explicit_project: Option<&str>, name: Option<&str>, pull_it: bool) -> Result<()> {
@@ -801,6 +935,9 @@ fn restore_with(
         let (s3, bucket) = source()?;
         pull(d, &s3, &bucket, &project, &name)?;
     }
+    // Before the project's: a save of `pre-restore` takes them in that order too.
+    let _pre = if name != PRE_RESTORE { Some(lock(d, &project, PRE_RESTORE)?) } else { None };
+    let _project = lock_project(d, &project)?;
     let all = snapshots(d, Some(&project))?;
     let Some(snap) = all.iter().find(|s| s.name == name) else {
         let have: Vec<&str> = all.iter().map(|s| s.name.as_str()).collect();
@@ -820,32 +957,60 @@ fn restore_with(
             d.docker(&args.iter().map(String::as_str).collect::<Vec<_>>())?;
         }
     }
-    let running = running_containers(d, &project)?;
+    // `pre-restore` copies the live volumes, then the snapshot is copied over them: room
+    // for both, checked before anything stops.
+    let mut sizes: Vec<&str> = snap.volumes.values().map(String::as_str).collect();
+    if name != PRE_RESTORE {
+        sizes.extend(snap.volumes.keys().map(String::as_str));
+    }
+    check_room(d, &sizes, &format!("restoring `{name}`"))?;
+    let running = to_stop(d, &project)?;
+    let start = |ids: &[String]| {
+        if !ids.is_empty()
+            && let Err(e) = d.docker(&[&["start"][..], &ids.iter().map(String::as_str).collect::<Vec<_>>()].concat())
+        {
+            eprintln!("rekcod: warning: {e:#}");
+        }
+    };
     if !running.is_empty() {
         let ids: Vec<&str> = running.iter().map(String::as_str).collect();
         if let Err(e) = d.docker(&[&["stop"][..], &ids].concat()) {
             // `docker stop a b` can stop `a` and then fail on `b`.
-            if let Err(e) = d.docker(&[&["start"][..], &ids].concat()) {
-                eprintln!("rekcod: warning: {e:#}");
-            }
+            start(&running);
             return Err(e);
         }
     }
-    // What's there now, so a restore to the wrong snapshot can be undone.
-    let backed_up = if name != PRE_RESTORE {
-        lock(d, &project, PRE_RESTORE).and_then(|_held| save_as(d, &project, PRE_RESTORE, None).map(|_| ()))
-    } else {
-        Ok(())
-    };
-    let pairs: Vec<(String, String)> = snap.volumes.iter().map(|(v, s)| (s.clone(), v.clone())).collect();
-    let copied = backed_up.and_then(|_| copy_volumes(d, &pairs));
-    if !running.is_empty() {
-        let started = d.docker(&[&["start"][..], &running.iter().map(String::as_str).collect::<Vec<_>>()].concat());
-        if let Err(e) = started {
-            eprintln!("rekcod: warning: {e:#}");
-        }
+    // What's there now, so a restore to the wrong snapshot, or one that fails half way, can
+    // be undone.
+    if name != PRE_RESTORE
+        && let Err(e) = save_as(d, &project, PRE_RESTORE, None)
+    {
+        // Nothing was copied yet: the volumes are as they were.
+        start(&running);
+        return Err(e.context(format!("saving `{PRE_RESTORE}` first failed; nothing was restored")));
     }
-    copied?;
+    let pairs: Vec<(String, String)> = snap.volumes.iter().map(|(v, s)| (s.clone(), v.clone())).collect();
+    if let Err(e) = copy_volumes(d, &pairs) {
+        // Some volumes may hold the snapshot and some the old data: put back what was there.
+        let back = (name != PRE_RESTORE)
+            .then(|| find(d, &project, PRE_RESTORE))
+            .transpose()?
+            .flatten()
+            .map(|p| p.volumes.iter().map(|(v, s)| (s.clone(), v.clone())).collect::<Vec<_>>());
+        return match back.map(|b| copy_volumes(d, &b)) {
+            Some(Ok(())) => {
+                start(&running);
+                Err(e.context(format!("restoring `{name}` failed; the volumes are back as they were (snapshot `{PRE_RESTORE}`)")))
+            }
+            Some(Err(e2)) => Err(e.context(format!(
+                "restoring `{name}` failed, and so did copying `{PRE_RESTORE}` back ({e2:#}); the containers stay stopped. Free up space, then: rekcod snap restore {PRE_RESTORE} -p {project}"
+            ))),
+            None => Err(e.context(format!(
+                "restoring `{name}` failed part way; the containers stay stopped. Free up space, then run it again: rekcod snap restore {name} -p {project}"
+            ))),
+        };
+    }
+    start(&running);
     println!(
         "restored `{name}` for {project}: {} volume(s), {} container(s) restarted, {:.1}s{}",
         pairs.len(),
@@ -919,12 +1084,19 @@ mod tests {
         unlabelled_markers: bool,
         /// The next `stop` stops its first container and then fails.
         stop_fails_after_first: bool,
+        /// The next `run` whose command line contains this copies its first pair, then fails
+        /// (a disk that fills up).
+        run_fails_part_way: Option<String>,
+        /// Every command, as run.
+        log: Vec<String>,
+        /// KiB the VM's disk has free, for the room check (plenty when unset).
+        free_kib: Option<u64>,
     }
 
     /// Docker as far as snapshots use it, in memory. "Tar" is the volume's bytes as they are.
     struct Fake {
         home: PathBuf,
-        now: u64,
+        now: std::sync::atomic::AtomicU64,
         w: Mutex<World>,
     }
 
@@ -935,7 +1107,7 @@ mod tests {
             let home = std::env::temp_dir().join(format!("rekcod-snap-test-{}-{n}", std::process::id()));
             let _ = std::fs::remove_dir_all(&home);
             std::fs::create_dir_all(&home).unwrap();
-            Fake { home, now, w: Mutex::new(World::default()) }
+            Fake { home, now: now.into(), w: Mutex::new(World::default()) }
         }
 
         fn volume(&self, name: &str, project: &str, data: &[u8]) {
@@ -990,6 +1162,7 @@ mod tests {
         fn docker(&self, args: &[&str]) -> Result<String> {
             let mut w = self.w.lock().unwrap();
             let line = args.join(" ");
+            w.log.push(line.clone());
             if let Some(i) = w.fail.iter().position(|f| line.starts_with(f.as_str())) {
                 w.fail.remove(i);
                 bail!("docker {line}: failed (test)");
@@ -1033,11 +1206,13 @@ mod tests {
                     }
                     Ok(String::new())
                 }
-                ["ps", "-a", ..] => Ok(String::new()),
-                ["ps", ..] => {
-                    let (_, project) = label_filter(args).unwrap();
-                    let running = w.containers.iter().filter(|(_, (p, s))| *p == project && *s == "running");
-                    Ok(running.map(|(id, _)| id.as_str()).collect::<Vec<_>>().join("\n"))
+                ["ps", "-a", ..] => {
+                    let (key, project) = label_filter(args).unwrap();
+                    if key != PROJECT_LABEL {
+                        return Ok(String::new());
+                    }
+                    let mine = w.containers.iter().filter(|(_, (p, _))| *p == project);
+                    Ok(mine.map(|(id, (_, st))| format!("{id} {st}")).collect::<Vec<_>>().join("\n"))
                 }
                 ["pause", id] => {
                     if w.containers.get(*id).context("no such container")?.1 != "running" {
@@ -1055,8 +1230,19 @@ mod tests {
                 }
                 ["stop", ids @ ..] => set(&mut w, ids, "exited"),
                 ["image", "inspect", _] => Ok(String::new()),
+                ["run", .., "sh", "-c", script] if script.contains("du -sck") => {
+                    let mounts = args.windows(2).filter(|p| p[0] == "-v").map(|p| p[1].split(':').next().unwrap());
+                    let need: usize = mounts.map(|m| w.vols.get(m).map_or(0, |v| v.data.len())).sum();
+                    Ok(format!("{} {}", need.div_ceil(1024), w.free_kib.unwrap_or(1 << 30)))
+                }
                 ["run", ..] => {
                     let mounts: Vec<&str> = args.windows(2).filter(|p| p[0] == "-v").map(|p| p[1].split(':').next().unwrap()).collect();
+                    if w.run_fails_part_way.as_deref().is_some_and(|m| line.contains(m)) {
+                        w.run_fails_part_way = None;
+                        let data = w.vols.get(mounts[0]).context("no such volume")?.data.clone();
+                        w.vols.get_mut(mounts[1]).context("no such volume")?.data = data;
+                        bail!("docker {line}: No space left on device (test)");
+                    }
                     for pair in mounts.chunks(2) {
                         let data = w.vols.get(pair[0]).context("no such volume")?.data.clone();
                         w.vols.get_mut(pair[1]).context("no such volume")?.data = data;
@@ -1096,7 +1282,7 @@ mod tests {
         }
 
         fn now(&self) -> u64 {
-            self.now
+            self.now.load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -1244,17 +1430,19 @@ mod tests {
                 assert_eq!(s3.keys(), first, "the failed push's archives are deleted");
             }
         }
+        d.now.store(10_000, std::sync::atomic::Ordering::Relaxed);
         save_with(&d, Some("shop"), Some("seeded"), to(&s3)).unwrap();
         assert_eq!(pulled(), [b"a2".to_vec(), b"b2".to_vec()]);
-        // This push and the one it replaced; the archives of the push that failed at the
-        // manifest are gone.
+        // This push, the one it replaced, and the one that failed at the manifest: it isn't
+        // an hour older than the replaced one, so it could be another Mac's push in flight.
         let generations = |keys: Vec<String>| {
             let mut g: Vec<String> =
                 keys.iter().filter(|k| k.split('/').nth(5).is_some()).map(|k| k.split('/').nth(4).unwrap().to_string()).collect();
             g.dedup();
             g
         };
-        assert_eq!(generations(s3.keys()).len(), 2, "{:?}", s3.keys());
+        assert_eq!(generations(s3.keys()).len(), 3, "{:?}", s3.keys());
+        d.now.store(20_000, std::sync::atomic::Ordering::Relaxed);
         save_with(&d, Some("shop"), Some("seeded"), to(&s3)).unwrap();
         let kept = generations(s3.keys());
         assert_eq!(kept.len(), 2, "{:?}", s3.keys());
@@ -1380,5 +1568,148 @@ mod tests {
             save.join().unwrap().unwrap();
         });
         assert_eq!(d.snapshot("shop", "seeded"), bytes(&[("shop_pg", "v1")]));
+    }
+
+    #[test]
+    fn saves_and_restores_of_one_project_take_turns() {
+        let _serial = serial();
+        let d = Fake::new(1000);
+        d.volume("shop_pg", "shop", b"v1");
+        d.container("c1", "shop");
+        save_with(&d, Some("shop"), Some("b"), LOCAL).unwrap();
+        d.write("shop_pg", b"v2");
+        // A save of another name holds the project.
+        let held = lock_project(&d, "shop").unwrap();
+        let before = d.w.lock().unwrap().log.len();
+        std::thread::scope(|s| {
+            let restore = s.spawn(|| restore_with(&d, Some("shop"), Some("b"), LOCAL));
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            let log = d.w.lock().unwrap().log[before..].to_vec();
+            assert!(!log.iter().any(|l| l.starts_with("stop") || l.starts_with("run") || l.starts_with("pause")), "{log:?}");
+            drop(held);
+            restore.join().unwrap().unwrap();
+        });
+        assert_eq!(d.data("shop_pg"), b"v1");
+    }
+
+    #[test]
+    fn restore_stops_restarting_containers_and_refuses_paused_ones() {
+        let _serial = serial();
+        let d = Fake::new(1000);
+        d.volume("shop_pg", "shop", b"v1");
+        save_with(&d, Some("shop"), Some("b"), LOCAL).unwrap();
+        d.write("shop_pg", b"v2");
+        d.container("c1", "shop");
+        d.w.lock().unwrap().containers.insert("c2".into(), ("shop".into(), "paused"));
+        let e = restore_with(&d, Some("shop"), Some("b"), LOCAL).unwrap_err();
+        assert!(e.to_string().contains("c2 of shop is paused"), "{e:#}");
+        assert_eq!((d.data("shop_pg"), d.state("c1")), (b"v2".to_vec(), "running"));
+
+        d.w.lock().unwrap().containers.insert("c2".into(), ("shop".into(), "restarting"));
+        // A save can't pause it, so it refuses too.
+        assert!(save_with(&d, Some("shop"), Some("x"), LOCAL).unwrap_err().to_string().contains("restarting"));
+        let before = d.w.lock().unwrap().log.len();
+        restore_with(&d, Some("shop"), Some("b"), LOCAL).unwrap();
+        let log = d.w.lock().unwrap().log[before..].to_vec();
+        assert!(log.iter().any(|l| l == "stop c1 c2"), "{log:?}");
+        assert_eq!(d.data("shop_pg"), b"v1");
+        assert_eq!([d.state("c1"), d.state("c2")], ["running"; 2]);
+    }
+
+    #[test]
+    fn a_restore_without_room_stops_nothing() {
+        let _serial = serial();
+        let d = Fake::new(1000);
+        d.volume("shop_pg", "shop", &vec![1u8; 600 * 1024]);
+        d.container("c1", "shop");
+        save_with(&d, Some("shop"), Some("big"), LOCAL).unwrap();
+        // 600 KiB live plus 600 KiB of snapshot, and 1000 KiB free.
+        d.w.lock().unwrap().free_kib = Some(1000);
+        let e = restore_with(&d, Some("shop"), Some("big"), LOCAL).unwrap_err();
+        assert!(e.to_string().contains("1000 KiB") || e.to_string().contains("MiB are free"), "{e:#}");
+        assert_eq!(d.state("c1"), "running");
+        d.w.lock().unwrap().free_kib = Some(1400);
+        restore_with(&d, Some("shop"), Some("big"), LOCAL).unwrap();
+    }
+
+    #[test]
+    fn a_restore_that_fails_part_way_puts_the_volumes_back() {
+        let _serial = serial();
+        let d = Fake::new(1000);
+        d.volume("shop_a", "shop", b"a1");
+        d.volume("shop_b", "shop", b"b1");
+        d.container("c1", "shop");
+        save_with(&d, Some("shop"), Some("good"), LOCAL).unwrap();
+        d.write("shop_a", b"a2");
+        d.write("shop_b", b"b2");
+        d.w.lock().unwrap().run_fails_part_way = Some("rekcod-snap.shop.good.".into());
+        let e = restore_with(&d, Some("shop"), Some("good"), LOCAL).unwrap_err();
+        assert!(format!("{e:#}").contains("back as they were"), "{e:#}");
+        assert_eq!([d.data("shop_a"), d.data("shop_b")], [b"a2".to_vec(), b"b2".to_vec()]);
+        assert_eq!(d.state("c1"), "running");
+
+        // Copying back fails too: nothing starts on half-copied volumes.
+        d.w.lock().unwrap().run_fails_part_way = Some("rekcod-snap.shop.good.".into());
+        d.fail("run --rm --network none -v rekcod-snap.shop.pre-restore.");
+        let e = restore_with(&d, Some("shop"), Some("good"), LOCAL).unwrap_err();
+        assert!(format!("{e:#}").contains("rekcod snap restore pre-restore -p shop"), "{e:#}");
+        assert_eq!(d.state("c1"), "exited");
+    }
+
+    #[test]
+    fn a_pulled_branch_snapshot_saves_again() {
+        let _serial = serial();
+        let s3 = crate::s3::mock::start();
+        let d = Fake::new(1000);
+        d.volume("shop_pg", "shop", b"v1");
+        save_with(&d, Some("shop"), Some("feature/x"), to(&s3)).unwrap();
+        let other = Fake::new(2000);
+        other.volume("shop_pg", "shop", b"");
+        restore_with(&other, Some("shop"), Some("feature/x"), to(&s3)).unwrap();
+        // The default save on that branch on the other Mac.
+        other.write("shop_pg", b"v2");
+        save_with(&other, Some("shop"), Some("feature/x"), LOCAL).unwrap();
+        assert_eq!(other.snapshot("shop", "feature-x"), bytes(&[("shop_pg", "v2")]));
+    }
+
+    #[test]
+    fn a_push_that_lands_late_keeps_its_archives() {
+        let _serial = serial();
+        let s3 = crate::s3::mock::start();
+        let d = Fake::new(1000);
+        d.volume("shop_pg", "shop", b"v1");
+        save_with(&d, Some("shop"), Some("seeded"), to(&s3)).unwrap();
+        // This Mac uploads its archives...
+        d.now.store(10_000, std::sync::atomic::Ordering::Relaxed);
+        d.write("shop_pg", b"v2");
+        let a = save_as(&d, "shop", "seeded", None).unwrap();
+        let staged = upload(&d, &s3.s3, "snaps", "shop", "seeded", &a).unwrap();
+        // ...another Mac pushes the same snapshot from start to end...
+        let other = Fake::new(10_001);
+        other.volume("shop_pg", "shop", b"v3");
+        save_with(&other, Some("shop"), Some("seeded"), to(&s3)).unwrap();
+        // ...and this one's manifest is written last.
+        commit(&s3.s3, "snaps", "shop", "seeded", &a, staged).unwrap();
+        let third = Fake::new(20_000);
+        third.volume("shop_pg", "shop", b"");
+        restore_with(&third, Some("shop"), Some("seeded"), to(&s3)).unwrap();
+        assert_eq!(third.data("shop_pg"), b"v2");
+        let gens: std::collections::BTreeSet<String> =
+            s3.keys().iter().filter_map(|k| k.split('/').nth(4).filter(|_| k.split('/').nth(5).is_some()).map(String::from)).collect();
+        assert_eq!(gens.len(), 2, "the first push is pruned, the two recent ones kept: {:?}", s3.keys());
+    }
+
+    #[test]
+    fn temp_archives_of_dead_processes_are_removed() {
+        let d = Fake::new(1000);
+        let dir = d.home().join("run/snap/tmp");
+        std::fs::create_dir_all(&dir).unwrap();
+        // macOS pids stop at 99998.
+        std::fs::write(dir.join("snap-push-999999.tar.zst"), b"x").unwrap();
+        let mine = dir.join(format!("snap-pull-{}.tar.zst", std::process::id()));
+        std::fs::write(&mine, b"x").unwrap();
+        tmp_archive(&d, "push").unwrap();
+        assert!(!dir.join("snap-push-999999.tar.zst").exists());
+        assert!(mine.exists(), "a live process's file stays");
     }
 }

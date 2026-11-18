@@ -36,9 +36,58 @@ pub(crate) fn running_pid(paths: &Paths) -> Option<i32> {
     if crate::paths::locked(&paths.pid_file()) {
         return Some(pid);
     }
-    // Daemons from before the lock still run after an upgrade: trust the pid only if it's
-    // alive and is a rekcod binary.
-    (unsafe { libc::kill(pid, 0) } == 0 && pid_is_rekcod(pid)).then_some(pid)
+    // A daemon from before the lock (0.2.1) may still run after an upgrade. Anything else
+    // holding an unlocked file's pid is a process the OS gave that number to after a crash.
+    let written = std::fs::metadata(paths.pid_file()).and_then(|m| m.modified()).ok()?;
+    legacy_daemon(pid, &paths.home, written).then_some(pid)
+}
+
+/// Whether `pid` is a rekcod daemon for `home` that was running when its pid file was
+/// written: a rekcod binary, started before `written`, run as `rekcod daemon` with
+/// `REKCOD_HOME` set to `home` (as `boot` runs it).
+fn legacy_daemon(pid: i32, home: &std::path::Path, written: std::time::SystemTime) -> bool {
+    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 || !pid_is_rekcod(pid) {
+        return false;
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    if unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) } != size {
+        return false;
+    }
+    let started = std::time::UNIX_EPOCH + Duration::new(info.pbi_start_tvsec, info.pbi_start_tvusec as u32 * 1000);
+    if started > written {
+        return false;
+    }
+    let Some(ProcArgs { args, env }) = proc_args(pid) else { return false };
+    let home = home.as_os_str().as_encoded_bytes();
+    args.get(1).is_some_and(|a| a == b"daemon") && env.iter().any(|e| e.strip_prefix(b"REKCOD_HOME=".as_slice()).is_some_and(|h| h == home))
+}
+
+struct ProcArgs {
+    args: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+}
+
+/// A process's arguments and environment (`KERN_PROCARGS2`); only our own user's processes.
+fn proc_args(pid: i32) -> Option<ProcArgs> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut len: libc::size_t = 0;
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) } != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    // argc, the executable's path, NUL padding, then argv and the environment.
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let rest = &buf[4..];
+    let exe_end = rest.iter().position(|&b| b == 0)?;
+    let mut strings = rest[exe_end..].split(|&b| b == 0).skip_while(|s| s.is_empty());
+    let args: Vec<Vec<u8>> = strings.by_ref().take(argc).map(<[u8]>::to_vec).collect();
+    let env: Vec<Vec<u8>> = strings.take_while(|s| !s.is_empty()).map(<[u8]>::to_vec).collect();
+    (args.len() == argc).then_some(ProcArgs { args, env })
 }
 
 fn pid_is_rekcod(pid: i32) -> bool {
@@ -194,8 +243,11 @@ fn random_mac() -> Result<String> {
 }
 
 /// Root disk follows the installed guest version; data disk and MAC persist.
-fn prepare_vm(paths: &Paths, disk_gib: u64) -> Result<()> {
-    let guest = paths.guest_dir()?;
+fn prepare_vm(paths: &Paths, disk_gib: u64, guest: Option<&std::path::Path>) -> Result<()> {
+    let guest = match guest {
+        Some(g) => g.to_path_buf(),
+        None => paths.guest_dir()?,
+    };
     let version = std::fs::read_to_string(guest.join("VERSION")).unwrap_or_else(|_| "dev".into());
     let installed = std::fs::read_to_string(paths.guest_version()).unwrap_or_default();
     if !paths.root_disk().exists() || installed.trim() != version.trim() {
@@ -274,6 +326,11 @@ pub struct BootOptions {
     pub idle_ttl: Option<u64>,
     /// `e2fsck -fy` the data disk and reinstall the root disk before booting.
     pub repair: bool,
+    /// Sandbox: the only Mac ports it may listen on (127.0.0.1 and ::1); None is any
+    /// unprivileged port.
+    pub publish: Option<Vec<u16>>,
+    /// Sandbox: don't forward the ports its `--network host` containers listen on.
+    pub no_autoports: bool,
 }
 
 impl Default for BootOptions {
@@ -290,6 +347,8 @@ impl Default for BootOptions {
             reach: vec![],
             idle_ttl: None,
             repair: false,
+            publish: None,
+            no_autoports: false,
         }
     }
 }
@@ -305,17 +364,13 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         return Ok(Some(pid));
     }
     {
-        if let Some(dir) = &opts.guest_dir {
-            // SAFETY: single-threaded CLI, before spawning anything.
-            unsafe { std::env::set_var("REKCOD_GUEST_DIR", dir) };
-        }
         // The main VM boots with what `rekcod start` was last given; sandboxes say their own.
         let saved = if opts.project.is_none() { saved(paths) } else { Saved::default() };
         if opts.repair {
             // A fresh copy of the release's root disk; it holds nothing of yours.
             let _ = std::fs::remove_file(paths.root_disk());
         }
-        prepare_vm(paths, opts.disk_gib.max(saved.disk_gib.unwrap_or(0)))?;
+        prepare_vm(paths, opts.disk_gib.max(saved.disk_gib.unwrap_or(0)), opts.guest_dir.as_deref())?;
         let cpus = opts.cpus.or(saved.cpus).unwrap_or_else(default_cpus).clamp(1, vm::max_cpus());
         let host_mib = sysctl_u64("hw.memsize").unwrap_or(16 << 30) >> 20;
         let memory_mib = opts.memory_gib.or(saved.memory_gib).map(|g| g << 10).unwrap_or((host_mib / 2).min(8 << 10));
@@ -332,6 +387,10 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
             .stdin(Stdio::null())
             .stdout(log.try_clone()?)
             .stderr(log);
+        // On the child, not set_var: the API servers that boot sandboxes are threaded.
+        if let Some(dir) = &opts.guest_dir {
+            cmd.env("REKCOD_GUEST_DIR", dir);
+        }
         if let Some(base) = opts.base_memory_gib.or(saved.base_memory_gib) {
             cmd.args(["--base-memory-mib", &(base << 10).to_string()]);
         }
@@ -353,6 +412,12 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         if opts.repair {
             cmd.arg("--repair");
         }
+        if let Some(ports) = &opts.publish {
+            cmd.arg(format!("--publish={}", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")));
+        }
+        if opts.no_autoports {
+            cmd.arg("--no-autoports");
+        }
         if opts.project.is_none() && user_network(&saved) {
             cmd.arg("--network-user");
         }
@@ -369,15 +434,21 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         }
         let mut child = cmd.spawn().context("spawn rekcod daemon")?;
 
-        let deadline = Instant::now() + Duration::from_secs(if opts.repair { 1800 } else { 120 });
+        let limit = if opts.repair { crate::daemon::BOOT_WAIT_MAX } else { Duration::from_secs(120) };
+        // Time the guest spent running e2fsck on its data disk doesn't count against the limit.
+        let (waiting, mut checking, mut in_check) = (Instant::now(), Duration::ZERO, false);
         let mut checked = Instant::now();
         loop {
+            let round = Instant::now();
             if api_get(paths, "/_ping").is_ok_and(|b| b == b"OK") {
                 let _ = std::fs::remove_file(paths.data_fresh());
+                // Reaped when it exits, so a server that boots sandboxes collects no zombies.
+                std::thread::spawn(move || child.wait());
                 break;
             }
             if checked.elapsed() > Duration::from_millis(500) {
                 checked = Instant::now();
+                in_check = crate::vm::checking_disk(&paths.console_log());
                 if let Some(err) = data_disk_error(paths, console_start) {
                     bail!(
                         "the VM's data disk can't be used: {err}\nNothing was formatted. `rekcod stop`, then `rekcod start --repair` runs e2fsck -fy on it.\nsee {}",
@@ -394,10 +465,13 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
                     tail(&paths.console_log(), 25),
                 );
             }
-            if Instant::now() > deadline {
-                bail!("dockerd did not answer within 120s; see {}", paths.console_log().display());
+            if crate::daemon::boot_wait_over(waiting.elapsed(), checking, limit) {
+                bail!("dockerd did not answer within {}s; see {}", limit.as_secs(), paths.console_log().display());
             }
             std::thread::sleep(Duration::from_millis(50));
+            if in_check {
+                checking += round.elapsed();
+            }
         }
     }
     Ok(None)
@@ -422,17 +496,47 @@ pub(crate) fn stop_daemon(paths: &Paths) -> Result<bool> {
 /// Sends `sig` to the daemon and waits for it to exit (SIGUSR1: force stop the VM).
 pub(crate) fn signal_daemon(paths: &Paths, sig: libc::c_int) -> Result<bool> {
     let Some(pid) = running_pid(paths) else { return Ok(false) };
+    let killed = signal_pid(pid, sig, Duration::from_secs(45)).with_context(|| format!("see {}", paths.daemon_log().display()))?;
+    if killed {
+        // What the daemon does on its way out, so nothing reads this as a crash (the login
+        // agent would boot it again) or finds its sockets.
+        for f in [paths.socket(), paths.control_socket(), paths.pid_file(), paths.status_file()] {
+            let _ = std::fs::remove_file(f);
+        }
+        let _ = std::fs::write(paths.last_exit(), b"clean");
+    }
+    Ok(true)
+}
+
+/// Sends `sig` to `pid` and waits up to `wait` for it to exit. A force stop (SIGUSR1)
+/// that doesn't end it within that time ends it with SIGKILL, which takes the VM with it;
+/// returns true then.
+fn signal_pid(pid: i32, sig: libc::c_int, wait: Duration) -> Result<bool> {
+    let gone = |within: Duration| {
+        let deadline = Instant::now() + within;
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            // `rekcod x --sandbox` spawned this daemon itself: reap it, or its zombie answers kill(0).
+            if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
+                break;
+            }
+            if Instant::now() > deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        true
+    };
     unsafe { libc::kill(pid, sig) };
-    let deadline = Instant::now() + Duration::from_secs(45);
-    while unsafe { libc::kill(pid, 0) } == 0 {
-        // `rekcod x --sandbox` spawned this daemon itself: reap it, or its zombie answers kill(0).
-        if unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) } == pid {
-            break;
-        }
-        if Instant::now() > deadline {
-            bail!("daemon (pid {pid}) did not exit; see {}", paths.daemon_log().display());
-        }
-        std::thread::sleep(Duration::from_millis(100));
+    if gone(wait) {
+        return Ok(false);
+    }
+    if sig != libc::SIGUSR1 {
+        bail!("daemon (pid {pid}) did not exit");
+    }
+    eprintln!("rekcod: daemon (pid {pid}) did not exit after a force stop; sending SIGKILL");
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    if !gone(Duration::from_secs(5)) {
+        bail!("daemon (pid {pid}) did not exit after SIGKILL");
     }
     Ok(true)
 }
@@ -530,7 +634,10 @@ fn default_socket_on_start(paths: &Paths, no_switch: bool) -> Result<()> {
     // whether it worked or not; the menu bar (no terminal) only shows the menu item.
     let asked = paths.home.join("default.sock.asked");
     let tty = unsafe { libc::isatty(0) } == 1;
-    if tty && !asked.exists() {
+    if crate::syssock::lost(paths) {
+        // Another engine may have taken it on purpose, so no sudo prompt.
+        println!("default socket: /var/run/docker.sock no longer goes through rekcod; `rekcod socket install` routes it again");
+    } else if tty && !asked.exists() {
         std::fs::write(&asked, "")?;
         println!("routing /var/run/docker.sock to rekcod too, for clients that ignore docker contexts");
         if let Err(e) = crate::syssock::install(paths, true) {
@@ -901,7 +1008,7 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
     let daemon_id = |ctx: &[&str]| docker::run_ok(&[ctx, &["info", "--format", "{{.ID}}"]].concat());
     distinct_daemons(from, &daemon_id(&src)?, &daemon_id(&dst)?)?;
 
-    let (mut imported, mut skipped) = (0, 0);
+    let (mut imported, mut skipped, mut failed) = (0, 0, Vec::<String>::new());
     if images {
         let list = docker::run_ok(&[&src[..], &["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]].concat())?;
         let mut refs: Vec<&str> = list.lines().filter(|r| !r.contains("<none>") && wanted(r)).collect();
@@ -927,7 +1034,10 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
                     imported += 1;
                     println!("  [{}/{}] {r}: ok ({:.1}s)", i + 1, refs.len(), t.elapsed().as_secs_f64());
                 }
-                Err(e) => println!("  [{}/{}] {r}: FAILED: {e:#}", i + 1, refs.len()),
+                Err(e) => {
+                    println!("  [{}/{}] {r}: FAILED: {e:#}", i + 1, refs.len());
+                    failed.push(format!("image {r}"));
+                }
             }
         }
     }
@@ -983,17 +1093,104 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
                     imported += 1;
                     println!("  {name}: ok ({:.1}s)", t.elapsed().as_secs_f64());
                 }
-                Err(e) => println!("  {name}: FAILED: {e:#}"),
+                Err(e) => {
+                    // The copy empties the destination first; what's there now is partial.
+                    println!("  {name}: FAILED, the volume here is incomplete: {e:#}");
+                    failed.push(format!("volume {name}"));
+                }
             }
         }
     }
+    import_summary(imported, skipped, &failed)
+}
+
+/// Prints the totals; an error when anything failed, so a script doesn't go on to remove
+/// the old engine.
+fn import_summary(imported: usize, skipped: usize, failed: &[String]) -> Result<()> {
     println!("imported {imported}, skipped {skipped}. Containers are not copied: run `docker compose up -d` in your projects.");
+    if !failed.is_empty() {
+        anyhow::bail!("{} failed: {}; run the import again for them", failed.len(), failed.join(", "));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale pid file, its pid now another `rekcod` process: only a daemon for this home
+    /// that predates the file counts.
+    #[test]
+    fn an_unlocked_pid_file_names_this_homes_daemon_or_nothing() {
+        let t = std::env::temp_dir().join(format!("rekcod-stale-pid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("bin")).unwrap();
+        // This test binary under the name rekcod, running `sleeper` (a copied system binary
+        // is killed at exec). The first argument is a filter that matches no test.
+        let rekcod = t.join("bin/rekcod");
+        let exe = std::env::current_exe().unwrap();
+        std::fs::hard_link(&exe, &rekcod).or_else(|_| std::fs::copy(&exe, &rekcod).map(drop)).unwrap();
+        let home = Paths::at(t.join("home")).unwrap();
+        let spawn = |arg: &str, home: &std::path::Path| {
+            Command::new(&rekcod)
+                .args([arg, "cli::tests::sleeper", "--exact", "--ignored"])
+                .env("REKCOD_HOME", home)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut daemon = spawn("daemon", &home.home);
+        let mut other_home = spawn("daemon", &t.join("elsewhere"));
+        let mut menubar = spawn("menubar", &home.home);
+        std::thread::sleep(Duration::from_millis(300));
+
+        let pid_of = |c: &std::process::Child, back: u64| {
+            std::fs::write(home.pid_file(), c.id().to_string()).unwrap();
+            let f = std::fs::File::options().write(true).open(home.pid_file()).unwrap();
+            f.set_modified(std::time::SystemTime::now() - Duration::from_secs(back)).unwrap();
+            running_pid(&home)
+        };
+        assert_eq!(pid_of(&daemon, 0), Some(daemon.id() as i32), "a pre-lock daemon after an upgrade");
+        assert_eq!(pid_of(&daemon, 3600), None, "the file is older than the process");
+        assert_eq!(pid_of(&other_home, 0), None, "another home's daemon");
+        assert_eq!(pid_of(&menubar, 0), None, "not a daemon");
+        for c in [&mut daemon, &mut other_home, &mut menubar] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        assert_eq!(pid_of(&daemon, 0), None, "gone");
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn a_force_stop_that_hangs_ends_in_sigkill() {
+        // A daemon whose shutdown is stuck: it ignores both signals. Short sleeps, so nothing
+        // it started outlives it by much.
+        let stuck = || Command::new("/bin/sh").args(["-c", "trap '' TERM USR1; while :; do sleep 0.1; done"]).spawn().unwrap();
+        let (mut a, b) = (stuck(), stuck());
+        std::thread::sleep(Duration::from_millis(200));
+        let err = signal_pid(a.id() as i32, libc::SIGTERM, Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("did not exit"), "{err}");
+        assert!(a.try_wait().unwrap().is_none(), "a plain stop leaves it running");
+        // Reaped by signal_pid, as a sandbox daemon `rekcod x` spawned would be.
+        assert!(signal_pid(b.id() as i32, libc::SIGUSR1, Duration::from_millis(300)).unwrap());
+        assert_ne!(unsafe { libc::kill(b.id() as i32, 0) }, 0);
+        let _ = a.kill();
+        let _ = a.wait();
+    }
+
+    #[test]
+    #[ignore = "a process for an_unlocked_pid_file_names_this_homes_daemon_or_nothing"]
+    fn sleeper() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
+
+    #[test]
+    fn an_import_with_failures_is_an_error() {
+        assert!(import_summary(3, 1, &[]).is_ok());
+        let e = import_summary(2, 0, &["volume pg".into(), "image web:1".into()]).unwrap_err();
+        assert_eq!(e.to_string(), "2 failed: volume pg, image web:1; run the import again for them");
+    }
 
     #[test]
     fn memory_is_checked_before_it_is_saved() {

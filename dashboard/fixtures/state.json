@@ -796,6 +796,17 @@
           ],
           "interactive": false,
           "confirm": "Destroy dash? Its instances and release history are deleted."
+        },
+        {
+          "kind": "AppWebhook",
+          "label": "GitHub webhook (URL and secret)",
+          "argv": [
+            "app",
+            "webhook",
+            "dash"
+          ],
+          "interactive": true,
+          "confirm": null
         }
       ],
       "detail": {
@@ -1350,6 +1361,17 @@
           ],
           "interactive": false,
           "confirm": "Destroy api? Its instances and release history are deleted."
+        },
+        {
+          "kind": "AppWebhook",
+          "label": "GitHub webhook (URL and secret)",
+          "argv": [
+            "app",
+            "webhook",
+            "api"
+          ],
+          "interactive": true,
+          "confirm": null
         }
       ],
       "detail": {
@@ -1608,6 +1630,17 @@
           ],
           "interactive": false,
           "confirm": "Destroy blog? Its instances and release history are deleted."
+        },
+        {
+          "kind": "AppWebhook",
+          "label": "GitHub webhook (URL and secret)",
+          "argv": [
+            "app",
+            "webhook",
+            "blog"
+          ],
+          "interactive": true,
+          "confirm": null
         }
       ],
       "detail": {
@@ -3867,6 +3900,16 @@
       ],
       "interactive": false,
       "confirm": "Remove stopped containers, unused networks, dangling images and unused build cache? Volumes are kept."
+    },
+    {
+      "kind": "SandboxPrune",
+      "label": "Remove unused agent sandboxes",
+      "argv": [
+        "sandbox",
+        "prune"
+      ],
+      "interactive": false,
+      "confirm": "Delete agent sandboxes stopped and unused for a week, and what failed creates left? Unapplied changes in them are lost."
     }
   ],
   "remotes": {
@@ -3898,6 +3941,26 @@
         "backup"
       ],
       "interactive": false,
+      "confirm": null
+    },
+    {
+      "kind": "ControllerTokens",
+      "label": "Tokens",
+      "argv": [
+        "controller",
+        "tokens"
+      ],
+      "interactive": true,
+      "confirm": null
+    },
+    {
+      "kind": "ControllerAudit",
+      "label": "Audit log",
+      "argv": [
+        "controller",
+        "audit"
+      ],
+      "interactive": true,
       "confirm": null
     }
   ],

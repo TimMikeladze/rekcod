@@ -153,7 +153,7 @@ def main():
                 wait_for(lambda h=home: (h / "edge-routes.json").exists())
 
             def get(address, client):
-                request = urllib.request.Request("http://" + address + "/", headers={"Host": "web.apps.test", "CF-Connecting-IP": client})
+                request = urllib.request.Request("http://" + address + "/", headers={"Host": "web.apps.test", "X-Forwarded-For": client})
                 with opener.open(request, timeout=2) as response:
                     assert response.status == 200 and response.read() == b"ok\n"
 

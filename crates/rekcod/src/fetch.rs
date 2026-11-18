@@ -25,21 +25,16 @@ pub fn release_url(base: Option<&str>, version: &str, file: &str) -> String {
     }
 }
 
-/// Seconds under 1 KiB/s before a download counts as stalled.
-const STALL_SECS: u32 = 30;
-
-/// `curl` for a download into `dest`: gives up on a connection that takes 15 s or stalls
-/// for [`STALL_SECS`], retries 3 times, and has no cap on the whole transfer (a slow link
-/// still finishes). `https_only` refuses plain http and old TLS, also after a redirect;
+/// `curl` for a download into `dest`: [`CURL_LIMITS`], 3 retries, and no cap on the whole
+/// transfer (a slow link still finishes). `https_only` refuses plain http and old TLS, also after a redirect;
 /// a `REKCOD_RELEASE_URL` someone points at a local server turns it off.
 pub fn download_cmd(url: &str, dest: &Path, https_only: bool) -> Command {
-    download_cmd_with(url, dest, https_only, STALL_SECS, 3)
+    download_cmd_with(url, dest, https_only, &CURL_LIMITS, 3)
 }
 
-fn download_cmd_with(url: &str, dest: &Path, https_only: bool, stall: u32, retries: u32) -> Command {
+fn download_cmd_with(url: &str, dest: &Path, https_only: bool, limits: &[&str], retries: u32) -> Command {
     let mut c = Command::new("curl");
-    c.args(["-fL", "--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", &stall.to_string()]);
-    c.args(["--retry", &retries.to_string()]);
+    c.arg("-fL").args(limits).args(["--retry", &retries.to_string()]);
     if https_only {
         c.args(["--proto", "=https", "--tlsv1.2"]);
     }
@@ -51,6 +46,21 @@ fn download_cmd_with(url: &str, dest: &Path, https_only: bool, stall: u32, retri
 pub fn parse_shasum(out: &str) -> Option<&str> {
     let hash = out.split_whitespace().next()?;
     (hash.len() == 64 && hash.bytes().all(|b| b.is_ascii_hexdigit())).then_some(hash)
+}
+
+/// Passed to every download's curl: give up on a connection that doesn't open in 15 s or
+/// stays under 1 KiB/s for a minute, instead of holding the download lock for good.
+pub const CURL_LIMITS: [&str; 6] = ["--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "60"];
+
+/// Removes what interrupted downloads left in `parent`: entries named `<prefix><pid>`. The
+/// caller holds the lock every download there takes, so none of them is in use.
+pub fn clear_stale(parent: &Path, prefix: &str) {
+    for e in std::fs::read_dir(parent).into_iter().flatten().flatten() {
+        if e.file_name().to_string_lossy().starts_with(prefix) {
+            let p = e.path();
+            let _ = if p.is_dir() { std::fs::remove_dir_all(&p) } else { std::fs::remove_file(&p) };
+        }
+    }
 }
 
 /// `~/.rekcod/guest/<version>`, downloading and verifying it first if needed.
@@ -68,8 +78,8 @@ pub fn ensure_guest(rekcod_home: &Path) -> Result<Option<PathBuf>> {
     if dir.join("Image").exists() && dir.join("root.img").exists() {
         return Ok(Some(dir));
     }
+    clear_stale(parent, ".download-");
     let tmp = parent.join(format!(".download-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp)?;
     let result = download(gv, sha, &tmp)
         .and_then(|()| std::fs::rename(tmp.join("unpacked"), &dir).with_context(|| format!("install {}", dir.display())));
@@ -144,7 +154,8 @@ mod tests {
         });
         let t0 = std::time::Instant::now();
         let dest = std::env::temp_dir().join(format!("rekcod-stall-{}", std::process::id()));
-        let st = download_cmd_with(&url, &dest, false, 2, 0).arg("-sS").status().unwrap();
+        let quick = ["--connect-timeout", "15", "--speed-limit", "1024", "--speed-time", "2"];
+        let st = download_cmd_with(&url, &dest, false, &quick, 0).arg("-sS").status().unwrap();
         assert!(!st.success() && t0.elapsed() < std::time::Duration::from_secs(5), "{st} after {:?}", t0.elapsed());
         let _ = std::fs::remove_file(&dest);
         held.join().unwrap();

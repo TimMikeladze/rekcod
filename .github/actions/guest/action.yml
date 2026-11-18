@@ -1,11 +1,16 @@
 name: guest image
-description: Builds rekcod-agent and the guest image (out/guest) on an arm64 Linux runner.
+description: Builds rekcod-agent and the guest image (out/guest) on an arm64 Linux runner, then boots it under QEMU.
+inputs:
+  kernel-cache:
+    description: Restore and save the compiled kernel. "false" for release builds, so the shipped guest holds only what this run compiled.
+    default: "true"
 runs:
   using: composite
   steps:
     # The compiled guest kernel, reused until guest/kernel, guest/fuse, guest/build.sh or the
     # pinned versions change (guest/build.sh keys its cache on the same inputs).
-    - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+    - if: inputs.kernel-cache == 'true'
+      uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
       with:
         path: ${{ runner.temp }}/kernel-cache
         key: guest-kernel-${{ hashFiles('guest/build.sh', 'guest/versions.env', 'guest/kernel/**', 'guest/fuse/**') }}
@@ -22,3 +27,9 @@ runs:
         ls -l out/guest
         size=$(stat -c %s out/guest/root.img)
         test "$size" -lt $((400 * 1024 * 1024)) || { echo "root.img too big: $size"; exit 1; }
+    - name: boot it (QEMU)
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -yqq --no-install-recommends qemu-system-arm >/dev/null
+        sudo guest/smoke.sh out/guest

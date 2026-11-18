@@ -287,6 +287,14 @@ impl Sandbox {
         Ok(())
     }
 
+    /// Clones the project into `ws/` and records what was cloned. The manifest is read from
+    /// the clone (clonefile keeps sizes, mtimes and modes): the project may change while
+    /// it's walked, and apply must judge the Mac against what the sandbox actually got.
+    fn copy_project(&self) -> Result<()> {
+        clonefile(&self.meta.project, &self.ws())?;
+        self.save_manifest(&manifest(&self.ws()))
+    }
+
     fn plan(&self) -> Option<crate::xrun::Plan> {
         crate::xrun::plan(&self.meta.project, &["sh".into()])
     }
@@ -566,8 +574,7 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
         paths: sb,
     };
     if !o.mount || macos {
-        clonefile(&project, &s.ws())?;
-        s.save_manifest(&manifest(&project))?;
+        s.copy_project()?;
     } else {
         std::fs::write(s.paths.home.join("git.json"), serde_json::to_vec(&s.git_now())?)?;
     }
@@ -2172,6 +2179,19 @@ mod tests {
     }
 
     #[test]
+    fn the_manifest_is_what_was_cloned() {
+        let (paths, project, m, ws) = setup("cloned", &[("f", "as cloned")]);
+        // An editor saves between the clone and the manifest walk.
+        std::fs::write(project.join("f"), "saved on the Mac after the clone").unwrap();
+        let s = find(&paths, &m.id).unwrap();
+        s.save_manifest(&manifest(&ws)).unwrap();
+        std::fs::write(ws.join("other"), "x").unwrap();
+        let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
+        assert!(e.ends_with("since the sandbox copied it: f"), "{e}");
+        assert_eq!(std::fs::read_to_string(project.join("f")).unwrap(), "saved on the Mac after the clone");
+    }
+
+    #[test]
     fn mount_sandboxes_share_every_git_read_only() {
         let base = tmp("mount-git");
         let project = base.join("p");
@@ -2329,8 +2349,7 @@ pub(crate) mod testing {
         };
         edit(&mut meta);
         let s = Sandbox { meta, paths: Paths { home } };
-        clonefile(&s.meta.project, &s.ws()).unwrap();
-        s.save_manifest(&manifest(&s.meta.project)).unwrap();
+        s.copy_project().unwrap();
         s.save().unwrap();
         s.meta
     }

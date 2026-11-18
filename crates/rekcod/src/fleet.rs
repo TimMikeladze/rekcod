@@ -77,15 +77,7 @@ pub fn send_within(
 ) -> Result<(u16, BufReader<crate::tls::Stream>)> {
     let addr = authority(base)?;
     let sock = crate::bonjour::socket_addr(&addr)?;
-    // A name was checked when it was added, but it may resolve elsewhere now (Tailscale off,
-    // another network's resolver). An IP address can't change.
-    if base.starts_with("http://")
-        && std::env::var_os("REKCOD_INSECURE").is_none()
-        && addr.rsplit_once(':').is_some_and(|(h, _)| h.trim_matches(['[', ']']).parse::<IpAddr>().is_err())
-        && !plain_http_ip(sock.ip())
-    {
-        bail!("{base} resolves to {}, not a loopback or tailnet address; not sending a token in clear text", sock.ip());
-    }
+    check_resolved(base, &addr, sock.ip())?;
     let tcp = TcpStream::connect_timeout(&sock, Duration::from_secs(5)).with_context(|| format!("connect {base}"))?;
     tcp.set_read_timeout(timeout)?;
     tcp.set_write_timeout(Some(QUICK))?;
@@ -335,6 +327,17 @@ pub fn check_plain_http(authority: &str, what: &str) -> Result<()> {
 /// counts only by its addresses: with Tailscale off, another resolver answers it.
 fn plain_http_ok(host: &str, ips: &[IpAddr]) -> bool {
     host == "localhost" || (!ips.is_empty() && ips.iter().all(|ip| plain_http_ip(*ip)))
+}
+
+/// Before a request with a token: a plain http name was checked when it was added, but it may
+/// resolve elsewhere now (Tailscale off, another network's resolver). An IP address can't change.
+fn check_resolved(base: &str, authority: &str, ip: IpAddr) -> Result<()> {
+    let host = authority.rsplit_once(':').map_or(authority, |(h, _)| h).trim_matches(['[', ']']);
+    if !base.starts_with("http://") || host.parse::<IpAddr>().is_ok() || plain_http_ip(ip) || std::env::var_os("REKCOD_INSECURE").is_some()
+    {
+        return Ok(());
+    }
+    bail!("{base} resolves to {ip}, not a loopback or tailnet address; not sending a token in clear text (REKCOD_INSECURE=1 allows it)")
 }
 
 fn plain_http_ip(ip: IpAddr) -> bool {
@@ -2330,7 +2333,9 @@ fn proxy(node_url: &str, secret: &str, req: &crate::sandbox_api::Request, path: 
     let q: Vec<String> = req.query.iter().map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v))).collect();
     let path = if q.is_empty() { path.to_string() } else { format!("{path}?{}", q.join("&")) };
     let addr = authority(node_url)?;
-    let tcp = TcpStream::connect(&addr).with_context(|| format!("connect node {node_url}"))?;
+    let sock = crate::bonjour::socket_addr(&addr)?;
+    check_resolved(node_url, &addr, sock.ip())?;
+    let tcp = TcpStream::connect(sock).with_context(|| format!("connect node {node_url}"))?;
     let mut s = crate::tls::connect(node_url, &addr, tcp)?;
     write!(
         s,
@@ -6662,6 +6667,13 @@ mod tests {
         assert!(!plain_http_ok("mini.tail1.ts.net", &[ip("203.0.113.5")]));
         assert!(!plain_http_ok("mini.tail1.ts.net", &[ip("100.100.1.2"), ip("203.0.113.5")]));
         assert!(!plain_http_ok("mini.tail1.ts.net", &[]));
+        // And again before each request, by the address it resolves to then.
+        if std::env::var_os("REKCOD_INSECURE").is_none() {
+            assert!(check_resolved("http://mini.tail1.ts.net:7700", "mini.tail1.ts.net:7700", ip("203.0.113.5")).is_err());
+        }
+        assert!(check_resolved("http://mini.tail1.ts.net:7700", "mini.tail1.ts.net:7700", ip("100.100.1.2")).is_ok());
+        assert!(check_resolved("https://mini.example:7700", "mini.example:7700", ip("203.0.113.5")).is_ok());
+        assert!(check_resolved("http://10.0.0.5:7700", "10.0.0.5:7700", ip("10.0.0.5")).is_ok(), "checked when it was added");
         if std::env::var_os("REKCOD_INSECURE").is_none() {
             for bad in ["10.0.0.5:7700", "192.168.1.9:7700", "203.0.113.1:7700", "100.200.0.1:7700"] {
                 assert!(check_plain_http(bad, "x").is_err(), "{bad}");

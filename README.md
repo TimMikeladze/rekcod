@@ -283,8 +283,9 @@ Tailscale, rekcod uses Bonjour discovery on the LAN; both Macs need the same sub
 Server setup uses https. A plain `http://` controller or node URL is accepted only when it
 resolves to a loopback or tailnet address (100.64.0.0/10 or fd7a:115c:a1e0::/48), and the
 address is checked again before every request, so a `.ts.net` name stops working while
-Tailscale is off. `REKCOD_INSECURE=1` allows plain http on a network you trust; services
-installed with it set keep it.
+Tailscale is off. `REKCOD_INSECURE=1` allows plain http on a network you trust. Set it for
+every command that talks to such an address. Services installed with it set keep it;
+services installed by an older rekcod need installing again with it set.
 
 To add a remote or join a node by hand, pass tokens through a file, stdin or the
 environment. Tokens on the command line are visible to other accounts on the Mac in the

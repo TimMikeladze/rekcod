@@ -1257,7 +1257,8 @@ enum ServerCmd {
         #[arg(long, requires = "edge_only")]
         remote: Option<String>,
         /// Existing controller's join token, required when this Mac has not joined yet.
-        #[arg(long, requires = "edge_only", env = "REKCOD_JOIN_TOKEN", hide_env_values = true)]
+        /// REKCOD_JOIN_TOKEN keeps it off argv.
+        #[arg(long, requires = "edge_only")]
         join_token: Option<String>,
         /// Listen here instead of the Tailscale IP.
         #[arg(long, conflicts_with = "lan")]
@@ -1513,6 +1514,9 @@ fn main() {
         }
         Cmd::Server(ServerCmd::Setup { domain, addr, lan, no_power, edge_only, remote, join_token }) => {
             if edge_only {
+                // Read here, not as the flag's clap `env`: an exported variable would make a
+                // plain setup fail `requires = "edge_only"`.
+                let join_token = join_token.or_else(|| std::env::var("REKCOD_JOIN_TOKEN").ok().filter(|t| !t.is_empty()));
                 server::setup_edge(
                     &paths,
                     remote.as_deref().context("--edge-only requires --remote")?,
@@ -2022,7 +2026,6 @@ mod tests {
         };
         assert_eq!(env_of(&["remote", "add"], "token"), (Some("REKCOD_TOKEN".into()), true));
         assert_eq!(env_of(&["node", "join"], "join_token"), (Some("REKCOD_JOIN_TOKEN".into()), true));
-        assert_eq!(env_of(&["server", "setup"], "join_token"), (Some("REKCOD_JOIN_TOKEN".into()), true));
         assert!(Args::try_parse_from(["rekcod", "remote", "add", "x", "https://h:7700", "--token-file", "-"]).is_ok());
         assert!(Args::try_parse_from(["rekcod", "node", "join", "https://h:7700", "--token-file", "/t"]).is_ok());
         assert!(Args::try_parse_from(["rekcod", "node", "join", "https://h:7700", "jt", "--listen", "127.0.0.1:1"]).is_ok());

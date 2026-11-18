@@ -36,9 +36,58 @@ pub(crate) fn running_pid(paths: &Paths) -> Option<i32> {
     if crate::paths::locked(&paths.pid_file()) {
         return Some(pid);
     }
-    // Daemons from before the lock still run after an upgrade: trust the pid only if it's
-    // alive and is a rekcod binary.
-    (unsafe { libc::kill(pid, 0) } == 0 && pid_is_rekcod(pid)).then_some(pid)
+    // A daemon from before the lock (0.2.1) may still run after an upgrade. Anything else
+    // holding an unlocked file's pid is a process the OS gave that number to after a crash.
+    let written = std::fs::metadata(paths.pid_file()).and_then(|m| m.modified()).ok()?;
+    legacy_daemon(pid, &paths.home, written).then_some(pid)
+}
+
+/// Whether `pid` is a rekcod daemon for `home` that was running when its pid file was
+/// written: a rekcod binary, started before `written`, run as `rekcod daemon` with
+/// `REKCOD_HOME` set to `home` (as `boot` runs it).
+fn legacy_daemon(pid: i32, home: &std::path::Path, written: std::time::SystemTime) -> bool {
+    if pid <= 0 || unsafe { libc::kill(pid, 0) } != 0 || !pid_is_rekcod(pid) {
+        return false;
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    if unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) } != size {
+        return false;
+    }
+    let started = std::time::UNIX_EPOCH + Duration::new(info.pbi_start_tvsec, info.pbi_start_tvusec as u32 * 1000);
+    if started > written {
+        return false;
+    }
+    let Some(ProcArgs { args, env }) = proc_args(pid) else { return false };
+    let home = home.as_os_str().as_encoded_bytes();
+    args.get(1).is_some_and(|a| a == b"daemon") && env.iter().any(|e| e.strip_prefix(b"REKCOD_HOME=".as_slice()).is_some_and(|h| h == home))
+}
+
+struct ProcArgs {
+    args: Vec<Vec<u8>>,
+    env: Vec<Vec<u8>>,
+}
+
+/// A process's arguments and environment (`KERN_PROCARGS2`); only our own user's processes.
+fn proc_args(pid: i32) -> Option<ProcArgs> {
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut len: libc::size_t = 0;
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, std::ptr::null_mut(), &mut len, std::ptr::null_mut(), 0) } != 0 {
+        return None;
+    }
+    let mut buf = vec![0u8; len];
+    if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0) } != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    // argc, the executable's path, NUL padding, then argv and the environment.
+    let argc = i32::from_ne_bytes(buf.get(..4)?.try_into().ok()?) as usize;
+    let rest = &buf[4..];
+    let exe_end = rest.iter().position(|&b| b == 0)?;
+    let mut strings = rest[exe_end..].split(|&b| b == 0).skip_while(|s| s.is_empty());
+    let args: Vec<Vec<u8>> = strings.by_ref().take(argc).map(<[u8]>::to_vec).collect();
+    let env: Vec<Vec<u8>> = strings.take_while(|s| !s.is_empty()).map(<[u8]>::to_vec).collect();
+    (args.len() == argc).then_some(ProcArgs { args, env })
 }
 
 fn pid_is_rekcod(pid: i32) -> bool {
@@ -966,6 +1015,56 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stale pid file, its pid now another `rekcod` process: only a daemon for this home
+    /// that predates the file counts.
+    #[test]
+    fn an_unlocked_pid_file_names_this_homes_daemon_or_nothing() {
+        let t = std::env::temp_dir().join(format!("rekcod-stale-pid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("bin")).unwrap();
+        // This test binary under the name rekcod, running `sleeper` (a copied system binary
+        // is killed at exec). The first argument is a filter that matches no test.
+        let rekcod = t.join("bin/rekcod");
+        let exe = std::env::current_exe().unwrap();
+        std::fs::hard_link(&exe, &rekcod).or_else(|_| std::fs::copy(&exe, &rekcod).map(drop)).unwrap();
+        let home = Paths::at(t.join("home")).unwrap();
+        let spawn = |arg: &str, home: &std::path::Path| {
+            Command::new(&rekcod)
+                .args([arg, "cli::tests::sleeper", "--exact", "--ignored"])
+                .env("REKCOD_HOME", home)
+                .stdout(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        let mut daemon = spawn("daemon", &home.home);
+        let mut other_home = spawn("daemon", &t.join("elsewhere"));
+        let mut menubar = spawn("menubar", &home.home);
+        std::thread::sleep(Duration::from_millis(300));
+
+        let pid_of = |c: &std::process::Child, back: u64| {
+            std::fs::write(home.pid_file(), c.id().to_string()).unwrap();
+            let f = std::fs::File::options().write(true).open(home.pid_file()).unwrap();
+            f.set_modified(std::time::SystemTime::now() - Duration::from_secs(back)).unwrap();
+            running_pid(&home)
+        };
+        assert_eq!(pid_of(&daemon, 0), Some(daemon.id() as i32), "a pre-lock daemon after an upgrade");
+        assert_eq!(pid_of(&daemon, 3600), None, "the file is older than the process");
+        assert_eq!(pid_of(&other_home, 0), None, "another home's daemon");
+        assert_eq!(pid_of(&menubar, 0), None, "not a daemon");
+        for c in [&mut daemon, &mut other_home, &mut menubar] {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+        assert_eq!(pid_of(&daemon, 0), None, "gone");
+        std::fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    #[ignore = "a process for an_unlocked_pid_file_names_this_homes_daemon_or_nothing"]
+    fn sleeper() {
+        std::thread::sleep(Duration::from_secs(30));
+    }
 
     #[test]
     fn port_lines_collapse_localhost_pairs() {

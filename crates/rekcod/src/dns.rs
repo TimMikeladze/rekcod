@@ -134,17 +134,7 @@ fn header_and_question(q: &[u8]) -> Option<&[u8]> {
     q.get(..skip_name(q, 12)? + 4)
 }
 
-/// `query` turned into an answer with RCODE REFUSED and no records: its header and first
-/// question, never more, so a guest can't make the answer as big as it likes.
-pub fn refused(query: &[u8]) -> Option<Vec<u8>> {
-    query.get(..12)?;
-    let mut out = header_and_question(query).unwrap_or(&query[..12]).to_vec();
-    let questions = if out.len() > 12 { 1 } else { 0 };
-    out[2] |= 0x80; // QR
-    out[3] = (out[3] & 0xf0) | 5;
-    out[4..12].copy_from_slice(&[0, questions, 0, 0, 0, 0, 0, 0]);
-    Some(out)
-}
+pub use rekcod_proto::dns_refused as refused;
 
 /// Whether `reply` answers `query`: same ID, a response, and the same question when the
 /// query has one that parses.

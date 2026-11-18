@@ -1464,7 +1464,8 @@ Logs are in `~/.rekcod/logs`: `daemon.log` (the Mac side), `console.log` (the gu
 and boot), plus `controller.log`, `node.log`, `edge.log`, `storage.log`, `dashboard.log`
 and `menubar.log` for whichever runs. Each boot starts a fresh `daemon.log` and
 `console.log`, keeping the previous one as `.1`. A log that passes 20 MB is moved to `.1` and
-started again, checked every minute for `daemon.log` and every hour for the others.
+started again: `console.log` as it's written, `daemon.log` checked every minute, the others
+every hour. A sandbox's guest can write at most 64 KiB/s to its `console.log`.
 `rekcod shell` opens a root shell in the VM.
 
 ### The VM won't start

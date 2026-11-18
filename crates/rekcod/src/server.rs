@@ -1129,6 +1129,17 @@ pub fn remote_setup(
 mod tests {
     use super::*;
 
+    /// No child process `setup` starts gets a token in its argv; tokens go through
+    /// `run_env`.
+    #[test]
+    fn setup_children_carry_no_tokens() {
+        let src = include_str!("server.rs");
+        let body = &src[src.find("pub fn setup_edge(").unwrap()..src.find("/// Reads a line from the terminal").unwrap()];
+        for line in body.lines().filter(|l| l.contains("run(&exe")) {
+            assert!(!line.contains("token") && !line.contains("\"join\"") && !line.contains("admin"), "{line}");
+        }
+    }
+
     /// On a LAN nothing listens on, or points at, an address that can change.
     #[test]
     fn lan_layout_uses_no_lan_address() {

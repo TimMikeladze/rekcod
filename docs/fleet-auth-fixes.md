@@ -59,3 +59,6 @@ Fixes for the fleet-auth findings in `docs/audit-2026-11-18.md` that land on the
 - The controller gives TLS handshake plus request head 10 s, sets a write timeout, caps
   connections per peer address (loopback exempt), and keeps a reserve of slots for addresses
   that recently authenticated as a node or edge.
+- Left to the deploy branch (`audit-fixes-deploy`), which already changes that code: git's
+  low-speed limits and deadline in `git_cmd`/`resolve`, and the 409 for a third queued deploy
+  of one app. A connect timeout in `proxy()` belongs with the tls branch's rewrite of that line.

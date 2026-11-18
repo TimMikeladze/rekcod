@@ -83,4 +83,27 @@ if [[ $(id -u) != 0 ]]; then
   grep -q "couldn't copy the dashboard; nothing was installed" "$t/out" || fail "read-only share: $(cat "$t/out")"
 fi
 chmod 755 "$p/share/rekcod"
+
+# Over a Developer ID-signed rekcod: a new one signed by the same team installs, an
+# unsigned one doesn't. Needs a standalone team-signed binary to stand in for both;
+# Docker Desktop's CLI is one.
+signed=/Applications/Docker.app/Contents/Resources/bin/docker
+if [[ -f $signed && $(codesign -dv "$signed" 2>&1) == *TeamIdentifier=[A-Z0-9]* ]]; then
+  team_rel() {
+    rm -rf "$t/src/bin/rekcod" && cp "$1" "$t/src/bin/rekcod"
+    tar -czf "$t/rel/rekcod-darwin-arm64.tar.gz" -C "$t/src" bin share
+    (cd "$t/rel" && shasum -a 256 rekcod-darwin-arm64.tar.gz > SHA256SUMS)
+  }
+  old_install "$p"
+  cp "$signed" "$p/bin/rekcod"
+  team_rel "$signed"
+  install "$p" || fail "same team: exited $?: $(cat "$t/out")"
+  grep -q "Developer ID signature of team" "$t/out" || fail "same team: $(cat "$t/out")"
+  printf '#!/bin/sh\necho new\n' > "$t/unsigned" && chmod +x "$t/unsigned"
+  team_rel "$t/unsigned"
+  if install "$p"; then fail "an unsigned binary replaced a team-signed one"; fi
+  cmp -s "$signed" "$p/bin/rekcod" || fail "team check: the signed binary changed"
+else
+  echo "install.sh: no team-signed binary here; skipped the Developer ID case"
+fi
 echo "install.sh ok"

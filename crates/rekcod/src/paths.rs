@@ -57,6 +57,40 @@ pub fn write_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// In a rekcod home that rekcod created (`Paths::at`).
+pub const HOME_MARKER: &str = ".rekcod-home";
+
+/// Top-level entries of a rekcod home from before [`HOME_MARKER`]; one holding anything
+/// else isn't deleted whole.
+pub const HOME_ENTRIES: &[&str] = &[
+    "bin",
+    "cli",
+    "config.json",
+    "controller",
+    "dashboard",
+    "default.sock",
+    "default.sock.asked",
+    "default.sock.original",
+    "docker",
+    "golden",
+    "guest",
+    "logs",
+    "macos",
+    "node.json",
+    "node-allow.json",
+    "remote-ws",
+    "remotes.json",
+    "run",
+    "sandbox",
+    "sandbox-token",
+    "sb",
+    "server",
+    "ssh",
+    "storage",
+    "vm",
+    ".DS_Store",
+];
+
 /// Data disk size; sparse, so only used space costs anything on the Mac.
 pub const DEFAULT_DISK_GIB: u64 = 256;
 
@@ -95,8 +129,13 @@ impl Paths {
     /// Modes that can't be changed are left for `rekcod doctor` to report.
     pub fn at(home: PathBuf) -> Result<Paths> {
         use std::os::unix::fs::DirBuilderExt;
+        let fresh = !home.exists();
         for dir in ["run", "logs", "vm"] {
             std::fs::DirBuilder::new().recursive(true).mode(0o700).create(home.join(dir))?;
+        }
+        if fresh {
+            // rekcod made this directory, so `uninstall` may delete it whole.
+            std::fs::write(home.join(HOME_MARKER), b"")?;
         }
         let paths = Paths { home };
         for (path, mode) in paths.private() {

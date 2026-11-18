@@ -49,7 +49,10 @@ main() {
   if command -v gh >/dev/null; then
     local bundle=()
     fetch -sS -o "$tmp/rekcod.sigstore.json" "$base/rekcod.sigstore.json" 2>/dev/null && bundle=(--bundle "$tmp/rekcod.sigstore.json")
-    if out=$(gh attestation verify "$tmp/$tarball" --repo "$repo" --signer-workflow "$workflow" "${bundle[@]+"${bundle[@]}"}" 2>&1 </dev/null); then
+    verify() { gh attestation verify "$tmp/$tarball" --repo "$repo" --signer-workflow "$workflow" "$@" 2>&1 </dev/null; }
+    # A bundle asset that doesn't load is no verdict: the lookup on GitHub can't be swapped
+    # along with the release's files.
+    if out=$(verify "${bundle[@]+"${bundle[@]}"}") || { ((${#bundle[@]})) && out=$(verify); }; then
       checked+=("build provenance from $repo's release workflow")
     elif grep -qiE 'gh auth login|authentication|not logged|http 401|could not resolve|no such host|timeout' <<<"$out"; then
       echo "rekcod: gh couldn't check the build provenance: $(tail -1 <<<"$out")"
@@ -69,7 +72,7 @@ main() {
   # Unsigned (or not a binary at all) prints no TeamIdentifier and fails; that's no team.
   if [[ -x $prefix/bin/rekcod ]]; then team=$({ codesign -dv "$prefix/bin/rekcod" 2>&1 || true; } | sed -n 's/^TeamIdentifier=//p'); fi
   if [[ -n $team && $team != "not set" ]]; then
-    if ! codesign --verify --strict -R="=anchor apple generic and certificate leaf[subject.OU] = \"$team\"" "$tmp/x/bin/rekcod" 2>/dev/null; then
+    if ! codesign --verify --strict -R "=anchor apple generic and certificate leaf[subject.OU] = \"$team\"" "$tmp/x/bin/rekcod" 2>/dev/null; then
       echo "rekcod: the new binary isn't signed by Developer ID team $team, which signed $prefix/bin/rekcod; not installing it" >&2
       exit 1
     fi

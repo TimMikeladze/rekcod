@@ -86,12 +86,20 @@ enum Provenance {
 /// signed, which whoever can replace a release asset can't forge. A failed verification
 /// refuses the download; gh being unable to check is reported.
 fn attestation(gh: &Path, tarball: &Path, bundle: Option<&Path>) -> Result<Provenance> {
-    let mut c = Command::new(gh);
-    c.args(["attestation", "verify"]).arg(tarball).args(["--repo", REPO, "--signer-workflow", SIGNER_WORKFLOW]);
-    if let Some(b) = bundle {
-        c.arg("--bundle").arg(b);
+    let verify = |bundle: Option<&Path>| -> Result<std::process::Output> {
+        let mut c = as_invoking_user(gh);
+        c.args(["attestation", "verify"]).arg(tarball).args(["--repo", REPO, "--signer-workflow", SIGNER_WORKFLOW]);
+        if let Some(b) = bundle {
+            c.arg("--bundle").arg(b);
+        }
+        c.stdin(Stdio::null()).output().context("run gh")
+    };
+    let mut out = verify(bundle)?;
+    // A bundle asset that doesn't load is no verdict: the lookup on GitHub can't be swapped
+    // along with the release's files.
+    if !out.status.success() && bundle.is_some() {
+        out = verify(None)?;
     }
-    let out = c.stdin(Stdio::null()).output().context("run gh")?;
     if out.status.success() {
         return Ok(Provenance::Verified);
     }
@@ -104,6 +112,20 @@ fn attestation(gh: &Path, tarball: &Path, bundle: Option<&Path>) -> Result<Prove
         return Ok(Provenance::Unchecked(err.lines().last().unwrap_or_default().to_string()));
     }
     bail!("{} has no valid build provenance from {REPO}'s release workflow; not installing it\n{err}", tarball.display())
+}
+
+/// `bin` as the user who ran `sudo rekcod upgrade`: gh reads that user's login, and as
+/// root it would leave root-owned files in their home.
+fn as_invoking_user(bin: &Path) -> Command {
+    let sudo_user = std::env::var("SUDO_USER").ok().filter(|u| !u.is_empty() && u != "root");
+    match sudo_user {
+        Some(u) if unsafe { libc::geteuid() } == 0 => {
+            let mut c = Command::new("/usr/bin/sudo");
+            c.args(["-u", &u, "-H", "--"]).arg(bin);
+            c
+        }
+        _ => Command::new(bin),
+    }
 }
 
 /// The Developer ID team that signed `bin`, if one did (`TeamIdentifier=` in `codesign -dv`).
@@ -468,13 +490,31 @@ fn execute(steps: &[Step], mut run: impl FnMut(&Step) -> Vec<(String, Result<()>
     Ok(())
 }
 
-/// The rekcod home, unless deleting it would take more than rekcod's own directory.
+/// The rekcod home, unless deleting it would take more than rekcod's own directory: one
+/// rekcod created (its marker), or one holding only what rekcod puts in a home.
 fn deletable(home: &Path, user_home: Option<&Path>) -> Result<()> {
     if home.parent().is_none() || user_home.is_some_and(|u| u.starts_with(home)) {
         bail!("{} holds more than rekcod's data; not deleting it", home.display());
     }
-    if !home.join("run").is_dir() || !home.join("vm").is_dir() {
-        bail!("{} doesn't look like a rekcod home (no run/ and vm/); not deleting it", home.display());
+    if home.join(crate::paths::HOME_MARKER).exists() {
+        return Ok(());
+    }
+    let strangers: Vec<String> = std::fs::read_dir(home)?
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| {
+            !crate::paths::HOME_ENTRIES.contains(&n.as_str())
+                && !n.starts_with("doctor-")
+                && !n.starts_with("dev.rekcod.")
+                && !n.ends_with(".tmp")
+        })
+        .collect();
+    if !strangers.is_empty() {
+        bail!(
+            "{} has files rekcod didn't put there ({}); not deleting it. Move them out, or use --keep-data and delete it yourself",
+            home.display(),
+            strangers.join(", ")
+        );
     }
     Ok(())
 }
@@ -907,6 +947,9 @@ mod tests {
         assert_eq!(ok, Provenance::Verified);
         let a = std::fs::read_to_string(&args).unwrap();
         assert!(a.contains("--repo TimMikeladze/rekcod") && a.contains("--signer-workflow") && a.contains("--bundle /b.json"), "{a}");
+        // A bundle gh can't read: the online lookup decides.
+        let online = fake("case \"$*\" in *--bundle*) echo 'failed to load bundle' >&2; exit 1;; esac; exit 0").unwrap();
+        assert_eq!(online, Provenance::Verified);
         assert!(fake("echo 'Error: verifying with issuer \"sigstore.dev\": no matching attestations' >&2; exit 1").is_err());
         assert!(matches!(
             fake("echo 'To get started with GitHub CLI, please run:  gh auth login' >&2; exit 4").unwrap(),
@@ -922,6 +965,16 @@ mod tests {
         let me = std::env::current_exe().unwrap();
         assert_eq!(team_of(&me), None);
         assert!(!signed_by(&me, "ABCDE12345"));
+        // And a team-signed one passes its own team's requirement, so the requirement
+        // itself parses (a malformed one would refuse everything too).
+        let signed = ["/Applications/Google Chrome.app", "/Applications/Docker.app", "/Applications/Slack.app"]
+            .iter()
+            .map(Path::new)
+            .find_map(|b| team_of(b).map(|t| (b, t)));
+        if let Some((b, team)) = signed {
+            assert!(signed_by(b, &team), "{} by {team}", b.display());
+            assert!(!signed_by(b, "ABCDE12345"));
+        }
     }
 
     #[test]
@@ -1053,15 +1106,28 @@ mod tests {
         assert!(execute(&plan(&facts(true, false)), |s| vec![(format!("{s:?}"), Ok(()))]).is_ok());
     }
 
+    /// Through Paths::at, as uninstall gets it: a home rekcod created goes; a directory
+    /// someone pointed REKCOD_HOME at, with their files in it, stays.
     #[test]
     fn only_a_rekcod_home_is_deleted() {
         let t = std::env::temp_dir().join(format!("rekcod-del-{}", std::process::id()));
-        let home = t.join("h");
-        std::fs::create_dir_all(home.join("run")).unwrap();
-        assert!(deletable(&home, None).is_err(), "no vm/");
-        std::fs::create_dir_all(home.join("vm")).unwrap();
-        deletable(&home, Some(Path::new("/Users/me"))).unwrap();
-        assert!(deletable(&home, Some(&home.join("me"))).is_err(), "the user's home is inside it");
+        let made = Paths::at(t.join("made")).unwrap().home;
+        std::fs::write(made.join("notes-of-mine"), "").unwrap();
+        deletable(&made, Some(Path::new("/Users/me"))).unwrap();
+        assert!(deletable(&made, Some(&made.join("me"))).is_err(), "the user's home is inside it");
+        let docs = t.join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(docs.join("taxes.pdf"), "").unwrap();
+        let docs = Paths::at(docs).unwrap().home;
+        let e = deletable(&docs, None).unwrap_err().to_string();
+        assert!(e.contains("taxes.pdf"), "{e}");
+        // A 0.3.0 home: no marker, only rekcod's entries.
+        let old = t.join("old");
+        for d in ["run", "vm", "logs", "sb"] {
+            std::fs::create_dir_all(old.join(d)).unwrap();
+        }
+        std::fs::write(old.join("config.json"), "{}").unwrap();
+        deletable(&old, None).unwrap();
         assert!(deletable(Path::new("/"), None).is_err());
         std::fs::remove_dir_all(&t).unwrap();
     }

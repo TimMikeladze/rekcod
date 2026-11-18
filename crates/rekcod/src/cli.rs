@@ -1086,8 +1086,9 @@ mod tests {
 
     #[test]
     fn a_force_stop_that_hangs_ends_in_sigkill() {
-        // A daemon whose shutdown is stuck: it ignores both signals.
-        let stuck = || Command::new("/bin/sh").args(["-c", "trap '' TERM USR1; sleep 30 & wait"]).spawn().unwrap();
+        // A daemon whose shutdown is stuck: it ignores both signals. Short sleeps, so nothing
+        // it started outlives it by much.
+        let stuck = || Command::new("/bin/sh").args(["-c", "trap '' TERM USR1; while :; do sleep 0.1; done"]).spawn().unwrap();
         let (mut a, b) = (stuck(), stuck());
         std::thread::sleep(Duration::from_millis(200));
         let err = signal_pid(a.id() as i32, libc::SIGTERM, Duration::from_millis(300)).unwrap_err();

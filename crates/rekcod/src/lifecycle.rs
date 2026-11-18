@@ -384,10 +384,15 @@ const LOG_MAX: u64 = 20 << 20;
 /// Checks `log` every hour for as long as this process runs. Its writers opened it
 /// `O_APPEND`, so after truncation they carry on at the new end.
 pub fn trim_log_hourly(log: PathBuf) {
+    trim_log_every(log, Duration::from_secs(3600));
+}
+
+/// [`trim_log_hourly`] for a log something else can write fast (a VM's daemon).
+pub fn trim_log_every(log: PathBuf, period: Duration) {
     std::thread::spawn(move || {
         loop {
             trim_log(&log, LOG_MAX);
-            std::thread::sleep(Duration::from_secs(3600));
+            std::thread::sleep(period);
         }
     });
 }

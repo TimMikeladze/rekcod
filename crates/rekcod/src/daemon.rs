@@ -134,7 +134,8 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     let mut kill = signal(SignalKind::user_defined1())?;
     let _ = std::fs::remove_file(paths.last_exit());
     raise_fd_limit();
-    crate::lifecycle::trim_log_hourly(paths.daemon_log());
+    // Every minute: what a sandbox's guest does reaches this log, limited but not silenced.
+    crate::lifecycle::trim_log_every(paths.daemon_log(), Duration::from_secs(60));
     let guest = paths.guest_dir()?;
     let mut cmdline = std::env::var("REKCOD_KERNEL_CMDLINE").unwrap_or_else(|_| KERNEL_CMDLINE.into());
     let fresh = paths.data_fresh().exists();
@@ -1690,8 +1691,10 @@ mod tests {
     }
 
     /// Runs the guest's `data_disk_ready` (data-disk.sh) on a scratch image with stub
-    /// `blkid`, `mkfs.ext4` and `e2fsck`; nothing real is formatted. Returns whether it
-    /// left an ext4 disk, and the tools it ran.
+    /// `blkid`, `mkfs.ext4` and `e2fsck`; nothing real is formatted. The stubs work on the
+    /// image's bytes: blkid reports ext4 when the superblock magic (0xEF53 at byte 1080) is
+    /// there, mkfs writes it, and e2fsck writes it when `recoverable` (a backup superblock
+    /// it could use). Returns whether it left an ext4 disk, and the tools it ran.
     fn data_disk_ready(image: &[u8], cmdline: &str, ext4: bool, recoverable: bool) -> (bool, String) {
         use std::os::unix::fs::PermissionsExt;
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1699,19 +1702,20 @@ mod tests {
         let t = std::env::temp_dir().join(format!("rekcod-data-disk-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&t);
         std::fs::create_dir_all(t.join("bin")).unwrap();
-        std::fs::write(t.join("vdb"), image).unwrap();
-        for (flag, on) in [("ext4", ext4), ("recoverable", recoverable)] {
-            if on {
-                std::fs::write(t.join(flag), b"").unwrap();
-            }
+        let mut image = image.to_vec();
+        if ext4 {
+            image[1080..1082].copy_from_slice(&[0x53, 0xef]);
         }
-        // blkid sees ext4 once $T/ext4 exists; mkfs makes it, and so does e2fsck on a disk
-        // whose backup superblock is intact.
-        let stubs = [
-            ("blkid", r#"[ -e "$T/ext4" ] && echo "$1: LABEL=\"rekcod-data\" TYPE=\"ext4\"""#),
-            ("mkfs.ext4", r#"echo "mkfs.ext4 $*" >>"$T/ran"; touch "$T/ext4""#),
-            ("e2fsck", r#"echo "e2fsck $*" >>"$T/ran"; [ -e "$T/recoverable" ] && touch "$T/ext4"; exit 8"#),
-        ];
+        std::fs::write(t.join("vdb"), &image).unwrap();
+        if recoverable {
+            std::fs::write(t.join("recoverable"), b"").unwrap();
+        }
+        // The device is the last argument of each tool.
+        let magic = r#"for d; do :; done; printf '\123\357' | dd of="$d" bs=1 seek=1080 conv=notrunc 2>/dev/null"#;
+        let blkid = r#"[ "$(dd if="$1" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')" = 53ef ] && echo "$1: LABEL=\"rekcod-data\" TYPE=\"ext4\"""#;
+        let mkfs = format!(r#"echo "mkfs.ext4 $*" >>"$T/ran"; {magic}"#);
+        let e2fsck = format!(r#"echo "e2fsck $*" >>"$T/ran"; [ -e "$T/recoverable" ] && {{ {magic}; exit 1; }}; exit 8"#);
+        let stubs = [("blkid", blkid.to_string()), ("mkfs.ext4", mkfs), ("e2fsck", e2fsck)];
         for (name, body) in stubs {
             let p = t.join("bin").join(name);
             std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
@@ -1728,7 +1732,10 @@ mod tests {
             .status()
             .unwrap();
         let ran = std::fs::read_to_string(t.join("ran")).unwrap_or_default();
+        let after = std::fs::read(t.join("vdb")).unwrap();
         std::fs::remove_dir_all(&t).unwrap();
+        // What the script decided is what the disk now says.
+        assert_eq!(status.success(), after[1080..1082] == [0x53, 0xef], "{ran}");
         (status.success(), ran)
     }
 
@@ -1796,7 +1803,14 @@ mod tests {
         // What apply_forwards does when the port goes away.
         task.abort();
         let _ = task.await;
-        UdpSocket::bind(addr).await.expect("the port is free right away");
+        // A process another test spawns at the wrong moment can inherit the socket (macOS
+        // sets close-on-exec after socket()); it lets go within moments. A flow holding it
+        // would keep it as long as the guest end stays open.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Err(e) = UdpSocket::bind(addr).await {
+            assert!(Instant::now() < deadline, "the port is still taken: {e}");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
         let closed = tokio::time::timeout(Duration::from_secs(5), guest.read(&mut buf)).await;
         assert!(matches!(closed, Ok(Ok(0))), "the flow ended with it: {closed:?}");
     }

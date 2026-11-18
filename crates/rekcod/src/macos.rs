@@ -122,6 +122,10 @@ pub struct GuestConfig {
     pub cpus: usize,
     pub memory_gib: u64,
     pub mac: String,
+    /// The base image it was cloned from (or is): whose SSH host key it has. None for
+    /// sandboxes made before rekcod recorded it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 
 fn read_config(dir: &Path) -> Result<GuestConfig> {
@@ -197,8 +201,8 @@ fn configuration(dir: &Path, g: &GuestConfig) -> Result<Retained<VZVirtualMachin
 /// Installs the downloaded restore image into a new base image `name`.
 pub fn install(paths: &Paths, name: &str, disk_gib: u64, cpus: usize, memory_gib: u64) -> Result<()> {
     crate::sandbox::check_name("macOS image", name)?;
-    // A new base image has a new host key.
-    let _ = std::fs::remove_file(known_hosts(paths));
+    // A new base image has a new host key; other images' pins stay.
+    let _ = std::fs::remove_file(known_hosts(paths, Some(name)));
     let restore = ipsw(paths);
     if !restore.exists() {
         bail!("no restore image; run `rekcod macos fetch` first");
@@ -228,6 +232,7 @@ pub fn install(paths: &Paths, name: &str, disk_gib: u64, cpus: usize, memory_gib
         cpus: cpus.max(unsafe { req.minimumSupportedCPUCount() }),
         memory_gib: memory_gib.max(unsafe { req.minimumSupportedMemorySize() } >> 30),
         mac: new_mac(),
+        image: Some(name.to_string()),
     };
     std::fs::write(dir.join("config.json"), serde_json::to_vec_pretty(&g)?)?;
     let vm = crate::vm::Vm::from_config(configuration(&dir, &g)?);
@@ -403,7 +408,8 @@ pub fn clone_image(paths: &Paths, name: &str, home: &Path, cpus: usize, memory_g
         crate::sandbox::clonefile(&src.join(f), &home.join(f))?;
     }
     new_machine_id(home)?;
-    let g = GuestConfig { cpus: cpus.max(base.cpus), memory_gib: memory_gib.max(base.memory_gib), mac: new_mac() };
+    let g =
+        GuestConfig { cpus: cpus.max(base.cpus), memory_gib: memory_gib.max(base.memory_gib), mac: new_mac(), image: Some(name.into()) };
     std::fs::write(home.join("config.json"), serde_json::to_vec_pretty(&g)?)?;
     Ok(())
 }
@@ -417,17 +423,45 @@ pub fn reidentify(home: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Guest host keys seen so far. Clones share their base image's key, so the first one
-/// learned for an address holds for every guest given it; another VM on the vmnet that
-/// answers there with a different key is refused. `macos install` starts it over.
-fn known_hosts(paths: &Paths) -> PathBuf {
-    root(paths).join("known_hosts")
+/// Guest host keys seen so far, one file per base image: clones share their image's key,
+/// so the key is pinned to the image (`HostKeyAlias`), not to the vmnet address DHCP happens
+/// to give a guest. Sandboxes from before images were recorded share the old file, keyed by
+/// address. `macos install` starts an image's file over.
+fn known_hosts(paths: &Paths, image: Option<&str>) -> PathBuf {
+    match image {
+        Some(i) => root(paths).join("known_hosts.d").join(i),
+        None => root(paths).join("known_hosts"),
+    }
+}
+
+/// The base image of the running guest at `ip`, from the sandboxes' configs.
+fn image_at(paths: &Paths, ip: &str) -> Option<String> {
+    crate::sandbox::list(paths).into_iter().filter(|s| s.meta.os == "macos").find_map(|s| {
+        let g = read_config(&s.home).ok()?;
+        (running_ip(&g.mac).as_deref() == Some(ip)).then_some(g.image).flatten()
+    })
+}
+
+/// ssh's host key options for a guest of `image` at `ip`.
+fn host_key_opts(paths: &Paths, image: Option<&str>) -> Result<Vec<String>> {
+    let file = known_hosts(paths, image);
+    std::fs::create_dir_all(file.parent().context("known_hosts dir")?)?;
+    let mut o =
+        vec!["-o".to_string(), "StrictHostKeyChecking=accept-new".into(), "-o".into(), format!("UserKnownHostsFile={}", file.display())];
+    if let Some(i) = image {
+        o.extend(["-o".into(), format!("HostKeyAlias=rekcod-macos-{i}")]);
+    }
+    Ok(o)
 }
 
 fn ssh_base(paths: &Paths, ip: &str) -> Result<Command> {
+    ssh_to(paths, ip, image_at(paths, ip).as_deref(), true)
+}
+
+fn ssh_to(paths: &Paths, ip: &str, image: Option<&str>, quiet: bool) -> Result<Command> {
     let mut c = Command::new("ssh");
-    c.args(["-q", "-o", "StrictHostKeyChecking=accept-new", "-o"])
-        .arg(format!("UserKnownHostsFile={}", known_hosts(paths).display()))
+    c.args(if quiet { ["-q"].as_slice() } else { ["-o", "LogLevel=ERROR"].as_slice() })
+        .args(host_key_opts(paths, image)?)
         .args(["-o", "ConnectTimeout=5", "-o", "BatchMode=yes", "-i"])
         .arg(key(paths)?)
         .arg(format!("{USER}@{ip}"));
@@ -453,10 +487,18 @@ pub fn boot(paths: &Paths, home: &Path, idle_ttl: u64) -> Result<String> {
     }
     let t0 = Instant::now();
     loop {
-        if let Some(ip) = running_ip(&g.mac)
-            && ssh_base(paths, &ip)?.arg("true").stdin(Stdio::null()).status().is_ok_and(|s| s.success())
-        {
-            return Ok(ip);
+        if let Some(ip) = running_ip(&g.mac) {
+            let out = ssh_to(paths, &ip, g.image.as_deref(), false)?.arg("true").stdin(Stdio::null()).output()?;
+            if out.status.success() {
+                return Ok(ip);
+            }
+            let err = String::from_utf8_lossy(&out.stderr);
+            if err.contains("Host key verification failed") {
+                bail!(
+                    "the macOS guest at {ip} doesn't have the SSH host key {} has for it; if its base image was set up again, delete that file",
+                    known_hosts(paths, g.image.as_deref()).display()
+                );
+            }
         }
         if t0.elapsed() > Duration::from_secs(240) {
             bail!("the macOS guest didn't answer SSH within 240s; see {}", sb.daemon_log().display());
@@ -660,6 +702,23 @@ pub fn run(home: PathBuf, idle_ttl: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest's host key is pinned per base image under an alias, so a new DHCP address
+    /// doesn't make it a stranger; a sandbox from before images were recorded keeps the
+    /// shared, address-keyed file.
+    #[test]
+    fn host_keys_follow_the_image() {
+        let home = std::env::temp_dir().join(format!("rekcod-macos-kh-{}", std::process::id()));
+        let paths = Paths { home: home.clone() };
+        let o = host_key_opts(&paths, Some("base")).unwrap().join(" ");
+        assert!(o.contains(&format!("UserKnownHostsFile={}", home.join("macos/known_hosts.d/base").display())), "{o}");
+        assert!(o.contains("HostKeyAlias=rekcod-macos-base"), "{o}");
+        let legacy = host_key_opts(&paths, None).unwrap().join(" ");
+        assert!(legacy.ends_with(&format!("UserKnownHostsFile={}", home.join("macos/known_hosts").display())), "{legacy}");
+        let old: GuestConfig = serde_json::from_str(r#"{"cpus":4,"memory_gib":8,"mac":"aa:bb:cc:dd:ee:ff"}"#).unwrap();
+        assert_eq!(old.image, None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn leases_and_input() {

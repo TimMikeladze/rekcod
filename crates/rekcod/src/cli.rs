@@ -323,6 +323,19 @@ impl Default for BootOptions {
     }
 }
 
+/// The daemon flags for a sandbox's port forwarding: `--publish=P,Q` (empty: none) and
+/// `--no-autoports`.
+pub(crate) fn forwarding_args(opts: &BootOptions) -> Vec<String> {
+    let mut a = Vec::new();
+    if let Some(ports) = &opts.publish {
+        a.push(format!("--publish={}", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")));
+    }
+    if opts.no_autoports {
+        a.push("--no-autoports".into());
+    }
+    a
+}
+
 /// Boots the VM unless it is running; returns the pid when it already was.
 pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
     if let Some(pid) = running_pid(paths) {
@@ -382,12 +395,7 @@ pub(crate) fn boot(paths: &Paths, opts: &BootOptions) -> Result<Option<i32>> {
         if opts.repair {
             cmd.arg("--repair");
         }
-        if let Some(ports) = &opts.publish {
-            cmd.arg(format!("--publish={}", ports.iter().map(u16::to_string).collect::<Vec<_>>().join(",")));
-        }
-        if opts.no_autoports {
-            cmd.arg("--no-autoports");
-        }
+        cmd.args(forwarding_args(opts));
         if opts.project.is_none() && user_network(&saved) {
             cmd.arg("--network-user");
         }

@@ -432,7 +432,8 @@ impl Action {
 }
 
 pub fn shell_quote(s: &str) -> String {
-    if !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,".contains(c)) {
+    // A word zsh starts with `=` is replaced by a command's path (`=ls` is /bin/ls).
+    if !s.is_empty() && !s.starts_with('=') && s.chars().all(|c| c.is_ascii_alphanumeric() || "-_./:=@+,".contains(c)) {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', r"'\''"))
@@ -1828,6 +1829,8 @@ pub mod tests {
         }
         assert_eq!(shell_quote("a b"), "'a b'");
         assert_eq!(shell_quote("it's"), r"'it'\''s'");
+        assert_eq!((shell_quote("=="), shell_quote("=ls")), ("'=='".into(), "'=ls'".into()));
+        assert_eq!(shell_quote("KEY=value"), "KEY=value");
     }
 
     #[test]

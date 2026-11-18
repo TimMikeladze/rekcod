@@ -152,9 +152,15 @@ pub fn mux_opts() -> Vec<String> {
     ["-o", "ControlMaster=auto", "-o", &format!("ControlPath={}", path.display()), "-o", "ControlPersist=60"].map(String::from).into()
 }
 
+/// A peer that stops answering (asleep, off the network) is dropped after ~10 s instead of
+/// TCP keepalive's two hours. The master's options are the ones that count, so every
+/// command that may create it sets them.
+const ALIVE: [&str; 4] = ["-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2"];
+
 fn ssh_opts(dest: &str, extra: &[&str]) -> Command {
     let mut cmd = Command::new("ssh");
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"])
+        .args(ALIVE)
         .args(mux_opts())
         .args(extra)
         .args(ssh_dest(dest));
@@ -381,20 +387,21 @@ pub fn uninstall(paths: &Paths, name: &str, yes: bool) -> Result<()> {
     // The same build there, so it knows everything this one would undo.
     let bin = crate::server::ensure_binary(&dest, || ssh(&dest), &ssh_dest(&dest))?;
     eprintln!("rekcod: running `rekcod uninstall` on {dest}; sudo there asks for the password of that Mac's account");
-    if !ssh_opts(&dest, &["-t"]).arg(format!("'{bin}' uninstall --yes && rm -f '{bin}'")).status()?.success() {
+    if !ssh_opts(&dest, &["-t"]).arg(format!("'{bin}' uninstall --yes")).status()?.success() {
         bail!("`rekcod uninstall` failed on {dest}; nothing removed here");
+    }
+    if let Some(left) = user_binary(&bin) {
+        eprintln!("rekcod: {left} on {dest} was installed there, not copied by rekcod; it stays (remove it there if you want it gone)");
     }
     // Last thing over SSH: without its key rekcod can't get back in.
     let key = std::fs::read_to_string(crate::sshkey::key(paths).with_extension("pub")).unwrap_or_default();
     if !key.trim().is_empty() {
-        let mut child = ssh(&dest)
-            // Rewritten in place (cat >), so the file keeps its mode and owner.
-            .arg(r#"k=$(cat); f=~/.ssh/authorized_keys; if [ -f "$f" ]; then grep -vxF "$k" "$f" > "$f.rekcod"; cat "$f.rekcod" > "$f"; rm -f "$f.rekcod"; fi"#)
-            .stdin(Stdio::piped())
-            .spawn()?;
+        let mut child = ssh(&dest).arg(DROP_KEY).stdin(Stdio::piped()).spawn()?;
         child.stdin.take().context("ssh stdin")?.write_all(key.trim().as_bytes())?;
         if child.wait()?.success() {
             eprintln!("rekcod: removed rekcod's key from {dest}'s ~/.ssh/authorized_keys");
+        } else {
+            eprintln!("rekcod: couldn't take rekcod's key out of {dest}'s ~/.ssh/authorized_keys; the file is unchanged");
         }
     }
     forget(paths, name)?;
@@ -404,6 +411,17 @@ pub fn uninstall(paths: &Paths, name: &str, yes: bool) -> Result<()> {
     }
     println!("rekcod is gone from {dest}");
     Ok(())
+}
+
+/// The key on stdin out of `~/.ssh/authorized_keys`. Rewritten in place (`cat >`), so the
+/// file keeps its mode and owner, and only once grep's copy is complete: grep exits 1 when
+/// nothing is left, 2 on an error, and a failed redirect must not truncate the file.
+const DROP_KEY: &str = r#"k=$(cat); f=~/.ssh/authorized_keys; [ -f "$f" ] || exit 0; t="$f.rekcod"; rm -f "$t"; grep -vxF "$k" "$f" > "$t"; r=$?; if [ "$r" -le 1 ] && [ -f "$t" ]; then cat "$t" > "$f" || r=2; else r=2; fi; rm -f "$t"; [ "$r" -le 1 ]"#;
+
+/// The remote binary `host uninstall` leaves: one the user installed (install.sh, the pkg,
+/// Homebrew). A copy rekcod made lives in `~/.rekcod/bin` and goes with the home.
+fn user_binary(bin: &str) -> Option<&str> {
+    (!bin.ends_with("/.rekcod/bin/rekcod")).then_some(bin)
 }
 
 /// `user@host[:port]` with the host swapped for `target`.
@@ -691,6 +709,7 @@ const LOCAL_KEYS: &[&str] =
 fn engine_ssh(dest: &str, extra: &[&str]) -> Command {
     let mut cmd = Command::new(std::env::var_os("REKCOD_SSH").unwrap_or_else(|| "ssh".into()));
     cmd.args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "-o", "StrictHostKeyChecking=accept-new"])
+        .args(ALIVE)
         .args(mux_opts())
         .args(extra)
         .args(ssh_dest(dest));
@@ -704,17 +723,28 @@ fn dest_of(name: &str) -> Result<String> {
     dest_of_host(host)
 }
 
+/// Without a pty sshd sends no signal when the client goes: the command runs on until it
+/// next writes. Once the session's sshd is gone (this shell's parent is launchd), the
+/// watcher stops it. Stdin stays with the command; the watcher holds none of the session's
+/// descriptors, so they close when the command exits.
+const ORPHAN_WATCH: &str = "s=$$; { while sleep 2; do p=$(ps -o ppid= -p $s) || exit 0; [ $p -eq 1 ] && { pkill -TERM -P $s; exit 0; }; done; } </dev/null >/dev/null 2>&1 & w=$!; ";
+
 /// The remote command line for `rekcod ARGS` there, found as `host restart` finds it.
-fn remote_rekcod(dir: Option<&str>, args: &[String]) -> String {
+/// `watch`: there's no pty, so add [`ORPHAN_WATCH`].
+fn remote_rekcod(dir: Option<&str>, args: &[String], watch: bool) -> String {
     use crate::actions::shell_quote;
     let cd = dir.map(|d| format!("cd {} && ", shell_quote(d))).unwrap_or_default();
     // The dashboard's followers set it: a stopped VM there stays stopped too.
     let no_boot = if std::env::var_os("REKCOD_NO_BOOT").is_some_and(|v| !v.is_empty()) { "export REKCOD_NO_BOOT=1; " } else { "" };
     let args: Vec<String> = args.iter().map(|a| shell_quote(a)).collect();
+    let run = if watch {
+        format!("{ORPHAN_WATCH}\"$r\" {}; c=$?; kill $w 2>/dev/null; exit $c", args.join(" "))
+    } else {
+        format!("exec \"$r\" {}", args.join(" "))
+    };
     let script = format!(
-        "r=$({}); [ -n \"$r\" ] || {{ echo \"rekcod isn't installed on $(hostname -s)\" >&2; exit 127; }}; {no_boot}{cd}exec \"$r\" {}",
+        "r=$({}); [ -n \"$r\" ] || {{ echo \"rekcod isn't installed on $(hostname -s)\" >&2; exit 127; }}; {no_boot}{cd}{run}",
         crate::server::FIND,
-        args.join(" ")
     );
     format!("/bin/zsh -lc {}", shell_quote(&script))
 }
@@ -753,14 +783,46 @@ pub fn rewrite(v: &mut serde_json::Value, name: &str) {
     }
 }
 
+/// Under the dashboard's 40 s, so rekcod reaps its own ssh rather than being killed over it.
+const STATE_DEADLINE: Duration = Duration::from_secs(20);
+
+/// `cmd`'s output, or an error once `deadline` passes, with the child killed. Both pipes
+/// are drained meanwhile: a state larger than a pipe buffer would otherwise stall the child.
+fn output_within(mut cmd: Command, deadline: Duration) -> Result<std::process::Output> {
+    use std::io::Read;
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let drain = |r: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut r) = r {
+                let _ = r.read_to_end(&mut buf);
+            }
+            buf
+        })
+    };
+    let out = drain(child.stdout.take().map(|r| Box::new(r) as _));
+    let err = drain(child.stderr.take().map(|r| Box::new(r) as _));
+    let t0 = std::time::Instant::now();
+    let status = loop {
+        if let Some(st) = child.try_wait()? {
+            break st;
+        }
+        if t0.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!("no answer in {} s", deadline.as_secs());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    Ok(std::process::Output { status, stdout: out.join().unwrap_or_default(), stderr: err.join().unwrap_or_default() })
+}
+
 /// `rekcod host state NAME`: `rekcod state --local` on that Mac, rewritten to run from here.
 pub fn engine_state(name: &str) -> Result<serde_json::Value> {
     let dest = dest_of(name)?;
-    let out = engine_ssh(&dest, &[])
-        .arg(remote_rekcod(None, &["state".into(), "--local".into()]))
-        .stdin(Stdio::null())
-        .output()
-        .context("run ssh")?;
+    let mut cmd = engine_ssh(&dest, &[]);
+    cmd.arg(remote_rekcod(None, &["state".into(), "--local".into()], false)).stdin(Stdio::null());
+    let out = output_within(cmd, STATE_DEADLINE).with_context(|| name.to_string())?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         bail!("{name}: {}", err.trim().lines().last().unwrap_or("ssh failed"));
@@ -786,10 +848,16 @@ pub fn print_engine_state(name: &str) -> Result<()> {
 pub fn exec(name: &str, dir: Option<&str>, args: &[String]) -> Result<std::convert::Infallible> {
     use std::os::unix::process::CommandExt;
     let dest = dest_of(name)?;
-    let tty = unsafe { libc::isatty(0) } == 1;
+    let tty = wants_tty(unsafe { libc::isatty(0) } == 1, unsafe { libc::isatty(1) } == 1);
     let mut cmd = engine_ssh(&dest, if tty { &["-t"] } else { &[] });
-    cmd.arg(remote_rekcod(dir, args));
+    cmd.arg(remote_rekcod(dir, args, !tty));
     Err(cmd.exec()).context("exec ssh")
+}
+
+/// A pty there turns line ends into CR LF and mixes stderr into stdout: only for a
+/// terminal at both ends, never for output a script captures.
+fn wants_tty(stdin: bool, stdout: bool) -> bool {
+    stdin && stdout
 }
 
 #[cfg(test)]
@@ -878,9 +946,92 @@ mod tests {
         let mut lone = serde_json::json!({"open": {"kind": "OpenPort", "label": "Open", "url": "http://localhost:1"}});
         rewrite(&mut lone, "mini");
         assert_eq!(lone["open"], serde_json::json!({"kind": "OpenPort", "label": "Open"}));
-        let line = remote_rekcod(Some("/Users/me/my app"), &["logs".into(), "it's".into()]);
+        let line = remote_rekcod(Some("/Users/me/my app"), &["logs".into(), "it's".into()], false);
         assert!(line.starts_with("/bin/zsh -lc '"), "{line}");
         assert!(line.contains(r"cd '\''/Users/me/my app'\'' && exec"), "{line}");
+    }
+
+    /// Through a zsh standing in for the remote login shell, with a script that echoes as
+    /// rekcod: output, exit status and stdin all reach the caller with the watcher on.
+    #[test]
+    fn watched_command_keeps_status_and_stdin() {
+        let dir = std::env::temp_dir().join(format!("rekcod-watch-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake = dir.join("rekcod");
+        std::fs::write(&fake, "#!/bin/sh\necho \"args: $*\"; cat; exit 7\n").unwrap();
+        std::fs::set_permissions(&fake, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        // Never whatever rekcod this Mac has on PATH.
+        let line =
+            remote_rekcod(None, &["logs".into(), "=x".into()], true).replace(crate::server::FIND, &format!("echo {}", fake.display()));
+        let mut c =
+            Command::new("/bin/sh").args(["-c", &line]).env("ZDOTDIR", &dir).stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        c.stdin.take().unwrap().write_all(b"from stdin\n").unwrap();
+        let out = c.wait_with_output().unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "args: logs =x\nfrom stdin\n");
+        assert_eq!(out.status.code(), Some(7));
+    }
+
+    #[test]
+    fn tty_only_between_terminals() {
+        assert!(wants_tty(true, true));
+        assert!(!wants_tty(true, false) && !wants_tty(false, true) && !wants_tty(false, false));
+    }
+
+    #[test]
+    fn uninstall_keeps_binaries_the_user_installed() {
+        assert_eq!(user_binary("/usr/local/bin/rekcod"), Some("/usr/local/bin/rekcod"));
+        assert_eq!(user_binary("/opt/homebrew/bin/rekcod"), Some("/opt/homebrew/bin/rekcod"));
+        assert_eq!(user_binary("/Users/me/.rekcod/bin/rekcod"), None);
+    }
+
+    /// DROP_KEY with HOME at a scratch dir: the key goes, and when the copy can't be
+    /// written the file stays whole and the script fails.
+    #[test]
+    fn dropping_the_key_never_truncates() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = std::env::temp_dir().join(format!("rekcod-ak-{}", std::process::id()));
+        let ssh = home.join(".ssh");
+        std::fs::create_dir_all(&ssh).unwrap();
+        let ak = ssh.join("authorized_keys");
+        let run = || {
+            let mut c = Command::new("/bin/sh")
+                .args(["-c", DROP_KEY])
+                .env("HOME", &home)
+                .stdin(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            c.stdin.take().unwrap().write_all(b"ssh-ed25519 RK rekcod@x").unwrap();
+            c.wait().unwrap().success()
+        };
+        std::fs::write(&ak, "ssh-ed25519 A me\nssh-ed25519 RK rekcod@x\n").unwrap();
+        assert!(run());
+        assert_eq!(std::fs::read_to_string(&ak).unwrap(), "ssh-ed25519 A me\n");
+        std::fs::write(&ak, "ssh-ed25519 A me\nssh-ed25519 RK rekcod@x\n").unwrap();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let ok = run();
+        std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if unsafe { libc::geteuid() } != 0 {
+            assert!(!ok);
+            assert_eq!(std::fs::read_to_string(&ak).unwrap(), "ssh-ed25519 A me\nssh-ed25519 RK rekcod@x\n");
+        }
+        std::fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// A host that never answers is given up on and its ssh killed; a large answer isn't
+    /// mistaken for one.
+    #[test]
+    fn host_state_has_a_deadline() {
+        let mut c = Command::new("sleep");
+        c.arg("600");
+        let t0 = std::time::Instant::now();
+        let err = output_within(c, Duration::from_millis(300)).unwrap_err();
+        assert!(err.to_string().contains("no answer") && t0.elapsed() < Duration::from_secs(5), "{err}");
+        let mut big = Command::new("/bin/sh");
+        big.args(["-c", "head -c 1000000 /dev/zero; echo e >&2"]);
+        let out = output_within(big, Duration::from_secs(20)).unwrap();
+        assert_eq!((out.stdout.len(), out.stderr.as_slice()), (1_000_000, &b"e\n"[..]));
     }
 
     #[test]

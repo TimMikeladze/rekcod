@@ -853,7 +853,7 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
     let daemon_id = |ctx: &[&str]| docker::run_ok(&[ctx, &["info", "--format", "{{.ID}}"]].concat());
     distinct_daemons(from, &daemon_id(&src)?, &daemon_id(&dst)?)?;
 
-    let (mut imported, mut skipped) = (0, 0);
+    let (mut imported, mut skipped, mut failed) = (0, 0, Vec::<String>::new());
     if images {
         let list = docker::run_ok(&[&src[..], &["image", "ls", "--format", "{{.Repository}}:{{.Tag}}"]].concat())?;
         let mut refs: Vec<&str> = list.lines().filter(|r| !r.contains("<none>") && wanted(r)).collect();
@@ -879,7 +879,10 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
                     imported += 1;
                     println!("  [{}/{}] {r}: ok ({:.1}s)", i + 1, refs.len(), t.elapsed().as_secs_f64());
                 }
-                Err(e) => println!("  [{}/{}] {r}: FAILED: {e:#}", i + 1, refs.len()),
+                Err(e) => {
+                    println!("  [{}/{}] {r}: FAILED: {e:#}", i + 1, refs.len());
+                    failed.push(format!("image {r}"));
+                }
             }
         }
     }
@@ -935,17 +938,37 @@ pub fn import(paths: &Paths, from: &str, only: &[String], images: bool, volumes:
                     imported += 1;
                     println!("  {name}: ok ({:.1}s)", t.elapsed().as_secs_f64());
                 }
-                Err(e) => println!("  {name}: FAILED: {e:#}"),
+                Err(e) => {
+                    // The copy empties the destination first; what's there now is partial.
+                    println!("  {name}: FAILED, the volume here is incomplete: {e:#}");
+                    failed.push(format!("volume {name}"));
+                }
             }
         }
     }
+    import_summary(imported, skipped, &failed)
+}
+
+/// Prints the totals; an error when anything failed, so a script doesn't go on to remove
+/// the old engine.
+fn import_summary(imported: usize, skipped: usize, failed: &[String]) -> Result<()> {
     println!("imported {imported}, skipped {skipped}. Containers are not copied: run `docker compose up -d` in your projects.");
+    if !failed.is_empty() {
+        anyhow::bail!("{} failed: {}; run the import again for them", failed.len(), failed.join(", "));
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_import_with_failures_is_an_error() {
+        assert!(import_summary(3, 1, &[]).is_ok());
+        let e = import_summary(2, 0, &["volume pg".into(), "image web:1".into()]).unwrap_err();
+        assert_eq!(e.to_string(), "2 failed: volume pg, image web:1; run the import again for them");
+    }
 
     #[test]
     fn port_lines_collapse_localhost_pairs() {

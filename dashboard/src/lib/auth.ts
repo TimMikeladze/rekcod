@@ -1,4 +1,4 @@
-// The per-launch token (README, "Dashboard"). `rekcod dashboard` and `npm run dev` put it in
+// The per-launch token (crates/rekcod/src/dashboard.rs). `rekcod dashboard` and `npm run dev` put it in
 // REKCOD_DASHBOARD_TOKEN; `/auth?token=` stores it in the page's localStorage, and every API
 // request sends it as `Authorization: Bearer`. Never a cookie: cookies ignore ports, so every
 // other server on localhost would receive it. No "server-only" here: proxy.ts imports this too.

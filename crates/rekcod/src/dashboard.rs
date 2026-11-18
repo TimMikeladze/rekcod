@@ -1,4 +1,4 @@
-//! `rekcod dashboard`: runs the web dashboard's standalone build (README, "Dashboard") on
+//! `rekcod dashboard`: runs the web dashboard's standalone build (README, "Manage it from the terminal, menu bar or dashboard") on
 //! 127.0.0.1 and opens it. A dashboard that's already running is just opened.
 //!
 //! Each launch gets a new token. It goes to the server in `REKCOD_DASHBOARD_TOKEN` and to

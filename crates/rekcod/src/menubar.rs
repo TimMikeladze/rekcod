@@ -1,6 +1,6 @@
-//! `rekcod menubar`: a menu bar item with the same actions as the CLI
-//! (docs/frontends.md). The title follows the VM every 2 s; the menu is
-//! built from `actions::Model` each time it opens, and every item runs an
+//! `rekcod menubar`: a menu bar item with the same actions as the CLI (README, "Manage it
+//! from the terminal, menu bar or dashboard"). The title follows the VM every 2 s; the menu
+//! is built from `actions::Model` each time it opens, and every item runs an
 //! `actions::Action` (a `rekcod` command).
 
 use std::cell::{Cell, OnceCell, RefCell};

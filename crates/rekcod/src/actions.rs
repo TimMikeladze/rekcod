@@ -1,4 +1,4 @@
-//! What the menu bar shows and can do (docs/frontends.md).
+//! What the menu bar shows and can do (README, "Manage it from the terminal, menu bar or dashboard").
 //!
 //! The CLI is the implementation: every [`Action`] is a `rekcod` command line
 //! (or opening a URL). The menu bar renders the lists returned by the

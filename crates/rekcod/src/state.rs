@@ -1,5 +1,5 @@
 //! `rekcod state`: everything the front ends show, with each item's actions attached, as one
-//! JSON document. The dashboard (`dashboard/`, docs/dashboard.md) renders it as is and only
+//! JSON document. The dashboard (`dashboard/`) renders it as is and only
 //! runs the argv it finds here.
 
 use serde_json::{Value, json};

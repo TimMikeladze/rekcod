@@ -214,6 +214,8 @@ check "schedule every 60s" job --name tick --every 60s -- echo tick
 for _ in $(seq 30); do "$R" job ls --remote alice | grep -q '"schedule": "tick"' && break; sleep 1; done
 check "schedule ran" sh -c '"$0" job ls --remote alice | grep -q "\"schedule\": \"tick\""' "$R"
 check "unschedule" cr job unschedule --remote alice tick
+# Active jobs count against alice's cap of 2, which the namespace checks below need.
+for _ in $(seq 60); do "$R" job ls --remote alice | grep -qE '"state": "(pending|running|cancelling)"' || break; sleep 1; done
 
 echo "namespaces"
 check "ns create (4 CPUs, 4 GiB)" cr ns create team --max-cpus 4 --max-memory 4 --remote admin

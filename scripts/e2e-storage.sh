@@ -32,6 +32,8 @@ mkdir -p "$C/bin" "$N"
 [[ -f $HOME/.rekcod/bin/rustfs-1.0.1 ]] && cp -c "$HOME/.rekcod/bin/rustfs-1.0.1" "$C/bin/"
 [[ -d $HOME/.rekcod/golden/default ]] && mkdir -p "$N/golden" && cp -cR "$HOME/.rekcod/golden/default" "$N/golden/"
 export REKCOD_HOME=$C
+# The test repo is a local bare repo; real fleets only fetch over https/ssh/http.
+export REKCOD_ALLOW_LOCAL_GIT=1
 
 repo=$(mktemp -d "${TMPDIR:-/tmp}/rekcod-storage-XXXXXX")
 git init -q --bare "$repo/app.git"
@@ -72,7 +74,8 @@ check "first instance built, second loaded the stored image" sh -c 'grep -q "hel
 ep=$(sqlite3 "$C/controller/fleet.db" "select endpoint from instances where app = 'hello' and state = 'live' limit 1")
 envs=$(curl -s -m 3 "http://$ep/")
 key=$(printf '%s\n' "$envs" | sed -n 's/^AWS_ACCESS_KEY_ID=//p') sec=$(printf '%s\n' "$envs" | sed -n 's/^AWS_SECRET_ACCESS_KEY=//p')
-check "instance gets S3_ENDPOINT, S3_BUCKET and its keys" sh -c 'printf "%s" "$0" | grep -q "^S3_BUCKET=app-hello" && printf "%s" "$0" | grep -q "^S3_ENDPOINT=http://127.0.0.1:17710" && test -n "$1"' "$envs" "$key"
+# 198.18.0.1 is the Mac's loopback as the VM dials it.
+check "instance gets S3_ENDPOINT, S3_BUCKET and its keys" sh -c 'printf "%s" "$0" | grep -q "^S3_BUCKET=app-hello" && printf "%s" "$0" | grep -q "^S3_ENDPOINT=http://198.18.0.1:17710" && test -n "$1"' "$envs" "$key"
 echo hi >"$repo/obj"
 check "its key writes and reads its bucket" sh -c 'curl -sf -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" -T "$1" http://127.0.0.1:17710/app-hello/x.txt && test "$(curl -sf -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" http://127.0.0.1:17710/app-hello/x.txt)" = hi' "$key:$sec" "$repo/obj"
 check "deploy a second app" sh -c 'cd "$1" && "$0" app deploy --remote admin --name other' "$R" "$repo/w"
@@ -108,7 +111,9 @@ check "bucket is gone" eventually 'test "$(curl -s -o /dev/null -w "%{http_code}
 echo "versioning and a lost policy (RD-13)"
 # What a tenant's S3 library may do with its own key: versioning on, overwrites, a delete
 # marker. The destroy must remove every version, or RustFS answers the bucket DELETE with 409.
-check "app key turns on versioning" sh -c 'printf "<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>" | curl -sf -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" -T - "http://127.0.0.1:17710/app-other?versioning"' "$key2:$sec2"
+# From a file: RustFS answers a chunked upload (-T -) with 411.
+printf '<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>' >"$repo/versioning.xml"
+check "app key turns on versioning" s3 "$key2:$sec2" -f -T "$repo/versioning.xml" "http://127.0.0.1:17710/app-other?versioning"
 for v in a b; do echo "$v" >"$repo/obj"; s3 "$key2:$sec2" -sf -T "$repo/obj" http://127.0.0.1:17710/app-other/v.txt; done
 s3 "$key2:$sec2" -sf -X DELETE http://127.0.0.1:17710/app-other/v.txt
 
@@ -121,8 +126,10 @@ check "controller restore" "$R" controller restore
 pids+=($!)
 sleep 2
 check "restored controller has the app and remembers storage" sh -c '"$0" app ls --remote admin | grep -q "\"other\"" && grep -c "storage on" "$1" | grep -q 2' "$R" "$C/controller.log"
-# Someone removed the bucket's policy by hand: the destroy treats it as already gone.
-check "remove other's policy by hand" s3 "$(root)" -sf -X DELETE "http://127.0.0.1:17710/rustfs/admin/v3/remove-canned-policy?name=bucket-app-other"
+# Someone removed the bucket's user and policy by hand (RustFS keeps a policy a user still
+# has): the destroy treats both as already gone.
+check "remove other's user and policy by hand" sh -c 's3() { curl -s -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" -f -X DELETE "$1"; }
+  s3 "http://127.0.0.1:17710/rustfs/admin/v3/remove-user?accessKey=$1" && s3 "http://127.0.0.1:17710/rustfs/admin/v3/remove-canned-policy?name=bucket-app-other"' "$(root)" "$key2"
 check "destroy other" cr app destroy other --force
 check "versioned bucket is gone" eventually 'test "$(curl -s -o /dev/null -w "%{http_code}" -m 10 --aws-sigv4 aws:amz:us-east-1:s3 --user "$0" -I http://127.0.0.1:17710/app-other)" = 404' "$(root)"
 check "and so is the app row" eventually '! "$0" app status other --remote admin' "$R"

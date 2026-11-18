@@ -342,6 +342,11 @@ enum Cmd {
         repair: bool,
         #[arg(long)]
         network_user: bool,
+        /// Sandbox VM: the only Mac ports it may listen on, comma-separated (empty: none).
+        #[arg(long)]
+        publish: Option<String>,
+        #[arg(long)]
+        no_autoports: bool,
     },
 }
 
@@ -1543,9 +1548,35 @@ fn main() {
         Cmd::Research(Research::BenchMeta { dir }) => {
             daemon::send_control(&paths, &rekcod_proto::Control::BenchMeta(dir)).map(|r| println!("{r}"))
         }
-        Cmd::Daemon { cpus, memory_mib, base_memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user } => daemon::run(
+        Cmd::Daemon {
+            cpus,
+            memory_mib,
+            base_memory_mib,
+            project,
+            workspace,
+            allow,
+            reach,
+            idle_ttl,
+            repair,
+            network_user,
+            publish,
+            no_autoports,
+        } => daemon::run(
             paths,
-            daemon::Options { cpus, memory_mib, base_memory_mib, project, workspace, allow, reach, idle_ttl, repair, network_user },
+            daemon::Options {
+                cpus,
+                memory_mib,
+                base_memory_mib,
+                project,
+                workspace,
+                allow,
+                reach,
+                idle_ttl,
+                repair,
+                network_user,
+                publish,
+                no_autoports,
+            },
         ),
     });
     if let Err(e) = result {

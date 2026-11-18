@@ -73,6 +73,20 @@ pub struct Options {
     pub repair: bool,
     /// Main VM: the daemon's userspace network instead of NAT (`rekcod start --network user`).
     pub network_user: bool,
+    /// Sandbox VM: the only Mac ports it may listen on, comma-separated; None is any
+    /// unprivileged port.
+    pub publish: Option<String>,
+    /// Sandbox VM: don't forward the ports its autoports containers listen on.
+    pub no_autoports: bool,
+}
+
+/// `--publish`: ports, comma-separated; empty is none.
+fn publish_ports(s: &str) -> Result<BTreeSet<u16>> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u16>().ok().filter(|&p| p > 0).with_context(|| format!("--publish {p}: not a port")))
+        .collect()
 }
 
 /// `IP:PORT,...` checked, so nothing else lands on the kernel command line (boot.sh reads it).
@@ -150,6 +164,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         .map(|a| a.split(',').map(str::trim).filter(|h| !h.is_empty()).map(String::from).collect())
         .filter(|a: &Vec<String>| !a.iter().any(|h| h == "*"));
     let reach = reach_addrs(opts.reach.as_deref().unwrap_or(""))?;
+    let scope = PortScope { sandbox: opts.project.is_some(), allowed: opts.publish.as_deref().map(publish_ports).transpose()? };
     let resolved = Arc::new(netstack::Resolved::default());
     let mut host_net = None;
     let mut main_user_net = false;
@@ -267,15 +282,17 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
     for line in watch.set_roots(Default::default()) {
         log!("{line}");
     }
-    let status = Arc::new(Status::new(
-        paths.clone(),
-        cfg.cpus,
-        (cfg.memory_mib, cfg.elastic_mib),
-        fs_cache,
-        watch,
-        opts.project.clone(),
-        network_name,
-    ));
+    let role = Role {
+        project: opts.project.clone(),
+        network: network_name,
+        ports: scope,
+        watch: match (&opts.project, &opts.workspace) {
+            (None, _) => WatchScope::All,
+            (Some(dir), None) => WatchScope::Within(dir.clone()),
+            (Some(_), Some(_)) => WatchScope::Nothing,
+        },
+    };
+    let status = Arc::new(Status::new(paths.clone(), cfg.cpus, (cfg.memory_mib, cfg.elastic_mib), fs_cache, watch, role));
     status.write();
     let ctl = paths.control_socket();
     let _ = std::fs::remove_file(&ctl);
@@ -296,7 +313,7 @@ async fn serve(paths: Paths, opts: Options) -> Result<()> {
         tokio::spawn(warm_recent(vm.clone(), paths.warm_paths()));
     }
     tokio::spawn(dns_bridge(vm.clone(), dns_filter));
-    tokio::spawn(port_forwarder(vm.clone(), status.clone()));
+    tokio::spawn(port_forwarder(vm.clone(), status.clone(), !opts.no_autoports));
 
     let mut term = signal(SignalKind::terminate())?;
     let mut int = signal(SignalKind::interrupt())?;
@@ -863,23 +880,98 @@ struct Status {
     autoport: Mutex<Vec<(String, String)>>,
     /// Ports those containers listen on (from the agent).
     listening: Mutex<BTreeMap<Binding, String>>,
+    scope: PortScope,
+    watch_scope: WatchScope,
+    /// Bindings `scope` refused at the last apply, so each is logged once.
+    refused: Mutex<BTreeSet<Binding>>,
+}
+
+/// Most Mac ports one sandbox VM may listen on.
+const SANDBOX_PORTS_MAX: usize = 64;
+
+/// Which Mac listeners a VM may open. The main VM gets what its Docker publishes. A
+/// sandbox runs code nobody vetted and its guest reports the ports, so it gets loopback
+/// only (a wildcard becomes 127.0.0.1 and ::1, any other address is refused), the ports the
+/// host side allowed (or any from 1024 up), and at most [`SANDBOX_PORTS_MAX`] of them.
+#[derive(Default)]
+struct PortScope {
+    sandbox: bool,
+    allowed: Option<BTreeSet<u16>>,
+}
+
+impl PortScope {
+    /// `want` narrowed to what this VM may open, and the bindings refused.
+    fn apply(&self, want: BTreeMap<Binding, String>) -> (BTreeMap<Binding, String>, BTreeSet<Binding>) {
+        if !self.sandbox {
+            return (want, BTreeSet::new());
+        }
+        let (mut out, mut refused, mut ports) = (BTreeMap::new(), BTreeSet::new(), BTreeSet::new());
+        for (b, name) in want {
+            let addrs: Vec<std::net::IpAddr> = if b.addr.is_unspecified() {
+                vec![std::net::Ipv4Addr::LOCALHOST.into(), std::net::Ipv6Addr::LOCALHOST.into()]
+            } else if b.addr.is_loopback() {
+                vec![b.addr]
+            } else {
+                vec![]
+            };
+            let port_ok = self.allowed.as_ref().map_or(b.port >= 1024, |a| a.contains(&b.port));
+            if addrs.is_empty() || !port_ok || (!ports.contains(&b.port) && ports.len() >= SANDBOX_PORTS_MAX) {
+                refused.insert(b);
+                continue;
+            }
+            ports.insert(b.port);
+            for addr in addrs {
+                out.entry(Binding { addr, ..b }).or_insert_with(|| name.clone());
+            }
+        }
+        (out, refused)
+    }
+}
+
+/// Mac directories whose bind mounts get file events and cache warming.
+enum WatchScope {
+    /// The main VM: every bind source under the shared roots.
+    All,
+    /// A sandbox sharing the live project: bind sources inside it. Its guest decides
+    /// what `/containers/json` says, so a source outside would hand it events (names,
+    /// sizes, times) for Mac files it can't otherwise see.
+    Within(PathBuf),
+    /// A sandbox sharing a copy: its files change only from inside the guest.
+    Nothing,
+}
+
+impl WatchScope {
+    fn filter(&self, binds: BTreeSet<PathBuf>) -> BTreeSet<PathBuf> {
+        match self {
+            WatchScope::All => binds,
+            WatchScope::Nothing => BTreeSet::new(),
+            // Resolved first: a symlink inside the project may point anywhere.
+            WatchScope::Within(root) => {
+                let Ok(root) = std::fs::canonicalize(root) else { return BTreeSet::new() };
+                binds.into_iter().filter(|p| std::fs::canonicalize(p).is_ok_and(|c| c.starts_with(&root))).collect()
+            }
+        }
+    }
+}
+
+/// What this daemon's VM is: for the status file, and for what its guest may ask of the Mac.
+struct Role {
+    /// A sandbox's shared directory.
+    project: Option<PathBuf>,
+    network: &'static str,
+    ports: PortScope,
+    watch: WatchScope,
 }
 
 impl Status {
-    fn new(
-        paths: Paths,
-        cpus: usize,
-        (base_mib, elastic_mib): (u64, u64),
-        fs_cache: bool,
-        watch: Arc<Watch>,
-        project: Option<PathBuf>,
-        network: &str,
-    ) -> Status {
+    fn new(paths: Paths, cpus: usize, (base_mib, elastic_mib): (u64, u64), fs_cache: bool, watch: Arc<Watch>, role: Role) -> Status {
         let started_at = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+        let Role { project, network, ports: scope, watch: watch_scope } = role;
         Status {
             paths,
             network: network.to_string(),
             watch,
+            watch_scope,
             started_at,
             cpus,
             memory_mib: base_mib + elastic_mib,
@@ -892,6 +984,8 @@ impl Status {
             published: Mutex::default(),
             autoport: Mutex::default(),
             listening: Mutex::default(),
+            scope,
+            refused: Mutex::default(),
         }
     }
 
@@ -936,8 +1030,10 @@ impl Status {
 
 const EVENTS_PATH: &str = "/events?filters=%7B%22type%22%3A%5B%22container%22%5D%7D";
 
-async fn port_forwarder(vm: Vm, status: Arc<Status>) {
-    tokio::spawn(autoports(vm.clone(), status.clone()));
+async fn port_forwarder(vm: Vm, status: Arc<Status>, autoports_on: bool) {
+    if autoports_on {
+        tokio::spawn(autoports(vm.clone(), status.clone()));
+    }
     loop {
         if let Err(e) = watch_events(&vm, &status).await {
             log!("port forwarder: {e:#}");
@@ -967,7 +1063,7 @@ async fn reconcile(vm: &Vm, status: &Arc<Status>) -> Result<()> {
     let body = http::get(vm.connect(DOCKER_PORT).await?, "/containers/json?all=1").await?;
     *status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ports::desired(&body)?;
     *status.autoport.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ports::autoport_containers(&body)?;
-    let binds = watch::bind_sources(&body)?;
+    let binds = status.watch_scope.filter(watch::bind_sources(&body)?);
     if status.fs_cache {
         let new: Vec<PathBuf> = binds
             .difference(&status.binds.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
@@ -1031,6 +1127,14 @@ async fn autoports(vm: Vm, status: Arc<Status>) {
 fn apply_forwards(vm: &Vm, status: &Status, retry_failed: bool) {
     let mut want = status.listening.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     want.extend(status.published.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone());
+    let (want, refused) = status.scope.apply(want);
+    {
+        let mut last = status.refused.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for b in refused.difference(&last) {
+            log!("port {}:{}/{:?}: not opened, outside what this sandbox may listen on", b.addr, b.port, b.proto);
+        }
+        *last = refused;
+    }
     let mut changed = false;
     {
         let mut active = status.forwards.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1484,6 +1588,49 @@ mod tests {
         UdpSocket::bind(addr).await.expect("the port is free right away");
         let closed = tokio::time::timeout(Duration::from_secs(5), guest.read(&mut buf)).await;
         assert!(matches!(closed, Ok(Ok(0))), "the flow ended with it: {closed:?}");
+    }
+
+    #[test]
+    fn a_sandbox_listens_on_loopback_ports_it_was_allowed() {
+        let b = |addr: &str, port: u16| Binding { proto: Proto::Tcp, addr: addr.parse().unwrap(), port };
+        let want: BTreeMap<Binding, String> =
+            [b("::", 8080), b("192.168.1.5", 9000), b("0.0.0.0", 22), b("127.0.0.1", 5432)].into_iter().map(|b| (b, "x".into())).collect();
+        let main = PortScope::default();
+        assert_eq!(main.apply(want.clone()).0, want, "the main VM opens what Docker publishes");
+
+        let sandbox = PortScope { sandbox: true, allowed: None };
+        let (open, refused) = sandbox.apply(want.clone());
+        assert_eq!(open.keys().copied().collect::<Vec<_>>(), [b("127.0.0.1", 5432), b("127.0.0.1", 8080), b("::1", 8080)]);
+        assert_eq!(refused, [b("0.0.0.0", 22), b("192.168.1.5", 9000)].into());
+
+        let fleet = PortScope { sandbox: true, allowed: Some([5432].into()) };
+        assert_eq!(fleet.apply(want).0.keys().copied().collect::<Vec<_>>(), [b("127.0.0.1", 5432)]);
+
+        // A guest that listens on everything gets a few ports, not the Mac's loopback.
+        let many: BTreeMap<Binding, String> = (2000..3000).map(|p| (b("127.0.0.1", p), "x".into())).collect();
+        let (open, refused) = sandbox.apply(many);
+        assert_eq!((open.len(), refused.len()), (SANDBOX_PORTS_MAX, 1000 - SANDBOX_PORTS_MAX));
+        assert!(publish_ports("3000, 8080").is_ok_and(|p| p == [3000, 8080].into()));
+        assert!(publish_ports("").is_ok_and(|p| p.is_empty()));
+        assert!(publish_ports("0").is_err() && publish_ports("http").is_err());
+    }
+
+    #[test]
+    fn a_sandbox_watches_only_inside_its_live_project() {
+        let t = std::env::temp_dir().join(format!("rekcod-watch-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        let (app, docs) = (t.join("app"), t.join("Documents"));
+        std::fs::create_dir_all(app.join("src")).unwrap();
+        std::fs::create_dir_all(&docs).unwrap();
+        std::os::unix::fs::symlink(&docs, app.join("link")).unwrap();
+        let t = t.canonicalize().unwrap();
+        let (app, docs) = (t.join("app"), t.join("Documents"));
+        let binds: BTreeSet<PathBuf> = [app.clone(), app.join("src"), docs.clone(), app.join("link"), app.join("../Documents")].into();
+
+        assert_eq!(WatchScope::All.filter(binds.clone()), binds);
+        assert_eq!(WatchScope::Within(app.clone()).filter(binds.clone()), [app.clone(), app.join("src")].into());
+        assert!(WatchScope::Nothing.filter(binds).is_empty(), "a copy-mode sandbox watches nothing");
+        std::fs::remove_dir_all(&t).unwrap();
     }
 
     #[test]

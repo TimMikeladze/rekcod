@@ -267,34 +267,71 @@ impl Sandbox {
         Ok(())
     }
 
-    fn start_workspace(&self) -> Result<()> {
+    fn plan(&self) -> Option<crate::xrun::Plan> {
+        crate::xrun::plan(&self.meta.project, &["sh".into()])
+    }
+
+    /// The project's `.git` entries now, as a `--mount` workspace container sees them.
+    fn git_now(&self) -> crate::xrun::GitEntries {
+        crate::xrun::git_entries(&self.meta.project, &self.plan().map(|p| p.local_dirs).unwrap_or_default())
+    }
+
+    fn git_at_create(&self) -> crate::xrun::GitEntries {
+        std::fs::read(self.paths.home.join("git.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// `.git` entries a `--mount` sandbox made or replaced in the project since it was
+    /// created, printed as a warning. The binds cover only those that existed then.
+    fn warn_git(&self) -> bool {
+        if self.meta.mode != "mount" || !self.paths.home.join("git.json").exists() {
+            return false;
+        }
+        let made = crate::xrun::new_git_entries(&self.git_at_create(), &self.git_now());
+        if made.is_empty() {
+            return false;
+        }
+        let list: Vec<String> = made.iter().map(|p| printable(&p.to_string_lossy())).collect();
+        eprintln!(
+            "rekcod: sandbox {} made or replaced {} in {}; git on this Mac runs what a .git names, so check it before running git there",
+            self.meta.id,
+            list.join(", "),
+            self.meta.project.display()
+        );
+        true
+    }
+
+    /// `docker run` arguments for the workspace container.
+    fn workspace_args(&self) -> Vec<String> {
         let m = &self.meta;
         let p = m.project.to_string_lossy().to_string();
-        let mut c = self.docker()?;
-        c.args(["run", "-d", "--name", WS, "--restart", "unless-stopped", "--init"]);
+        let mut a: Vec<String> = ["run", "-d", "--name", WS, "--restart", "unless-stopped", "--init"].map(String::from).to_vec();
         // Raw sockets would skip the guest's egress rules; nothing in a workspace needs them.
-        c.args(["--cap-drop", "NET_RAW", "--security-opt", "no-new-privileges"]);
+        a.extend(["--cap-drop", "NET_RAW", "--security-opt", "no-new-privileges"].map(String::from));
         if m.offline {
-            c.args(["--network", "none"]);
+            a.extend(["--network".into(), "none".into()]);
         } else {
-            c.args(["--network", "host", "--label", &format!("{}=1", crate::ports::AUTOPORTS_LABEL)]);
+            a.extend(["--network".into(), "host".into(), "--label".into(), format!("{}=1", crate::ports::AUTOPORTS_LABEL)]);
         }
-        c.args(["-v", &format!("{p}:{p}"), "-w", &p]);
-        if m.mode == "mount" && m.project.join(".git").is_dir() {
+        a.extend(["-v".into(), format!("{p}:{p}"), "-w".into(), p.clone()]);
+        if m.mode == "mount" {
             // A live .git is code the Mac runs: hooks and core.fsmonitor fire on the next
             // `git status`, which shell prompts run on their own.
-            c.args(["-v", &format!("{p}/.git:{p}/.git:ro")]);
+            a.extend(crate::xrun::git_binds(&m.project, &self.git_at_create()));
         }
-        if let Some(plan) = crate::xrun::plan(&m.project, &["sh".into()]) {
+        if let Some(plan) = self.plan() {
             for dir in &plan.local_dirs {
-                c.args(["-v", &format!("{}:{p}/{dir}", crate::xrun::local_volume(&m.project, dir))]);
+                a.extend(["-v".into(), format!("{}:{p}/{dir}", crate::xrun::local_volume(&m.project, dir))]);
             }
         }
         for s in &m.secrets {
-            c.args(["-e", s]);
+            a.extend(["-e".into(), s.clone()]);
         }
-        c.args([&m.image, "sh", "-c", "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"]);
-        let out = c.stdin(Stdio::null()).output().context("run docker")?;
+        a.extend([m.image.clone(), "sh".into(), "-c".into(), "trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done".into()]);
+        a
+    }
+
+    fn start_workspace(&self) -> Result<()> {
+        let out = self.docker()?.args(self.workspace_args()).stdin(Stdio::null()).output().context("run docker")?;
         if !out.status.success() {
             bail!("starting the workspace container failed: {}", String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -471,6 +508,8 @@ pub fn create(paths: &Paths, o: CreateOptions) -> Result<Meta> {
     if !o.mount || macos {
         clonefile(&project, &s.ws())?;
         s.save_manifest(&manifest(&project))?;
+    } else {
+        std::fs::write(s.paths.home.join("git.json"), serde_json::to_vec(&s.git_now())?)?;
     }
     s.save()?;
     let result = if macos {
@@ -542,7 +581,7 @@ pub fn exec(paths: &Paths, id: &str, o: ExecOptions, cmd: &[String]) -> Result<i
     let cwd = o.workdir.clone().unwrap_or_else(|| s.meta.project.to_string_lossy().into());
     log_exec(&s, cmd, &cwd, code, t0.elapsed().as_millis());
     s.touch();
-    Ok(code)
+    Ok(if s.warn_git() && code == 0 { 1 } else { code })
 }
 
 /// Runs `c`, killing it after `timeout` seconds (exit 124, like `timeout`).
@@ -1302,7 +1341,12 @@ pub fn print_list(paths: &Paths, json: bool) -> Result<()> {
 }
 
 pub fn stop(paths: &Paths, id: &str) -> Result<()> {
-    crate::cli::stop_daemon(&find(paths, id)?.paths).map(|_| ())
+    let s = find(paths, id)?;
+    crate::cli::stop_daemon(&s.paths)?;
+    if s.warn_git() {
+        bail!("stopped, but check the .git entries above");
+    }
+    Ok(())
 }
 
 fn remove(s: &Sandbox) -> Result<()> {
@@ -1319,6 +1363,7 @@ fn remove(s: &Sandbox) -> Result<()> {
 pub fn rm(paths: &Paths, ids: &[String], every: bool) -> Result<()> {
     let targets: Vec<Sandbox> = if every { all(paths) } else { ids.iter().map(|i| find(paths, i)).collect::<Result<_>>()? };
     for s in targets {
+        s.warn_git();
         remove(&s)?;
         println!("{}", s.meta.id);
     }
@@ -1595,6 +1640,28 @@ mod tests {
         symlink("alias/../.GIT/hooks", ws.join("hooks")).unwrap();
         let e = apply(&paths, &m.id, false, None).unwrap_err().to_string();
         assert!(e.contains("into .git"), "{e}");
+    }
+
+    #[test]
+    fn mount_sandboxes_share_every_git_read_only() {
+        let base = tmp("mount-git");
+        let project = base.join("p");
+        std::fs::create_dir_all(project.join("sub")).unwrap();
+        // A worktree: `.git` is a file.
+        std::fs::write(project.join(".git"), "gitdir: /elsewhere/.git/worktrees/p\n").unwrap();
+        std::fs::write(project.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        let paths = Paths { home: base.join("home") };
+        let m = fake(&paths, &project, |m| m.mode = "mount".into());
+        let s = find(&paths, &m.id).unwrap();
+        std::fs::write(s.paths.home.join("git.json"), serde_json::to_vec(&s.git_now()).unwrap()).unwrap();
+        let a = s.workspace_args().join(" ");
+        let p = project.display();
+        for r in [".git", "sub/.git"] {
+            assert!(a.contains(&format!("-v {p}/{r}:{p}/{r}:ro")), "{r}: {a}");
+        }
+        assert!(!s.warn_git());
+        std::fs::create_dir_all(project.join("new/.git")).unwrap();
+        assert!(s.warn_git());
     }
 
     #[test]

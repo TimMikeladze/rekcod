@@ -5,7 +5,7 @@
 //! current directory is mounted at the same path, Linux dependencies live on
 //! VM-local volumes, and listening ports show up on the Mac's localhost
 //! (the daemon's autoports). `--sandbox` runs it in a separate VM that sees
-//! only this directory (docs/sandbox.md).
+//! only this directory (README, "Run project tools without installing them on your Mac").
 
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -311,8 +311,58 @@ pub struct Options {
     pub keep: bool,
 }
 
-/// The `docker run` arguments (everything after `docker`).
-pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, tty: bool) -> Vec<String> {
+/// `.git` entries under a project shared live, keyed by path from the project: kind (`f`,
+/// `d`, `l`) and, for a link, its target. Git on the Mac runs what a `.git` names (hooks,
+/// `core.fsmonitor`), from a worktree's or submodule's `.git` file as much as a directory.
+pub type GitEntries = std::collections::BTreeMap<PathBuf, (char, Option<PathBuf>)>;
+
+/// Every `.git` under `project`, under any spelling the Mac's filesystem takes for it, not
+/// entering one or a link. `skip` names directories at the root the container sees as
+/// volumes instead of the Mac's copy.
+pub fn git_entries(project: &Path, skip: &[&str]) -> GitEntries {
+    fn walk(base: &Path, rel: &Path, skip: &[&str], out: &mut GitEntries) {
+        let Ok(rd) = std::fs::read_dir(base.join(rel)) else { return };
+        for e in rd.flatten() {
+            let (name, r) = (e.file_name(), rel.join(e.file_name()));
+            let Ok(t) = e.file_type() else { continue };
+            if crate::sandbox::is_git(&name) {
+                let kind = if t.is_symlink() {
+                    'l'
+                } else if t.is_dir() {
+                    'd'
+                } else {
+                    'f'
+                };
+                let target = t.is_symlink().then(|| std::fs::read_link(base.join(&r)).ok()).flatten();
+                out.insert(r, (kind, target));
+            } else if t.is_dir() && !(rel.as_os_str().is_empty() && skip.iter().any(|s| name == *s)) {
+                walk(base, &r, skip, out);
+            }
+        }
+    }
+    let mut out = GitEntries::new();
+    walk(project, Path::new(""), skip, &mut out);
+    out
+}
+
+/// `-v` options that share every `.git` file and directory in `git` read-only. A link can't
+/// be bound in its place; a change to one shows in [`new_git_entries`].
+pub fn git_binds(project: &Path, git: &GitEntries) -> Vec<String> {
+    let p = project.to_string_lossy();
+    git.iter()
+        .filter(|(_, (k, _))| *k != 'l')
+        .flat_map(|(r, _)| ["-v".into(), format!("{p}/{}:{p}/{}:ro", r.display(), r.display())])
+        .collect()
+}
+
+/// `.git` entries in `after` that weren't in `before`, or are a different kind or link now.
+pub fn new_git_entries(before: &GitEntries, after: &GitEntries) -> Vec<PathBuf> {
+    after.iter().filter(|(r, v)| before.get(*r) != Some(v)).map(|(r, _)| r.clone()).collect()
+}
+
+/// The `docker run` arguments (everything after `docker`). `git` is the project's `.git`
+/// entries, bound read-only for `--sandbox`.
+pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, tty: bool, git: &GitEntries) -> Vec<String> {
     let p = project.to_string_lossy().to_string();
     let mut a: Vec<String> = vec!["run".into(), "--rm".into(), "-i".into()];
     if tty {
@@ -338,11 +388,9 @@ pub fn docker_args(project: &Path, cmd: &[String], plan: &Plan, opts: &Options, 
     if opts.sandbox {
         // Raw sockets would skip the sandbox VM's egress rules.
         a.extend(["--cap-drop".into(), "NET_RAW".into(), "--security-opt".into(), "no-new-privileges".into()]);
-        if project.join(".git").is_dir() {
-            // The share is live, and a .git the sandbox could write is code the Mac runs
-            // (hooks, core.fsmonitor) on the next `git status`.
-            a.extend(["-v".into(), format!("{p}/.git:{p}/.git:ro")]);
-        }
+        // The share is live, and a .git the sandbox could write is code the Mac runs
+        // (hooks, core.fsmonitor) on the next `git status`.
+        a.extend(git_binds(project, git));
     }
     for dir in &plan.local_dirs {
         a.extend(["-v".into(), format!("{}:{p}/{dir}", local_volume(project, dir))]);
@@ -395,7 +443,8 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
     }
     let target = if opts.sandbox { sandbox_boot(paths, &project)? } else { main_boot(paths)? };
     let tty = unsafe { libc::isatty(0) == 1 && libc::isatty(1) == 1 };
-    let args = docker_args(&project, cmd, &plan, &opts, tty);
+    let git = if opts.sandbox { git_entries(&project, &plan.local_dirs) } else { GitEntries::new() };
+    let args = docker_args(&project, cmd, &plan, &opts, tty, &git);
     if std::env::var_os("REKCOD_DEBUG").is_some() {
         eprintln!("rekcod: docker {}", args.join(" "));
     }
@@ -417,6 +466,17 @@ pub fn run(paths: &Paths, cmd: &[String], opts: Options) -> Result<std::convert:
     let status = docker.status().context("run docker")?;
     if !opts.keep {
         let _ = crate::cli::stop_daemon(&target);
+    }
+    let made = new_git_entries(&git, &git_entries(&project, &plan.local_dirs));
+    if !made.is_empty() {
+        // A bind can't cover a .git that didn't exist yet.
+        let list: Vec<String> = made.iter().map(|p| crate::sandbox::printable(&p.to_string_lossy())).collect();
+        eprintln!(
+            "rekcod: the command made or replaced {} in {}; git on this Mac runs what a .git names, so check it before running git there",
+            list.join(", "),
+            project.display()
+        );
+        std::process::exit(status.code().filter(|c| *c != 0).unwrap_or(1));
     }
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -559,7 +619,7 @@ mod tests {
             secrets: vec!["TOKEN".into()],
             keep: false,
         };
-        let a = docker_args(project, &["pnpm".into(), "dev".into()], &plan, &opts, false).join(" ");
+        let a = docker_args(project, &["pnpm".into(), "dev".into()], &plan, &opts, false, &GitEntries::new()).join(" ");
         assert!(a.contains("--network host --label dev.rekcod.autoports=1"), "{a}");
         assert!(a.contains("-v /Users/me/My App:/Users/me/My App -w /Users/me/My App"), "{a}");
         assert!(a.contains(&format!("-v {}:/Users/me/My App/node_modules", local_volume(project, "node_modules"))), "{a}");
@@ -567,8 +627,49 @@ mod tests {
         assert!(a.ends_with("-- pnpm dev"), "{a}");
 
         let opts = Options { publish: vec!["3000".into()], sandbox: true, ..opts };
-        let a = docker_args(project, &["node".into()], &plan, &opts, false).join(" ");
+        let a = docker_args(project, &["node".into()], &plan, &opts, false, &GitEntries::new()).join(" ");
         assert!(a.contains("-p 127.0.0.1:3000:3000") && !a.contains("host-gateway") && !a.contains("autoports"), "{a}");
+    }
+
+    #[test]
+    fn every_git_entry_is_bound_read_only() {
+        let dir = std::env::temp_dir().join(format!("rekcod-x-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A worktree's `.git` file, a submodule's, a nested repository, one under a dependency
+        // volume (shadowed in the container) and a link.
+        std::fs::create_dir_all(dir.join("sub/vendor/.git")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/pkg/.git")).unwrap();
+        std::fs::write(dir.join(".git"), "gitdir: /elsewhere/.git/worktrees/wt\n").unwrap();
+        std::fs::write(dir.join("sub/.git"), "gitdir: ../.git/modules/sub\n").unwrap();
+        std::fs::create_dir_all(dir.join("linked")).unwrap();
+        std::os::unix::fs::symlink("/elsewhere", dir.join("linked/.git")).unwrap();
+        let git = git_entries(&dir, &["node_modules"]);
+        let keys: Vec<&str> = git.keys().map(|k| k.to_str().unwrap()).collect();
+        assert_eq!(keys, vec![".git", "linked/.git", "sub/.git", "sub/vendor/.git"]);
+        let plan = Plan { image: "alpine".into(), local_dirs: vec!["node_modules"], caches: vec![], corepack: false };
+        let opts = Options {
+            image: None,
+            publish: vec![],
+            env: vec![],
+            no_autoports: false,
+            sandbox: true,
+            offline: false,
+            secrets: vec![],
+            keep: false,
+        };
+        let a = docker_args(&dir, &["sh".into()], &plan, &opts, false, &git).join(" ");
+        let p = dir.display();
+        for r in [".git", "sub/.git", "sub/vendor/.git"] {
+            assert!(a.contains(&format!("-v {p}/{r}:{p}/{r}:ro")), "{r}: {a}");
+        }
+        assert!(!a.contains("linked/.git") && !a.contains("node_modules/pkg"), "{a}");
+        // One the command made, or a link it swapped for a directory, is reported.
+        std::fs::create_dir_all(dir.join("new/.git")).unwrap();
+        std::fs::remove_dir_all(dir.join("sub/vendor/.git")).unwrap();
+        std::fs::write(dir.join("sub/vendor/.git"), "gitdir: /tmp/evil").unwrap();
+        let made = new_git_entries(&git, &git_entries(&dir, &["node_modules"]));
+        assert_eq!(made, vec![PathBuf::from("new/.git"), PathBuf::from("sub/vendor/.git")]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

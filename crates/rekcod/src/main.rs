@@ -388,7 +388,7 @@ enum Snap {
 fn quota_value(s: &str) -> Result<i64, String> {
     match s {
         "unlimited" => Ok(-1),
-        _ => s.parse::<u32>().map(i64::from).map_err(|_| format!("{s}: a number or `unlimited`")),
+        _ => s.parse::<i64>().ok().filter(|n| (0..=100_000).contains(n)).ok_or_else(|| format!("{s}: 0 to 100000 or `unlimited`")),
     }
 }
 
@@ -1983,7 +1983,7 @@ mod tests {
     fn quota_values() {
         assert_eq!(super::quota_value("unlimited"), Ok(-1));
         assert_eq!(super::quota_value("8"), Ok(8));
-        assert!(super::quota_value("-1").is_err() && super::quota_value("lots").is_err());
+        assert!(super::quota_value("-1").is_err() && super::quota_value("lots").is_err() && super::quota_value("100001").is_err());
     }
 
     #[test]

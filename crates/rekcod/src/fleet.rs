@@ -1412,6 +1412,12 @@ const MIGRATIONS: &[&str] = &[
     "update jobs set state = 'failed', log = coalesce(log, '') || 'rekcod: lost before an upgrade' || char(10)
        where state = 'lost' and finished is not null;
      create table if not exists leftover_storage (bucket text, storage_key text, app text not null, since integer not null);",
+    // Audit 2026-11-18 (docs/fleet-auth-fixes.md). Token caps that `Caller` can hold; each
+    // app's own webhook secret, sealed like its secrets; the newest pull request event seen
+    // per base app and PR, kept after the preview is gone so an older event can't undo it.
+    "update tokens set max_sandboxes = case when max_sandboxes < 0 then -1 else min(max_sandboxes, 100000) end;
+     alter table apps add column webhook_secret text;
+     create table if not exists pr_seen (app text not null, pr integer not null, updated text not null, primary key (app, pr));",
 ];
 
 pub struct Db(rusqlite::Connection);
@@ -1549,6 +1555,22 @@ impl Caller {
     }
 }
 
+/// The largest `max_sandboxes` a token may have; -1 is no cap.
+const MAX_TOKEN_CAP: i64 = 100_000;
+
+/// `max_sandboxes` from a request: -1 (no cap) or 0 to [`MAX_TOKEN_CAP`].
+fn token_cap(v: &Value) -> Result<i64> {
+    match v.as_i64() {
+        Some(n) if n == -1 || (0..=MAX_TOKEN_CAP).contains(&n) => Ok(n),
+        _ => bail!("max_sandboxes is -1 (no cap) or 0 to {MAX_TOKEN_CAP}"),
+    }
+}
+
+/// A stored cap as `Caller::max`; rows from before the range check may hold anything.
+fn cap(v: i64) -> i32 {
+    if v < 0 { -1 } else { v.min(MAX_TOKEN_CAP) as i32 }
+}
+
 /// Tokens are kept as SHA-256 hex; the plaintext only exists on the client.
 fn hash_token(t: &str) -> String {
     use sha2::Digest;
@@ -1643,6 +1665,12 @@ impl Controller {
         });
     }
 
+    /// The database. A thread that panicked holding it leaves it poisoned, which says
+    /// nothing about the rows (each statement is atomic); they're used as they are.
+    fn db(&self) -> std::sync::MutexGuard<'_, Db> {
+        self.db.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     fn config(&self, key: &str) -> Result<Option<String>> {
         Ok(self
             .db
@@ -1663,7 +1691,7 @@ impl Controller {
         Ok(row.map(|r| Caller {
             name: r.get(0),
             admin: r.get(1),
-            max: r.get(2),
+            max: cap(r.get(2)),
             default_role: Role::parse(&r.get::<String>(3)).ok(),
             edge: r.get(4),
         }))
@@ -1945,9 +1973,7 @@ fn watchdog(c: Arc<Controller>) {
         std::thread::spawn(move || {
             std::thread::sleep(first);
             loop {
-                if let Err(e) = f(&c) {
-                    eprintln!("rekcod: watchdog {name}: {e:#}");
-                }
+                duty_pass(&c, name, f);
                 std::thread::sleep(period);
             }
         });
@@ -1963,6 +1989,19 @@ fn watchdog(c: Arc<Controller>) {
     // Nodes heartbeat every 5 s; give them three beats after a restart before calling any lost.
     every("lost nodes", s5, Duration::from_secs(20), mark_lost_nodes);
     every("reconcile", Duration::from_secs(10), Duration::from_secs(30), reconcile);
+}
+
+/// One pass of a duty. A panic is logged and alerted, and the duty runs again next time
+/// instead of its thread ending.
+fn duty_pass(c: &Arc<Controller>, name: &str, f: fn(&Arc<Controller>) -> Result<()>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(c))) {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => eprintln!("rekcod: watchdog {name}: {e:#}"),
+        Err(_) => {
+            eprintln!("rekcod: watchdog {name} panicked; it runs again on its next tick");
+            c.alert(&format!("watchdog {name} panicked"));
+        }
+    }
 }
 
 fn mark_lost_nodes(c: &Arc<Controller>) -> Result<()> {
@@ -2134,14 +2173,14 @@ fn reconcile(c: &Arc<Controller>) -> Result<()> {
         }
         let lock = c.app_lock(&name);
         // Deploying, waking or recycling right now: that fixes it, or the next pass will.
-        if lock.try_lock().is_err() {
+        if try_app_lock(&lock).is_none() {
             continue;
         }
         short.insert(name.clone(), Instant::now());
         drop(short);
         let c = c.clone();
         std::thread::spawn(move || {
-            let Ok(_g) = lock.try_lock() else { return };
+            let Some(_g) = try_app_lock(&lock) else { return };
             eprintln!("rekcod: {name} has {live} of {wanted} healthy instance(s); topping up");
             let r = load_app_key(&c, &name).and_then(|a| a.ok_or_else(|| anyhow!("gone"))).and_then(|app| top_up_locked(&c, &app));
             if let Err(e) = r {
@@ -2561,7 +2600,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         }),
         ("POST", ["tokens"]) => admin_only().and_then(|_| {
             let (t, name) = (secret()?, body["name"].as_str().context("missing name")?.to_string());
-            let max = body["max_sandboxes"].as_i64().unwrap_or(10) as i32;
+            let max = if body["max_sandboxes"].is_null() { 10 } else { token_cap(&body["max_sandboxes"])? };
             let admin = body["admin"].as_bool().unwrap_or(false);
             let edge = body["edge"].as_bool().unwrap_or(false);
             let member_of = body["ns"].as_str().filter(|n| *n != "default");
@@ -2600,7 +2639,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
             Ok(json!({"removed": name, "tokens": n}))
         }),
         ("POST", ["tokens", name]) => admin_only().and_then(|_| {
-            let max = body["max_sandboxes"].as_i64().context("missing max_sandboxes")?;
+            let max = token_cap(&body["max_sandboxes"])?;
             let n =
                 c.db.lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2665,9 +2704,7 @@ fn controller_handle(c: &Arc<Controller>, peer: Option<IpAddr>, stream: impl Rea
         }),
         ("GET", ["bans"]) => edge_or_admin().and_then(|_| {
             let rows = c
-                .db
-                .lock()
-                .unwrap()
+                .db()
                 .query("select net, reason, until, created, by from bans where until is null or until > ?1 order by created", &[&now()])?;
             Ok(json!(
                 rows.iter()
@@ -2888,8 +2925,7 @@ fn namespaces_route(c: &Arc<Controller>, who: &Caller, method: &str, seg: &[&str
                 bail!("namespace names are lowercase letters, digits and single dashes, at most 40");
             }
             let salt: [u8; 16] = random_bytes()?;
-            c.db.lock()
-                .unwrap()
+            c.db()
                 .execute("insert into namespaces (name, created, salt) values (?1, ?2, ?3)", &[&name, &now(), &salt.to_vec()])
                 .map_err(|_| anyhow!("namespace {name} exists"))?;
             for (k, col) in quota_cols {
@@ -3815,9 +3851,7 @@ fn drop_leftover_storage(c: &Controller, s: &crate::s3::S3) -> Result<()> {
 // ------------------------------------------------------------- scale to zero, recycling
 
 fn live_commit(c: &Controller, app: &str) -> Result<Option<String>> {
-    Ok(c.db
-        .lock()
-        .unwrap()
+    Ok(c.db()
         .query_opt("select r.commit_sha from apps a join releases r on r.app = a.name and r.n = a.live_release where a.name = ?1", &[&app])?
         .map(|r| r.get(0)))
 }
@@ -3910,11 +3944,9 @@ fn sleep_idle(c: &Arc<Controller>) -> Result<()> {
         let name: String = r.get(0);
         let lock = c.app_lock(&name);
         // Waking or recycling right now: try again on the next tick.
-        let Ok(_g) = lock.try_lock() else { continue };
+        let Some(_g) = try_app_lock(&lock) else { continue };
         let stopped =
-            c.db.lock()
-                .unwrap()
-                .query("update instances set state = 'sleeping' where app = ?1 and state = 'live' returning node, sandbox", &[&name])?;
+            c.db().query("update instances set state = 'sleeping' where app = ?1 and state = 'live' returning node, sandbox", &[&name])?;
         let targets: Vec<_> = stopped.iter().map(|s| (s.get::<String>(1), c.node(&s.get::<String>(0)))).collect();
         drop(_g);
         // Holds the app's lock until the VMs are down: a wake that comes in meanwhile waits,
@@ -3948,12 +3980,12 @@ fn recycle_due(c: &Arc<Controller>) -> Result<()> {
     for r in rows {
         let (name, commit): (String, String) = (r.get(0), r.get(1));
         let lock = c.app_lock(&name);
-        if lock.try_lock().is_err() {
+        if try_app_lock(&lock).is_none() {
             continue;
         }
         let c = c.clone();
         std::thread::spawn(move || {
-            let Ok(_g) = lock.try_lock() else { return };
+            let Some(_g) = try_app_lock(&lock) else { return };
             let r = load_app_key(&c, &name)
                 .and_then(|a| a.ok_or_else(|| anyhow!("gone")))
                 .and_then(|app| deploy_locked(&c, &app, Some(commit), "recycle"));
@@ -4411,12 +4443,11 @@ fn apps_route(c: &Arc<Controller>, who: &Caller, ns: &str, method: &str, seg: &[
             if let Some(r) = kept {
                 return Ok(json!({"logs": r.get::<String>(0), "ended": r.get::<i64>(1)}));
             }
-            let node: String =
-                c.db.lock()
-                    .unwrap()
-                    .query_opt("select node from instances where app = ?1 and sandbox = ?2", &[&app.name, sb])?
-                    .ok_or_else(|| anyhow!("{name} has no instance {sb}"))?
-                    .get(0);
+            let node: String = c
+                .db()
+                .query_opt("select node from instances where app = ?1 and sandbox = ?2", &[&app.name, sb])?
+                .ok_or_else(|| anyhow!("{name} has no instance {sb}"))?
+                .get(0);
             let (url, sec, _) = c.node(&node)?;
             let v = call(&url, "GET", &format!("/sandboxes/{sb}/logs"), Some(&sec), &Value::Null)?;
             Ok(json!({"logs": v["logs"].as_str().unwrap_or("")}))
@@ -4759,7 +4790,8 @@ fn run_schedules(c: &Controller) -> Result<()> {
         &[&now()],
     )?;
     for r in rows {
-        let (name, owner, spec, max, ns): (String, String, String, i32, String) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+        let (name, owner, spec, max, ns): (String, String, String, i64, String) = (r.get(0), r.get(1), r.get(2), r.get(3), r.get(4));
+        let max = cap(max);
         let spec: Value = serde_json::from_str(&spec)?;
         // Marked as run even when it can't start, so a full fleet isn't retried every 5 s.
         let job = start_job(c, &ns, &owner, max, &spec, Some(&name));
@@ -6055,7 +6087,7 @@ fn graceful_exit(c: Option<Arc<Controller>>) {
         if let Some(c) = c {
             let locks: Vec<Arc<Mutex<()>>> = c.busy.lock().unwrap_or_else(std::sync::PoisonError::into_inner).values().cloned().collect();
             for l in locks {
-                while l.try_lock().is_err() && t0.elapsed() < Duration::from_secs(30) {
+                while try_app_lock(&l).is_none() && t0.elapsed() < Duration::from_secs(30) {
                     std::thread::sleep(Duration::from_millis(200));
                 }
             }
@@ -6990,9 +7022,74 @@ mod tests {
             )
             .unwrap();
         }
-        db.0.execute_batch(MIGRATIONS.last().unwrap()).unwrap();
+        db.0.execute_batch(MIGRATIONS.iter().find(|m| m.contains("lost before an upgrade")).unwrap()).unwrap();
         let mut state = |id: &str| db.query_one("select state from jobs where id = ?1", &[&id]).unwrap().get::<String>(0);
         assert_eq!((state("j-old"), state("j-new")), ("failed".into(), "lost".into()));
+    }
+
+    #[test]
+    fn token_caps_stay_in_range_and_a_panicking_duty_runs_again() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        add_token(&c, "bob-t", "bob", false, "member", false, None);
+        for bad in [json!(4_294_967_296i64), json!(3_000_000_000i64), json!(-2), json!("10")] {
+            let e = call(&url, "POST", "/tokens/bob", Some("admin-t"), &json!({"max_sandboxes": bad})).unwrap_err().to_string();
+            assert!(e.contains("(400)"), "{bad}: {e}");
+            let e =
+                call(&url, "POST", "/tokens", Some("admin-t"), &json!({"name": "carol", "max_sandboxes": bad})).unwrap_err().to_string();
+            assert!(e.contains("(400)"), "{bad}: {e}");
+        }
+        // A row from before the check still authenticates, with the cap clamped.
+        c.db().execute("update tokens set max_sandboxes = 4294967296 where name = 'bob'", &[]).unwrap();
+        assert_eq!(c.caller("bob-t").unwrap().unwrap().max, MAX_TOKEN_CAP as i32);
+        c.db().execute("insert into schedules (name, owner, spec, every, ns) values ('s', 'bob', '{}', 60, 'default')", &[]).unwrap();
+        run_schedules(&c).unwrap_or_default();
+
+        static PASSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        fn panics_once(_: &Arc<Controller>) -> Result<()> {
+            if PASSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                panic!("first pass");
+            }
+            Ok(())
+        }
+        duty_pass(&c, "test", panics_once);
+        duty_pass(&c, "test", panics_once);
+        assert_eq!(PASSES.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_poisoned_database_lock_doesnt_take_routes_down() {
+        let (url, c) = serve_test(Controller::new(Db::open(Path::new(":memory:")).unwrap(), "apps.test".into(), 0, [7; 32]));
+        add_token(&c, "admin-t", "admin", true, "member", false, None);
+        let cc = c.clone();
+        let _ = std::thread::spawn(move || {
+            let _g = cc.db.lock().unwrap();
+            panic!("poison the database lock");
+        })
+        .join();
+        assert!(c.db.is_poisoned());
+        call(&url, "GET", "/bans", Some("admin-t"), &Value::Null).unwrap();
+        call(&url, "POST", "/namespaces", Some("admin-t"), &json!({"name": "team"})).unwrap();
+        assert_eq!(live_commit(&c, "nope").unwrap(), None);
+        sleep_idle(&c).unwrap();
+    }
+
+    /// A panic while the database is locked poisons it; every use outside tests goes
+    /// through `Controller::db()` or `unwrap_or_else(PoisonError::into_inner)`.
+    #[test]
+    fn nothing_outside_tests_unwraps_a_lock() {
+        let mut in_test = false;
+        let mut code = String::new();
+        for l in include_str!("fleet.rs").lines() {
+            if l.starts_with("mod ") && l.ends_with('{') {
+                in_test = true;
+            } else if in_test && l == "}" {
+                in_test = false;
+            } else if !in_test {
+                code.push_str(l.trim());
+            }
+        }
+        assert!(!code.contains(".lock().unwrap()"), "use Controller::db() or unwrap_or_else(PoisonError::into_inner)");
     }
 
     #[test]

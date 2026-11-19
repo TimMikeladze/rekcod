@@ -2,7 +2,7 @@
 import type { Landing } from '../lib/landing';
 
 // The hero drawing: the README's "Docker runs inside a Linux VM" diagram, laid out by
-// hand, plus the shared project directory. Markup only.
+// hand, plus the shared project directory.
 interface Props { d: Landing['diagram'] }
 const { d } = Astro.props;
 const node = (x: number, y: number, w: number, h: number) => ({ x, y, w, h, cx: x + w / 2, cy: y + h / 2 });
@@ -14,75 +14,122 @@ const engine = node(338, 360, 186, 40);
 const containerd = node(338, 420, 90, 38);
 const runc = node(436, 420, 88, 38);
 const box = node(36, 300, 196, 196);
+const tips = {
+  clients: [d.clients, `Run ${d.composeCommand} from your project directory to send requests through the rekcod Docker context. Import images and named volumes from Docker Desktop before starting your project if you need the data.`],
+  socket: [d.socket, 'The rekcod Docker context points Docker clients to this local socket on the Mac.'],
+  daemon: [d.daemon, `${d.startCommand} boots the VM. The daemon manages it, shares files, forwards published ports and applies the Mac’s DNS settings. rekcod stop restores the previous Docker context.`],
+  project: [d.project, 'Edit source files on your Mac and bind-mount the project into a container.'],
+  share: [d.share, 'virtio-fs shares your project at the same path in Linux. Mac edits trigger inotify events for file watchers inside containers.'],
+  vsock: [d.vsock, 'This channel carries Docker API requests between the Mac and the Linux guest.'],
+  guest: [d.guest, 'Apple’s Virtualization framework runs ARM Linux on the Mac’s M-series chip. Docker Engine and the containers run inside this guest.'],
+  agent: [d.agent, 'The guest agent connects the Mac’s vsock channel to Docker Engine’s socket inside Linux.'],
+  engine: [d.engine, 'Upstream Docker Engine manages images, networks and containers. Its embedded BuildKit builds images.'],
+  containerd: [d.containerd, 'Docker Engine uses containerd to manage images and container execution.'],
+  runc: [d.runc, 'containerd invokes runc to create and start a container using the Linux kernel.'],
+  containers: [d.containers, 'Compose starts your app and its services as Linux containers inside the VM.'],
+  silicon: [d.silicon, 'ARM64 images run natively. Intel images require Rosetta on your Mac. Use --platform linux/amd64 to request an Intel image.'],
+};
+const trigger = (id: keyof typeof tips) => ({
+  'data-arch-trigger': '',
+  role: 'button' as const,
+  tabindex: 0,
+  'aria-label': tips[id][0],
+  'aria-describedby': `arch-tip-${id}`,
+});
 ---
-<svg class="arch" viewBox="0 0 560 616" role="img" aria-labelledby="arch-title arch-desc">
-  <title id="arch-title">{d.clients} to containers through {d.daemon} and a Linux VM</title>
-  <desc id="arch-desc">{d.clients} connect over a {d.socket} to the {d.daemon} on macOS, which reaches {d.agent} in the {d.guest} over {d.vsock}. {d.agent} talks to {d.engine}, which runs containers through {d.containerd} and {d.runc}. Your project directory is shared at the same path. All of it runs on an {d.silicon}: {d.native}, and {d.rosetta}.</desc>
-  <defs>
-    <pattern id="dots" width="16" height="16" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" class="dot" /></pattern>
-    <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" class="head" /></marker>
-    <marker id="head-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" class="head-accent" /></marker>
-  </defs>
+<div class="arch-wrap" data-arch>
+  <svg class="arch" viewBox="0 0 560 616" role="group" aria-labelledby="arch-title" aria-describedby="arch-desc">
+    <title id="arch-title">{d.clients} to containers through {d.daemon} and a Linux VM</title>
+    <desc id="arch-desc">{d.clients} connect over a {d.socket} to the {d.daemon} on macOS, which reaches {d.agent} in the {d.guest} over {d.vsock}. {d.agent} talks to {d.engine}, which runs containers through {d.containerd} and {d.runc}. Your project directory is shared at the same path. All of it runs on an {d.silicon}: {d.native}, and {d.rosetta}.</desc>
+    <defs>
+      <pattern id="dots" width="16" height="16" patternUnits="userSpaceOnUse"><circle cx="1" cy="1" r="1" class="dot" /></pattern>
+      <marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" class="head" /></marker>
+      <marker id="head-accent" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" class="head-accent" /></marker>
+    </defs>
 
-  <rect x="0" y="0" width="560" height="616" fill="url(#dots)" />
+    <rect x="0" y="0" width="560" height="616" fill="url(#dots)" />
 
-  <g class="panel">
-    <rect x="12" y="12" width="536" height="196" rx="14" />
-    <line x1="12" y1="44" x2="548" y2="44" />
-    <circle cx="32" cy="28" r="5" /><circle cx="48" cy="28" r="5" /><circle cx="64" cy="28" r="5" />
-    <text x="280" y="32" class="panel-title" text-anchor="middle">{d.mac}</text>
-  </g>
-  <g class="panel panel--vm">
-    <rect x="12" y="250" width="536" height="268" rx="14" />
-    <text x="150" y="279" class="panel-title">{d.guest}</text>
-  </g>
-
-  <path class="edge" d={`M${clients.x + clients.w} ${clients.cy}H${daemon.x - 4}`} marker-end="url(#head)" />
-  <text x={(clients.x + clients.w + daemon.x) / 2} y={clients.cy - 9} class="edge-label" text-anchor="middle">{d.socket}</text>
-
-  <path class="edge edge--accent flow" d={`M${daemon.cx} ${daemon.y + daemon.h}V${agent.y - 4}`} marker-end="url(#head-accent)" />
-  <text x={daemon.cx + 10} y="232" class="edge-label">{d.vsock}</text>
-
-  <path class="edge edge--accent flow" d={`M${project.cx} ${project.y + project.h}V${box.y - 4}`} marker-end="url(#head-accent)" />
-  <text x={project.cx + 10} y="232" class="edge-label">{d.share}</text>
-
-  <path class="edge" d={`M${agent.cx} ${agent.y + agent.h}V${engine.y - 4}`} marker-end="url(#head)" />
-  <path class="edge" d={`M${containerd.cx} ${engine.y + engine.h}V${containerd.y - 4}`} marker-end="url(#head)" />
-  <path class="edge" d={`M${containerd.x + containerd.w} ${containerd.cy}H${runc.x - 4}`} marker-end="url(#head)" />
-  <path class="edge" d={`M${runc.cx} ${runc.y + runc.h}V476H${box.x + box.w + 4}`} marker-end="url(#head)" />
-
-  {[
-    [clients, d.clients], [daemon, d.daemon], [agent, d.agent], [engine, d.engine],
-    [containerd, d.containerd], [runc, d.runc],
-  ].map(([n, label]: any) => (
-    <g class="node">
-      <rect x={n.x} y={n.y} width={n.w} height={n.h} rx="9" />
-      <text x={n.cx} y={n.cy + 4.5} text-anchor="middle">{label}</text>
+    <g class="panel">
+      <rect x="12" y="12" width="536" height="196" rx="14" />
+      <line x1="12" y1="44" x2="548" y2="44" />
+      <circle cx="32" cy="28" r="5" /><circle cx="48" cy="28" r="5" /><circle cx="64" cy="28" r="5" />
+      <text x="280" y="32" class="panel-title" text-anchor="middle">{d.mac}</text>
     </g>
+    <g class="panel panel--vm">
+      <rect x="12" y="250" width="536" height="268" rx="14" />
+    </g>
+
+    <path class="edge" d={`M${clients.x + clients.w} ${clients.cy}H${daemon.x - 4}`} marker-end="url(#head)" />
+
+    <path class="edge edge--accent flow" d={`M${daemon.cx} ${daemon.y + daemon.h}V${agent.y - 4}`} marker-end="url(#head-accent)" />
+
+    <path class="edge edge--accent flow" d={`M${project.cx} ${project.y + project.h}V${box.y - 4}`} marker-end="url(#head-accent)" />
+
+    <path class="edge" d={`M${agent.cx} ${agent.y + agent.h}V${engine.y - 4}`} marker-end="url(#head)" />
+    <path class="edge" d={`M${containerd.cx} ${engine.y + engine.h}V${containerd.y - 4}`} marker-end="url(#head)" />
+    <path class="edge" d={`M${containerd.x + containerd.w} ${containerd.cy}H${runc.x - 4}`} marker-end="url(#head)" />
+    <path class="edge" d={`M${runc.cx} ${runc.y + runc.h}V476H${box.x + box.w + 4}`} marker-end="url(#head)" />
+
+    <g class="node" {...trigger('clients')}>
+      <rect x={clients.x} y={clients.y} width={clients.w} height={clients.h} rx="9" />
+      <text x={clients.cx} y={clients.cy + 4.5} text-anchor="middle">{d.clients}</text>
+    </g>
+    <g {...trigger('socket')}>
+      <rect class="arch-hit" x="234" y="70" width="102" height="50" rx="6" />
+      <text x={(clients.x + clients.w + daemon.x) / 2} y={clients.cy - 9} class="edge-label" text-anchor="middle">{d.socket}</text>
+    </g>
+    <g class="node" {...trigger('daemon')}>
+      <rect x={daemon.x} y={daemon.y} width={daemon.w} height={daemon.h} rx="9" />
+      <text x={daemon.cx} y={daemon.cy + 4.5} text-anchor="middle">{d.daemon}</text>
+    </g>
+    <g class="node node--folder" {...trigger('project')}>
+      <rect x={project.x} y={project.y} width={project.w} height={project.h} rx="9" />
+      <path d={`M${project.x + 16} ${project.cy - 6}h7l3 3h10v10h-20z`} />
+      <text x={project.x + 46} y={project.cy + 4.5} class="mono">{d.project}</text>
+    </g>
+
+    <g {...trigger('share')}>
+      <rect class="arch-hit" x="130" y="202" width="156" height="48" rx="6" />
+      <text x={project.cx + 10} y="232" class="edge-label">{d.share}</text>
+    </g>
+    <g {...trigger('vsock')}>
+      <rect class="arch-hit" x="426" y="202" width="74" height="48" rx="6" />
+      <text x={daemon.cx + 10} y="232" class="edge-label">{d.vsock}</text>
+    </g>
+    <g {...trigger('guest')}>
+      <rect class="arch-hit" x="140" y="254" width="272" height="40" rx="6" />
+      <text x="150" y="279" class="panel-title">{d.guest}</text>
+    </g>
+    {([['agent', agent], ['engine', engine], ['containerd', containerd], ['runc', runc]] as const).map(([id, n]) => (
+      <g class="node" {...trigger(id)}>
+        <rect x={n.x} y={n.y} width={n.w} height={n.h} rx="9" />
+        <text x={n.cx} y={n.cy + 4.5} text-anchor="middle">{tips[id][0]}</text>
+      </g>
+    ))}
+    <g class="node node--box" {...trigger('containers')}>
+      <rect x={box.x} y={box.y} width={box.w} height={box.h} rx="10" />
+      <text x={box.x + 16} y={box.y + 26}>{d.containers}</text>
+      <g class="chip"><rect x={box.x + 16} y={box.y + 42} width={box.w - 32} height="34" rx="7" /><circle cx={box.x + 32} cy={box.y + 59} r="4" class="live" /><text x={box.x + 44} y={box.y + 63.5} class="mono">{d.container}</text></g>
+      <g class="chip chip--ghost"><rect x={box.x + 16} y={box.y + 86} width={box.w - 32} height="34" rx="7" /><rect x={box.x + 30} y={box.y + 100} width="90" height="6" rx="3" class="skel" /></g>
+      <g class="chip chip--ghost"><rect x={box.x + 16} y={box.y + 130} width={box.w - 32} height="34" rx="7" /><rect x={box.x + 30} y={box.y + 144} width="62" height="6" rx="3" class="skel" /></g>
+    </g>
+    <g class="silicon" {...trigger('silicon')}>
+      <rect x="12" y="530" width="536" height="74" rx="14" />
+      <g transform="translate(32 549)" class="chip-glyph">
+        <rect x="6" y="6" width="24" height="24" rx="5" />
+        <rect x="12" y="12" width="12" height="12" rx="2" class="core" />
+        <path d="M12 0v6M18 0v6M24 0v6M12 30v6M18 30v6M24 30v6M0 12h6M0 18h6M0 24h6M30 12h6M30 18h6M30 24h6" />
+      </g>
+      <text x="84" y="563" class="silicon-title">{d.silicon}</text>
+      <text x="84" y="583" class="silicon-sub">{d.arch}</text>
+      <text x="528" y="563" class="silicon-note" text-anchor="end">{d.native}</text>
+      <text x="528" y="583" class="silicon-note" text-anchor="end">{d.rosetta}</text>
+    </g>
+  </svg>
+  {Object.entries(tips).map(([id, [label, description]]) => (
+    <div id={`arch-tip-${id}`} class="arch-tooltip" role="tooltip" hidden>
+      <strong aria-hidden="true">{label}</strong>
+      <span>{description}</span>
+    </div>
   ))}
-  <g class="node node--folder">
-    <rect x={project.x} y={project.y} width={project.w} height={project.h} rx="9" />
-    <path d={`M${project.x + 16} ${project.cy - 6}h7l3 3h10v10h-20z`} />
-    <text x={project.x + 46} y={project.cy + 4.5} class="mono">{d.project}</text>
-  </g>
-
-  <g class="node node--box">
-    <rect x={box.x} y={box.y} width={box.w} height={box.h} rx="10" />
-    <text x={box.x + 16} y={box.y + 26}>{d.containers}</text>
-    <g class="chip"><rect x={box.x + 16} y={box.y + 42} width={box.w - 32} height="34" rx="7" /><circle cx={box.x + 32} cy={box.y + 59} r="4" class="live" /><text x={box.x + 44} y={box.y + 63.5} class="mono">{d.container}</text></g>
-    <g class="chip chip--ghost"><rect x={box.x + 16} y={box.y + 86} width={box.w - 32} height="34" rx="7" /><rect x={box.x + 30} y={box.y + 100} width="90" height="6" rx="3" class="skel" /></g>
-    <g class="chip chip--ghost"><rect x={box.x + 16} y={box.y + 130} width={box.w - 32} height="34" rx="7" /><rect x={box.x + 30} y={box.y + 144} width="62" height="6" rx="3" class="skel" /></g>
-  </g>
-  <g class="silicon">
-    <rect x="12" y="530" width="536" height="74" rx="14" />
-    <g transform="translate(32 549)" class="chip-glyph">
-      <rect x="6" y="6" width="24" height="24" rx="5" />
-      <rect x="12" y="12" width="12" height="12" rx="2" class="core" />
-      <path d="M12 0v6M18 0v6M24 0v6M12 30v6M18 30v6M24 30v6M0 12h6M0 18h6M0 24h6M30 12h6M30 18h6M30 24h6" />
-    </g>
-    <text x="84" y="563" class="silicon-title">{d.silicon}</text>
-    <text x="84" y="583" class="silicon-sub">{d.arch}</text>
-    <text x="528" y="563" class="silicon-note" text-anchor="end">{d.native}</text>
-    <text x="528" y="583" class="silicon-note" text-anchor="end">{d.rosetta}</text>
-  </g>
-</svg>
+</div>

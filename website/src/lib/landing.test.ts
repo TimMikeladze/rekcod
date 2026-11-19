@@ -9,18 +9,12 @@ const { readme, landing } = load();
 describe('landing references into README.md', () => {
   test('every shown block is a README block, found exactly once', () => {
     const artifacts = [
-      ...landing.capabilities.flatMap((c) => c.show),
-      ...landing.showcase.tabs.map((t) => t.snippet),
-      ...landing.guides.map((g) => g.snippet),
-      ...landing.start.panels,
-      landing.split.terminal,
+      ...landing.capabilities.map((c) => c.example),
+      landing.start.example,
+      landing.agents.sandbox,
       landing.measured.terminal,
     ];
-    for (const a of artifacts) {
-      if (a.kind === 'table') expect(readme.markdown).toContain(a.markdown);
-      else expect(readme.markdown).toContain(a.block.value);
-    }
-    expect(readme.markdown).toContain(landing.install);
+    for (const a of artifacts) expect(readme.markdown).toContain(a.block.value);
   });
 
   test('a reference to a missing or repeated example fails the build', () => {
@@ -62,6 +56,8 @@ describe('landing references into README.md', () => {
     const d = landing.diagram;
     for (const label of [d.mac, d.guest, d.clients, d.daemon, d.agent, d.engine, d.containerd, d.runc, d.containers, d.socket, d.vsock]) expect(block).toContain(label);
     expect(readme.markdown).toContain(`$ rekcod exec ${d.container} `);
+    expect(landing.start.example.block.value.split('\n')).toContain(d.startCommand);
+    expect(readme.paragraph('You can also keep using')).toContain(`\`${d.composeCommand}\``);
     const broken = new Readme(readme.markdown.replace('daemon["rekcod daemon"]', 'daemon'));
     expect(() => buildLanding(broken, readRepo('CHANGELOG.md'))).toThrow('has no daemon');
   });
@@ -85,6 +81,10 @@ describe('generated Markdown and helpers', () => {
   test('page, llms.txt and AGENTS.md carry every section and absolute links', () => {
     const page = pageMarkdown(landing);
     const llms = llmsTxt(landing);
+    for (const markdown of [page, llms]) {
+      expect(markdown).toContain(landing.start.example.block.value);
+      expect(markdown.indexOf(`## ${landing.start.title}`)).toBeLessThan(markdown.indexOf(`## ${landing.capabilities[0].title}`));
+    }
     for (const c of landing.capabilities) {
       expect(page).toContain(`## ${c.title}`);
       expect(llms).toContain(`## ${c.title}`);

@@ -1,13 +1,13 @@
 # Website
 
-The site at rekcod.vercel.app is an Astro static build in `website/`. README.md is its only
-source: the landing page quotes it, the reference page renders all of it.
+The site at rekcod.vercel.app is an Astro static build in `website/`. The landing page
+uses examples from README.md. The reference page renders the whole README.
 
 ## Pages and files
 
 | Path | What it is |
 | --- | --- |
-| `/` | Landing page: hero with an architecture drawing, split demo, one section per capability, each showing a README block |
+| `/` | Install and run a first container, use an existing Compose project, and see examples for Linux volumes, snapshots, toolchains and sandboxes |
 | `/docs/` | README.md in full, with a sticky contents column and the Mermaid diagrams |
 | `/llms.txt`, `/AGENTS.md`, `/index.md` | The landing page's model as Markdown, for agents |
 | `/sitemap.xml`, `/robots.txt` | Generated from the same model |
@@ -27,11 +27,17 @@ README fenced block or table, resolved at build time by `website/src/lib/readme.
 - `snippet("dev.rekcod.local:")`: the block containing that line
 - `table("Key")`: the table whose first header cell is that text
 - figures: a regex over a captured block, never retyped
-- `diagram("Local Docker architecture")`: node and edge labels of that Mermaid block, which the
-  hero drawing (`components/HeroDiagram.astro`) uses. The Apple Silicon strip under it is copy.
+- `diagram("Local Docker architecture")`: technical labels from the README’s Mermaid block used
+  in the hero workflow and its tooltips.
+
+The hero’s SVG shows the Docker API and file-sharing paths from macOS into the Linux VM. Its
+labels open tooltips on hover, keyboard focus or tap. The visible notes below show the two
+commands to run an existing Compose project, what rekcod takes over from Docker Desktop and how
+Apple Silicon runs ARM and Intel images.
 
 A reference that matches no block, or more than one, throws and fails the build. Captured
-output in the README comes from real runs; the benchmark block names the Mac it ran on.
+output in the README comes from recorded runs. The benchmark section links to the commands and
+records the Mac, software versions and VM size used to measure them.
 
 ## Pieces
 
@@ -46,8 +52,3 @@ output in the README comes from real runs; the benchmark block names the Mac it 
 - Tests: `bun test` checks references, figures, sections and the generated Markdown;
   `bun run check:site` checks the built `dist/` (self-contained pages, head metadata, files
   the sitemap names, og.png size, contrast in both themes, header and footer links).
-
-## Left out
-
-No adoption figures (the repository has no stars to show), no adjacent-tools cards (no
-sibling packages) and no scaffold command (rekcod has none).

@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { Readme, latestRelease, type Artifact, type Block, type Snippet, type Terminal } from './readme';
+import { Readme, latestRelease, type Block, type Snippet, type Terminal } from './readme';
 
 // The landing page model: copy, section order, which README block each section shows and
 // the link table. No markup. Copy is written here; every example is a README reference.
@@ -87,17 +87,10 @@ export interface Figure { value: string; label: string }
 export interface Capability {
   id: string;
   title: string;
-  /** 1 to 3 sentences of inline Markdown naming the exact command or option. */
   text: string;
-  show: Artifact[];
-  /** One sentence offering the adjacent thing, shown after the section. */
-  aside?: string;
+  example: Snippet | Terminal;
+  guide: string;
 }
-
-export interface Tab { label: string; snippet: Snippet }
-export interface Guide { title: string; text: string; href: string; snippet: Snippet }
-export interface Principle { title: string; text: string }
-export interface Brand { name: BrandName; label: string }
 
 const root = path.resolve(process.cwd(), '..');
 
@@ -107,98 +100,51 @@ export function readRepo(file: string): string {
 
 export function buildLanding(readme: Readme, changelog: string) {
   const release = latestRelease(changelog);
-  const install = readme.line('scripts/install.sh | bash');
-  const sandbox = readme.terminal('rekcod sandbox diff "$id"');
-  const bench = {
-    start: readme.terminal('rekcod start --no-switch'),
-  };
-  const benchBlock: Block = bench.start.block;
+  const firstContainer = readme.snippet('rekcod run --rm hello-world');
+  const benchmark = readme.terminal('rekcod start --no-switch');
+  const benchBlock: Block = benchmark.block;
   const figures: Figure[] = [
-    { value: `${readme.figure(benchBlock, /rekcod ready in ([\d.]+)s/)} s`, label: 'from a stopped VM to Docker answering' },
-    { value: `${readme.figure(benchBlock, /inotify round trip .*?p50 ([\d.]+) ms/)} ms`, label: 'Mac edit to inotify in a container and back, p50' },
-    { value: `${readme.figure(benchBlock, /mac p50\s+([\d.]+) µs/)} µs`, label: 'TCP round trip through a published port, p50' },
-    { value: Number(readme.figure(benchBlock, /(\d+) req\/s/)).toLocaleString('en-US'), label: 'requests a second over 8 connections from the Mac' },
+    { value: `${readme.figure(benchBlock, /rekcod ready in ([\d.]+)s/)} s`, label: 'Stopped VM to Docker ready' },
+    { value: `${readme.figure(benchBlock, /inotify round trip .*?p50 ([\d.]+) ms/)} ms`, label: 'File change round trip, median' },
+    { value: `${readme.figure(benchBlock, /mac p50\s+([\d.]+) µs/)} µs`, label: 'Published TCP port round trip, median' },
+    { value: Number(readme.figure(benchBlock, /(\d+) req\/s/)).toLocaleString('en-US'), label: 'TCP requests per second across 8 connections' },
   ];
 
   const capabilities: Capability[] = [
     {
       id: 'run-the-project-you-already-have',
-      title: 'Bring your Compose project',
-      text: 'Run `rekcod compose up -d` from the project directory, or keep using `docker compose` with the `rekcod` context. rekcod runs the unmodified upstream `dockerd` with its embedded BuildKit, so builds, Compose and SDKs talk to Docker itself. [Run the project you already have](/docs/#run-the-project-you-already-have).',
-      show: [readme.snippet('rekcod ps')],
+      title: 'Use your existing Compose file',
+      text: 'Run `rekcod compose up -d` from your project directory. You can also use `docker compose` while the `rekcod` context is active. If you’re switching from Docker Desktop or OrbStack, [copy your images and named volumes](/docs/#bring-your-images-and-volumes) before starting your project.',
+      example: readme.snippet('rekcod ps'),
+      guide: 'Compose commands',
     },
     {
       id: 'keep-dependency-writes-inside-linux',
-      title: 'node_modules stays in Linux',
-      text: 'Label a Compose service with `dev.rekcod.local` and the paths to keep in the VM. rekcod mounts a named volume at each one, so installs and build output live on ext4 while your source stays editable on the Mac.',
-      show: [readme.snippet('dev.rekcod.local: "node_modules,.next"'), readme.terminal("rekcod exec shop-web-1 sh -c 'mount | grep /app'")],
+      title: 'Keep dependency writes in Linux',
+      text: 'List paths such as `node_modules` and `.next` in the `dev.rekcod.local` Compose label. Installs and builds write to Linux volumes, and edits to your Mac source files still trigger inotify for file watchers in the container.',
+      example: readme.snippet('dev.rekcod.local: "node_modules,.next"'),
+      guide: 'Linux volume configuration',
     },
     {
       id: 'restore-your-database-to-a-known-state',
-      title: 'Snapshot your database',
-      text: '`rekcod snap save` copies a Compose project\'s named volumes after you migrate and seed. `rekcod snap restore` puts them back and keeps what it replaced as the `pre-restore` snapshot. `--push` and `--pull` move snapshots through S3-compatible storage.',
-      show: [readme.terminal('rekcod snap save seeded')],
+      title: 'Reset your local database',
+      text: 'After migrating and seeding, run `rekcod snap save` to copy the Compose project’s named volumes. Use `rekcod snap restore` after a test run or failed migration to return to that state. Restore saves the data it replaces as `pre-restore`.',
+      example: readme.terminal('rekcod snap save seeded'),
+      guide: 'Snapshot and restore options',
     },
     {
       id: 'run-project-tools-without-installing-them-on-your-mac',
-      title: 'Toolchains without installs',
-      text: '`rekcod x` runs a command in a Linux image picked from the command and files such as `.nvmrc`, `.python-version` and `rust-toolchain.toml`. It mounts the directory at the same path, passes `.env` and forwards listening ports to the Mac.',
-      show: [readme.snippet('rekcod x cargo test')],
-      aside: 'Want it in a VM that can only see this directory? Add [`--sandbox`](/docs/#run-it-in-a-separate-vm).',
+      title: 'Run Linux tools from your project',
+      text: '`rekcod x` runs commands such as `bun install` and `cargo test` in Linux. It picks an image using the command and version files such as `.nvmrc` or `rust-toolchain.toml`, mounts your project, and forwards listening ports to your Mac.',
+      example: readme.snippet('rekcod x cargo test'),
+      guide: 'Toolchain and image selection',
     },
     {
-      id: 'let-an-agent-drive-sandboxes',
-      title: 'Let agents drive sandboxes',
-      text: '`rekcod mcp` serves the sandbox operations over stdio and `rekcod sandbox serve` over HTTP, for the directory they started in. Anything beyond a plain copy sandbox needs a flag from you.',
-      show: [readme.snippet('rekcod mcp'), readme.table('Flag', 'Lets callers')],
-    },
-    {
-      id: 'published-ports',
-      title: 'Ports behave like Linux',
-      text: 'A plain `-p 8080:80` listens on every interface of the Mac, and `-p 127.0.0.1:8080:80` on this Mac only. `rekcod status` lists each forwarded port, and a port another Mac process already holds with its error.',
-      show: [readme.snippet('docker run -d -p 127.0.0.1:8080:80 nginx')],
-    },
-    {
-      id: 'amd64-images',
-      title: 'amd64 images through Rosetta',
-      text: '`linux/amd64` images run in the same VM through Rosetta. A Mac without Rosetta boots without it, and `softwareupdate --install-rosetta` fixes that.',
-      show: [readme.snippet('docker run --rm --platform linux/amd64 alpine uname -m')],
-    },
-    {
-      id: 'use-another-mac-as-your-docker-engine',
-      title: 'Another Mac as your engine',
-      text: '`rekcod host add` sets up SSH to a Mac running rekcod and selects its Docker context, so `docker ps` lists its containers. `rekcod host forward` brings its published ports to your `localhost`.',
-      show: [readme.snippet('rekcod host forward mini')],
-    },
-    {
-      id: 'self-host-apps-on-a-mac',
-      title: 'Deploy apps to a Mac',
-      text: '`rekcod host add --server` installs a controller, worker node, HTTP edge and RustFS on another Mac. Commit a `rekcod.toml`, push, and `rekcod app deploy` builds that commit in fresh VMs and switches traffic once their health checks pass.',
-      show: [readme.snippet('name = "blog"'), readme.snippet('rekcod app deploy --remote mini', 'deploy')],
-    },
-    {
-      id: 'deploy-pull-request-previews',
-      title: 'Pull request previews',
-      text: '`rekcod app webhook` prints a GitHub webhook URL and secret for an app. Each pull request deploys as `blog-pr-N`, sleeps after 15 minutes without a request and is destroyed when the PR closes.',
-      show: [readme.snippet('rekcod app webhook blog --remote mini')],
-    },
-    {
-      id: 'run-s3-compatible-storage',
-      title: 'S3 storage on your Mac',
-      text: '`rekcod storage up` runs RustFS in the VM and prints its endpoint and credentials. A deployed app gets its own bucket and scoped keys with `bucket = true` under `[storage]`.',
-      show: [readme.snippet('rekcod storage up')],
-    },
-    {
-      id: 'manage-it-from-the-terminal-menu-bar-or-dashboard',
-      title: 'Terminal, menu bar or dashboard',
-      text: '`rekcod menubar` and `rekcod dashboard` offer the same actions as the CLI and run its command lines. `rekcod state` prints everything they show, with each item\'s actions, as JSON.',
-      show: [readme.snippet('rekcod menubar --install')],
-    },
-    {
-      id: 'when-something-breaks',
-      title: 'One command to diagnose',
-      text: '`rekcod doctor` prints a line per check and a fix for each one that fails. `--bundle` packs configuration, status and logs into a tarball, with tokens and keys left out.',
-      show: [readme.snippet('rekcod doctor --bundle')],
+      id: 'review-an-agents-changes-before-applying-them',
+      title: 'Run coding agents in a VM',
+      text: '`rekcod sandbox create` copies your project into a separate VM with its own Docker engine. After the agent runs commands there, use `rekcod sandbox diff` to review the changes and `rekcod sandbox apply --reviewed` with the printed review ID to apply them.',
+      example: readme.snippet('sandbox_id=$(rekcod sandbox create)'),
+      guide: 'Sandbox review and apply',
     },
   ];
 
@@ -209,7 +155,8 @@ export function buildLanding(readme: Readme, changelog: string) {
   };
   const diagram = {
     href: '/docs/#docker-runs-inside-a-linux-vm',
-    caption: 'How a docker command reaches a container, with the labels of the README\'s diagram.',
+    startCommand: 'rekcod start',
+    composeCommand: 'docker compose up -d',
     mac: need(arch.nodes, 'mac'),
     guest: need(arch.nodes, 'guest'),
     clients: need(arch.nodes, 'clients'),
@@ -236,73 +183,38 @@ export function buildLanding(readme: Readme, changelog: string) {
     diagram,
     version: release.version,
     released: release.date,
-    title: 'rekcod, an open source Docker Desktop alternative for Apple Silicon',
+    title: 'rekcod | Docker Engine on Apple Silicon',
     description: metaDescription(readme.intro),
-    h1: 'Docker on your Mac, without Docker Desktop',
-    lede: 'rekcod is an open source Docker Desktop alternative for Apple Silicon Macs. It runs upstream [Docker Engine](https://docs.docker.com/engine/) in a Linux VM on Apple\'s `Virtualization.framework`, and your `docker` commands and Compose files work as they are. Built by [linesofcode](https://x.com/linesofcode).',
-    install,
-    agentCommand: `curl -fsSL ${url('/llms.txt')}`,
-    split: {
-      title: 'Review an agent\'s changes',
-      href: '/docs/#review-an-agents-changes-before-applying-them',
-      terminal: sandbox,
+    h1: 'Docker Engine on Apple Silicon',
+    lede: 'rekcod is an open source Docker Desktop alternative. It runs upstream Docker Engine in a Linux VM using Apple’s Virtualization framework, so you can use your existing Docker commands, Compose files and Buildx workflows.',
+    start: {
+      id: 'run-your-first-container',
+      title: 'Install and run',
+      text: 'On first start, rekcod downloads the Linux guest image and selects the `rekcod` Docker context. If the Docker CLI is missing, rekcod installs it along with Compose and Buildx.',
+      example: firstContainer,
+      href: '/docs/#run-your-first-container',
     },
+    agentCommand: `curl -fsSL ${url('/llms.txt')}`,
     figures,
     measured: {
       id: 'benchmarks',
-      title: 'Measured on an M5 Pro',
-      text: readme.paragraph('The bench/ scripts time'),
-      terminal: bench.start,
-    },
-    ecosystem: {
-      title: 'Built for Apple Silicon Macs',
-      text: 'macOS on Apple Silicon with Linux guests and Rosetta for amd64. Docker Engine and Compose, toolchains for Bun, Node.js, Python and Rust, Tailscale and Cloudflare Tunnel for servers, GitHub for runners and previews, and MCP for agents.',
-      brands: [
-        { name: 'apple', label: 'macOS on Apple Silicon' },
-        { name: 'linux', label: 'Linux guest' },
-        { name: 'docker', label: 'Docker Engine and Compose' },
-        { name: 'homebrew', label: 'Homebrew' },
-        { name: 'bun', label: 'Bun' },
-        { name: 'nodedotjs', label: 'Node.js' },
-        { name: 'python', label: 'Python' },
-        { name: 'rust', label: 'Rust' },
-        { name: 'tailscale', label: 'Tailscale' },
-        { name: 'cloudflare', label: 'Cloudflare Tunnel' },
-        { name: 'githubactions', label: 'GitHub Actions' },
-        { name: 'modelcontextprotocol', label: 'Model Context Protocol' },
-      ] satisfies Brand[],
-    },
-    principles: [
-      { title: 'Upstream engine', text: 'rekcod runs unmodified `dockerd`, containerd and runc. Docker API behaviour comes from Docker.' },
-      { title: 'One action catalog', text: 'The menu bar and dashboard run the `rekcod` command lines from one list, and parity tests fail on a gap.' },
-      { title: 'Checked installs', text: 'The installer refuses a tarball that doesn\'t match `SHA256SUMS`, and checks build provenance when `gh` is there.' },
-    ] satisfies Principle[],
-    showcase: {
-      title: 'One binary for all of it',
-      text: 'The CLI, the VM daemon and the menu bar are modes of one native executable. Each tab is a block from the README; the docs have the options, defaults and failure cases for every command.',
-      supports: ['docker', 'apple', 'tailscale', 'cloudflare', 'githubactions'] satisfies BrandName[],
-      tabs: [
-        { label: 'Snapshots', snippet: readme.snippet('rekcod snap ls', 'snapshots') },
-        { label: 'Sandbox', snippet: readme.snippet('sandbox_id=$(rekcod sandbox create)', 'sandbox') },
-        { label: 'Fleet', snippet: readme.snippet('rekcod node approve NODE_ID --remote mini', 'nodes') },
-        { label: 'Jobs', snippet: readme.snippet('rekcod job run --remote mini -- bun test', 'jobs') },
-      ] satisfies Tab[],
+      title: 'Benchmarks',
+      text: readme.paragraph('The bench/ scripts time')
+        .replace(/^The `bench\/` scripts time the paths above\. On an /, 'Measured on an ')
+        .replace(/:$/, '. The guest image was already downloaded for the startup measurement.'),
+      terminal: benchmark,
+      href: '/docs/#benchmarks',
     },
     capabilities,
-    start: {
-      id: 'run-your-first-container',
-      title: 'Install it',
-      text: 'The installer puts `rekcod` in `/usr/local/bin` and installs nothing unless the tarball matches the release\'s `SHA256SUMS`. To check a download yourself, verify the checksum and the build attestation.',
-      panels: [readme.snippet('rekcod run --rm hello-world', 'install'), readme.snippet('shasum -a 256 -c SHA256SUMS --ignore-missing', 'verify')],
-    },
-    today: { title: 'Run your first container today' },
     guides: [
-      { title: 'Self-host apps on a Mac', text: 'A `rekcod.toml`, a push and a deploy.', href: '/docs/#deploy-an-app', snippet: readme.snippet('idle_stop = "15m"') },
-      { title: 'Run a GitHub Actions runner', text: 'An arm64 Linux runner in the local VM.', href: '/docs/#run-a-self-hosted-github-actions-runner', snippet: readme.snippet('cd examples/github-runner') },
-      { title: 'Give people access', text: 'A token per person, namespaces and roles.', href: '/docs/#give-people-access', snippet: readme.snippet('rekcod controller tokens --remote mini') },
-    ] satisfies Guide[],
+      { label: 'Configure VM CPU, memory and disk', href: '/docs/#configure-the-vm' },
+      { label: 'Use another Mac as your Docker engine', href: '/docs/#use-another-mac-as-your-docker-engine' },
+      { label: 'Deploy an app to a Mac', href: '/docs/#deploy-an-app' },
+      { label: 'Use the menu bar or web dashboard', href: '/docs/#manage-it-from-the-terminal-menu-bar-or-dashboard' },
+      { label: 'Review platform and networking limits', href: '/docs/#limitations' },
+    ],
     agents: {
-      minimal: readme.snippet('rekcod run --rm hello-world'),
+      sandbox: readme.terminal('rekcod sandbox diff "$id"'),
       commands: readme.table('Command', 'What it does'),
       mistakes: [
         'A shell that sets `DOCKER_HOST` overrides Docker contexts, so `docker` talks to another engine. Commands passed to `rekcod` itself always use its local engine.',
@@ -310,7 +222,6 @@ export function buildLanding(readme: Readme, changelog: string) {
         '`rekcod sandbox apply --reviewed REVIEW` refuses once another diff of the sandbox replaced the frozen copy, or the project changed since the review. Run `sandbox diff` again and apply the new review ID.',
       ],
     },
-    credit: 'rekcod is built and maintained by [linesofcode](https://linesofcode.dev) and released under the MIT license.',
   };
 }
 

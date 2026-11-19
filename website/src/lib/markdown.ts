@@ -1,6 +1,6 @@
 import type { Landing } from './landing';
 import { url, repository } from './landing';
-import type { Artifact } from './readme';
+import type { Snippet, Terminal } from './readme';
 
 // The landing model as Markdown: /index.md, /llms.txt and /AGENTS.md.
 
@@ -13,8 +13,7 @@ function absolute(markdown: string): string {
   return markdown.replace(/\]\((\/[^)]*)\)/g, (_, p) => `](${url(p)})`);
 }
 
-function artifact(a: Artifact): string {
-  if (a.kind === 'table') return a.markdown;
+function artifact(a: Snippet | Terminal): string {
   if (a.kind === 'terminal') {
     const lines = a.block.value.split('\n');
     return fence('console', lines.slice(lines.indexOf(`$ ${a.command}`)).join('\n'));
@@ -23,26 +22,30 @@ function artifact(a: Artifact): string {
 }
 
 function sections(l: Landing): string[] {
-  return l.capabilities.map((c) => [`## ${c.title}`, absolute(c.text), ...c.show.map(artifact), ...(c.aside ? [absolute(c.aside)] : [])].join('\n\n'));
+  return l.capabilities.map(({ id, title, text, example, guide }) => [
+    `## ${title}`,
+    absolute(text),
+    artifact(example),
+    `[${guide}](${url(`/docs/#${id}`)})`,
+  ].join('\n\n'));
+}
+
+function start(l: Landing): string[] {
+  return [`## ${l.start.title}`, artifact(l.start.example), l.start.text, `[Installation details](${url(l.start.href)})`];
 }
 
 export function pageMarkdown(l: Landing): string {
   return [
     `# ${l.h1}`,
     absolute(l.lede),
-    fence('sh', l.install),
-    `Currently v${l.version}.`,
-    `## ${l.split.title}`,
-    fence('console', l.split.terminal.block.value),
+    ...start(l),
     ...sections(l),
     `## ${l.measured.title}`,
     l.measured.text,
-    ...l.figures.map((f) => `- ${f.value}: ${f.label}`),
-    fence('console', l.measured.terminal.block.value),
-    `## ${l.start.title}`,
-    absolute(l.start.text),
-    ...l.start.panels.map(artifact),
-    `Full documentation: ${url('/docs/')}`,
+    l.figures.map((f) => `- ${f.value} ${f.label}`).join('\n'),
+    `[Benchmark commands and output](${url(l.measured.href)})`,
+    '## More in the docs',
+    l.guides.map(({ label, href }) => `- [${label}](${url(href)})`).join('\n'),
   ].join('\n\n') + '\n';
 }
 
@@ -51,8 +54,8 @@ export function llmsTxt(l: Landing): string {
     `# ${l.name}`,
     `> ${l.description}`,
     absolute(l.lede),
-    `Install (v${l.version}):`,
-    fence('sh', l.install),
+    `Current release v${l.version}.`,
+    ...start(l),
     ...sections(l),
     '## Links',
     [
@@ -68,8 +71,7 @@ export function agentsMd(l: Landing): string {
   return [
     '# Using rekcod',
     `rekcod runs Docker Engine in a Linux VM on Apple Silicon Macs. It is a single \`rekcod\` binary; anything it doesn't know runs as \`docker COMMAND\` against its engine. Docs: ${url('/docs/')}`,
-    '## Install and run',
-    fence(l.agents.minimal.block.lang, l.agents.minimal.block.value),
+    ...start(l),
     '## Commands',
     'Run `rekcod COMMAND --help` for each command\'s options.',
     l.agents.commands.markdown,
@@ -77,6 +79,6 @@ export function agentsMd(l: Landing): string {
     l.agents.mistakes.map((m) => `- ${m}`).join('\n'),
     '## Sandboxes for agents',
     'Give an agent `rekcod mcp` (MCP on stdio) or `rekcod sandbox serve`. It works on a copy of the project in its own VM; you review `rekcod sandbox diff` and apply it.',
-    fence('console', l.split.terminal.block.value),
+    fence('console', l.agents.sandbox.block.value),
   ].join('\n\n') + '\n';
 }

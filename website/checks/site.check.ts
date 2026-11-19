@@ -92,6 +92,34 @@ describe('built pages', () => {
     for (const slug of load().readme.slugs) expect(pages.docs).toContain(`id="${slug}"`);
   });
 
+  test('diagram labels expose keyboard-focusable tooltips with descriptions', () => {
+    const diagram = pages.landing.match(/<svg class="arch"[\s\S]*?<\/svg>/)?.[0] ?? '';
+    const triggers = [...diagram.matchAll(/<g[^>]+data-arch-trigger[^>]*>/g)].map(([tag]) => tag);
+    expect(diagram).toContain('viewBox="0 0 560 616"');
+    expect(triggers).toHaveLength(13);
+    for (const trigger of triggers) {
+      expect(trigger).toContain('role="button"');
+      expect(trigger).toContain('tabindex="0"');
+      const id = trigger.match(/aria-describedby="([^"]+)"/)?.[1];
+      expect(id).toBeTruthy();
+      expect(pages.landing).toMatch(new RegExp(`<div id="${id}"[^>]+role="tooltip" hidden[^>]*>[\\s\\S]*?<span>[^<]+</span>`));
+    }
+  });
+
+  test('visible workflow notes follow the drawing', () => {
+    const html = pages.landing;
+    const start = html.indexOf('class="hero-workflow shell"');
+    expect(start).toBeGreaterThan(html.indexOf('</figure>'));
+    const notes = html.slice(start, html.indexOf('</section>', start)).replace(/<[^>]*>/g, ' ');
+    const labels = ['rekcod start', 'Docker Desktop', 'docker compose up -d', 'upstream Docker Engine', 'Bind mounts', 'Virtualization framework', 'linux/arm64', 'linux/amd64', 'images use Rosetta'];
+    let previous = -1;
+    for (const label of labels) {
+      const at = notes.indexOf(label);
+      expect(at).toBeGreaterThan(previous);
+      previous = at;
+    }
+  });
+
   test('agent files exist and the sitemap names only built files', () => {
     for (const f of ['llms.txt', 'AGENTS.md', 'index.md', 'robots.txt', 'sitemap.xml', 'og.png', 'theme.js', 'site.js']) expect(existsSync(path.join(dist, f))).toBe(true);
     expect(read('robots.txt')).toContain(`Sitemap: ${url('/sitemap.xml')}`);
@@ -128,13 +156,20 @@ describe('built pages', () => {
     expect(footer).toContain('https://discord.com/users/linesofcode');
   });
 
-  test('the hero offers both audiences and draws the architecture', () => {
-    expect(pages.landing).toContain('<svg class="arch"');
+  test('the hero offers a copyable quickstart before the architecture and feature examples', () => {
     const html = pages.landing;
-    expect(html).toContain('data-panel="humans"');
-    expect(html).toContain('data-panel="agents"');
-    expect(html).toContain(`data-copy="${landing.install.replace(/&/g, '&amp;')}"`);
-    const agents = html.slice(html.indexOf('data-panel="agents"'), html.indexOf('class="hero-buttons"'));
+    const start = html.indexOf('data-panel="humans"');
+    const agentPanel = html.indexOf('data-panel="agents"');
+    const diagram = html.indexOf('class="arch"');
+    expect(start).toBeGreaterThan(0);
+    expect(agentPanel).toBeGreaterThan(start);
+    expect(diagram).toBeGreaterThan(agentPanel);
+    expect(diagram).toBeLessThan(html.indexOf(`id="${landing.capabilities[0].id}"`));
+    const quickstart = html.slice(start, agentPanel);
+    expect(quickstart).toContain('aria-label="Copy install and run commands"');
+    const copied = quickstart.match(/data-copy="([^"]*)"/)?.[1];
+    expect(copied?.replace(/&#10;/g, '\n')).toBe(landing.start.example.block.value.replace(/&/g, '&amp;'));
+    const agents = html.slice(agentPanel, diagram);
     for (const [, href] of agents.matchAll(/href="([^"]+)"/g)) expect(existsSync(path.join(dist, href))).toBe(true);
   });
 });

@@ -2,64 +2,48 @@
 import Base from '../layouts/Base.astro';
 import Icon from '../components/Icon.astro';
 import HeroDiagram from '../components/HeroDiagram.astro';
-import { load, repository } from '../lib/landing';
-import type { Artifact } from '../lib/readme';
-import { block, code, commandIndex, consoleHtml, escape, inline } from '../lib/render';
+import { load } from '../lib/landing';
+import { block, code, commandIndex, consoleHtml, inline } from '../lib/render';
 
-const { landing } = load();
-const l = landing;
-
-async function artifact(a: Artifact) {
-  if (a.kind === 'table') return { label: '', bar: '', html: await block(a.markdown), table: true };
-  if (a.kind === 'terminal') {
-    const start = commandIndex(a.block.value, a.command);
-    return { label: `$ ${a.command}`, bar: 'captured output', html: consoleHtml(a.block.value, start), table: false };
-  }
-  return { label: a.label, bar: '', html: await code(a.block), table: false, glyph: a.block.lang === 'sh' ? 'terminal' : 'file' };
-}
-
+const { landing: l } = load();
 const lede = await inline(l.lede);
-// Long URLs wrap after a slash, not mid-word.
-const installHtml = escape(l.install).replace(/\//g, '/<wbr>');
-const split = l.split.terminal.block.value;
-const diffAt = commandIndex(split, 'rekcod sandbox diff "$id"');
-const splitLeft = consoleHtml(split, 0, diffAt);
-const splitRight = consoleHtml(split, diffAt + 1);
-const capabilities = await Promise.all(l.capabilities.map(async (c) => ({
-  ...c,
-  html: await inline(c.text),
-  aside: c.aside ? await inline(c.aside) : undefined,
-  artifacts: await Promise.all(c.show.map(artifact)),
-})));
-const principles = await Promise.all(l.principles.map(async (p) => ({ ...p, html: await inline(p.text) })));
-const tabs = await Promise.all(l.showcase.tabs.map(async (t) => ({ ...t, html: await code(t.snippet.block) })));
-const guides = await Promise.all(l.guides.map(async (g) => ({ ...g, html: await code(g.snippet.block), textHtml: await inline(g.text) })));
 const startText = await inline(l.start.text);
-const panels = await Promise.all(l.start.panels.map(artifact));
-const measuredText = await inline(l.measured.text);
-const measured = consoleHtml(l.measured.terminal.block.value);
-const showcaseText = await inline(l.showcase.text);
+const startCode = await code(l.start.example.block);
+const measuredText = await block(l.measured.text);
+const capabilities = await Promise.all(l.capabilities.map(async ({ example, ...section }) => ({
+  ...section,
+  example,
+  text: await inline(section.text),
+  html: example.kind === 'terminal'
+    ? consoleHtml(example.block.value, commandIndex(example.block.value, example.command))
+    : await code(example.block),
+})));
 ---
 <Base title={l.title} description={l.description} path="/" markdown="/index.md">
   <main id="main">
     <section class="hero" aria-labelledby="hero-title">
       <div class="hero-grid shell">
         <div class="hero-copy">
-          <a class="release" href={`${repository}/releases`}><span class="release-dot" aria-hidden="true"></span>v{l.version} · macOS on Apple Silicon · MIT<span class="ext" aria-hidden="true">↗</span></a>
           <h1 id="hero-title">{l.h1}</h1>
           <p class="lede" set:html={lede} />
-          <div class="audience">
+          <div class="audience" id={l.start.id}>
             <input type="radio" name="audience" id="for-humans" checked />
             <input type="radio" name="audience" id="for-agents" />
             <div class="audience-tabs">
-              <label for="for-humans">For humans</label>
-              <label for="for-agents">For agents</label>
+              <label for="for-humans">{l.start.title}</label>
+              <label for="for-agents">Agent docs</label>
             </div>
             <div class="audience-panel" data-panel="humans">
-              <div class="pill">
-                <span class="ps" aria-hidden="true">$</span><code set:html={installHtml} />
-                <button type="button" class="pill-copy" data-copy={l.install} aria-label="Copy install command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
+              <div class="frame">
+                <div class="frame-bar">
+                  <Icon name="terminal" size={14} />
+                  <span class="mono">Terminal</span>
+                  <button type="button" class="bar-copy" data-copy={l.start.example.block.value} aria-label="Copy install and run commands"><Icon name="copy" size={14} class="i-copy" /><Icon name="check" size={14} class="i-check" /></button>
+                </div>
+                <div class="frame-body" set:html={startCode} />
               </div>
+              <p class="start-note" set:html={startText} />
+              <a class="section-link" href={l.start.href}>Installation details</a>
             </div>
             <div class="audience-panel" data-panel="agents">
               <div class="pill">
@@ -73,137 +57,66 @@ const showcaseText = await inline(l.showcase.text);
               </p>
             </div>
           </div>
-          <div class="hero-buttons">
-            <a class="control control--solid pill-button" href="/docs/"><Icon name="book" />Documentation</a>
-            <a class="control pill-button" href={repository}><Icon name="github" />Source</a>
-          </div>
         </div>
-        <figure class="hero-figure">
+        <figure class="hero-figure" id="hero-diagram">
           <HeroDiagram d={l.diagram} />
-          <figcaption>{l.diagram.caption} <a href={l.diagram.href}>How it works</a></figcaption>
+          <figcaption>
+            <span>Hover, tab, or tap for technical details.</span>
+            <a class="section-link" href={l.diagram.href}>How Docker runs in the VM</a>
+          </figcaption>
         </figure>
       </div>
-    </section>
-
-    <section class="split shell" aria-label={l.split.title}>
-      <div class="frame">
-        <div class="frame-bar"><Icon name="bot" size={14} /><span class="mono">agent · sandbox exec</span></div>
-        <div class="frame-body" set:html={splitLeft} />
-      </div>
-      <div class="frame">
-        <div class="frame-bar"><Icon name="terminal" size={14} /><span class="mono">$ rekcod sandbox diff "$id"</span><span class="chip">captured output</span></div>
-        <div class="frame-body" set:html={splitRight} />
-      </div>
-      <p class="split-caption"><a href={l.split.href}>{l.split.title}</a>: the agent works on a copy in its own VM, and <code>apply --reviewed</code> writes the copy that diff froze.</p>
-    </section>
-
-    <section class="band ecosystem" aria-labelledby="ecosystem-title">
-      <div class="shell center">
-        <h2 id="ecosystem-title">{l.ecosystem.title}</h2>
-        <p class="band-lede">{l.ecosystem.text}</p>
-        <ul class="brands">
-          {l.ecosystem.brands.map((b) => <li title={b.label}><Icon name={b.name} size={40} color /><span class="sr-only">{b.label}</span></li>)}
-        </ul>
-      </div>
-    </section>
-
-    <section class="principles shell" aria-label="Principles">
-      {principles.map((p) => (
-        <div><h2>{p.title}</h2><p set:html={p.html} /></div>
-      ))}
-    </section>
-
-    <section class="showcase shell" aria-labelledby="showcase-title">
-      <div class="showcase-copy">
-        <h2 id="showcase-title">{l.showcase.title}</h2>
-        <p set:html={showcaseText} />
-        <a class="control control--solid pill-button" href="/docs/"><Icon name="book" />Visit documentation</a>
-        <p class="supports-caption">Works with</p>
-        <div class="avatars">
-          {l.showcase.supports.map((b) => <span class="avatar"><Icon name={b} size={18} /></span>)}
-          <span class="more">+ Compose, Bun, Python and more</span>
-        </div>
-      </div>
-      <div class="tabs">
-        {tabs.map((_, i) => <input type="radio" name="showcase" id={`tab-${i}`} checked={i === 0} />)}
-        <div class="tab-row" role="presentation">
-          {tabs.map((t, i) => <label for={`tab-${i}`}>{t.label}</label>)}
-        </div>
-        {tabs.map((t, i) => (
-          <div class="tab-panel frame" data-tab={i}>
-            <div class="frame-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="mono center-label">{t.snippet.label}</span><button type="button" class="bar-copy" data-copy={t.snippet.block.value} aria-label={`Copy ${t.label} example`}><Icon name="copy" size={14} class="i-copy" /><Icon name="check" size={14} class="i-check" /></button></div>
-            <div class="frame-body fade" set:html={t.html} />
+      <section class="hero-workflow shell" aria-labelledby="hero-workflow-title">
+        <h2 id="hero-workflow-title">How your Compose project runs</h2>
+        <div class="hero-workflow-notes">
+          <div>
+            <h3><code>{l.diagram.startCommand}</code></h3>
+            <p>Starts the Linux VM and selects the <code>rekcod</code> Docker context. Rekcod takes over VM management from Docker Desktop.</p>
           </div>
-        ))}
-        <div class="pager" aria-hidden="true">{tabs.map((_, i) => <i data-dot={i}></i>)}</div>
-      </div>
+          <div>
+            <h3><code>{l.diagram.composeCommand}</code></h3>
+            <p>Run this in your project directory. Compose uses your existing file and sends requests to upstream Docker Engine in the VM. Bind mounts share your Mac source files so file watchers inside containers see your edits.</p>
+          </div>
+          <div>
+            <h3>Apple Silicon and Rosetta</h3>
+            <p>Apple’s Virtualization framework runs ARM Linux on your M-series chip. <code>linux/arm64</code> images run natively. <code>linux/amd64</code> images use Rosetta, which you install on your Mac.</p>
+          </div>
+        </div>
+      </section>
     </section>
 
-    {capabilities.map((c) => (
-      <>
-        <section class="capability shell" id={c.id} aria-labelledby={`${c.id}-title`}>
-          <h2 id={`${c.id}-title`}>{c.title}</h2>
-          <p class="explain" set:html={c.html} />
-          <div class:list={['artifacts', { pair: c.artifacts.length > 1 && !c.artifacts.some((a) => a.table) }]}>
-            {c.artifacts.map((a) => a.table ? (
-              <div class="table-wrap" set:html={a.html} />
-            ) : (
-              <div class="frame">
-                <div class="frame-bar"><Icon name={a.bar ? 'terminal' : (a as any).glyph ?? 'file'} size={14} /><span class="mono">{a.label}</span>{a.bar && <span class="chip">{a.bar}</span>}</div>
-                <div class="frame-body" set:html={a.html} />
-              </div>
-            ))}
+    {capabilities.map(({ id, title, text, example, guide, html }) => (
+      <section class="capability shell" id={id} aria-labelledby={`${id}-title`}>
+        <h2 id={`${id}-title`}>{title}</h2>
+        <p class="explain" set:html={text} />
+        <div class="example frame">
+          <div class="frame-bar">
+            <Icon name={example.block.lang === 'yaml' ? 'file' : 'terminal'} size={14} />
+            <span class="mono">{example.kind === 'terminal' ? 'Terminal output' : example.label}</span>
+            {example.kind === 'snippet' && (
+              <button type="button" class="bar-copy" data-copy={example.block.value} aria-label="Copy example"><Icon name="copy" size={14} class="i-copy" /><Icon name="check" size={14} class="i-check" /></button>
+            )}
           </div>
-        </section>
-        {c.aside && <p class="aside shell" set:html={c.aside} />}
-      </>
+          <div class="frame-body" set:html={html} />
+        </div>
+        <a class="section-link" href={`/docs/#${id}`}>{guide}</a>
+      </section>
     ))}
 
-    <section class="capability shell measured" id={l.measured.id} aria-labelledby="benchmarks-title">
+    <section class="capability shell" id={l.measured.id} aria-labelledby="benchmarks-title">
       <h2 id="benchmarks-title">{l.measured.title}</h2>
-      <p class="explain" set:html={measuredText} />
+      <div class="explain" set:html={measuredText} />
       <dl class="figures">
         {l.figures.map((f) => <div><dt>{f.label}</dt><dd>{f.value}</dd></div>)}
       </dl>
-      <div class="frame">
-        <div class="frame-bar"><Icon name="terminal" size={14} /><span class="mono">bench/</span><span class="chip">captured output</span></div>
-        <div class="frame-body" set:html={measured} />
-      </div>
+      <a class="section-link" href={l.measured.href}>Benchmark commands and output</a>
     </section>
 
-    <section class="capability shell" id={l.start.id} aria-labelledby="start-title">
-      <h2 id="start-title">{l.start.title}</h2>
-      <p class="explain" set:html={startText} />
-      <div class="artifacts pair">
-        {panels.map((p) => (
-          <div class="frame">
-            <div class="frame-bar"><Icon name="terminal" size={14} /><span class="mono">{p.label}</span></div>
-            <div class="frame-body" set:html={p.html} />
-          </div>
-        ))}
-      </div>
-    </section>
-
-    <section class="today shell" aria-labelledby="today-title">
-      <h2 id="today-title">{l.today.title}</h2>
-      <div class="today-actions">
-        <a class="control control--solid pill-button" href="/docs/#run-your-first-container"><Icon name="book" />Documentation</a>
-        <div class="pill pill--outline">
-          <span class="ps" aria-hidden="true">$</span><code set:html={installHtml} />
-          <button type="button" class="pill-copy" data-copy={l.install} aria-label="Copy install command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
-        </div>
-      </div>
-    </section>
-
-    <section class="guides shell" aria-labelledby="guides-title">
-      <h2 id="guides-title" class="sr-only">Guides</h2>
-      {guides.map((g) => (
-        <a class="guide" href={g.href}>
-          <span class="guide-title">{g.title}<Icon name="arrow" size={14} /></span>
-          <span class="guide-text" set:html={g.textHtml} />
-          <span class="guide-preview" set:html={g.html} />
-        </a>
-      ))}
+    <section class="capability shell" aria-labelledby="guides-title">
+      <h2 id="guides-title">More in the docs</h2>
+      <ul class="guide-links">
+        {l.guides.map(({ label, href }) => <li><a class="section-link" href={href}>{label}</a></li>)}
+      </ul>
     </section>
   </main>
 </Base>

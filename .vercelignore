@@ -1,6 +1,7 @@
 *
 !vercel.json
 !README.md
+!CHANGELOG.md
 !website
 !website/**
 website/node_modules

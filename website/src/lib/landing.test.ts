@@ -66,6 +66,11 @@ describe('landing references into README.md', () => {
     expect(() => buildLanding(broken, readRepo('CHANGELOG.md'))).toThrow('has no daemon');
   });
 
+  test('.vercelignore uploads every repository file the build reads', () => {
+    const ignore = readRepo('.vercelignore').split('\n');
+    for (const f of ['README.md', 'CHANGELOG.md']) expect(ignore).toContain(`!${f}`);
+  });
+
   test('version is the newest dated CHANGELOG release', () => {
     expect(latestRelease('## [0.3.0] - Unreleased\n\n## [0.2.1] - 2026-10-12\n')).toEqual({ version: '0.2.1', date: '2026-10-12' });
     expect(landing.version).toMatch(/^\d+\.\d+\.\d+/);

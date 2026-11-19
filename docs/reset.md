@@ -25,7 +25,10 @@ deletes the directory. `check` refuses when the Mac lacks the snapshots' size pl
 Snapshots pushed to an outside S3 are never touched; `storage up`'s RustFS is the
 `rekcod-storage` volume on data.img, so what was pushed there goes, and the prompt says so.
 
-- VM stopped: nothing can be read, the prompt says the snapshots go too.
+- VM stopped: reset boots it (`--no-switch`) before the prompt, reads the facts again and
+  plans as for `--no-start`, so it ends stopped; the context isn't touched. Declining the
+  prompt stops it again. If that boot fails, the prompt says the snapshots can't be copied
+  out, and a `yes` resets without them (a disk that doesn't boot is often why you reset).
 - `--no-start`: boots once for the import, then stops.
 - The boot fails: the archives stay. A later `rekcod reset` sees `manifest.json` and only
   boots and imports (`Facts::unfinished`), deleting nothing.

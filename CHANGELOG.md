@@ -179,7 +179,8 @@ release notes, and refuses to publish without one.
   `--backup-dir`, `GET /metrics`, kept logs of removed instances, graceful SIGTERM.
 - `scripts/e2e-lifecycle.sh`: VM crash, damaged-disk and repair checks on a VM of its own.
 - `rekcod reset` (menu bar and dashboard: Reset the Docker engine) deletes the VM's data disk
-  and boots on a new, empty one. Local snapshots are copied across; settings, launchd jobs,
+  and boots on a new, empty one. Local snapshots are copied across (a stopped VM boots once
+  for that and ends stopped); settings, launchd jobs,
   contexts, agent sandboxes and golden disks stay. `--all` also deletes sandboxes, golden
   disks and snapshots; `--no-start` leaves the VM stopped. It refuses while a fleet node or
   controller of that home runs.

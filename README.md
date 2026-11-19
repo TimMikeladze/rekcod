@@ -1351,12 +1351,13 @@ It stops the VM first, like `rekcod stop`. When that fails, nothing is deleted a
 non-zero. A VM that was running boots again on the new disk; `--no-start` leaves it stopped.
 At the end it prints how much space came back on the Mac.
 
-Local snapshots (`rekcod snap`) are volumes on the data disk. While the VM runs, reset copies
-them to `~/.rekcod/vm/reset-snapshots`, checks there is room on the Mac first, and puts them
-back once the new disk is up (with `--no-start` the VM boots once for that, then stops).
-When the VM is stopped they can't be copied out, and the prompt says so: `rekcod start`
-first to keep them. If the VM doesn't come back, the copies stay, and running `rekcod reset`
-again puts them back without deleting anything.
+Local snapshots (`rekcod snap`) are volumes on the data disk, and plain `reset` keeps them: it
+copies them to `~/.rekcod/vm/reset-snapshots`, checks there is room on the Mac first, and puts
+them back once the new disk is up (with `--no-start` the VM boots once for that, then stops).
+Only dockerd can read them, so a stopped VM is booted first and is stopped again at the end.
+If that boot fails, the prompt says the snapshots can't be copied out, and the reset can go
+ahead without them. If the VM doesn't come back after the reset, the copies stay, and running
+`rekcod reset` again puts them back without deleting anything.
 
 Snapshots pushed to S3 outside the VM (`S3_ENDPOINT`) are never touched. `rekcod storage up`
 runs RustFS in the VM with its data in the `rekcod-storage` volume, so its buckets, and

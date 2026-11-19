@@ -76,6 +76,10 @@ struct Facts {
     mac_free: u64,
     /// An earlier reset deleted the disk and didn't get its snapshots back in.
     unfinished: bool,
+    /// The VM was stopped and reset booted it to copy the snapshots out; it ends stopped.
+    was_stopped: bool,
+    /// The stopped VM didn't boot for that, so its snapshots can't be copied out.
+    boot_failed: Option<String>,
 }
 
 impl Facts {
@@ -124,12 +128,14 @@ fn plan(f: &Facts) -> Vec<Step> {
         return if f.running { vec![RestoreSnapshots] } else { vec![Start, RestoreSnapshots] };
     }
     let carry = f.carry();
+    // A VM reset booted itself was started with --no-switch: the context is already back.
+    let back = f.default_home && !f.was_stopped;
     let mut steps = Vec::new();
     if carry {
         steps.push(SaveSnapshots);
     }
     if f.running {
-        steps.push(StopVm { switch_back: f.default_home && f.no_start && !carry });
+        steps.push(StopVm { switch_back: back && f.no_start && !carry });
     }
     if f.all {
         if !f.sandboxes.is_empty() {
@@ -145,7 +151,7 @@ fn plan(f: &Facts) -> Vec<Step> {
     if carry {
         steps.push(RestoreSnapshots);
         if f.no_start {
-            steps.push(StopVm { switch_back: f.default_home });
+            steps.push(StopVm { switch_back: back });
         }
     }
     steps
@@ -197,11 +203,8 @@ fn summary(f: &Facts, home: &str) -> Vec<String> {
         out.push("  local snapshots, if any".into());
     } else if !f.all && f.snapshots_unknown {
         out.push("  local snapshots: dockerd doesn't answer, so they can't be copied out first".into());
-    } else if !f.all && !f.running {
-        out.push(
-            "  local snapshots, if any: the VM is stopped, so they can't be copied out first (`rekcod start` and reset again to keep them)"
-                .into(),
-        );
+    } else if let (false, Some(e)) = (f.all, &f.boot_failed) {
+        out.push(format!("  local snapshots, if any: the VM didn't boot to copy them out first ({e})"));
     }
     if f.local_storage {
         out.push(
@@ -230,6 +233,8 @@ fn summary(f: &Facts, home: &str) -> Vec<String> {
     }
     out.push(format!("Kept: {kept}. Snapshots pushed to S3 outside this VM (S3_ENDPOINT) aren't touched."));
     out.push(match (f.running, f.no_start) {
+        (true, _) if f.was_stopped && f.carry() => "The VM was stopped: it boots once more to take the snapshots back, then stops.".into(),
+        (true, _) if f.was_stopped => "The VM was stopped and stays stopped; the next start formats the new disk.".into(),
         (true, false) => "The VM boots again on the new disk afterwards.".into(),
         (true, true) if f.carry() => "The VM boots once to take the snapshots back, then stops (--no-start).".into(),
         (true, true) => "The VM stays stopped (--no-start); the next start formats the new disk.".into(),
@@ -390,9 +395,26 @@ fn start(paths: &Paths) -> Result<()> {
 
 /// `rekcod reset [--all] [--no-start] [--yes]`.
 pub fn reset(paths: &Paths, all: bool, no_start: bool, yes: bool) -> Result<()> {
-    let f = facts(paths, all, no_start, yes);
+    let mut f = facts(paths, all, no_start, yes);
     let home = paths.home.display().to_string();
     check(&f)?;
+    // Snapshots live on the disk, and only dockerd can read them: a stopped VM boots first.
+    if !f.unfinished && !f.running && !all && paths.data_disk().exists() {
+        println!("The VM is stopped; booting it to copy the local snapshots out first.");
+        match start(paths) {
+            Ok(()) => {
+                f = Facts { was_stopped: true, ..facts(paths, all, true, yes) };
+                if let Err(e) = check(&f) {
+                    let _ = crate::cli::stop(paths, true, false);
+                    return Err(e);
+                }
+            }
+            Err(e) => {
+                let _ = crate::cli::stop(paths, true, true);
+                f.boot_failed = Some(format!("{e:#}"));
+            }
+        }
+    }
     if f.unfinished {
         println!("An earlier reset of {home} didn't put its snapshots back; importing them now. Nothing is deleted.");
     } else {
@@ -405,6 +427,9 @@ pub fn reset(paths: &Paths, all: bool, no_start: bool, yes: bool) -> Result<()> 
             let mut line = String::new();
             std::io::stdin().read_line(&mut line)?;
             if line.trim() != "yes" {
+                if f.was_stopped {
+                    let _ = crate::cli::stop(paths, true, false);
+                }
                 bail!("nothing changed");
             }
         }
@@ -492,7 +517,15 @@ mod tests {
             plan(&facts(true, true, false)),
             [StopVm { switch_back: false }, RemoveSandboxes, RemoveGolden("default".into()), ResetDataDisk, Start]
         );
-        // A stopped VM stays stopped; nothing to copy out.
+        // A stopped VM is booted to copy its snapshots out (facts gathered again, running),
+        // and ends stopped without touching the docker context.
+        let booted = Facts { was_stopped: true, ..facts(true, false, true) };
+        assert_eq!(
+            plan(&booted),
+            [SaveSnapshots, StopVm { switch_back: false }, ResetDataDisk, Start, RestoreSnapshots, StopVm { switch_back: false }]
+        );
+        assert_eq!(plan(&Facts { snapshots: vec![], ..booted }), [StopVm { switch_back: false }, ResetDataDisk]);
+        // One that didn't boot (or has no disk) has nothing to copy out.
         assert_eq!(plan(&facts(false, false, false)), [ResetDataDisk]);
         assert_eq!(plan(&facts(false, true, true)), [RemoveSandboxes, RemoveGolden("default".into()), ResetDataDisk]);
         // --no-start: stopped like `rekcod stop` (context back) ...
@@ -608,7 +641,10 @@ mod tests {
                 && s.contains("local snapshots: shop/seed"),
             "{s}"
         );
-        assert!(summary(&facts(false, false, false), "/h").join("\n").contains("can't be copied out first"));
+        let failed = Facts { boot_failed: Some("dockerd did not answer".into()), ..facts(false, false, false) };
+        assert!(summary(&failed, "/h").join("\n").contains("didn't boot to copy them out first (dockerd did not answer)"));
+        let booted = Facts { was_stopped: true, ..facts(true, false, true) };
+        assert!(summary(&booted, "/h").join("\n").contains("boots once more to take the snapshots back, then stops"));
         assert!(summary(&facts(false, true, false), "/h").join("\n").contains("local snapshots, if any"));
         assert!(summary(&Facts { local_storage: true, ..facts(true, false, false) }, "/h").join("\n").contains("rekcod-storage"));
         assert_eq!(flag_value(&["serve".into(), "--db=/x/f.db".into()], "--db").as_deref(), Some("/x/f.db"));

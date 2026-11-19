@@ -126,6 +126,10 @@ check "config.json is unchanged" cmp "$cfg" "$REKCOD_HOME/config.json"
 check "the snapshot came across" sh -c "'$R' snap ls -p rkreset | grep -q seed"
 check "and restores its data" sh -c "'$R' snap restore -p rkreset seed >/dev/null 2>&1 && $D run --rm -v rkreset_db:/d alpine:3.24 cat /d/f | grep -q seeded"
 check "nothing was left on the Mac" test ! -e "$REKCOD_HOME/vm/reset-snapshots"
+"$R" stop --no-switch >/dev/null
+"$R" reset --yes >"$log" 2>&1
+check "a stopped VM is booted to copy its snapshots out, and ends stopped" sh -c "'$R' status | grep -q 'not running'"
+check "those snapshots came across too" sh -c "'$R' start --no-switch >/dev/null 2>&1 && '$R' snap ls -p rkreset | grep -q seed"
 "$R" reset --all --no-start --yes >"$log" 2>&1
 check "reset --all --no-start leaves the VM stopped" sh -c "'$R' status | grep -q 'not running'"
 check "with no data disk and data.fresh written" sh -c "test ! -e '$REKCOD_HOME/vm/data.img' && test -e '$REKCOD_HOME/vm/data.fresh'"

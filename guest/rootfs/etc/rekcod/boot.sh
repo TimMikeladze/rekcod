@@ -68,6 +68,8 @@ else
   rc=$?
   if [ $rc -ge 4 ]; then
     data_fail "e2fsck found errors it can't fix safely (exit $rc); run \`rekcod start --repair\`"
+  elif grep -q 'rekcod\.fsck=yes' /proc/cmdline && ! orphan_file_ok /dev/vdb; then
+    data_fail "the data disk's orphan file is gone and turning orphan_file off failed; run \`rekcod start --repair\`"
   elif mount -o noatime /dev/vdb /var/lib/docker; then
     # The Mac side may have grown data.img (`rekcod start --disk`); ext4 grows online.
     resize2fs /dev/vdb >/dev/null 2>&1 || log "data disk resize failed"

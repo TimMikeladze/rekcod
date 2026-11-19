@@ -98,10 +98,8 @@ wait $fg
 check "rekcod stop makes --foreground exit 0" test $? -eq 0
 
 echo "reset"
-# A home of its own: the crash checks above can leave a disk that needs --repair.
-cleanup
+# The disk --repair rebuilt from a backup superblock, kill -9'd since: it must boot.
 check "boots for the reset" start
-docker save alpine:3.24 | $D load >/dev/null
 cfg=$(mktemp)
 cp "$REKCOD_HOME/config.json" "$cfg"
 $D volume create gone >/dev/null

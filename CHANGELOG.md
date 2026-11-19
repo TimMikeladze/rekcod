@@ -226,6 +226,11 @@ release notes, and refuses to publish without one.
 
 ### Fixed
 
+- A data disk repaired from a backup superblock (`start --repair`) no longer needs
+  `--repair` again after the next crash. e2fsck 1.47.4 cleared ext4's orphan file (inode 12)
+  but kept the `orphan_file` feature and called the disk clean; the kernel then gave inode 12
+  to a new file, and the next unclean stop failed with e2fsck exit 4. `--repair` now turns
+  `orphan_file` off when its inode is free.
 - `[http] timeout` in `rekcod.toml` is accepted.
 - `rekcod import --help` prints rekcod's help instead of booting the VM.
 - `--memory` is checked before it's saved, and a failed boot puts the old settings back.

@@ -1829,6 +1829,52 @@ mod tests {
         assert!(ok && ran.is_empty(), "an ext4 disk is left alone: {ran}");
     }
 
+    /// Runs data-disk.sh's `orphan_file_ok` with stub e2fsprogs: dumpe2fs names an orphan
+    /// file inode when the disk has the feature, debugfs says whether that inode is in use.
+    /// Returns whether it succeeded, and the tools that changed the disk.
+    fn orphan_file_ok(feature: bool, testi: &str) -> (bool, String) {
+        use std::os::unix::fs::PermissionsExt;
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let t = std::env::temp_dir().join(format!("rekcod-orphan-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&t);
+        std::fs::create_dir_all(t.join("bin")).unwrap();
+        let dumpe2fs = if feature {
+            "echo 'Filesystem features:      has_journal orphan_file'; echo 'Orphan file inode:        12'"
+        } else {
+            "echo 'Filesystem features:      has_journal'"
+        };
+        let debugfs = format!("echo '{testi}'");
+        let log = r#"echo "$(basename "$0") $*" >>"$T/ran""#;
+        for (name, body) in [("dumpe2fs", dumpe2fs), ("debugfs", &debugfs), ("tune2fs", log), ("e2fsck", log)] {
+            let p = t.join("bin").join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let script = concat!(env!("CARGO_MANIFEST_DIR"), "/../../guest/rootfs/etc/rekcod/data-disk.sh");
+        let ok = std::process::Command::new("/bin/sh")
+            .args(["-c", r#"log() { :; }; . "$1"; orphan_file_ok vdb"#, "sh", script])
+            .env("PATH", format!("{}:/usr/bin:/bin", t.join("bin").display()))
+            .env("T", &t)
+            .env("REKCOD_CONSOLE", "/dev/null")
+            .status()
+            .unwrap()
+            .success();
+        let ran = std::fs::read_to_string(t.join("ran")).unwrap_or_default();
+        std::fs::remove_dir_all(&t).unwrap();
+        (ok, ran)
+    }
+
+    #[test]
+    fn a_data_disk_whose_orphan_file_is_gone_loses_the_feature() {
+        let (used, free) = ("Inode 12 is marked in use", "Inode 12 is not in use");
+        assert_eq!(orphan_file_ok(false, free), (true, String::new()), "no orphan_file");
+        assert_eq!(orphan_file_ok(true, used), (true, String::new()), "a healthy disk is left alone");
+        let unreadable = "debugfs: Block bitmap checksum does not match bitmap while reading allocation bitmaps";
+        assert_eq!(orphan_file_ok(true, unreadable), (true, String::new()), "only a free inode counts");
+        assert_eq!(orphan_file_ok(true, free), (true, "tune2fs -O ^orphan_file vdb\ne2fsck -fy vdb\n".into()));
+    }
+
     #[tokio::test]
     async fn removing_a_udp_port_frees_it_with_a_flow_open() {
         // Below macOS's ephemeral range, so another test's `bind(:0)` can't take it while it's free.

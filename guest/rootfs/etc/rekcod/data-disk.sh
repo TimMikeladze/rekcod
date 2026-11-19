@@ -30,3 +30,22 @@ data_disk_ready() {
   fi
   is_ext4 "$dev"
 }
+
+# orphan_file_ok DEV: 0 unless DEV has the orphan_file feature but its inode is free and
+# turning the feature off failed. e2fsck 1.47.4 -fy from a backup superblock clears that
+# inode (12) with the other "garbage" and keeps the feature, and later checks call the disk
+# clean. The kernel then refuses to mount it or gives inode 12 to a new file, and the next
+# unclean stop ends in e2fsck exit 4. Without the feature ext4 keeps orphans in the
+# superblock's list, as before 1.47; e2fsck -fy fixes the inode count tune2fs leaves.
+# Only run it right after e2fsck -fy (--repair): after a -p recovery from a backup the
+# bitmaps can still fail their checksums, debugfs reads inode 12 as free and tune2fs refuses.
+orphan_file_ok() {
+  local dev=$1 out=${REKCOD_CONSOLE:-/dev/console} ino
+  ino=$(dumpe2fs -h "$dev" 2>/dev/null | sed -n 's/^Orphan file inode: *//p')
+  [ -z "$ino" ] && return 0
+  debugfs -R "testi <$ino>" "$dev" 2>&1 | grep -q 'is not in use' || return 0
+  log "the data disk's orphan file (inode $ino) is gone; turning orphan_file off"
+  tune2fs -O ^orphan_file "$dev" >"$out" 2>&1 || return 1
+  e2fsck -fy "$dev" >"$out" 2>&1
+  [ $? -lt 4 ]
+}

@@ -5,7 +5,8 @@ import { Readme, latestRelease, type Artifact, type Block, type Snippet, type Te
 // The landing page model: copy, section order, which README block each section shows and
 // the link table. No markup. Copy is written here; every example is a README reference.
 
-export const origin = 'https://rekcod.vercel.app';
+// The same variable astro.config.mjs reads, so canonical URLs follow a custom domain.
+export const origin = (process.env.SITE_URL || 'https://rekcod.vercel.app').replace(/\/$/, '');
 export const repository = 'https://github.com/TimMikeladze/rekcod';
 export const themeKey = 'rekcod-theme';
 
@@ -234,7 +235,6 @@ export function buildLanding(readme: Readme, changelog: string) {
         { name: 'bun', label: 'Bun' },
         { name: 'nodedotjs', label: 'Node.js' },
         { name: 'python', label: 'Python' },
-        { name: 'uv', label: 'uv' },
         { name: 'rust', label: 'Rust' },
         { name: 'tailscale', label: 'Tailscale' },
         { name: 'cloudflare', label: 'Cloudflare Tunnel' },

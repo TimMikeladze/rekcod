@@ -9,7 +9,7 @@
     "typecheck": "astro check",
     "check:links": "python3 scripts/check-links.py",
     "test": "bun test src",
-    "check:site": "bun test checks"
+    "check:site": "bun test ./checks/site.check.ts"
   },
   "packageManager": "bun@1.4.4",
   "engines": {

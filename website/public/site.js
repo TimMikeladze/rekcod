@@ -48,6 +48,7 @@
   document.addEventListener('click', function (event) {
     var button = event.target.closest && event.target.closest('[data-copy],[data-copy-url]');
     if (!button) return;
+    event.preventDefault();
     if (button.hasAttribute('data-copy')) return copy(button, button.getAttribute('data-copy'));
     fetch(button.getAttribute('data-copy-url')).then(function (r) { return r.text(); }).then(function (t) { copy(button, t); });
   });

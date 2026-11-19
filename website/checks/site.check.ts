@@ -3,7 +3,8 @@ import { existsSync, readFileSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { links, load, themeKey, url } from '../src/lib/landing';
 
-// Checks the built site in dist/. Run after `bun run build`: `bun run check:site`.
+// Checks the built site in dist/. Run after `bun run build`: `bun run check:site`. Named
+// .check.ts so a bare `bun test`, which runs before the build in CI, doesn't pick it up.
 
 const dist = path.resolve(import.meta.dir, '../dist');
 const read = (p: string) => readFileSync(path.join(dist, p), 'utf8');
@@ -100,7 +101,8 @@ describe('built pages', () => {
     }
   });
 
-  test('og.png is a 1200x630 PNG under 300 KB', () => {
+  test('og.png is a 1200x630 PNG under 300 KB, drawn from the page\'s H1', () => {
+    expect(readFileSync(path.resolve(import.meta.dir, '../scripts/og-card.html'), 'utf8')).toContain(`<h1>${landing.h1}</h1>`);
     const png = readFileSync(path.join(dist, 'og.png'));
     expect(png.subarray(1, 4).toString()).toBe('PNG');
     expect(png.readUInt32BE(16)).toBe(1200);

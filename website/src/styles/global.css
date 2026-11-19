@@ -77,7 +77,7 @@
 @layer layout {
   .site-header {
     position: sticky; top: 0; z-index: 40; border-bottom: 1px solid var(--line);
-    background: color-mix(in oklab, var(--paper) 82%, transparent); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px);
+    background: color-mix(in oklab, var(--paper) 94%, transparent); backdrop-filter: blur(12px);
   }
   .bar { width: min(1180px, calc(100% - 3rem)); margin-inline: auto; min-height: 3.75rem; display: flex; align-items: center; gap: 1.75rem; }
   .brand { font-weight: 700; font-size: 1.05rem; color: var(--ink); text-decoration: none; letter-spacing: -.01em; }

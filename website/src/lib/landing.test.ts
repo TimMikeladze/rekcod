@@ -57,6 +57,15 @@ describe('landing references into README.md', () => {
     for (const c of landing.capabilities) expect(readme.hasSection(c.id)).toBe(true);
   });
 
+  test('the hero diagram uses the README diagram\'s labels and a captured container name', () => {
+    const block = readme.blocks.find((b) => b.lang === 'mermaid' && b.value.includes('accTitle: Local Docker architecture'))!.value;
+    const d = landing.diagram;
+    for (const label of [d.mac, d.guest, d.clients, d.daemon, d.agent, d.engine, d.containerd, d.runc, d.containers, d.socket, d.vsock]) expect(block).toContain(label);
+    expect(readme.markdown).toContain(`$ rekcod exec ${d.container} `);
+    const broken = new Readme(readme.markdown.replace('daemon["rekcod daemon"]', 'daemon'));
+    expect(() => buildLanding(broken, readRepo('CHANGELOG.md'))).toThrow('has no daemon');
+  });
+
   test('version is the newest dated CHANGELOG release', () => {
     expect(latestRelease('## [0.3.0] - Unreleased\n\n## [0.2.1] - 2026-10-12\n')).toEqual({ version: '0.2.1', date: '2026-10-12' });
     expect(landing.version).toMatch(/^\d+\.\d+\.\d+/);

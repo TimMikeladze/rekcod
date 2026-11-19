@@ -202,8 +202,38 @@ export function buildLanding(readme: Readme, changelog: string) {
     },
   ];
 
+  const arch = readme.diagram('Local Docker architecture');
+  const need = (map: Record<string, string>, key: string) => {
+    if (!map[key]) throw new Error(`README.md: the architecture diagram has no ${key}`);
+    return map[key];
+  };
+  const diagram = {
+    href: '/docs/#docker-runs-inside-a-linux-vm',
+    caption: 'How a docker command reaches a container, with the labels of the README\'s diagram.',
+    mac: need(arch.nodes, 'mac'),
+    guest: need(arch.nodes, 'guest'),
+    clients: need(arch.nodes, 'clients'),
+    daemon: need(arch.nodes, 'daemon'),
+    agent: need(arch.nodes, 'agent'),
+    engine: need(arch.nodes, 'engine'),
+    containerd: need(arch.nodes, 'containerd'),
+    runc: need(arch.nodes, 'runc'),
+    containers: need(arch.nodes, 'containers'),
+    socket: need(arch.edges, 'clients-daemon'),
+    vsock: need(arch.edges, 'daemon-agent'),
+    // A container name from a captured run in the README.
+    container: readme.figure(readme.terminal("rekcod exec shop-web-1 sh -c 'mount | grep /app'").block, /\$ rekcod exec (\S+)/),
+    share: 'virtio-fs, same path',
+    silicon: 'Apple Silicon Mac',
+    arch: 'arm64, M-series',
+    native: 'linux/arm64 images run natively',
+    rosetta: 'linux/amd64 images run through Rosetta',
+    project: '~/project',
+  };
+
   return {
     name: 'rekcod',
+    diagram,
     version: release.version,
     released: release.date,
     title: 'rekcod, an open source Docker Desktop alternative for Apple Silicon',

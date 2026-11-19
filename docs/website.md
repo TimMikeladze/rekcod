@@ -7,7 +7,7 @@ source: the landing page quotes it, the reference page renders all of it.
 
 | Path | What it is |
 | --- | --- |
-| `/` | Landing page: hero, split demo, one section per capability, each showing a README block |
+| `/` | Landing page: hero with an architecture drawing, split demo, one section per capability, each showing a README block |
 | `/docs/` | README.md in full, with a sticky contents column and the Mermaid diagrams |
 | `/llms.txt`, `/AGENTS.md`, `/index.md` | The landing page's model as Markdown, for agents |
 | `/sitemap.xml`, `/robots.txt` | Generated from the same model |
@@ -27,6 +27,8 @@ README fenced block or table, resolved at build time by `website/src/lib/readme.
 - `snippet("dev.rekcod.local:")`: the block containing that line
 - `table("Key")`: the table whose first header cell is that text
 - figures: a regex over a captured block, never retyped
+- `diagram("Local Docker architecture")`: node and edge labels of that Mermaid block, which the
+  hero drawing (`components/HeroDiagram.astro`) uses. The Apple Silicon strip under it is copy.
 
 A reference that matches no block, or more than one, throws and fails the build. Captured
 output in the README comes from real runs; the benchmark block names the Mac it ran on.

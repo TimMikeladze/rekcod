@@ -1,9 +1,10 @@
 ---
 import Base from '../layouts/Base.astro';
 import Icon from '../components/Icon.astro';
-import { load } from '../lib/landing';
+import HeroDiagram from '../components/HeroDiagram.astro';
+import { load, repository } from '../lib/landing';
 import type { Artifact } from '../lib/readme';
-import { block, code, commandIndex, consoleHtml, inline } from '../lib/render';
+import { block, code, commandIndex, consoleHtml, escape, inline } from '../lib/render';
 
 const { landing } = load();
 const l = landing;
@@ -18,6 +19,8 @@ async function artifact(a: Artifact) {
 }
 
 const lede = await inline(l.lede);
+// Long URLs wrap after a slash, not mid-word.
+const installHtml = escape(l.install).replace(/\//g, '/<wbr>');
 const split = l.split.terminal.block.value;
 const diffAt = commandIndex(split, 'rekcod sandbox diff "$id"');
 const splitLeft = consoleHtml(split, 0, diffAt);
@@ -40,35 +43,46 @@ const showcaseText = await inline(l.showcase.text);
 <Base title={l.title} description={l.description} path="/" markdown="/index.md">
   <main id="main">
     <section class="hero" aria-labelledby="hero-title">
-      <span class="mark-tile"><Icon name="mark" size={30} /></span>
-      <h1 id="hero-title">{l.h1}</h1>
-      <p class="lede" set:html={lede} />
-      <div class="audience">
-        <input type="radio" name="audience" id="for-humans" checked />
-        <input type="radio" name="audience" id="for-agents" />
-        <div class="audience-tabs">
-          <label for="for-humans">For humans</label>
-          <label for="for-agents">For agents</label>
-        </div>
-        <div class="audience-panel" data-panel="humans">
-          <div class="pill">
-            <span class="ps" aria-hidden="true">$</span><code>{l.install}</code>
-            <button type="button" class="pill-copy" data-copy={l.install} aria-label="Copy install command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
+      <div class="hero-grid shell">
+        <div class="hero-copy">
+          <a class="release" href={`${repository}/releases`}><span class="release-dot" aria-hidden="true"></span>v{l.version} · macOS on Apple Silicon · MIT<span class="ext" aria-hidden="true">↗</span></a>
+          <h1 id="hero-title">{l.h1}</h1>
+          <p class="lede" set:html={lede} />
+          <div class="audience">
+            <input type="radio" name="audience" id="for-humans" checked />
+            <input type="radio" name="audience" id="for-agents" />
+            <div class="audience-tabs">
+              <label for="for-humans">For humans</label>
+              <label for="for-agents">For agents</label>
+            </div>
+            <div class="audience-panel" data-panel="humans">
+              <div class="pill">
+                <span class="ps" aria-hidden="true">$</span><code set:html={installHtml} />
+                <button type="button" class="pill-copy" data-copy={l.install} aria-label="Copy install command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
+              </div>
+            </div>
+            <div class="audience-panel" data-panel="agents">
+              <div class="pill">
+                <span class="ps" aria-hidden="true">$</span><code>{l.agentCommand}</code>
+                <button type="button" class="pill-copy" data-copy={l.agentCommand} aria-label="Copy llms.txt command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
+              </div>
+              <p class="agent-links">
+                <a href="/llms.txt">llms.txt</a>
+                <a href="/AGENTS.md">AGENTS.md</a>
+                <a href="/index.md" data-copy-url="/index.md">Copy page as Markdown</a>
+              </p>
+            </div>
+          </div>
+          <div class="hero-buttons">
+            <a class="control control--solid pill-button" href="/docs/"><Icon name="book" />Documentation</a>
+            <a class="control pill-button" href={repository}><Icon name="github" />Source</a>
           </div>
         </div>
-        <div class="audience-panel" data-panel="agents">
-          <div class="pill">
-            <span class="ps" aria-hidden="true">$</span><code>{l.agentCommand}</code>
-            <button type="button" class="pill-copy" data-copy={l.agentCommand} aria-label="Copy llms.txt command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
-          </div>
-          <p class="agent-links">
-            <a href="/llms.txt">llms.txt</a>
-            <a href="/AGENTS.md">AGENTS.md</a>
-            <a href="/index.md" data-copy-url="/index.md">Copy page as Markdown</a>
-          </p>
-        </div>
+        <figure class="hero-figure">
+          <HeroDiagram d={l.diagram} />
+          <figcaption>{l.diagram.caption} <a href={l.diagram.href}>How it works</a></figcaption>
+        </figure>
       </div>
-      <p class="version">Currently v{l.version} for macOS on Apple Silicon. Pre-1.0, MIT licensed.</p>
     </section>
 
     <section class="split shell" aria-label={l.split.title}>
@@ -175,7 +189,7 @@ const showcaseText = await inline(l.showcase.text);
       <div class="today-actions">
         <a class="control control--solid pill-button" href="/docs/#run-your-first-container"><Icon name="book" />Documentation</a>
         <div class="pill pill--outline">
-          <span class="ps" aria-hidden="true">$</span><code>{l.install}</code>
+          <span class="ps" aria-hidden="true">$</span><code set:html={installHtml} />
           <button type="button" class="pill-copy" data-copy={l.install} aria-label="Copy install command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
         </div>
       </div>

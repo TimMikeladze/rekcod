@@ -112,6 +112,19 @@ export class Readme {
     return match[1];
   }
 
+  /**
+   * Node and edge labels of the Mermaid block with this accTitle, so a drawing of the
+   * diagram uses the README's own names.
+   */
+  diagram(accTitle: string): { nodes: Record<string, string>; edges: Record<string, string> } {
+    const block = this.one(this.blocks.filter((b) => b.lang === 'mermaid' && b.value.includes(`accTitle: ${accTitle}`)), `diagram("${accTitle}")`);
+    const nodes: Record<string, string> = {};
+    const edges: Record<string, string> = {};
+    for (const [, id, label] of block.value.matchAll(/(\w+)\["([^"]+)"\]/g)) nodes[id] = label;
+    for (const [, from, label, to] of block.value.matchAll(/(\w+)(?:\["[^"]*"\])?\s*-->\|([^|]+)\|\s*(\w+)/g)) edges[`${from}-${to}`] = label;
+    return { nodes, edges };
+  }
+
   hasSection(slug: string): boolean {
     return this.slugs.has(slug);
   }

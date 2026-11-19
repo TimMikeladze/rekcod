@@ -128,12 +128,13 @@ describe('built pages', () => {
     expect(footer).toContain('https://discord.com/users/linesofcode');
   });
 
-  test('the hero is centred and offers both audiences', () => {
+  test('the hero offers both audiences and draws the architecture', () => {
+    expect(pages.landing).toContain('<svg class="arch"');
     const html = pages.landing;
     expect(html).toContain('data-panel="humans"');
     expect(html).toContain('data-panel="agents"');
     expect(html).toContain(`data-copy="${landing.install.replace(/&/g, '&amp;')}"`);
-    const agents = html.slice(html.indexOf('data-panel="agents"'), html.indexOf('class="version"'));
+    const agents = html.slice(html.indexOf('data-panel="agents"'), html.indexOf('class="hero-buttons"'));
     for (const [, href] of agents.matchAll(/href="([^"]+)"/g)) expect(existsSync(path.join(dist, href))).toBe(true);
   });
 });

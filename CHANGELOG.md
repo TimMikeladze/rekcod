@@ -232,6 +232,8 @@ release notes, and refuses to publish without one.
   but kept the `orphan_file` feature and called the disk clean; the kernel then gave inode 12
   to a new file, and the next unclean stop failed with e2fsck exit 4. `--repair` now turns
   `orphan_file` off when its inode is free.
+- `rekcod snap rm` deletes the snapshot's `rekcod-snap-done.*` marker volume too. Markers an
+  earlier `rm` left behind go with the next `snap rm NAME` of the same name.
 - `[http] timeout` in `rekcod.toml` is accepted.
 - `rekcod import --help` prints rekcod's help instead of booting the VM.
 - `--memory` is checked before it's saved, and a failed boot puts the old settings back.

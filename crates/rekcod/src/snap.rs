@@ -270,6 +270,9 @@ pub struct Snapshot {
     /// The live generation; empty for a snapshot from before generations.
     #[serde(skip)]
     pub generation: String,
+    /// The live generation's marker volumes, which `rm` deletes with its data.
+    #[serde(skip)]
+    pub markers: Vec<String>,
     #[serde(skip)]
     pub commit: u64,
 }
@@ -322,7 +325,17 @@ pub fn parse(json: &[u8]) -> Vec<Snapshot> {
             }
         }
         if let Some((generation, g)) = live.and_then(|k| gens.into_iter().find(|(gk, _)| *gk == k)) {
-            out.push(Snapshot { project, name, created: g.created, volumes: g.volumes, stale, raw: g.raw, generation, commit: g.commit });
+            out.push(Snapshot {
+                project,
+                name,
+                created: g.created,
+                volumes: g.volumes,
+                stale,
+                raw: g.raw,
+                generation,
+                commit: g.commit,
+                markers: g.markers,
+            });
         } else if !stale.is_empty() {
             // Only unfinished saves: nothing to restore, but `rm` can clean them up.
             out.push(Snapshot {
@@ -334,6 +347,7 @@ pub fn parse(json: &[u8]) -> Vec<Snapshot> {
                 raw: None,
                 generation: String::new(),
                 commit: 0,
+                markers: Vec::new(),
             });
         }
     }
@@ -1049,12 +1063,17 @@ pub fn list(paths: &Paths, explicit_project: Option<&str>, all: bool, json: bool
 }
 
 pub fn remove(paths: &Paths, explicit_project: Option<&str>, name: &str) -> Result<()> {
-    let d = Cli(paths);
-    let project = project(&d, explicit_project)?;
+    remove_with(&Cli(paths), explicit_project, name)
+}
+
+/// Deletes every volume of the snapshot: its data, its marker, and any other generation.
+fn remove_with(d: &dyn Engine, explicit_project: Option<&str>, name: &str) -> Result<()> {
+    let project = project(d, explicit_project)?;
     let name = normalize_name(name);
-    let _lock = lock(&d, &project, &name)?;
-    let Some(snap) = find(&d, &project, &name)? else { bail!("no snapshot `{name}` for {project}") };
+    let _lock = lock(d, &project, &name)?;
+    let Some(snap) = find(d, &project, &name)? else { bail!("no snapshot `{name}` for {project}") };
     let mut vols: Vec<&str> = snap.volumes.values().map(String::as_str).collect();
+    vols.extend(snap.markers.iter().map(String::as_str));
     vols.extend(snap.stale.iter().map(String::as_str));
     d.docker(&[&["volume", "rm"][..], &vols].concat())?;
     println!("removed `{name}` for {project}");
@@ -1474,6 +1493,18 @@ mod tests {
         let s = find(&d, "shop", "seeded").unwrap().unwrap();
         assert_eq!((s.commit, s.created, s.stale.len()), (2, 1000, 0));
         assert_eq!(d.names().len(), 3, "one generation and its marker: {:?}", d.names());
+    }
+
+    #[test]
+    fn rm_deletes_the_marker_too() {
+        let _serial = serial();
+        let d = Fake::new(1000);
+        d.volume("shop_pg", "shop", b"v1");
+        save_with(&d, Some("shop"), Some("seeded"), LOCAL).unwrap();
+        save_with(&d, Some("shop"), Some("seeded"), LOCAL).unwrap();
+        assert!(d.names().iter().any(|n| n.starts_with("rekcod-snap-done.")), "{:?}", d.names());
+        remove_with(&d, Some("shop"), "seeded").unwrap();
+        assert_eq!(d.names(), ["shop_pg"]);
     }
 
     #[test]

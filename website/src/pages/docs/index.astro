@@ -1,0 +1,88 @@
+---
+import Base from '../../layouts/Base.astro';
+import { compileMarkdown, getDocuments, repository } from '../../lib/content';
+
+const readme = (await getDocuments()).find((doc) => doc.file === 'README.md')!;
+const { html, headings } = await compileMarkdown(readme.markdown, readme.file, new Set(['README.md']));
+const toc = headings.filter((h) => h.depth === 2 || h.depth === 3);
+---
+<Base title="rekcod docs" description={readme.description} path="/docs/">
+  <main id="main" class="docs shell">
+    <nav class="toc" aria-label="Contents">
+      <p>Contents</p>
+      <ul>{toc.map((h) => <li class={`h${h.depth}`}><a href={`#${h.id}`}>{h.text}</a></li>)}</ul>
+    </nav>
+    <div class="doc">
+      <details class="toc-mobile">
+        <summary>Contents</summary>
+        <nav class="toc" aria-label="Contents">
+          <ul>{toc.filter((h) => h.depth === 2).map((h) => <li class="h2"><a href={`#${h.id}`}>{h.text}</a></li>)}</ul>
+        </nav>
+      </details>
+      <article class="prose" set:html={html} />
+      <p class="doc-meta">
+        <a href={`${repository}/blob/main/README.md`}>This page is README.md</a>
+        <a href={`${repository}/edit/main/README.md`}>Edit it on GitHub</a>
+      </p>
+    </div>
+  </main>
+</Base>
+
+<script>
+  // Mermaid draws the README's diagrams with the page's tokens and draws them again when
+  // the theme changes. The source stays in data-source.
+  const nodes = [...document.querySelectorAll<HTMLPreElement>('.prose pre.mermaid')];
+  if (nodes.length) {
+    for (const node of nodes) node.dataset.source = node.textContent ?? '';
+    const { default: mermaid } = await import('mermaid');
+    const draw = async () => {
+      // Mermaid can't parse oklch(), so each token goes through a canvas pixel to hex.
+      const css = getComputedStyle(document.documentElement);
+      const ctx = document.createElement('canvas').getContext('2d', { willReadFrequently: true })!;
+      const v = (name: string) => {
+        const value = css.getPropertyValue(name).trim();
+        if (!value.startsWith('oklch')) return value;
+        ctx.clearRect(0, 0, 1, 1);
+        ctx.fillStyle = value;
+        ctx.fillRect(0, 0, 1, 1);
+        const [r, g, b] = ctx.getImageData(0, 0, 1, 1).data;
+        return '#' + [r, g, b].map((n) => n.toString(16).padStart(2, '0')).join('');
+      };
+      mermaid.initialize({
+        startOnLoad: false,
+        securityLevel: 'strict',
+        theme: 'base',
+        fontFamily: v('--sans'),
+        themeVariables: {
+          background: v('--paper'),
+          primaryColor: v('--raise'),
+          primaryTextColor: v('--ink'),
+          primaryBorderColor: v('--soft'),
+          secondaryColor: v('--band'),
+          tertiaryColor: v('--band'),
+          lineColor: v('--soft'),
+          textColor: v('--body'),
+          clusterBkg: v('--band'),
+          clusterBorder: v('--soft'),
+          actorBkg: v('--raise'),
+          actorBorder: v('--soft'),
+          actorTextColor: v('--ink'),
+          signalColor: v('--body'),
+          signalTextColor: v('--body'),
+          noteBkgColor: v('--band'),
+          noteTextColor: v('--body'),
+        },
+        flowchart: { htmlLabels: false, useMaxWidth: true },
+        sequence: { useMaxWidth: true },
+      });
+      for (const node of nodes) {
+        node.removeAttribute('data-processed');
+        node.textContent = node.dataset.source ?? '';
+      }
+      await mermaid.run({ nodes });
+    };
+    await draw();
+    document.addEventListener('rekcod-theme', draw);
+    matchMedia('(prefers-color-scheme: dark)').addEventListener('change', draw);
+  }
+</script>

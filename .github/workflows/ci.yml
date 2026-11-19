@@ -121,6 +121,7 @@ jobs:
       - run: bun test
       - run: bun run typecheck
       - run: bun run build
+      - run: bun run check:site
       - run: bun run check:links
 
   guest:

@@ -23,6 +23,8 @@ class Page(HTMLParser):
 
 root = Path(__file__).resolve().parent.parent / "dist"
 pages = {str(path.relative_to(root)): Page(path) for path in root.rglob("*.html")}
+# Built files that aren't pages (/llms.txt, /og.png): a link to one needs the file.
+files = {str(path.relative_to(root)) for path in root.rglob("*") if path.is_file()}
 if not pages:
     sys.exit("No built pages. Run bun run build first.")
 
@@ -33,7 +35,11 @@ for name, page in pages.items():
         link = urlsplit(href)
         if link.scheme or link.netloc:
             continue
-        target = f"{unquote(link.path).lstrip('/')}index.html" if link.path else name
+        path = unquote(link.path).lstrip("/")
+        if link.path and not link.path.endswith("/") and path in files:
+            checked += 1
+            continue
+        target = f"{path}index.html" if link.path else name
         if target not in pages:
             errors.append(f"{name}: missing page {href}")
             continue

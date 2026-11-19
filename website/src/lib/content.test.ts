@@ -1,29 +1,14 @@
 import { describe, expect, test } from 'bun:test';
-import { readFile } from 'node:fs/promises';
 import {
   compileMarkdown,
   getDocuments,
-  landingParts,
   resolveLink,
   routeFor,
 } from './content';
 
 describe('repository Markdown', () => {
-  test('landing content follows the README without separate website copy', async () => {
-    const markdown = await readFile(new URL('../../../README.md', import.meta.url), 'utf8');
-    const parts = landingParts(markdown);
-    expect(parts.title).toBe('rekcod');
-    expect(parts.intro).toContain('Docker Desktop alternative');
-    expect(parts.body).toContain('rekcod start');
-    expect(parts.intro + parts.body).toContain('[MIT](LICENSE)');
-    const edited = landingParts('# Changed name\n\nChanged introduction.\n\n## Install now\n\n```sh\nnew-command\n```');
-    expect(edited.title).toBe('Changed name');
-    expect(edited.intro).toContain('Changed introduction.');
-    expect(edited.body).toContain('new-command');
-  });
-
   test('maps readmes and nested documents to stable routes', () => {
-    expect(routeFor('README.md')).toBe('/');
+    expect(routeFor('README.md')).toBe('/docs/');
     expect(routeFor('docs/README.md')).toBe('/docs/');
     expect(routeFor('docs/getting-started.md')).toBe('/docs/getting-started/');
     expect(routeFor('examples/github-runner/README.md')).toBe('/docs/examples/github-runner/');
@@ -32,7 +17,8 @@ describe('repository Markdown', () => {
 
   test('resolves relative documents, fragments and source files', () => {
     const files = new Set(['README.md', 'docs/README.md', 'docs/getting-started.md']);
-    expect(resolveLink('../README.md#how-it-works', 'docs/getting-started.md', files)).toBe('/#how-it-works');
+    expect(resolveLink('../README.md#how-it-works', 'docs/getting-started.md', files)).toBe('/docs/#how-it-works');
+    expect(resolveLink('/docs/#how-it-works', 'README.md', files)).toBe('/docs/#how-it-works');
     expect(resolveLink('getting-started.md', 'docs/README.md', files)).toBe('/docs/getting-started/');
     expect(resolveLink('../scripts/install.sh', 'docs/getting-started.md', files)).toBe('https://github.com/TimMikeladze/rekcod/blob/main/scripts/install.sh');
     expect(resolveLink('#install', 'docs/getting-started.md', files)).toBe('#install');
@@ -54,7 +40,7 @@ describe('repository Markdown', () => {
   test('uses only the root README as website content', async () => {
     const documents = await getDocuments();
     expect(documents.map((doc) => doc.file)).toEqual(['README.md']);
-    expect(documents[0].url).toBe('/');
+    expect(documents[0].url).toBe('/docs/');
   });
 
   test('preserves Mermaid source for rendering and escapes embedded HTML', async () => {

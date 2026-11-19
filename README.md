@@ -153,6 +153,17 @@ installs and build output stay inside Linux, while your source remains editable 
 Mac. The volumes survive container recreation. Their contents are only visible inside
 the VM, so Mac tools that need those dependencies need their own installation.
 
+In a project directory named `shop`, `/app` is the Mac directory over virtio-fs and the
+two labelled paths are ext4 volumes, `rekcod-local_shop_web_app-node_modules` and
+`rekcod-local_shop_web_app-.next`:
+
+```console
+$ rekcod exec shop-web-1 sh -c 'mount | grep /app'
+mac on /app type virtiofs (rw,relatime)
+/dev/vdb on /app/.next type ext4 (rw,noatime)
+/dev/vdb on /app/node_modules type ext4 (rw,noatime)
+```
+
 ## Restore your database to a known state
 
 Save a Compose project's named volumes after migrating and seeding. You can return to
@@ -165,7 +176,15 @@ rekcod snap restore seeded
 
 Run these from the Compose project directory. Saving pauses its running containers while
 copying the volumes, then unpauses them. Restoring stops the running containers, copies
-the saved data back and restarts them.
+the saved data back and restarts them. For a project `db` with one Postgres volume:
+
+```console
+$ rekcod snap save seeded
+saved `seeded` for db: 1 volume(s), 1 container(s) paused, 0.3s
+$ rekcod snap restore seeded
+saved `pre-restore` for db: 1 volume(s), 0 container(s) paused, 0.2s
+restored `seeded` for db: 1 volume(s), 1 container(s) restarted, 0.6s; the previous state is snapshot `pre-restore`
+```
 
 You can also name snapshots after your current git branch:
 
@@ -271,10 +290,22 @@ rekcod sandbox exec "$sandbox_id" -- bun test
 rekcod sandbox diff "$sandbox_id"
 ```
 
-`diff` ends with the line that applies what it showed:
+`diff` ends with the line that applies what it showed. Here an agent's one-line fix to a
+Python file:
 
-```
-rekcod: `rekcod sandbox apply ID --reviewed REVIEW` writes exactly this; without --reviewed it takes the workspace as it is then
+```console
+$ id=$(rekcod sandbox create --image alpine:3.24)
+rekcod: sandbox uqy55l2j ready in 14.2s
+$ rekcod sandbox exec "$id" -- sed -i 's/a - b/a + b/' calc.py
+$ rekcod sandbox diff "$id"
+diff --git a/calc.py b/calc.py
+--- a/calc.py
++++ b/calc.py
+@@ -1,2 +1,2 @@
+ def add(a, b):
+-    return a - b
++    return a + b
+rekcod: `rekcod sandbox apply uqy55l2j --reviewed 236ecbe4c941f77b31d44754b51a3279` writes exactly this; without --reviewed it takes the workspace as it is then
 ```
 
 When you've reviewed the diff, apply that version and remove the sandbox:
@@ -1876,6 +1907,26 @@ without replacing the local engine's images and volumes. Server app instances an
 agent sandboxes have their own disks, so their lifecycle is independent of the main
 Docker VM. The controller's encryption key is stored outside `fleet.db` and must
 accompany a database restore.
+
+### Benchmarks
+
+The `bench/` scripts time the paths above. On an Apple M5 Pro with macOS 27.2.1, rekcod
+0.3.0, dockerd 29.9.3 and a VM of 6 CPUs and 8 GiB:
+
+```console
+$ rekcod start --no-switch
+rekcod ready in 1.0s · dockerd 29.9.3
+docker context `rekcod` is available (not switched: --no-switch)
+$ python3 bench/inotify_rtt.py --context rekcod -n 50
+inotify round trip over 50/50: p50 14.4 ms, p90 15.2 ms, min 6.5 ms, mean 14.2 ms
+$ python3 bench/tcp_rtt.py --context rekcod
+rekcod         mac p50   92.1 µs p99  120.5 µs | in-container p50  21.1 µs | mac 8 conns    38243 req/s
+```
+
+The start booted a stopped VM whose guest image was already downloaded. The inotify round
+trip is an edit on the Mac, the container seeing it and writing a file back, so it bounds the
+one-way delay from above. The TCP figures are a 64-byte round trip through a published port
+from the Mac, and over loopback inside the container; `req/s` is 8 connections from the Mac.
 
 ## Limitations
 

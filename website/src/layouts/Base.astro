@@ -1,101 +1,109 @@
 ---
-import '@fontsource-variable/geist';
-import '@fontsource-variable/geist-mono';
 import '../styles/global.css';
-import Arrow from '../components/Arrow.astro';
-import { repository } from '../lib/content';
+import Icon from '../components/Icon.astro';
+import { footerColumns, href, links, load, origin, url } from '../lib/landing';
 
-interface Props { title: string; description: string; source?: string; noindex?: boolean }
-const { title, description, source = 'README.md', noindex = false } = Astro.props;
-const canonical = new URL(Astro.url.pathname, Astro.site);
+interface Props { title: string; description: string; path: string; markdown?: string; noindex?: boolean }
+const { title, description, path, markdown, noindex = false } = Astro.props;
+const { landing } = load();
+const canonical = url(path);
+const ogImage = url('/og.png');
+const external = (h: string) => /^https?:/.test(h);
+const header = links.filter((l) => l.where.includes('header'));
+const footerIcons = links.filter((l) => l.where.includes('footer') && l.icon !== 'text');
+const jsonLd = JSON.stringify({
+  '@context': 'https://schema.org',
+  '@type': 'SoftwareApplication',
+  name: landing.name,
+  description: landing.description,
+  url: url('/'),
+  applicationCategory: 'DeveloperApplication',
+  operatingSystem: 'macOS (Apple Silicon)',
+  softwareVersion: landing.version,
+  offers: { '@type': 'Offer', price: '0', priceCurrency: 'USD' },
+  license: 'https://opensource.org/licenses/MIT',
+  codeRepository: href({ href: 'repo' }),
+  author: { '@type': 'Organization', name: 'linesofcode', url: 'https://linesofcode.dev' },
+}).replace(/</g, '\\u003c');
+const year = landing.released.slice(0, 4);
 ---
 <!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
+    <script is:inline src="/theme.js"></script>
     <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>{title}</title>
     <meta name="description" content={description} />
-    <meta name="theme-color" content="#ffffff" />
+    <link rel="canonical" href={canonical} />
+    <meta name="theme-color" content="#0b0b0b" media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content="#fcfcfc" media="(prefers-color-scheme: light)" />
     <meta property="og:type" content="website" />
+    <meta property="og:site_name" content="rekcod" />
     <meta property="og:title" content={title} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical} />
-    <meta name="twitter:card" content="summary" />
+    <meta property="og:image" content={ogImage} />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:alt" content={`rekcod: ${landing.h1}`} />
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content={title} />
+    <meta name="twitter:description" content={description} />
+    <meta name="twitter:image" content={ogImage} />
     {noindex && <meta name="robots" content="noindex" />}
-    <link rel="canonical" href={canonical} />
     <link rel="icon" type="image/svg+xml" href="/logo.svg" />
     <link rel="sitemap" href="/sitemap.xml" />
-    <title>{title}</title>
+    {markdown && <link rel="alternate" type="text/markdown" href={markdown} />}
+    <script is:inline type="application/ld+json" set:html={jsonLd} />
+    <script is:inline defer src="/site.js"></script>
   </head>
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
     <header class="site-header">
-      <a class="wordmark" href="/" aria-label="rekcod home"><img src="/logo.svg" alt="" width="32" height="32" /></a>
-      <nav class="header-nav" aria-label="Main navigation">
-        <a href="/#run-your-first-container">Install</a>
-        <a href={repository}>GitHub <Arrow /></a>
-      </nav>
+      <div class="bar">
+        <a class="brand" href="/">rekcod</a>
+        <nav class="nav" aria-label="Main">
+          {header.filter((l) => l.icon === 'text').map((l) => (
+            <a href={href(l)} aria-current={l.href === path ? 'page' : undefined}>{l.label}{external(href(l)) && <span class="ext" aria-hidden="true">↗</span>}</a>
+          ))}
+        </nav>
+        <div class="icon-links">
+          {header.filter((l) => l.icon !== 'text').map((l) => (
+            <a class="icon-link" href={href(l)}><Icon name={l.icon as any} size={18} /><span class="sr-only">{l.label}</span></a>
+          ))}
+          <button class="theme-toggle" type="button" data-theme-toggle aria-label="Theme: system. Click to change">
+            <Icon name="monitor" class="t-system" /><Icon name="moon" class="t-dark" /><Icon name="sun" class="t-light" />
+          </button>
+        </div>
+      </div>
     </header>
     <slot />
     <footer class="site-footer">
-      <a href="/">rekcod</a>
-      <div>
-        <a href={`${repository}/blob/main/${source}`}>View source <Arrow /></a>
-        <a href={`${repository}/blob/main/LICENSE`}>License</a>
+      <div class="shell">
+        <p class="credit">rekcod is built and maintained by <a href="https://linesofcode.dev">linesofcode</a> and released under the MIT license. Version {landing.version}, {origin.replace('https://', '')}.</p>
+        <div class="footer-grid">
+          {footerColumns.map((column) => (
+            <div class="footer-col">
+              <h2>{column.title}</h2>
+              <ul>{column.links.map((l) => <li><a href={l.href}>{l.label}{external(l.href) && <span class="ext" aria-hidden="true">↗</span>}</a></li>)}</ul>
+            </div>
+          ))}
+        </div>
+        <div class="footer-icons">
+          {footerIcons.map((l) => <a class="icon-link" href={href(l)}><Icon name={l.icon as any} size={18} /><span class="sr-only">{l.label}</span></a>)}
+        </div>
+        <div class="footer-bottom">
+          <span class="footer-mark"><span class="mark-tile mark-tile--small"><Icon name="mark" size={14} /></span>© {year} linesofcode</span>
+          <div class="theme-switch" role="group" aria-label="Theme">
+            <button type="button" data-set-theme="system" aria-pressed="true"><Icon name="monitor" size={14} /><span class="sr-only">System theme</span></button>
+            <button type="button" data-set-theme="light" aria-pressed="false"><Icon name="sun" size={14} /><span class="sr-only">Light theme</span></button>
+            <button type="button" data-set-theme="dark" aria-pressed="false"><Icon name="moon" size={14} /><span class="sr-only">Dark theme</span></button>
+          </div>
+        </div>
       </div>
     </footer>
     <div class="sr-only" role="status" aria-live="polite" id="copy-status"></div>
-    <script>
-      const diagrams = document.querySelectorAll<HTMLPreElement>('.prose pre.mermaid');
-      if (diagrams.length) {
-        const { default: mermaid } = await import('mermaid');
-        await document.fonts.ready;
-        mermaid.initialize({
-          startOnLoad: false,
-          securityLevel: 'strict',
-          theme: 'base',
-          fontFamily: 'Geist Variable, sans-serif',
-          themeVariables: {
-            primaryColor: '#f7f7f5',
-            primaryTextColor: '#20201e',
-            primaryBorderColor: '#b4b4ad',
-            lineColor: '#62625d',
-            secondaryColor: '#efefec',
-            tertiaryColor: '#ffffff',
-          },
-          flowchart: { htmlLabels: false, useMaxWidth: true },
-          sequence: { useMaxWidth: true },
-        });
-        await mermaid.run({ nodes: diagrams });
-        for (const svg of document.querySelectorAll<SVGSVGElement>('.mermaid > svg')) {
-          svg.style.minWidth = `${svg.viewBox.baseVal.width * 0.85}px`;
-        }
-      }
-
-      for (const pre of document.querySelectorAll<HTMLPreElement>('.prose pre:not(.mermaid)')) {
-        const button = document.createElement('button');
-        button.className = 'copy-code';
-        button.type = 'button';
-        button.textContent = 'Copy';
-        button.setAttribute('aria-label', 'Copy code');
-        button.addEventListener('click', async () => {
-          try {
-            await navigator.clipboard.writeText(pre.querySelector('code')?.textContent ?? '');
-            button.textContent = 'Copied';
-            document.querySelector('#copy-status')!.textContent = 'Code copied to clipboard.';
-            setTimeout(() => { button.textContent = 'Copy'; }, 2000);
-          } catch {
-            button.textContent = 'Select code';
-            const range = document.createRange();
-            range.selectNodeContents(pre.querySelector('code') ?? pre);
-            const selection = window.getSelection();
-            selection?.removeAllRanges();
-            selection?.addRange(range);
-            document.querySelector('#copy-status')!.textContent = 'Code selected. Use your keyboard to copy.';
-          }
-        });
-        pre.append(button);
-      }
-    </script>
   </body>
 </html>

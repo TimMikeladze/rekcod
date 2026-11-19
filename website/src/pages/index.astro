@@ -1,25 +1,195 @@
 ---
 import Base from '../layouts/Base.astro';
-import Arrow from '../components/Arrow.astro';
-import { compileMarkdown, getDocuments, landingParts } from '../lib/content';
+import Icon from '../components/Icon.astro';
+import { load } from '../lib/landing';
+import type { Artifact } from '../lib/readme';
+import { block, code, commandIndex, consoleHtml, inline } from '../lib/render';
 
-const documents = await getDocuments();
-const readme = documents.find((doc) => doc.file === 'README.md')!;
-const files = new Set(documents.map((doc) => doc.file));
-const parts = landingParts(readme.markdown);
-const intro = await compileMarkdown(parts.intro, readme.file, files);
-const body = await compileMarkdown(parts.body, readme.file, files);
+const { landing } = load();
+const l = landing;
+
+async function artifact(a: Artifact) {
+  if (a.kind === 'table') return { label: '', bar: '', html: await block(a.markdown), table: true };
+  if (a.kind === 'terminal') {
+    const start = commandIndex(a.block.value, a.command);
+    return { label: `$ ${a.command}`, bar: 'captured output', html: consoleHtml(a.block.value, start), table: false };
+  }
+  return { label: a.label, bar: '', html: await code(a.block), table: false, glyph: a.block.lang === 'sh' ? 'terminal' : 'file' };
+}
+
+const lede = await inline(l.lede);
+const split = l.split.terminal.block.value;
+const diffAt = commandIndex(split, 'rekcod sandbox diff "$id"');
+const splitLeft = consoleHtml(split, 0, diffAt);
+const splitRight = consoleHtml(split, diffAt + 1);
+const capabilities = await Promise.all(l.capabilities.map(async (c) => ({
+  ...c,
+  html: await inline(c.text),
+  aside: c.aside ? await inline(c.aside) : undefined,
+  artifacts: await Promise.all(c.show.map(artifact)),
+})));
+const principles = await Promise.all(l.principles.map(async (p) => ({ ...p, html: await inline(p.text) })));
+const tabs = await Promise.all(l.showcase.tabs.map(async (t) => ({ ...t, html: await code(t.snippet.block) })));
+const guides = await Promise.all(l.guides.map(async (g) => ({ ...g, html: await code(g.snippet.block), textHtml: await inline(g.text) })));
+const startText = await inline(l.start.text);
+const panels = await Promise.all(l.start.panels.map(artifact));
+const measuredText = await inline(l.measured.text);
+const measured = consoleHtml(l.measured.terminal.block.value);
+const showcaseText = await inline(l.showcase.text);
 ---
-<Base title={`${parts.title} — ${readme.description.split('.')[0]}`} description={readme.description}>
-  <main id="main" class="landing">
+<Base title={l.title} description={l.description} path="/" markdown="/index.md">
+  <main id="main">
     <section class="hero" aria-labelledby="hero-title">
-      <h1 id="hero-title">{parts.title}</h1>
-      <div class="prose hero-intro" set:html={intro.html} />
-      <div class="hero-actions">
-        <a class="button" href="#run-your-first-container">Get started <Arrow direction="right" /></a>
-        <a class="text-link" href="#how-it-works">How it works <Arrow direction="right" /></a>
+      <span class="mark-tile"><Icon name="mark" size={30} /></span>
+      <h1 id="hero-title">{l.h1}</h1>
+      <p class="lede" set:html={lede} />
+      <div class="audience">
+        <input type="radio" name="audience" id="for-humans" checked />
+        <input type="radio" name="audience" id="for-agents" />
+        <div class="audience-tabs">
+          <label for="for-humans">For humans</label>
+          <label for="for-agents">For agents</label>
+        </div>
+        <div class="audience-panel" data-panel="humans">
+          <div class="pill">
+            <span class="ps" aria-hidden="true">$</span><code>{l.install}</code>
+            <button type="button" class="pill-copy" data-copy={l.install} aria-label="Copy install command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
+          </div>
+        </div>
+        <div class="audience-panel" data-panel="agents">
+          <div class="pill">
+            <span class="ps" aria-hidden="true">$</span><code>{l.agentCommand}</code>
+            <button type="button" class="pill-copy" data-copy={l.agentCommand} aria-label="Copy llms.txt command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
+          </div>
+          <p class="agent-links">
+            <a href="/llms.txt">llms.txt</a>
+            <a href="/AGENTS.md">AGENTS.md</a>
+            <a href="/index.md" data-copy-url="/index.md">Copy page as Markdown</a>
+          </p>
+        </div>
+      </div>
+      <p class="version">Currently v{l.version} for macOS on Apple Silicon. Pre-1.0, MIT licensed.</p>
+    </section>
+
+    <section class="split shell" aria-label={l.split.title}>
+      <div class="frame">
+        <div class="frame-bar"><Icon name="bot" size={14} /><span class="mono">agent · sandbox exec</span></div>
+        <div class="frame-body" set:html={splitLeft} />
+      </div>
+      <div class="frame">
+        <div class="frame-bar"><Icon name="terminal" size={14} /><span class="mono">$ rekcod sandbox diff "$id"</span><span class="chip">captured output</span></div>
+        <div class="frame-body" set:html={splitRight} />
+      </div>
+      <p class="split-caption"><a href={l.split.href}>{l.split.title}</a>: the agent works on a copy in its own VM, and <code>apply --reviewed</code> writes the copy that diff froze.</p>
+    </section>
+
+    <section class="band ecosystem" aria-labelledby="ecosystem-title">
+      <div class="shell center">
+        <h2 id="ecosystem-title">{l.ecosystem.title}</h2>
+        <p class="band-lede">{l.ecosystem.text}</p>
+        <ul class="brands">
+          {l.ecosystem.brands.map((b) => <li title={b.label}><Icon name={b.name} size={40} color /><span class="sr-only">{b.label}</span></li>)}
+        </ul>
       </div>
     </section>
-    <article class="prose readme" aria-label="README" set:html={body.html} />
+
+    <section class="principles shell" aria-label="Principles">
+      {principles.map((p) => (
+        <div><h2>{p.title}</h2><p set:html={p.html} /></div>
+      ))}
+    </section>
+
+    <section class="showcase shell" aria-labelledby="showcase-title">
+      <div class="showcase-copy">
+        <h2 id="showcase-title">{l.showcase.title}</h2>
+        <p set:html={showcaseText} />
+        <a class="control control--solid pill-button" href="/docs/"><Icon name="book" />Visit documentation</a>
+        <p class="supports-caption">Works with</p>
+        <div class="avatars">
+          {l.showcase.supports.map((b) => <span class="avatar"><Icon name={b} size={18} /></span>)}
+          <span class="more">+ Compose, Bun, Python and more</span>
+        </div>
+      </div>
+      <div class="tabs">
+        {tabs.map((_, i) => <input type="radio" name="showcase" id={`tab-${i}`} checked={i === 0} />)}
+        <div class="tab-row" role="presentation">
+          {tabs.map((t, i) => <label for={`tab-${i}`}>{t.label}</label>)}
+        </div>
+        {tabs.map((t, i) => (
+          <div class="tab-panel frame" data-tab={i}>
+            <div class="frame-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span><span class="mono center-label">{t.snippet.label}</span><button type="button" class="bar-copy" data-copy={t.snippet.block.value} aria-label={`Copy ${t.label} example`}><Icon name="copy" size={14} class="i-copy" /><Icon name="check" size={14} class="i-check" /></button></div>
+            <div class="frame-body fade" set:html={t.html} />
+          </div>
+        ))}
+        <div class="pager" aria-hidden="true">{tabs.map((_, i) => <i data-dot={i}></i>)}</div>
+      </div>
+    </section>
+
+    {capabilities.map((c) => (
+      <>
+        <section class="capability shell" id={c.id} aria-labelledby={`${c.id}-title`}>
+          <h2 id={`${c.id}-title`}>{c.title}</h2>
+          <p class="explain" set:html={c.html} />
+          <div class:list={['artifacts', { pair: c.artifacts.length > 1 && !c.artifacts.some((a) => a.table) }]}>
+            {c.artifacts.map((a) => a.table ? (
+              <div class="table-wrap" set:html={a.html} />
+            ) : (
+              <div class="frame">
+                <div class="frame-bar"><Icon name={a.bar ? 'terminal' : (a as any).glyph ?? 'file'} size={14} /><span class="mono">{a.label}</span>{a.bar && <span class="chip">{a.bar}</span>}</div>
+                <div class="frame-body" set:html={a.html} />
+              </div>
+            ))}
+          </div>
+        </section>
+        {c.aside && <p class="aside shell" set:html={c.aside} />}
+      </>
+    ))}
+
+    <section class="capability shell measured" id={l.measured.id} aria-labelledby="benchmarks-title">
+      <h2 id="benchmarks-title">{l.measured.title}</h2>
+      <p class="explain" set:html={measuredText} />
+      <dl class="figures">
+        {l.figures.map((f) => <div><dt>{f.label}</dt><dd>{f.value}</dd></div>)}
+      </dl>
+      <div class="frame">
+        <div class="frame-bar"><Icon name="terminal" size={14} /><span class="mono">bench/</span><span class="chip">captured output</span></div>
+        <div class="frame-body" set:html={measured} />
+      </div>
+    </section>
+
+    <section class="capability shell" id={l.start.id} aria-labelledby="start-title">
+      <h2 id="start-title">{l.start.title}</h2>
+      <p class="explain" set:html={startText} />
+      <div class="artifacts pair">
+        {panels.map((p) => (
+          <div class="frame">
+            <div class="frame-bar"><Icon name="terminal" size={14} /><span class="mono">{p.label}</span></div>
+            <div class="frame-body" set:html={p.html} />
+          </div>
+        ))}
+      </div>
+    </section>
+
+    <section class="today shell" aria-labelledby="today-title">
+      <h2 id="today-title">{l.today.title}</h2>
+      <div class="today-actions">
+        <a class="control control--solid pill-button" href="/docs/#run-your-first-container"><Icon name="book" />Documentation</a>
+        <div class="pill pill--outline">
+          <span class="ps" aria-hidden="true">$</span><code>{l.install}</code>
+          <button type="button" class="pill-copy" data-copy={l.install} aria-label="Copy install command"><Icon name="copy" class="i-copy" /><Icon name="check" class="i-check" /></button>
+        </div>
+      </div>
+    </section>
+
+    <section class="guides shell" aria-labelledby="guides-title">
+      <h2 id="guides-title" class="sr-only">Guides</h2>
+      {guides.map((g) => (
+        <a class="guide" href={g.href}>
+          <span class="guide-title">{g.title}<Icon name="arrow" size={14} /></span>
+          <span class="guide-text" set:html={g.textHtml} />
+          <span class="guide-preview" set:html={g.html} />
+        </a>
+      ))}
+    </section>
   </main>
 </Base>

@@ -43,7 +43,7 @@ cargo test --workspace --locked
 cargo deny --locked check
 python3 scripts/check-docs.py
 (cd dashboard && npm ci && npm audit --omit=dev --audit-level=high && npm test && npm run typecheck && npm run lint && npm run test:e2e)
-(cd website && bun install --frozen-lockfile && bun test && bun run typecheck && bun run build && bun run check:links)
+(cd website && bun install --frozen-lockfile && bun test && bun run typecheck && bun run build && bun run check:site && bun run check:links)
 ```
 
 The host job also runs the VM-free scripts: `scripts/e2e-edges.py`, the stand-in-ssh path of

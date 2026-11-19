@@ -156,7 +156,7 @@ def main() -> int:
 
     vercel = ROOT / "website/astro.config.mjs"
     if vercel.exists():
-        for m in re.finditer(r"'/#([A-Za-z0-9_-]+)'", vercel.read_text()):
+        for m in re.finditer(r"'/docs/#([A-Za-z0-9_-]+)'", vercel.read_text()):
             if m.group(1) not in anchors:
                 errors.append(f"website/astro.config.mjs: redirect to #{m.group(1)}, which README.md doesn't have")
 

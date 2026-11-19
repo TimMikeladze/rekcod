@@ -36,13 +36,13 @@ export interface Heading {
 }
 
 export function routeFor(file: string): string {
-  if (file === 'README.md') return '/';
+  if (file === 'README.md') return '/docs/';
   const slug = file.replace(/^docs\//, '').replace(/(?:^|\/)README\.md$/, '').replace(/\.md$/i, '').toLowerCase();
   return `/docs/${slug ? `${slug}/` : ''}`;
 }
 
 export function resolveLink(href: string, file: string, files: Set<string>): string {
-  if (!href || /^(?:[a-z][a-z\d+.-]*:|#|\/\/)/i.test(href)) return href;
+  if (!href || /^(?:[a-z][a-z\d+.-]*:|#|\/)/i.test(href)) return href;
   const suffixIndex = href.search(/[?#]/);
   const pathname = suffixIndex < 0 ? href : href.slice(0, suffixIndex);
   const suffix = suffixIndex < 0 ? '' : href.slice(suffixIndex);
@@ -51,19 +51,6 @@ export function resolveLink(href: string, file: string, files: Set<string>): str
   const target = path.posix.normalize(path.posix.join(path.posix.dirname(file), decoded));
   if (files.has(target) && !/#L\d+(?:-L\d+)?$/.test(suffix)) return routeFor(target) + suffix;
   return `${repository}/blob/main/${target.split('/').map(encodeURIComponent).join('/')}${suffix}`;
-}
-
-export function landingParts(markdown: string): { title: string; intro: string; body: string } {
-  const tree = parser.parse(markdown) as MarkdownRoot;
-  const title = tree.children.find((node) => node.type === 'heading' && node.depth === 1);
-  const firstSection = tree.children.find((node) => node.type === 'heading' && node.depth === 2);
-  const start = title?.position?.end.offset ?? 0;
-  const end = firstSection?.position?.start.offset ?? markdown.length;
-  return {
-    title: title ? toString(title) : 'rekcod',
-    intro: markdown.slice(start, end).trim(),
-    body: markdown.slice(end).trim(),
-  };
 }
 
 export async function getDocuments(): Promise<Document[]> {
@@ -108,7 +95,8 @@ const renderer = unified()
       node.children = [{ type: 'text', value: toText(code, { whitespace: 'pre' }) }];
     });
   })
-  .use(rehypeShiki, { theme: 'github-light-high-contrast', fallbackLanguage: 'text' });
+    // Both themes as CSS variables; global.css picks one from data-theme or the OS.
+  .use(rehypeShiki, { themes: { light: 'github-light-default', dark: 'github-dark-default' }, defaultColor: false, fallbackLanguage: 'text' });
 
 export async function compileMarkdown(markdown: string, file: string, files: Set<string>) {
   const headings: Heading[] = [];

@@ -49,6 +49,8 @@ mod menubar;
 #[cfg(target_os = "macos")]
 mod netstack;
 #[cfg(target_os = "macos")]
+mod reset;
+#[cfg(target_os = "macos")]
 mod s3;
 #[cfg(target_os = "macos")]
 mod safefs;
@@ -216,6 +218,22 @@ enum Cmd {
         /// Keep ~/.rekcod (VM disks, volumes, snapshots, stopped agent sandboxes).
         #[arg(long)]
         keep_data: bool,
+        /// Don't ask first.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Give the local Docker engine a new, empty data disk: deletes every image, container,
+    /// volume, network and build cache. Local snapshots are copied across; settings, login
+    /// agents, docker contexts, agent sandboxes and golden disks stay. Stops the VM first
+    /// and boots it again if it ran. Exits non-zero when a step fails, and deletes nothing
+    /// when stopping the VM fails.
+    Reset {
+        /// Also delete agent sandboxes, golden disks and local snapshots.
+        #[arg(long)]
+        all: bool,
+        /// Leave the VM stopped afterwards.
+        #[arg(long)]
+        no_start: bool,
         /// Don't ask first.
         #[arg(long)]
         yes: bool,
@@ -1420,6 +1438,7 @@ fn main() {
         Cmd::Upgrade { rollback: true, .. } => lifecycle::rollback(),
         Cmd::Upgrade { check, .. } => lifecycle::upgrade(check),
         Cmd::Uninstall { keep_data, yes } => lifecycle::uninstall(&paths, keep_data, yes),
+        Cmd::Reset { all, no_start, yes } => reset::reset(&paths, all, no_start, yes),
         Cmd::Doctor { bundle, json } => lifecycle::doctor(&paths, bundle, json),
         Cmd::Macos(MacosCmd::Fetch) => macos::fetch(&paths),
         Cmd::Macos(MacosCmd::Install { name, disk, cpus, memory }) => macos::install(&paths, &name, disk, cpus, memory),

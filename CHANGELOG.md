@@ -178,6 +178,11 @@ release notes, and refuses to publish without one.
   ones, `node approve|rm`, `controller ca|revoke|rotate-join`, `--alert-webhook`,
   `--backup-dir`, `GET /metrics`, kept logs of removed instances, graceful SIGTERM.
 - `scripts/e2e-lifecycle.sh`: VM crash, damaged-disk and repair checks on a VM of its own.
+- `rekcod reset` (menu bar and dashboard: Reset the Docker engine) deletes the VM's data disk
+  and boots on a new, empty one. Local snapshots are copied across; settings, launchd jobs,
+  contexts, agent sandboxes and golden disks stay. `--all` also deletes sandboxes, golden
+  disks and snapshots; `--no-start` leaves the VM stopped. It refuses while a fleet node or
+  controller of that home runs.
 
 ### Changed
 
@@ -228,6 +233,9 @@ release notes, and refuses to publish without one.
 - The `/var/run/docker.sock` route comes back after a reboot.
 - A sandbox with a long exec or an open shell isn't powered off by its idle TTL.
 - `rekcod x --sandbox` stops its VM only after its last user.
+- `start` under another `REKCOD_HOME` no longer kickstarts `~/.rekcod`'s login agent, which
+  booted the default VM too.
+- `node serve` holds `run/node.lock` while it runs; a second one on the same home stops at once.
 - Volume exports never overwrite an earlier one.
 - `host add` reuses one SSH connection (a dozen handshakes took most of a minute over Wi-Fi) and
   prints each step, including that sudo on the server is about to ask for a password.

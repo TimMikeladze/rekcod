@@ -1061,6 +1061,100 @@ pub fn remove(paths: &Paths, explicit_project: Option<&str>, name: &str) -> Resu
     Ok(())
 }
 
+/// A snapshot volume `rekcod reset` copies off the data disk it deletes and back onto the new
+/// one: every volume labelled `dev.rekcod.snap` (data and markers, every generation), so the
+/// snapshots come back exactly as they were.
+#[derive(Serialize, serde::Deserialize, Debug, Clone, PartialEq, Default)]
+pub struct Carried {
+    pub name: String,
+    pub labels: BTreeMap<String, String>,
+    /// Bytes in the VM (`/system/df`); 0 when docker didn't say.
+    #[serde(default)]
+    pub size: u64,
+    /// SHA-256 of `<name>.tar`, once it's written.
+    #[serde(default)]
+    pub sha256: String,
+}
+
+/// The snapshot volumes on the running VM's disk, and the snapshots they make up
+/// (`project/name`).
+pub fn carry_list(paths: &Paths) -> Result<(Vec<Carried>, Vec<String>)> {
+    let raw = Cli(paths).snap_volumes()?;
+    let vols: serde_json::Value = serde_json::from_slice(&raw).context("GET /volumes")?;
+    let df: serde_json::Value =
+        crate::cli::api_get(paths, "/system/df?type=volume").ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let size = |n: &str| {
+        let v = df["Volumes"].as_array().into_iter().flatten().find(|v| v["Name"] == n);
+        v.and_then(|v| v["UsageData"]["Size"].as_i64()).filter(|s| *s > 0).unwrap_or(0) as u64
+    };
+    let carried = vols["Volumes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let name = v["Name"].as_str().filter(|n| valid_volume(n))?.to_string();
+            let labels =
+                v["Labels"].as_object().map(|m| m.iter().filter_map(|(k, x)| Some((k.clone(), x.as_str()?.to_string()))).collect());
+            Some(Carried { size: size(&name), name, labels: labels.unwrap_or_default(), sha256: String::new() })
+        })
+        .collect();
+    let names = parse(&raw).into_iter().filter(|s| !s.volumes.is_empty()).map(|s| format!("{}/{}", s.project, s.name)).collect();
+    Ok((carried, names))
+}
+
+/// Writes each of `volumes` to `dir/<name>.tar` and the helper image the copies run in to
+/// `dir/helper.tar` (it's on the disk being deleted, and the VM may be offline), then
+/// `dir/manifest.json` last: a directory without one is a copy that didn't finish.
+pub fn carry_out(paths: &Paths, dir: &Path, volumes: &[Carried]) -> Result<()> {
+    let d = Cli(paths);
+    ensure_helper(&d)?;
+    std::fs::create_dir_all(dir)?;
+    d.docker(&["image", "save", "-o", &dir.join("helper.tar").display().to_string(), HELPER_IMAGE])?;
+    let mut out = Vec::new();
+    for v in volumes {
+        let path = dir.join(format!("{}.tar", v.name));
+        let mut w = Hashed::new(std::fs::File::create(&path)?);
+        d.export(&v.name, &mut w)?;
+        w.w.sync_all()?;
+        out.push(Carried { sha256: w.finish().1, ..v.clone() });
+    }
+    crate::paths::write_private(&dir.join("manifest.json"), &serde_json::to_vec_pretty(&out)?)
+}
+
+/// Puts back what [`carry_out`] wrote: loads the helper image if the VM lacks it, checks
+/// each archive against the manifest, creates the volume with its labels and unpacks it.
+/// Deletes `dir` once every volume is in; a failure leaves it for the next try. Returns
+/// how many volumes came back.
+pub fn carry_in(paths: &Paths, dir: &Path) -> Result<usize> {
+    let manifest: Vec<Carried> =
+        serde_json::from_slice(&std::fs::read(dir.join("manifest.json"))?).context("read the saved snapshots' manifest.json")?;
+    let d = Cli(paths);
+    if d.docker(&["image", "inspect", HELPER_IMAGE]).is_err() {
+        d.docker(&["image", "load", "-q", "-i", &dir.join("helper.tar").display().to_string()])?;
+    }
+    for v in &manifest {
+        if !valid_volume(&v.name) {
+            bail!("{:?} isn't a volume name", v.name);
+        }
+        let path = dir.join(format!("{}.tar", v.name));
+        let mut h = Hashed::new(std::io::sink());
+        std::io::copy(&mut std::fs::File::open(&path)?, &mut h)?;
+        if h.finish().1 != v.sha256 {
+            bail!("{} doesn't match its SHA-256 in manifest.json", path.display());
+        }
+        let labels: Vec<String> = v.labels.iter().map(|(k, x)| format!("{k}={x}")).collect();
+        let mut args = vec!["volume", "create"];
+        for l in &labels {
+            args.extend(["--label", l.as_str()]);
+        }
+        args.push(&v.name);
+        d.docker(&args)?;
+        d.import(&v.name, &mut std::fs::File::open(&path)?)?;
+    }
+    std::fs::remove_dir_all(dir)?;
+    Ok(manifest.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

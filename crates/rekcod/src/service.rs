@@ -235,6 +235,13 @@ pub fn install(paths: &Paths, name: &str, args: &[String]) -> Result<()> {
     install_with(paths, name, args, false)
 }
 
+/// Whether launchd has job `name` running now (`launchctl print` shows its pid).
+pub fn job_running(name: &str) -> bool {
+    let target = format!("{}/{}", domain_of(name), label(name));
+    launchctl(&["print", &target])
+        .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).lines().any(|l| l.trim_start().starts_with("pid = ")))
+}
+
 pub fn installed(name: &str) -> bool {
     plist_path(name).is_ok_and(|p| p.exists()) || is_daemon(name)
 }

@@ -582,7 +582,8 @@ pub fn start(
         paths,
         || save_settings(paths, cpus, (memory_gib, base_memory_gib), disk_gib, network),
         || {
-            if autostart_installed() && !repair {
+            // Labels carry no home: only this home's agent, or another home's start boots ~/.rekcod.
+            if crate::service::installed_here(paths, AUTOSTART) && !repair {
                 // Let the login agent own the VM, so a crash brings it back. Whoever boots
                 // first wins the boot lock; the agent supervises either way.
                 crate::service::kickstart(AUTOSTART);

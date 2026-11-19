@@ -1635,8 +1635,22 @@ pub fn node_join(paths: &Paths, controller: &str, join_token: &str, options: Nod
     Err(anyhow!(e).context("running rekcod node serve"))
 }
 
+/// Locked by `node serve` for as long as it runs, so `rekcod reset` can tell a node owns
+/// this home's sandboxes, whether launchd started it or a terminal did.
+pub fn node_lock_path(paths: &Paths) -> PathBuf {
+    paths.home.join("run/node.lock")
+}
+
 pub fn node_serve(paths: &Paths) -> Result<()> {
     let cfg: NodeConfig = serde_json::from_slice(&std::fs::read(paths.home.join("node.json")).context("not joined; `rekcod node join`")?)?;
+    let _lock = {
+        use std::os::fd::AsRawFd;
+        let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(node_lock_path(paths))?;
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            bail!("a node is already serving from {}", paths.home.display());
+        }
+        f
+    };
     let addr: SocketAddr = cfg.listen.parse()?;
     crate::lifecycle::raise_fd_limit();
     graceful_exit(None);

@@ -1867,8 +1867,7 @@ pub fn prune(paths: &Paths, older_than: u64, removed: &mut dyn FnMut(&str)) -> R
         if secs(&home).is_none_or(|t| t >= cutoff) {
             continue;
         }
-        open_up(&home);
-        std::fs::remove_dir_all(&home).with_context(|| format!("remove {}", home.display()))?;
+        remove_leftover(&home)?;
         removed(&home.file_name().unwrap_or_default().to_string_lossy());
     }
     Ok(())
@@ -1885,6 +1884,12 @@ pub fn leftovers(paths: &Paths) -> Vec<PathBuf> {
         .map(|e| e.path())
         .filter(|h| h.is_dir() && !Sandbox::meta_file(h).exists() && crate::cli::running_pid(&Paths { home: h.clone() }).is_none())
         .collect()
+}
+
+/// Deletes one of [`leftovers`], whatever modes the sandbox left inside it.
+pub fn remove_leftover(home: &Path) -> Result<()> {
+    open_up(home);
+    std::fs::remove_dir_all(home).with_context(|| format!("remove {}", home.display()))
 }
 
 pub fn golden_build(paths: &Paths, name: &str, images: &[String]) -> Result<()> {

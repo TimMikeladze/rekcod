@@ -82,6 +82,27 @@
       ],
       "interactive": true,
       "confirm": "Put back the rekcod binary the last upgrade replaced? A running VM keeps its version until it restarts."
+    },
+    {
+      "kind": "Reset",
+      "label": "Reset the Docker engine",
+      "argv": [
+        "reset",
+        "--yes"
+      ],
+      "interactive": true,
+      "confirm": "Reset the Docker engine? Every image, container, volume and build cache is deleted. Local snapshots are copied across while rekcod runs; settings, sandboxes and golden disks stay."
+    },
+    {
+      "kind": "ResetAll",
+      "label": "Reset the engine, sandboxes and golden disks",
+      "argv": [
+        "reset",
+        "--all",
+        "--yes"
+      ],
+      "interactive": true,
+      "confirm": "Reset the Docker engine and delete every agent sandbox, golden disk and local snapshot? Images, containers, volumes and build cache go too; settings stay."
     }
   ],
   "storage_actions": [

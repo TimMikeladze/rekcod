@@ -81,6 +81,8 @@ pub enum Kind {
     Upgrade,
     UpgradeRollback,
     Uninstall,
+    Reset,
+    ResetAll,
     ImagePull,
     ImageRun,
     ImageTag,
@@ -102,7 +104,7 @@ pub enum Kind {
 impl Kind {
     /// Every kind; the parity tests check each one reaches the menu bar.
     #[cfg_attr(not(test), allow(dead_code))]
-    pub const ALL: [Kind; 83] = [
+    pub const ALL: [Kind; 85] = [
         Kind::VmStart,
         Kind::VmStop,
         Kind::Compact,
@@ -170,6 +172,8 @@ impl Kind {
         Kind::Upgrade,
         Kind::UpgradeRollback,
         Kind::Uninstall,
+        Kind::Reset,
+        Kind::ResetAll,
         Kind::ImagePull,
         Kind::ImageRun,
         Kind::ImageTag,
@@ -207,6 +211,8 @@ impl Kind {
                 | Kind::Upgrade
                 | Kind::UpgradeRollback
                 | Kind::Uninstall
+                | Kind::Reset
+                | Kind::ResetAll
                 | Kind::StorageEnv
                 | Kind::StorageUp
                 | Kind::ContainerLogs
@@ -1228,6 +1234,18 @@ pub fn vm_actions(running: bool, socket_installed: bool, autostart: bool, rollba
                 .interactive(),
         );
     }
+    // Interactive: it runs in Terminal, which outlives the menu bar or dashboard tab that
+    // started it, and shows what was deleted and the space that came back.
+    out.push(
+        Action::rekcod(Kind::Reset, "Reset the Docker engine", &["reset", "--yes"])
+            .confirm("Reset the Docker engine? Every image, container, volume and build cache is deleted. Local snapshots are copied across while rekcod runs; settings, sandboxes and golden disks stay.".into())
+            .interactive(),
+    );
+    out.push(
+        Action::rekcod(Kind::ResetAll, "Reset the engine, sandboxes and golden disks", &["reset", "--all", "--yes"])
+            .confirm("Reset the Docker engine and delete every agent sandbox, golden disk and local snapshot? Images, containers, volumes and build cache go too; settings stay.".into())
+            .interactive(),
+    );
     out.push(
         Action::rekcod(Kind::Uninstall, "Uninstall rekcod", &["uninstall", "--yes"])
             .confirm("Uninstall rekcod? This stops it, removes its login agents and docker context, and deletes ~/.rekcod with every VM disk, volume and snapshot.".into())
@@ -1918,6 +1936,8 @@ pub mod tests {
                     | Kind::VmForceStop
                     | Kind::VmRepair
                     | Kind::Uninstall
+                    | Kind::Reset
+                    | Kind::ResetAll
                     | Kind::HostRestart
                     | Kind::HostUninstall
                     | Kind::ImagePush

@@ -1,5 +1,6 @@
 // Interactive kinds that only print or follow output; the dashboard streams them into a sheet.
-// The other interactive kinds (shells, sudo, prompts, `host forward`) open Terminal.app.
+// The other interactive kinds (shells, sudo, prompts, `host forward`) open Terminal.app, and so
+// do Reset and ResetAll: a stream ends with its sheet, and a reset must not stop half way.
 export const STREAMED = new Set(["ContainerLogs", "AppLogs", "JobLogs", "SandboxDiff", "StorageEnv", "Doctor", "ImageHistory", "VolumeBrowse"])
 
 /**

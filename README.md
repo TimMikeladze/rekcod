@@ -451,6 +451,8 @@ the docker command shown next to it:
 - Networks: create, remove, prune unused ones
 - Disk: remove dangling images, unused anonymous volumes, build cache, unused networks,
   unused agent sandboxes, or everything unused (`system prune`)
+- Engine: reset to a new, empty data disk (`rekcod reset`), with or without sandboxes and
+  golden disks
 
 Actions that need a value, such as an image to pull, ask for it first. Both front ends
 check values before running anything: no leading `-` or control characters, and ports,
@@ -1328,6 +1330,46 @@ Docker cleanup commands from a job can also remove other images, volumes and con
 that VM. To keep the runner off your own engine, run it in a VM of its own with a separate
 `REKCOD_HOME`.
 
+## Reset the engine
+
+```sh
+rekcod reset
+rekcod reset --no-start
+rekcod reset --all
+```
+
+`reset` gives the local Docker engine a new, empty data disk without uninstalling rekcod.
+It deletes `~/.rekcod/vm/data.img`, which holds every image, container, volume, network and
+build cache, and writes `vm/data.fresh`, so the next boot formats a new disk the way a first
+install does.
+
+Before it changes anything it prints what goes, with sizes, and the containers that are
+running, then asks for `yes`. `--yes` skips the question. Without `--yes` and without a
+terminal it stops with nothing changed.
+
+It stops the VM first, like `rekcod stop`. When that fails, nothing is deleted and it exits
+non-zero. A VM that was running boots again on the new disk; `--no-start` leaves it stopped.
+At the end it prints how much space came back on the Mac.
+
+Local snapshots (`rekcod snap`) are volumes on the data disk. While the VM runs, reset copies
+them to `~/.rekcod/vm/reset-snapshots`, checks there is room on the Mac first, and puts them
+back once the new disk is up (with `--no-start` the VM boots once for that, then stops).
+When the VM is stopped they can't be copied out, and the prompt says so: `rekcod start`
+first to keep them. Pushed snapshots in S3 are never touched. If the VM doesn't come back,
+the copies stay, and running `rekcod reset` again puts them back without deleting anything.
+
+These stay: `config.json` (CPUs, memory and disk size), the root disk and guest version, the
+VM's MAC address, launchd jobs, Docker contexts, the socket route, the `~/.zshenv` block, SSH
+config, agent sandboxes, golden disks, fleet, controller and storage state, and logs.
+
+`--all` also deletes agent sandboxes (running ones are stopped first, and what failed
+creates left goes too), golden disks and local snapshots.
+
+- It refuses while a fleet node or controller of this home runs, since they own its
+  sandboxes. The error names which one and how to stop it.
+- Under another `REKCOD_HOME` it resets only that home, and never switches the `rekcod`
+  Docker context.
+
 ## Upgrade, roll back and uninstall
 
 ```sh
@@ -1534,6 +1576,7 @@ tunnel at boot; a VPN connected later needs `rekcod stop && rekcod start`.
 | `rekcod mcp` | MCP server on stdio exposing the sandbox commands to agents |
 | `rekcod upgrade` | Install the latest release over this binary and restart the fleet services that run it (the VM keeps running the old one until restarted) |
 | `rekcod uninstall` | Stop rekcod and remove everything it set up: launchd jobs, the socket route, the docker contexts, the ~/.zshenv block, firewall exceptions, pmset (as `server setup` found it), and ~/.rekcod |
+| `rekcod reset` | Give the local Docker engine a new, empty data disk; local snapshots are copied across, settings and sandboxes stay (`--all` deletes sandboxes, golden disks and snapshots too) |
 | `rekcod doctor` | Check what usually goes wrong and say how to fix it |
 | `rekcod macos fetch` | Download the newest macOS restore image this Mac supports (resumable) |
 | `rekcod macos install` | Install the restore image into a new base image |

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # VM lifecycle and data safety against a VM of its own (REKCOD_HOME=~/.rke2l): first boot,
 # kill -9, stale pid files, concurrent starts, a damaged data disk, --repair, port
-# shadowing, the login agent's exit codes. Leaves your main VM alone.
+# shadowing, the login agent's exit codes, `rekcod reset`. Leaves your main VM alone.
 #
 # Needs alpine:3.24 in the current docker context (it's copied in; the test VM may not
 # have internet), and a guest: REKCOD_GUEST_DIR, else out/guest.
@@ -96,6 +96,43 @@ sleep 3
 "$R" stop --no-switch >/dev/null
 wait $fg
 check "rekcod stop makes --foreground exit 0" test $? -eq 0
+
+echo "reset"
+# A home of its own: the crash checks above can leave a disk that needs --repair.
+cleanup
+check "boots for the reset" start
+docker save alpine:3.24 | $D load >/dev/null
+cfg=$(mktemp)
+cp "$REKCOD_HOME/config.json" "$cfg"
+$D volume create gone >/dev/null
+$D volume create --label com.docker.compose.project=rkreset rkreset_db >/dev/null
+$D run --rm -v rkreset_db:/d alpine:3.24 sh -c 'echo seeded > /d/f'
+"$R" snap save -p rkreset seed >/dev/null 2>&1
+$D run -d --name doomed alpine:3.24 sleep 300 >/dev/null
+python3 -c "import fcntl,time; f=open('$REKCOD_HOME/run/node.lock','w'); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(20)" &
+locker=$!
+sleep 1
+check "reset refuses while a fleet node runs on the home" sh -c "'$R' reset --yes 2>&1 | grep -q 'fleet node'"
+kill "$locker" 2>/dev/null; wait "$locker" 2>/dev/null
+check "and without --yes when there's no terminal" sh -c "! '$R' reset </dev/null"
+check "the volume survived both refusals" $D volume inspect gone
+log=$(mktemp)
+"$R" reset --yes >"$log" 2>&1
+check "reset --yes succeeds" test $? -eq 0
+check "it named the running container it deleted" grep -q 'doomed (alpine:3.24)' "$log"
+check "the VM boots again" sh -c "'$R' status | grep -q 'rekcod running'"
+check "the volume is gone" sh -c "! $D volume inspect gone"
+check "the new disk was formatted" grep -aq "formatting data disk" "$REKCOD_HOME/logs/console.log"
+check "data.fresh is gone once dockerd answered" test ! -e "$REKCOD_HOME/vm/data.fresh"
+check "config.json is unchanged" cmp "$cfg" "$REKCOD_HOME/config.json"
+check "the snapshot came across" sh -c "'$R' snap ls -p rkreset | grep -q seed"
+check "and restores its data" sh -c "'$R' snap restore -p rkreset seed >/dev/null 2>&1 && $D run --rm -v rkreset_db:/d alpine:3.24 cat /d/f | grep -q seeded"
+check "nothing was left on the Mac" test ! -e "$REKCOD_HOME/vm/reset-snapshots"
+"$R" reset --all --no-start --yes >"$log" 2>&1
+check "reset --all --no-start leaves the VM stopped" sh -c "'$R' status | grep -q 'not running'"
+check "with no data disk and data.fresh written" sh -c "test ! -e '$REKCOD_HOME/vm/data.img' && test -e '$REKCOD_HOME/vm/data.fresh'"
+check "and the next start comes up empty" sh -c "'$R' start --no-switch >/dev/null 2>&1 && test -z \"\$($D volume ls -q)\""
+rm -f "$cfg" "$log"
 
 echo
 if [[ $fails -gt 0 ]]; then

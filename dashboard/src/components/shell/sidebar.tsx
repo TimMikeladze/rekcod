@@ -234,10 +234,13 @@ function NavLink({ item, on, count, alerts }: { item: NavItem; on: boolean; coun
   )
 }
 
+/** The VM menu's last group, in red: what stops or wipes the engine (or removes rekcod). */
+const ENDS_ENGINE = new Set(["VmStop", "VmForceStop", "Reset", "ResetAll", "Uninstall"])
+
 function ActionItems({ actions, subject }: { actions: Action[]; subject: string }) {
   const { trigger } = useAction()
   return actions.map((a) => (
-    <DropdownMenuItem key={a.kind + a.label} onClick={() => trigger(a, subject)} variant={a.kind === "VmStop" || a.kind === "VmForceStop" ? "destructive" : "default"}>
+    <DropdownMenuItem key={a.kind + a.label} onClick={() => trigger(a, subject)} variant={ENDS_ENGINE.has(a.kind) ? "destructive" : "default"}>
       {a.label}
     </DropdownMenuItem>
   ))
@@ -318,11 +321,11 @@ function VmSwitcher({ state }: { state: S }) {
           </>
         )}
         <DropdownMenuSeparator />
-        <ActionItems actions={vm.filter((a) => a.kind !== "VmStop" && a.kind !== "VmForceStop")} subject="rekcod" />
+        <ActionItems actions={vm.filter((a) => !ENDS_ENGINE.has(a.kind))} subject="rekcod" />
         {state.storage_actions.length > 0 && <DropdownMenuSeparator />}
         <ActionItems actions={state.storage_actions} subject="S3 storage" />
-        {vm.some((a) => a.kind === "VmStop") && <DropdownMenuSeparator />}
-        <ActionItems actions={vm.filter((a) => a.kind === "VmStop" || a.kind === "VmForceStop")} subject="rekcod" />
+        {vm.some((a) => ENDS_ENGINE.has(a.kind)) && <DropdownMenuSeparator />}
+        <ActionItems actions={vm.filter((a) => ENDS_ENGINE.has(a.kind))} subject="rekcod" />
       </DropdownMenuContent>
     </DropdownMenu>
   )

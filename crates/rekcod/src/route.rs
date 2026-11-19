@@ -16,6 +16,7 @@ const OWN: &[&str] = &[
     "mcp",
     "upgrade",
     "uninstall",
+    "reset",
     "doctor",
     "remote",
     "host",

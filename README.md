@@ -1355,8 +1355,12 @@ Local snapshots (`rekcod snap`) are volumes on the data disk. While the VM runs,
 them to `~/.rekcod/vm/reset-snapshots`, checks there is room on the Mac first, and puts them
 back once the new disk is up (with `--no-start` the VM boots once for that, then stops).
 When the VM is stopped they can't be copied out, and the prompt says so: `rekcod start`
-first to keep them. Pushed snapshots in S3 are never touched. If the VM doesn't come back,
-the copies stay, and running `rekcod reset` again puts them back without deleting anything.
+first to keep them. If the VM doesn't come back, the copies stay, and running `rekcod reset`
+again puts them back without deleting anything.
+
+Snapshots pushed to S3 outside the VM (`S3_ENDPOINT`) are never touched. `rekcod storage up`
+runs RustFS in the VM with its data in the `rekcod-storage` volume, so its buckets, and
+snapshots pushed there, go with the disk. The prompt lists that volume when it exists.
 
 These stay: `config.json` (CPUs, memory and disk size), the root disk and guest version, the
 VM's MAC address, launchd jobs, Docker contexts, the socket route, the `~/.zshenv` block, SSH

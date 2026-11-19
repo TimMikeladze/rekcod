@@ -28,6 +28,19 @@ enum Step {
 }
 
 impl Step {
+    /// The ok/FAIL/skip line's text.
+    fn name(&self, paths: &Paths) -> String {
+        match self {
+            Step::SaveSnapshots => format!("copy the snapshot volumes to {}", carry_dir(paths).display()),
+            Step::StopVm { .. } => "stop the VM".into(),
+            Step::RemoveSandboxes => "delete agent sandboxes".into(),
+            Step::RemoveGolden(g) => format!("delete golden disk {g}"),
+            Step::ResetDataDisk => format!("delete {} and mark the next one fresh", paths.data_disk().display()),
+            Step::Start => "start the VM".into(),
+            Step::RestoreSnapshots => "put the snapshots back".into(),
+        }
+    }
+
     /// Nothing after this one runs when it fails: the VM may still be using its disk, or
     /// the snapshots aren't safe on the Mac yet.
     fn halts(&self) -> bool {
@@ -55,6 +68,8 @@ struct Facts {
     data_disk: u64,
     /// `name (image)` of each running container.
     containers: Vec<String>,
+    /// The VM has `storage up`'s volume, which goes with the disk.
+    local_storage: bool,
     /// Fleet services of this home that run, as the refusal names them.
     fleet: Vec<String>,
     /// Free bytes on the Mac's volume holding the home.
@@ -138,15 +153,15 @@ fn plan(f: &Facts) -> Vec<Step> {
 
 /// Runs `steps`, printing each. A failed [`Step::halts`] step skips the rest; a failed
 /// start skips putting the snapshots back. Errs naming every step that failed.
-fn execute(steps: &[Step], mut run: impl FnMut(&Step) -> (String, Result<()>)) -> Result<()> {
+fn execute(steps: &[Step], name: impl Fn(&Step) -> String, mut run: impl FnMut(&Step) -> Result<()>) -> Result<()> {
     let (mut failed, mut halted, mut booted) = (Vec::<String>::new(), false, true);
     for step in steps {
+        let name = name(step);
         if halted || (*step == Step::RestoreSnapshots && !booted) {
-            println!("skip  {step:?}");
+            println!("skip  {name}");
             continue;
         }
-        let (name, r) = run(step);
-        match r {
+        match run(step) {
             Ok(()) => println!("ok    {name}"),
             Err(e) => {
                 println!("FAIL  {name}: {e:#}");
@@ -178,12 +193,19 @@ fn summary(f: &Facts, home: &str) -> Vec<String> {
     let snaps = f.snapshot_names.join(", ");
     if f.all && !f.snapshot_names.is_empty() {
         out.push(format!("  local snapshots: {snaps}"));
+    } else if f.all && !f.running {
+        out.push("  local snapshots, if any".into());
     } else if !f.all && f.snapshots_unknown {
         out.push("  local snapshots: dockerd doesn't answer, so they can't be copied out first".into());
     } else if !f.all && !f.running {
         out.push(
             "  local snapshots, if any: the VM is stopped, so they can't be copied out first (`rekcod start` and reset again to keep them)"
                 .into(),
+        );
+    }
+    if f.local_storage {
+        out.push(
+            "  local S3 storage (`rekcod storage up`): its volume rekcod-storage, with every bucket and the snapshots pushed there".into(),
         );
     }
     if f.all {
@@ -206,7 +228,7 @@ fn summary(f: &Facts, home: &str) -> Vec<String> {
     if !f.all {
         kept.push_str(", agent sandboxes, golden disks");
     }
-    out.push(format!("Kept: {kept}. Pushed snapshots (S3) aren't touched."));
+    out.push(format!("Kept: {kept}. Snapshots pushed to S3 outside this VM (S3_ENDPOINT) aren't touched."));
     out.push(match (f.running, f.no_start) {
         (true, false) => "The VM boots again on the new disk afterwards.".into(),
         (true, true) if f.carry() => "The VM boots once to take the snapshots back, then stops (--no-start).".into(),
@@ -302,6 +324,7 @@ fn facts(paths: &Paths, all: bool, no_start: bool, yes: bool) -> Facts {
                 format!("{name} ({})", c["Image"].as_str().unwrap_or("?"))
             })
             .collect();
+        f.local_storage = crate::cli::api_get(paths, "/volumes/rekcod-storage").is_ok();
         match crate::snap::carry_list(paths) {
             Ok((s, n)) => (f.snapshots, f.snapshot_names) = (s, n),
             Err(_) => f.snapshots_unknown = true,
@@ -388,36 +411,37 @@ pub fn reset(paths: &Paths, all: bool, no_start: bool, yes: bool) -> Result<()> 
     }
     let (mut free_before, mut free_after, mut disk_gone) = (None, None, false);
     let carry = carry_dir(paths);
-    let r = execute(&plan(&f), |step| match step {
-        Step::SaveSnapshots => {
-            let r = crate::snap::carry_out(paths, &carry, &f.snapshots);
-            if r.is_err() {
-                let _ = std::fs::remove_dir_all(&carry);
+    let r = execute(
+        &plan(&f),
+        |s| s.name(paths),
+        |step| match step {
+            Step::SaveSnapshots => {
+                let r = crate::snap::carry_out(paths, &carry, &f.snapshots);
+                if r.is_err() {
+                    let _ = std::fs::remove_dir_all(&carry);
+                }
+                r
             }
-            (format!("copy {} snapshot volume(s) to {}", f.snapshots.len(), carry.display()), r)
-        }
-        Step::StopVm { switch_back } => ("stop the VM".into(), crate::cli::stop(paths, !switch_back, false)),
-        Step::RemoveSandboxes => {
-            free_before.get_or_insert_with(|| mac_free(&paths.home));
-            ("delete agent sandboxes".into(), remove_sandboxes(paths))
-        }
-        Step::RemoveGolden(g) => {
-            free_before.get_or_insert_with(|| mac_free(&paths.home));
-            (format!("delete golden disk {g}"), crate::sandbox::golden_rm(paths, g))
-        }
-        Step::ResetDataDisk => {
-            free_before.get_or_insert_with(|| mac_free(&paths.home));
-            let r = reset_data_disk(paths);
-            disk_gone = !paths.data_disk().exists();
-            free_after = Some(mac_free(&paths.home));
-            (format!("delete {} and mark the next one fresh", paths.data_disk().display()), r)
-        }
-        Step::Start => ("start the VM on the new disk".into(), start(paths)),
-        Step::RestoreSnapshots => {
-            let r = crate::snap::carry_in(paths, &carry).map(|n| println!("      {n} snapshot volume(s) back"));
-            ("put the snapshots back".into(), r)
-        }
-    });
+            Step::StopVm { switch_back } => crate::cli::stop(paths, !switch_back, false),
+            Step::RemoveSandboxes => {
+                free_before.get_or_insert_with(|| mac_free(&paths.home));
+                remove_sandboxes(paths)
+            }
+            Step::RemoveGolden(g) => {
+                free_before.get_or_insert_with(|| mac_free(&paths.home));
+                crate::sandbox::golden_rm(paths, g)
+            }
+            Step::ResetDataDisk => {
+                free_before.get_or_insert_with(|| mac_free(&paths.home));
+                let r = reset_data_disk(paths);
+                disk_gone = !paths.data_disk().exists();
+                free_after = Some(mac_free(&paths.home));
+                r
+            }
+            Step::Start => start(paths),
+            Step::RestoreSnapshots => crate::snap::carry_in(paths, &carry).map(|n| println!("      {n} snapshot volume(s) back")),
+        },
+    );
     if let (Some(b), Some(a)) = (free_before, free_after) {
         println!("{} back on the Mac", gib(a.saturating_sub(b)));
     }
@@ -507,19 +531,26 @@ mod tests {
     fn a_failed_stop_halts_and_a_failed_boot_keeps_the_snapshots() {
         let steps = plan(&facts(true, true, false));
         let mut ran = Vec::new();
-        let r = execute(&steps, |s| {
-            ran.push(s.clone());
-            let r = if matches!(s, StopVm { .. }) { Err(anyhow::anyhow!("daemon did not exit")) } else { Ok(()) };
-            (format!("{s:?}"), r)
-        });
+        let r = execute(
+            &steps,
+            |s| format!("{s:?}"),
+            |s| {
+                ran.push(s.clone());
+                if matches!(s, StopVm { .. }) { Err(anyhow::anyhow!("daemon did not exit")) } else { Ok(()) }
+            },
+        );
         assert!(r.is_err());
         assert_eq!(ran, [StopVm { switch_back: false }]);
 
         let mut ran = Vec::new();
-        let r = execute(&plan(&facts(true, false, false)), |s| {
-            ran.push(s.clone());
-            (format!("{s:?}"), if *s == Start { Err(anyhow::anyhow!("dockerd did not answer")) } else { Ok(()) })
-        });
+        let r = execute(
+            &plan(&facts(true, false, false)),
+            |s| format!("{s:?}"),
+            |s| {
+                ran.push(s.clone());
+                if *s == Start { Err(anyhow::anyhow!("dockerd did not answer")) } else { Ok(()) }
+            },
+        );
         assert!(r.unwrap_err().to_string().contains("Start"));
         assert!(!ran.contains(&RestoreSnapshots) && ran.contains(&ResetDataDisk));
     }
@@ -545,10 +576,14 @@ mod tests {
         }
         std::fs::write(paths.data_disk(), b"ext4").unwrap();
         let f = Facts { yes: true, ..facts(false, false, false) };
-        let r = execute(&plan(&f), |s| {
-            assert_eq!(*s, ResetDataDisk);
-            ("reset".into(), reset_data_disk(&paths))
-        });
+        let r = execute(
+            &plan(&f),
+            |s| format!("{s:?}"),
+            |s| {
+                assert_eq!(*s, ResetDataDisk);
+                reset_data_disk(&paths)
+            },
+        );
         r.unwrap();
         assert!(!paths.data_disk().exists() && paths.data_fresh().exists());
         for k in keep {
@@ -574,6 +609,8 @@ mod tests {
             "{s}"
         );
         assert!(summary(&facts(false, false, false), "/h").join("\n").contains("can't be copied out first"));
+        assert!(summary(&facts(false, true, false), "/h").join("\n").contains("local snapshots, if any"));
+        assert!(summary(&Facts { local_storage: true, ..facts(true, false, false) }, "/h").join("\n").contains("rekcod-storage"));
         assert_eq!(flag_value(&["serve".into(), "--db=/x/f.db".into()], "--db").as_deref(), Some("/x/f.db"));
         assert_eq!(flag_value(&["--db".into(), "/y".into()], "--db").as_deref(), Some("/y"));
     }

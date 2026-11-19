@@ -22,6 +22,8 @@ volume labelled `dev.rekcod.snap` (markers and old generations too) to
 deleted) and `manifest.json` last, with labels and SHA-256s. `RestoreSnapshots`
 (`snap::carry_in`) checks each archive, recreates the volume with its labels, unpacks it and
 deletes the directory. `check` refuses when the Mac lacks the snapshots' size plus 10%.
+Snapshots pushed to an outside S3 are never touched; `storage up`'s RustFS is the
+`rekcod-storage` volume on data.img, so what was pushed there goes, and the prompt says so.
 
 - VM stopped: nothing can be read, the prompt says the snapshots go too.
 - `--no-start`: boots once for the import, then stops.

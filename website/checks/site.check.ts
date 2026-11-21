@@ -96,6 +96,8 @@ describe('built pages', () => {
     const diagram = pages.landing.match(/<svg class="arch"[\s\S]*?<\/svg>/)?.[0] ?? '';
     const triggers = [...diagram.matchAll(/<g[^>]+data-arch-trigger[^>]*>/g)].map(([tag]) => tag);
     expect(diagram).toContain('viewBox="0 0 560 616"');
+    // Without these the SVG paints solid black.
+    for (const rule of ['.arch .node rect{', '.arch .panel rect{', '.arch .edge{']) expect(pages.landing).toContain(rule);
     expect(triggers).toHaveLength(13);
     for (const trigger of triggers) {
       expect(trigger).toContain('role="button"');

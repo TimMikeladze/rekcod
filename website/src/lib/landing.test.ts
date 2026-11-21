@@ -11,6 +11,7 @@ describe('landing references into README.md', () => {
     const artifacts = [
       ...landing.capabilities.map((c) => c.example),
       landing.start.example,
+      landing.switching.example,
       landing.agents.sandbox,
       landing.measured.terminal,
     ];
@@ -60,6 +61,22 @@ describe('landing references into README.md', () => {
     expect(readme.paragraph('You can also keep using')).toContain(`\`${d.composeCommand}\``);
     const broken = new Readme(readme.markdown.replace('daemon["rekcod daemon"]', 'daemon'));
     expect(() => buildLanding(broken, readRepo('CHANGELOG.md'))).toThrow('has no daemon');
+  });
+
+  test('the explanation sections quote the README: file-event steps, figures and limitations', () => {
+    const sequence = readme.blocks.find((b) => b.lang === 'mermaid' && b.value.includes('accTitle: Shared files and change notifications'))!.value;
+    expect(landing.files.steps.length).toBe(4);
+    for (const s of landing.files.steps) for (const label of [s.from, s.to, s.text]) expect(sequence).toContain(label);
+    expect(landing.files.steps[0].text).toStartWith('FSEvents');
+    expect(landing.files.steps.at(-1)!.text).toBe('inotify event');
+    expect(landing.files.text).toContain(landing.figures[1].value);
+    const measures = landing.how.crossings.map((c) => c.measure).filter(Boolean);
+    expect(measures).toEqual([`${landing.figures[1].value} median round trip`, `${landing.figures[2].value} median round trip`]);
+    expect(landing.limitations.items).toBe(readme.markdown.split('## Limitations')[1].split('\n## ')[0].match(/^- /gm)!.length);
+    expect(landing.limitations.list).not.toMatch(/\]\(#/);
+    expect(readme.markdown).toContain(landing.measured.method);
+    const noEvents = new Readme(readme.markdown.replace('FSEvents reports an edit', 'An edit is reported'));
+    expect(() => buildLanding(noEvents, readRepo('CHANGELOG.md'))).toThrow('no FSEvents message');
   });
 
   test('.vercelignore uploads every repository file the build reads', () => {

@@ -28,6 +28,7 @@ export interface Link {
 
 export const links: Link[] = [
   { label: 'Docs', href: '/docs/', icon: 'text', where: ['header'] },
+  { label: 'How it works', href: '/#how-it-works', icon: 'text', where: ['header'] },
   { label: 'Benchmarks', href: '/#benchmarks', icon: 'text', where: ['header'] },
   { label: 'Changelog', href: `${repository}/blob/main/CHANGELOG.md`, icon: 'text', where: ['header'] },
   { label: 'TimMikeladze/rekcod on GitHub', href: 'repo', icon: 'github', where: ['header', 'footer'] },
@@ -83,6 +84,9 @@ export const footerColumns: FooterColumn[] = [
 ];
 
 export interface Figure { value: string; label: string }
+
+/** One thing that crosses between macOS and the Linux guest. */
+export interface Crossing { title: string; text: string; href: string; link: string; measure?: string }
 
 export interface Capability {
   id: string;
@@ -178,8 +182,121 @@ export function buildLanding(readme: Readme, changelog: string) {
     project: '~/project',
   };
 
+  const inotify = figures[1].value;
+  const tcp = figures[2].value;
+  const crossings: Crossing[] = [
+    {
+      title: 'Docker API',
+      text: 'The `rekcod` Docker context points the Docker CLI, Compose and SDKs at a Unix socket on the Mac. The daemon forwards each request over vsock to `rekcod-agent`, which connects it to `/var/run/docker.sock` in the guest.',
+      href: '/docs/#docker-runs-inside-a-linux-vm',
+      link: 'How a request reaches the engine',
+    },
+    {
+      title: 'Files',
+      text: 'virtio-fs shares Mac directories with the guest at their Mac paths, so a bind mount reads your source without a copy. A watcher sends macOS FSEvents to the guest, which emits inotify for file watchers in containers.',
+      href: '/docs/#file-sharing-includes-a-change-notification-path',
+      link: 'File sharing and change notifications',
+      measure: `${inotify} median round trip`,
+    },
+    {
+      title: 'Published ports',
+      text: 'The daemon listens on the Mac and the guest agent connects incoming traffic to the container’s published port. `host.docker.internal` uses a channel in the other direction to reach services on the Mac’s loopback address.',
+      href: '/docs/#published-ports',
+      link: 'Which interfaces a port listens on',
+      measure: `${tcp} median round trip`,
+    },
+    {
+      title: 'CPU architecture',
+      text: '`linux/arm64` images run natively on the M-series chip. `linux/amd64` images run through Rosetta, which you install on the Mac.',
+      href: '/docs/#amd64-images',
+      link: 'Running amd64 images',
+    },
+    {
+      title: 'Memory',
+      text: 'On macOS 27, half of `--memory` is RAM and the rest is swap whose memory goes back to macOS once the guest frees it. On older macOS all of it is RAM, held until `rekcod stop`.',
+      href: '/docs/#configure-the-vm',
+      link: 'CPU, memory and disk settings',
+    },
+  ];
+
+  // The second half of the README's file sharing diagram: what happens after an edit on the Mac.
+  const events = readme.sequence('Shared files and change notifications');
+  const firstEvent = events.messages.findIndex((m) => m.text.startsWith('FSEvents'));
+  if (firstEvent < 0) throw new Error('README.md: the file sharing diagram has no FSEvents message');
+  const who = (id: string) => {
+    if (!events.participants[id]) throw new Error(`README.md: the file sharing diagram has no participant ${id}`);
+    return events.participants[id];
+  };
+  const steps = events.messages.slice(firstEvent).map((m) => ({ from: who(m.from), to: who(m.to), text: m.text }));
+
+  const limits = readme.list('limitations');
+
   return {
     name: 'rekcod',
+    why: {
+      id: 'why-a-vm',
+      title: 'Docker on a Mac runs in a Linux VM',
+      text: 'Containers are Linux processes, and macOS has no Linux kernel to run them. Every Docker setup on a Mac boots a Linux VM, and each `docker` command, file read and published port crosses from macOS into it. rekcod is the Mac side of that crossing. It boots the VM, shares your files, forwards ports and applies the Mac’s DNS settings. The engine inside is the `dockerd` Docker ships for Linux.',
+    },
+    how: {
+      id: 'how-it-works',
+      title: 'What crosses between macOS and Linux',
+      text: 'The drawing follows a `docker compose up -d` from your terminal to a running container. Beside it is how requests, files and ports cross into the guest, and how the VM uses the Mac’s CPU and memory.',
+      crossings,
+    },
+    files: {
+      id: 'file-events',
+      title: 'How a Mac edit reaches a file watcher',
+      text: `A shared filesystem lets a container read your source. Learning that a file changed on the Mac is a separate path. rekcod sends each macOS FSEvents change to the guest over vsock, where a patched FUSE module drops the cached entry and emits the event. An edit on the Mac, the container seeing it and writing a file back takes ${inotify} at the median.`,
+      steps,
+      href: '/docs/#file-sharing-includes-a-change-notification-path',
+    },
+    decisions: {
+      id: 'design',
+      title: 'Why it’s built this way',
+      items: [
+        {
+          title: 'Upstream Docker Engine',
+          text: 'rekcod runs unmodified `dockerd`, containerd and runc with the embedded BuildKit. Docker API behavior comes from Docker itself, so Compose, Buildx and Docker SDK clients talk to the engine they were written for.',
+          href: '/docs/#docker-runs-inside-a-linux-vm',
+        },
+        {
+          title: 'One native executable',
+          text: 'The CLI, daemon and menu bar are modes of the same binary. The menu bar and web dashboard read one action catalog and run the `rekcod` commands it lists, so a container operation has one implementation.',
+          href: '/docs/#manage-it-from-the-terminal-menu-bar-or-dashboard',
+        },
+        {
+          title: 'Separate guest and data disks',
+          text: '`vm/root.img` holds the Linux guest and is replaced when the guest version changes. `vm/data.img` holds your images, containers, named volumes and snapshots and is kept across upgrades.',
+          href: '/docs/#guest-updates-and-application-data-use-separate-files',
+        },
+        {
+          title: 'Checked releases',
+          text: '`install.sh` and `rekcod upgrade` install nothing unless the tarball matches the release’s `SHA256SUMS`, and with `gh` installed they verify the build provenance too. `rekcod upgrade --rollback` puts the previous binary back.',
+          href: '/docs/#what-upgrade-verifies',
+        },
+      ],
+    },
+    commands: {
+      id: 'commands',
+      title: 'What you run',
+      text: 'Your `docker` and `docker compose` commands work as they are. These are the commands rekcod adds for local development.',
+    },
+    switching: {
+      id: 'bring-your-images-and-volumes',
+      title: 'Try it beside Docker Desktop or OrbStack',
+      text: '`rekcod start` selects the `rekcod` Docker context and `rekcod stop` restores the one you had, so your current engine stays installed. `rekcod import` copies images and named volumes and leaves the originals at the source.',
+      example: readme.snippet('rekcod import --from orbstack'),
+      guide: 'Import options',
+    },
+    limitations: {
+      id: 'limitations',
+      title: 'Limitations',
+      text: readme.paragraph("rekcod hasn't had an external security review").replace(/\]\(#/g, '](/docs/#'),
+      list: limits.markdown.replace(/\]\(#/g, '](/docs/#'),
+      items: limits.items,
+      href: '/docs/#limitations',
+    },
     diagram,
     version: release.version,
     released: release.date,
@@ -187,6 +304,7 @@ export function buildLanding(readme: Readme, changelog: string) {
     description: metaDescription(readme.intro),
     h1: 'Docker Engine on Apple Silicon',
     lede: 'rekcod is an open source Docker Desktop alternative. It runs upstream Docker Engine in a Linux VM using Apple’s Virtualization framework, so you can use your existing Docker commands, Compose files and Buildx workflows.',
+    meta: 'Open source · MIT license · Apple Silicon Macs',
     start: {
       id: 'run-your-first-container',
       title: 'Install and run',
@@ -201,7 +319,8 @@ export function buildLanding(readme: Readme, changelog: string) {
       title: 'Benchmarks',
       text: readme.paragraph('The bench/ scripts time')
         .replace(/^The `bench\/` scripts time the paths above\. On an /, 'Measured on an ')
-        .replace(/:$/, '. The guest image was already downloaded for the startup measurement.'),
+        .replace(/:$/, '.'),
+      method: readme.paragraph('The start booted a stopped VM'),
       terminal: benchmark,
       href: '/docs/#benchmarks',
     },

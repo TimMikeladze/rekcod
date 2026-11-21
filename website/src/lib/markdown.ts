@@ -10,7 +10,10 @@ function fence(lang: string, value: string): string {
 }
 
 function absolute(markdown: string): string {
-  return markdown.replace(/\]\((\/[^)]*)\)/g, (_, p) => `](${url(p)})`);
+  return markdown
+    .replace(/\]\((\/[^)]*)\)/g, (_, p) => `](${url(p)})`)
+    // A repository file the README links to by its relative path.
+    .replace(/\]\(([A-Z][\w.-]*\.md)\)/g, (_, f) => `](${repository}/blob/main/${f})`);
 }
 
 function artifact(a: Snippet | Terminal): string {
@@ -30,6 +33,30 @@ function sections(l: Landing): string[] {
   ].join('\n\n'));
 }
 
+/** The explanation sections between the quickstart and the commands. */
+function explanation(l: Landing): string[] {
+  return [
+    `## ${l.why.title}`,
+    l.why.text,
+    `## ${l.how.title}`,
+    l.how.crossings.map((c) => `- **${c.title}**${c.measure ? ` (${c.measure})` : ''}: ${c.text} [${c.link}](${url(c.href)})`).join('\n'),
+    `## ${l.files.title}`,
+    l.files.text,
+    l.files.steps.map((s) => `- ${s.from === s.to ? s.from : `${s.from} to ${s.to}`}: ${s.text}`).join('\n'),
+    `## ${l.decisions.title}`,
+    l.decisions.items.map((d) => `- **${d.title}**: ${d.text} [Details](${url(d.href)})`).join('\n'),
+  ];
+}
+
+function switching(l: Landing): string[] {
+  const s = l.switching;
+  return [`## ${s.title}`, s.text, artifact(s.example), `[${s.guide}](${url(`/docs/#${s.id}`)})`];
+}
+
+function limitations(l: Landing): string[] {
+  return [`## ${l.limitations.title}`, absolute(l.limitations.text), absolute(l.limitations.list)];
+}
+
 function start(l: Landing): string[] {
   return [`## ${l.start.title}`, artifact(l.start.example), l.start.text, `[Installation details](${url(l.start.href)})`];
 }
@@ -39,11 +66,16 @@ export function pageMarkdown(l: Landing): string {
     `# ${l.h1}`,
     absolute(l.lede),
     ...start(l),
+    ...explanation(l),
     ...sections(l),
+    ...switching(l),
     `## ${l.measured.title}`,
     l.measured.text,
     l.figures.map((f) => `- ${f.value} ${f.label}`).join('\n'),
+    fence('console', l.measured.terminal.block.value),
+    l.measured.method,
     `[Benchmark commands and output](${url(l.measured.href)})`,
+    ...limitations(l),
     '## More in the docs',
     l.guides.map(({ label, href }) => `- [${label}](${url(href)})`).join('\n'),
   ].join('\n\n') + '\n';
@@ -56,7 +88,10 @@ export function llmsTxt(l: Landing): string {
     absolute(l.lede),
     `Current release v${l.version}.`,
     ...start(l),
+    ...explanation(l),
     ...sections(l),
+    ...switching(l),
+    ...limitations(l),
     '## Links',
     [
       `- [Documentation (the README in full)](${url('/docs/')})`,

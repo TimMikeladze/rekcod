@@ -26,6 +26,7 @@ export class Readme {
   readonly blocks: Block[] = [];
   readonly tables: { header: string[]; markdown: string; section: string }[] = [];
   readonly paragraphs: { markdown: string; text: string; section: string }[] = [];
+  readonly lists: { markdown: string; items: number; section: string }[] = [];
   readonly slugs = new Set<string>();
   readonly title: string;
   readonly intro: string;
@@ -52,6 +53,8 @@ export class Readme {
           markdown: this.source(node),
           section,
         });
+      } else if (node.type === 'list') {
+        this.lists.push({ markdown: this.source(node), items: node.children.length, section });
       } else if (node.type === 'paragraph') {
         if (!section && !intro) intro = this.source(node);
         this.paragraphs.push({ markdown: this.source(node), text: toString(node as Paragraph), section });
@@ -123,6 +126,23 @@ export class Readme {
     for (const [, id, label] of block.value.matchAll(/(\w+)\["([^"]+)"\]/g)) nodes[id] = label;
     for (const [, from, label, to] of block.value.matchAll(/(\w+)(?:\["[^"]*"\])?\s*-->\|([^|]+)\|\s*(\w+)/g)) edges[`${from}-${to}`] = label;
     return { nodes, edges };
+  }
+
+  /**
+   * Participants and messages of the Mermaid sequence diagram with this accTitle, in order.
+   */
+  sequence(accTitle: string): { participants: Record<string, string>; messages: { from: string; to: string; text: string }[] } {
+    const block = this.one(this.blocks.filter((b) => b.lang === 'mermaid' && b.value.includes(`accTitle: ${accTitle}`)), `sequence("${accTitle}")`);
+    const participants: Record<string, string> = {};
+    for (const [, id, label] of block.value.matchAll(/^\s*participant (\w+) as (.+)$/gm)) participants[id] = label.trim();
+    const messages = [...block.value.matchAll(/^\s*(\w+)-{1,2}>>(\w+):\s*(.+)$/gm)].map(([, from, to, text]) => ({ from, to, text: text.trim() }));
+    if (!messages.length) throw new Error(`README.md: sequence("${accTitle}") has no messages`);
+    return { participants, messages };
+  }
+
+  /** The one list directly under the section with this slug. */
+  list(section: string): { markdown: string; items: number } {
+    return this.one(this.lists.filter((l) => l.section === section), `list("${section}")`);
   }
 
   hasSection(slug: string): boolean {

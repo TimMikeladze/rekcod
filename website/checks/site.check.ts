@@ -106,18 +106,29 @@ describe('built pages', () => {
     }
   });
 
-  test('visible workflow notes follow the drawing', () => {
+  test('the explanation sections come in order, each a labelled section', () => {
     const html = pages.landing;
-    const start = html.indexOf('class="hero-workflow shell"');
-    expect(start).toBeGreaterThan(html.indexOf('</figure>'));
-    const notes = html.slice(start, html.indexOf('</section>', start)).replace(/<[^>]*>/g, ' ');
-    const labels = ['rekcod start', 'Docker Desktop', 'docker compose up -d', 'upstream Docker Engine', 'Bind mounts', 'Virtualization framework', 'linux/arm64', 'linux/amd64', 'images use Rosetta'];
-    let previous = -1;
-    for (const label of labels) {
-      const at = notes.indexOf(label);
+    const ids = [landing.why.id, landing.how.id, landing.files.id, landing.decisions.id, landing.commands.id, landing.capabilities[0].id, landing.switching.id, landing.measured.id, landing.limitations.id];
+    let previous = html.indexOf('data-panel="agents"');
+    for (const id of ids) {
+      const at = html.indexOf(`id="${id}"`);
       expect(at).toBeGreaterThan(previous);
+      expect(html.slice(at, at + 200)).toContain('aria-labelledby=');
       previous = at;
     }
+    const text = (from: string, to: string) => html.slice(html.indexOf(`id="${from}"`), html.indexOf(`id="${to}"`)).replace(/<[^>]*>/g, ' ');
+    const how = text(landing.how.id, landing.files.id);
+    for (const c of landing.how.crossings) expect(how).toContain(c.title);
+    const files = text(landing.files.id, landing.decisions.id);
+    let step = -1;
+    for (const s of landing.files.steps) {
+      const at = files.indexOf(s.text);
+      expect(at).toBeGreaterThan(step);
+      step = at;
+    }
+    const limits = html.slice(html.indexOf(`id="${landing.limitations.id}"`));
+    expect((limits.slice(0, limits.indexOf('</section>')).match(/<li>/g) ?? []).length).toBe(landing.limitations.items);
+    expect(html.slice(html.indexOf(`id="${landing.measured.id}"`))).toContain('rekcod ready in');
   });
 
   test('agent files exist and the sitemap names only built files', () => {
@@ -169,7 +180,7 @@ describe('built pages', () => {
     expect(quickstart).toContain('aria-label="Copy install and run commands"');
     const copied = quickstart.match(/data-copy="([^"]*)"/)?.[1];
     expect(copied?.replace(/&#10;/g, '\n')).toBe(landing.start.example.block.value.replace(/&/g, '&amp;'));
-    const agents = html.slice(agentPanel, diagram);
+    const agents = html.slice(agentPanel, html.indexOf(`id="${landing.why.id}"`));
     for (const [, href] of agents.matchAll(/href="([^"]+)"/g)) expect(existsSync(path.join(dist, href))).toBe(true);
   });
 });
